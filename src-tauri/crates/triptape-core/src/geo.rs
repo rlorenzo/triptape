@@ -228,6 +228,18 @@ mod tests {
     }
 
     #[test]
+    fn umbrella_resorts_yield_to_their_parks() {
+        // The former coordinates of each resort row now name a park.
+        for (gps, park) in [
+            ((35.629722, 139.882778), "Tokyo Disneyland"),
+            ((28.3722, -81.5494), "Epcot"),
+            ((48.86872, 2.7818), "Disney Adventure World"),
+        ] {
+            assert_eq!(attraction_name(gps).as_deref(), Some(park));
+        }
+    }
+
+    #[test]
     fn attraction_name_radius_holds_at_high_latitude() {
         // ~1.9 km east of Quttinirpaaq National Park at 82.2°N: 0.126° of
         // longitude.
