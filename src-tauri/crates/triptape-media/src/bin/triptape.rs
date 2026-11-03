@@ -1,22 +1,25 @@
-//! Headless TripTape CLI: `scan` a folder into SQLite, `plan` a story.
+//! Headless TripTape CLI: `scan` a folder into SQLite, `plan` a story,
+//! `export` all eligible keepsakes (hero film, reels pack, photo book).
 //!
 //! ```sh
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F]
 //! ```
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use triptape_core::{
-    cluster, db::Db, hash, livephoto, metadata, plan as planmod, privacy, proxies, scan, score,
-    types::*,
+    cluster, db::Db, hash, jobs, livephoto, metadata, plan as planmod, privacy, proxies, scan,
+    score, types::*,
 };
+use triptape_media::{export::export_all, export::ExportOptions, ffmpeg, render_book::BookPreset};
 
 fn parse_args() -> (String, HashMap<String, String>) {
     let mut it = std::env::args().skip(1);
     let cmd = it.next().unwrap_or_else(|| {
-        eprintln!("usage: triptape <scan|plan> [--flag value]...");
+        eprintln!("usage: triptape <scan|plan|export> [--flag value]...");
         std::process::exit(2);
     });
     let mut flags = HashMap::new();
@@ -409,13 +412,100 @@ fn parse_lat_lon(s: &str) -> Option<(f64, f64)> {
     ((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)).then_some((lat, lon))
 }
 
+fn export_cmd(flags: &HashMap<String, String>) {
+    let db_path = need(flags, "db");
+    let out = need(flags, "out");
+    let preset = BookPreset::from_flag(&flag_or(flags, "preset", "P1"))
+        .unwrap_or_else(|| die("preset", "want P1|P2"));
+    let ffmpeg_bin = flag_or(flags, "ffmpeg", "ffmpeg");
+    let ffprobe_bin = flag_or(flags, "ffprobe", "ffprobe");
+    let typst_bin = flag_or(flags, "typst", "typst");
+    let music = flags.get("music").map(PathBuf::from);
+    if let Some(m) = &music {
+        if !m.exists() {
+            die("music", format!("not found: {}", m.display()));
+        }
+    }
+
+    let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
+    let (project_id, mut plan) = db
+        .latest_plan_with_project(flags.get("project").map(String::as_str))
+        .unwrap_or_else(|e| die("plan", e))
+        .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
+    // Rendered maps get the same home fuzzing as `plan` JSON (Sec 14).
+    if let Some(h) = flags.get("home") {
+        let home = parse_lat_lon(h).unwrap_or_else(|| die("--home", "want LAT,LON"));
+        plan.map_polyline = privacy::fuzz_home_route(&plan.map_polyline, home);
+    }
+    let assets = db
+        .list_assets(&project_id)
+        .unwrap_or_else(|e| die("assets", e));
+    let trip_name = db
+        .get_project(&project_id)
+        .unwrap_or_else(|e| die("project", e))
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| "trip".to_string());
+
+    let caps = ffmpeg::probe_capabilities(&ffmpeg_bin, &ffprobe_bin);
+    println!(
+        "ffmpeg caps: libx264={} xfade={} zoompan={} tonemap={} zscale={} loudnorm={} drawtext={} libass={} vidstab={}",
+        caps.libx264,
+        caps.xfade,
+        caps.zoompan,
+        caps.tonemap,
+        caps.zscale,
+        caps.loudnorm,
+        caps.drawtext,
+        caps.libass,
+        caps.vidstabdetect && caps.vidstabtransform,
+    );
+
+    // Free-space precheck: ~2 GB estimate for the three keepsakes (the
+    // precheck applies its own 1.5x headroom).
+    if let Err(e) = jobs::free_space_precheck(&out, 2_000_000_000) {
+        die("free space", e);
+    }
+
+    let report = export_all(
+        &caps,
+        &plan,
+        &assets,
+        &out,
+        &ExportOptions {
+            preset,
+            trip_name,
+            typst_bin,
+            music_path: music,
+        },
+    )
+    .unwrap_or_else(|e| die("export", e));
+
+    if let Some(v) = &report.video {
+        println!("video: {v}");
+    }
+    for r in &report.reels {
+        println!("reel: {r}");
+    }
+    if report.book_pages > 0 {
+        println!("book: {} pages", report.book_pages);
+    }
+    for s in &report.skipped {
+        println!("skipped {}: {}", s.keepsake, s.reason);
+    }
+    for f in &report.fallbacks {
+        println!("fallback: {f}");
+    }
+    println!("wrote {}", out.join("export.json").display());
+}
+
 fn main() {
     let (cmd, flags) = parse_args();
     match cmd.as_str() {
         "scan" => scan_cmd(&flags),
         "plan" => plan_cmd(&flags),
+        "export" => export_cmd(&flags),
         _ => {
-            eprintln!("unknown command {cmd}; want scan|plan");
+            eprintln!("unknown command {cmd}; want scan|plan|export");
             std::process::exit(2);
         }
     }
