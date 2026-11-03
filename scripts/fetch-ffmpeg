@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Fetch the pinned static FFmpeg + ffprobe sidecar binaries (full GPL build).
+# PLAN.md Section 7: --enable-gpl --enable-version3 with libx264 + libvidstab,
+# never --enable-nonfree. Records version + SHA-256 in docs/ffmpeg-build.md.
+#
+# Usage: ./scripts/fetch-ffmpeg [out-dir]   (default: sidecars/<os>-<arch>/)
+set -euo pipefail
+
+PIN_VERSION="8.0.1"
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+
+# Pinned SHA-256 hashes. PLACEHOLDERS until Sprint 1 maintainer run fills them
+# in from a downloaded copy and records them in docs/ffmpeg-build.md.
+# fetch-ffmpeg refuses to install while any entry is still a placeholder.
+PIN_SHA256_Darwin_arm64="<FILL: sha256 of macOS arm64 static build, FFmpeg ${PIN_VERSION}>"
+PIN_SHA256_Darwin_x86_64="<FILL: sha256 of macOS x86_64 static build, FFmpeg ${PIN_VERSION}>"
+PIN_SHA256_Windows_x64="<FILL: sha256 of BtbN win64-gpl-shared build, FFmpeg ${PIN_VERSION}>"
+
+# One platform table: download URL + expected hash.
+case "$OS-$ARCH" in
+  Darwin-arm64|Darwin-x86_64)
+    URL="https://evermeet.cx/ffmpeg/ffmpeg-${PIN_VERSION}.7z"
+    if [ "$ARCH" = arm64 ]; then WANT="$PIN_SHA256_Darwin_arm64"; else WANT="$PIN_SHA256_Darwin_x86_64"; fi ;;
+  MINGW*-x86_64|MSYS*-x86_64|Linux-x86_64)
+    URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-*-gpl-shared/ffmpeg-n*-win64-gpl-shared-${PIN_VERSION}.zip"
+    WANT="$PIN_SHA256_Windows_x64" ;;
+  *) echo "unsupported platform: $OS-$ARCH (see docs/ffmpeg-build.md)" >&2; exit 2 ;;
+esac
+
+if [[ "$WANT" == "<FILL"* ]]; then
+  echo "BLOCKED: no pinned SHA-256 for $OS-$ARCH yet." >&2
+  echo "Download the URL below, verify the publisher checksum, paste it into" >&2
+  echo "this script AND docs/ffmpeg-build.md, then re-run." >&2
+  echo "URL: $URL" >&2
+  exit 3
+fi
+
+OUT="${1:-sidecars/${OS}-${ARCH}}"
+mkdir -p "$OUT"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+curl -fL -o "$TMP/ffmpeg-pkg" "$URL"
+echo "$WANT  $TMP/ffmpeg-pkg" | shasum -a 256 -c -
+# Extraction is archive-dependent (.7z macOS / .zip Windows); unpack ffmpeg
+# and ffprobe side by side into $OUT, then run the gate:
+#   ./scripts/check-ffmpeg.sh "$OUT/ffmpeg"
+echo "hash OK; unpack $TMP/ffmpeg-pkg into $OUT, then run scripts/check-ffmpeg.sh"

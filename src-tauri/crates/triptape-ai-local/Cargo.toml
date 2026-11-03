@@ -1,0 +1,7 @@
+[package]
+name = "triptape-ai-local"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+triptape-core = { path = "../triptape-core" }
