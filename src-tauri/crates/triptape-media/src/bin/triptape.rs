@@ -4,7 +4,7 @@
 //! ```sh
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON]
-//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F] [--keep-ambience]
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -25,11 +25,20 @@ fn parse_args() -> (String, HashMap<String, String>) {
     let mut flags = HashMap::new();
     let mut pending: Option<String> = None;
     for a in it {
-        if let Some(p) = pending.take() {
-            flags.insert(p, a);
-        } else if let Some(k) = a.strip_prefix("--") {
+        if let Some(k) = a.strip_prefix("--") {
+            // A flag directly after a valueless boolean flag must not
+            // swallow it as its value: `--keep-ambience --out x`.
+            if let Some(p) = pending.take() {
+                flags.insert(p, "true".to_string());
+            }
             pending = Some(k.to_string());
+        } else if let Some(p) = pending.take() {
+            flags.insert(p, a);
         }
+    }
+    // Trailing valueless flag: `--export --keep-ambience`.
+    if let Some(p) = pending.take() {
+        flags.insert(p, "true".to_string());
     }
     (cmd, flags)
 }
@@ -487,6 +496,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
         die("free space", e);
     }
 
+    let keep_ambience = flags.get("keep-ambience").is_some_and(|v| v != "false");
     let report = export_all(
         &caps,
         &plan,
@@ -497,6 +507,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             trip_name,
             typst_bin,
             music_path: music,
+            keep_ambience,
             only: flag_or(flags, "only", "all"),
         },
     )

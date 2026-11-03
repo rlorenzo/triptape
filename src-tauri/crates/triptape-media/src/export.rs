@@ -8,10 +8,10 @@ use crate::ffmpeg::Capabilities;
 use crate::render_book::{self, BookOptions, BookPhoto};
 use crate::render_reels::{self, ReelOptions};
 use crate::render_video::{self, ResolvedEntry, VideoOptions};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{check_source_integrity, plan_eligibility, Integrity};
-use triptape_core::types::{AssetKind, Plan, PlanEntry};
+use triptape_core::types::{AssetKind, Plan, PlanEntry, Rendition};
 
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
@@ -19,6 +19,9 @@ pub struct ExportOptions {
     pub trip_name: String,
     pub typst_bin: String,
     pub music_path: Option<PathBuf>,
+    /// Keep the original film audio at 0.12 under the music bed (default
+    /// mutes it; the music is the primary audio).
+    pub keep_ambience: bool,
     /// "all" (default), or one keepsake: "video" | "reels" | "book".
     pub only: String,
 }
@@ -63,6 +66,7 @@ fn resolve_entry(
         still_path,
         motion_path,
         caption: plan.captions.get(asset_id).cloned(),
+        taken_at: a.taken_at,
     })
 }
 
@@ -214,6 +218,8 @@ pub fn export_all(
                 trip_name: opts.trip_name.clone(),
                 short_mode: elig.video == "short",
                 music_path: opts.music_path.clone(),
+                keep_ambience: opts.keep_ambience,
+                typst_bin: opts.typst_bin.clone(),
                 ..Default::default()
             },
         ) {
@@ -248,6 +254,24 @@ pub fn export_all(
             .take(elig.reels)
             .filter_map(|e| resolve_verified(plan, &by_id, e, "reels", &mut report.fallbacks))
             .collect();
+        // Still highlights become slideshows of their chapter neighbors,
+        // never reusing a photo across reels.
+        // Reserve every selected still first so an earlier reel cannot
+        // take a later reel's highlight as a neighbor.
+        let mut used_slides: HashSet<PathBuf> =
+            resolved.iter().map(|r| r.still_path.clone()).collect();
+        let mut slideshows: Vec<Vec<PathBuf>> = Vec::with_capacity(resolved.len());
+        for r in &resolved {
+            let slides =
+                chapter_slideshow(plan, &by_id, r, &mut used_slides, &mut report.fallbacks);
+            if slides.len() == 1 {
+                report.fallbacks.push(format!(
+                    "reel {}: no chapter neighbors; single-still reel",
+                    r.entry.asset_id
+                ));
+            }
+            slideshows.push(slides);
+        }
         let reels_dir = out_dir.join("reels");
         if resolved.is_empty() {
             // Every selected reel was filtered out (missing/changed source);
@@ -263,6 +287,7 @@ pub fn export_all(
                 &reels_dir,
                 &ReelOptions {
                     music_path: opts.music_path.clone(),
+                    slideshows,
                     ..Default::default()
                 },
             ) {
@@ -346,4 +371,163 @@ pub fn export_all(
     std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)
         .map_err(|e| crate::MediaError::Io(e.to_string()))?;
     Ok(report)
+}
+
+/// Most photos in one still-highlight slideshow reel.
+const MAX_SLIDES: usize = 5;
+
+/// Slideshow stills for one reel: the selected still, then the next stills
+/// of its own chapter in story order (wrapping to earlier ones), skipping
+/// clips, photos already in `used` (callers pre-reserve every reel's
+/// selected still), and neighbors that fail the source integrity check
+/// (recorded in `fallbacks`). Empty for motion reels.
+fn chapter_slideshow(
+    plan: &Plan,
+    by_id: &HashMap<String, triptape_core::types::Asset>,
+    r: &ResolvedEntry,
+    used: &mut HashSet<PathBuf>,
+    fallbacks: &mut Vec<String>,
+) -> Vec<PathBuf> {
+    if r.motion_path.is_some() || !matches!(r.entry.rendition, Rendition::Still) {
+        return vec![];
+    }
+    let mut slides = vec![r.still_path.clone()];
+    used.insert(r.still_path.clone());
+    let id = &r.entry.asset_id;
+    let Some((ch, start)) = plan
+        .chapters
+        .iter()
+        .find_map(|c| c.asset_ids.iter().position(|a| a == id).map(|p| (c, p)))
+    else {
+        return slides;
+    };
+    let neighbors = ch.asset_ids[start + 1..]
+        .iter()
+        .chain(&ch.asset_ids[..start]);
+    for a in neighbors.filter_map(|nid| by_id.get(nid)) {
+        if slides.len() >= MAX_SLIDES {
+            break;
+        }
+        if a.kind == AssetKind::Video || used.contains(&a.path) {
+            continue;
+        }
+        if let Err(reason) = verify_source(&asset_snapshot(a), &a.path) {
+            fallbacks.push(format!("reels: {reason}; neighbor skipped"));
+            continue;
+        }
+        used.insert(a.path.clone());
+        slides.push(a.path.clone());
+    }
+    slides
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_plan() -> Plan {
+        Plan {
+            plan_version: 1,
+            schema_version: 1,
+            hero: vec![],
+            reel_selects: vec![],
+            chapters: vec![],
+            captions: HashMap::new(),
+            map_polyline: vec![],
+            music: triptape_core::types::MusicPick {
+                track: "t".into(),
+                rationale: "r".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn chapter_slideshow_takes_neighbors_once_and_skips_clips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut by_id = HashMap::new();
+        for (id, kind) in [
+            ("p0", AssetKind::Photo),
+            ("p1", AssetKind::Photo),
+            ("v2", AssetKind::Video),
+            ("p3", AssetKind::Photo),
+            ("p4", AssetKind::Photo),
+        ] {
+            let path = dir.path().join(format!("{id}.jpg"));
+            std::fs::write(&path, b"x").unwrap();
+            let mut asset = triptape_core::types::Asset::new(id, path.clone(), kind);
+            let (size, mtime) = current_size_mtime(&path);
+            asset.size_bytes = size.unwrap();
+            asset.mtime = mtime.unwrap();
+            by_id.insert(id.to_string(), asset);
+        }
+        // p4 changed on disk after planning: must not enter a slideshow.
+        std::fs::write(&by_id["p4"].path, b"changed").unwrap();
+        let mut plan = empty_plan();
+        plan.chapters.push(triptape_core::types::Chapter {
+            title: "Day 1".into(),
+            asset_ids: ["p0", "p1", "v2", "p3", "p4"].map(String::from).to_vec(),
+        });
+        let still = |id: &str| ResolvedEntry {
+            entry: PlanEntry {
+                asset_id: id.into(),
+                content_hash: None,
+                size_bytes: 1,
+                mtime: 0,
+                rendition: Rendition::Still,
+            },
+            still_path: by_id[id].path.clone(),
+            motion_path: None,
+            caption: None,
+            taken_at: None,
+        };
+        // Both selected stills are reserved up front, as export_all does.
+        let mut used: HashSet<PathBuf> = [&by_id["p1"].path, &by_id["p3"].path]
+            .into_iter()
+            .cloned()
+            .collect();
+        let mut fallbacks = vec![];
+        let stems = |v: &[PathBuf]| -> Vec<String> {
+            v.iter()
+                .map(|p| p.file_stem().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        // From p1: clip skipped, p3 reserved for its own reel, changed p4
+        // rejected, then wrap to p0.
+        let a = chapter_slideshow(&plan, &by_id, &still("p1"), &mut used, &mut fallbacks);
+        assert_eq!(stems(&a), ["p1", "p0"]);
+        assert!(
+            fallbacks
+                .iter()
+                .any(|f| f.contains("p4") && f.contains("changed")),
+            "{fallbacks:?}"
+        );
+        // A second reel in the same chapter keeps its still, reuses nothing.
+        let b = chapter_slideshow(&plan, &by_id, &still("p3"), &mut used, &mut fallbacks);
+        assert_eq!(stems(&b), ["p3"]);
+        // Motion reels never become slideshows.
+        let mut clip = still("p0");
+        clip.motion_path = Some(dir.path().join("p0.mov"));
+        assert!(chapter_slideshow(&plan, &by_id, &clip, &mut used, &mut fallbacks).is_empty());
+    }
+
+    #[test]
+    fn resolve_entry_carries_taken_at_and_caption() {
+        let mut plan = empty_plan();
+        plan.hero.push(PlanEntry {
+            asset_id: "a0".into(),
+            content_hash: None,
+            size_bytes: 1,
+            mtime: 0,
+            rendition: triptape_core::types::Rendition::Still,
+        });
+        plan.captions.insert("a0".into(), "Overlook".into());
+        let mut asset =
+            triptape_core::types::Asset::new("a0", PathBuf::from("/tmp/a0.jpg"), AssetKind::Photo);
+        asset.taken_at = Some(1791288000);
+        let assets: HashMap<String, triptape_core::types::Asset> =
+            [("a0".to_string(), asset)].into_iter().collect();
+        let r = resolve_entry(&plan, &assets, "a0").expect("resolves");
+        assert_eq!(r.taken_at, Some(1791288000));
+        assert_eq!(r.caption.as_deref(), Some("Overlook"));
+    }
 }

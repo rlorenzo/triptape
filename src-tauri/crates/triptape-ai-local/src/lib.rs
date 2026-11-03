@@ -236,26 +236,21 @@ impl Captioner for HeuristicPipeline {
 
 /// Template caption from plan context (local-VLM fallback).
 ///
-/// Never empty: `{what} from {Month D}` / `{what} in {place}` /
-/// `{what} from the trip`. Mirrors the core plan builder's wording.
+/// Never empty, and factual only: `{place} · {Weekday, Mon D · h:MM AM}` /
+/// `{Weekday, Mon D · h:MM AM}` / `From the trip`. No invented prose —
+/// without a pinned VLM we cannot say what a photo shows. Mirrors the
+/// core plan builder's dateline wording.
 pub fn template_caption(ctx: &CaptionContext) -> String {
-    let what = match ctx.kind {
-        AssetKind::Video => "a favorite clip",
-        AssetKind::LivePhoto => "a living moment",
-        AssetKind::Photo => "a favorite photo",
-    };
-    if let Some(place) = ctx.place_label {
-        return format!("{what} in {place}");
+    let when = ctx
+        .taken_at
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map(|d| triptape_core::plan::dateline(&d));
+    match (ctx.place_label, when) {
+        (Some(place), Some(w)) => format!("{place} · {w}"),
+        (Some(place), None) => place.to_string(),
+        (None, Some(w)) => w,
+        (None, None) => "From the trip".to_string(),
     }
-    if let Some(taken) = ctx.taken_at {
-        if let Some(stamp) = chrono::DateTime::from_timestamp(taken, 0) {
-            use chrono::Datelike;
-            let month = stamp.format("%B").to_string();
-            let day = stamp.day();
-            return format!("{what} from {month} {day}");
-        }
-    }
-    format!("{what} from the trip")
 }
 
 // -- Music fit ("vibe fit", never fake emotion) -------------------------------------
@@ -387,8 +382,16 @@ mod tests {
             place_label: None,
         });
         assert!(!d.text.is_empty());
-        assert!(d.text.contains("favorite photo"));
-        assert!(d.text.contains("May"));
+        assert!(
+            d.text.contains("May 1"),
+            "factual dateline, got: {}",
+            d.text
+        );
+        assert!(
+            !d.text.contains("favorite"),
+            "no invented prose: {}",
+            d.text
+        );
         // Place label wins over date.
         let p = pipe.draft_caption(&CaptionContext {
             kind: AssetKind::Video,
@@ -399,7 +402,7 @@ mod tests {
         // No context at all: still non-empty.
         let b = pipe.draft_caption(&CaptionContext::new(AssetKind::LivePhoto));
         assert!(!b.text.is_empty());
-        assert!(b.text.contains("living moment"));
+        assert_eq!(b.text, "From the trip");
     }
 
     #[test]
@@ -409,7 +412,11 @@ mod tests {
         assert_eq!(ctx.kind, AssetKind::Video);
         assert_eq!(ctx.taken_at, Some(1_714_557_600));
         let d = HeuristicPipeline.draft_caption(&ctx);
-        assert!(d.text.contains("favorite clip"));
+        assert!(
+            d.text.contains("May 1"),
+            "factual dateline, got: {}",
+            d.text
+        );
     }
 
     #[test]

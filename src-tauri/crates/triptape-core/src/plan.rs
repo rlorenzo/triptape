@@ -11,6 +11,12 @@ use crate::types::{Asset, AssetKind, Chapter, MusicPick, Plan, PlanEntry, Rendit
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// Factual caption dateline, `Wed, May 1 · 10:00 AM` (UTC). Shared by the
+/// plan builder (which prefixes `Day N · `) and the local caption fallback.
+pub fn dateline(dt: &chrono::DateTime<chrono::Utc>) -> String {
+    format!("{} · {}", dt.format("%a, %b %-d"), dt.format("%-I:%M %p"))
+}
+
 pub const PLAN_VERSION: u32 = 1;
 
 /// Score assumed for assets missing from the score map.
@@ -27,6 +33,9 @@ const HERO_CAP: usize = 60;
 const MAX_REELS: usize = 5;
 const MIN_REELS: usize = 3;
 const REEL_MIN_SCORE: f32 = 0.3;
+/// Reel ranking bonus for motion-capable assets (clip / Live Photo with
+/// companion): motion makes a stronger reel.
+const REEL_MOTION_BONUS: f32 = 0.08;
 /// Chapter label for assets with no cluster.
 const UNGROUPED: &str = "Ungrouped";
 
@@ -96,25 +105,53 @@ pub fn build_plan(
         groups[i].1.push(a);
     }
 
-    // Reel selects: round-robin over clusters (by label), best-scored first.
-    let mut by_score: Vec<(&str, Vec<&Asset>)> = groups.clone();
-    by_score.sort_by_key(|g| g.0);
-    for (_, members) in &mut by_score {
-        members.sort_by(|a, b| score_of(&b.id).total_cmp(&score_of(&a.id)));
-    }
+    // Reel selects: trip highlights. Rank every asset trip-wide by score
+    // (motion-capable assets get a small ranking bonus — a clip or Live
+    // Photo makes a stronger reel), then greedily take distinct day/place
+    // moments so the pack spans the trip instead of stopping at the first
+    // few days. Fill to the minimum from the remaining best when there
+    // are not enough distinct moments. Presented in story order.
+    let rank_of = |a: &Asset| {
+        let motion = matches!(a.kind, AssetKind::Video)
+            || (matches!(a.kind, AssetKind::LivePhoto) && a.companion_path.is_some());
+        score_of(&a.id) + if motion { REEL_MOTION_BONUS } else { 0.0 }
+    };
+    let mut ranked: Vec<&Asset> = ordered.to_vec();
+    ranked.sort_by(|a, b| rank_of(b).total_cmp(&rank_of(a)));
+    // Quality floor, waived while the pack is below its minimum size.
+    let qualifies =
+        |a: &Asset, picked: usize| score_of(&a.id) >= REEL_MIN_SCORE || picked < MIN_REELS;
     let mut reel_selects: Vec<PlanEntry> = vec![];
-    'rounds: for round in 0..MAX_REELS {
-        for (_, members) in &by_score {
-            if reel_selects.len() >= MAX_REELS {
-                break 'rounds;
-            }
-            if let Some(a) = members.get(round) {
-                if score_of(&a.id) >= REEL_MIN_SCORE || reel_selects.len() < MIN_REELS {
-                    reel_selects.push(plan_entry(a));
-                }
-            }
+    let mut picked_ids: HashSet<&str> = HashSet::new();
+    let mut used_clusters: HashSet<&str> = HashSet::new();
+    // Pass 1: best asset of each distinct day/place moment.
+    for a in &ranked {
+        if reel_selects.len() >= MAX_REELS {
+            break;
+        }
+        let label = cluster_of.get(&a.id).map_or(UNGROUPED, String::as_str);
+        if !used_clusters.contains(label) && qualifies(a, reel_selects.len()) {
+            used_clusters.insert(label);
+            picked_ids.insert(&a.id);
+            reel_selects.push(plan_entry(a));
         }
     }
+    // Pass 2: fill remaining slots with the next-best qualifying assets.
+    for a in &ranked {
+        if reel_selects.len() >= MAX_REELS {
+            break;
+        }
+        if !picked_ids.contains(a.id.as_str()) && qualifies(a, reel_selects.len()) {
+            picked_ids.insert(&a.id);
+            reel_selects.push(plan_entry(a));
+        }
+    }
+    let story_pos: HashMap<&str, usize> = ordered
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (a.id.as_str(), i))
+        .collect();
+    reel_selects.sort_by_key(|e| story_pos[e.asset_id.as_str()]);
 
     // Chapters: one per cluster label, in story order.
     let chapters: Vec<Chapter> = groups
@@ -125,21 +162,32 @@ pub fn build_plan(
         })
         .collect();
 
-    // Template captions (local-VLM fallback): never empty, always editable.
+    // Auto captions (local-VLM fallback): factual datelines only. No VLM
+    // is pinned yet, so a caption may state only what metadata proves —
+    // trip day, weekday/date, and time of day — never invented prose like
+    // "a favorite photo". Always editable in Story review.
+    let trip_start = ordered
+        .iter()
+        .filter_map(|a| a.taken_at)
+        .filter_map(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map(|d| d.date_naive())
+        .min();
     let captions: HashMap<String, String> = ordered
         .iter()
         .map(|a| {
-            let when = a
-                .taken_at
-                .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-                .map(|d| d.format("%B %-d").to_string())
-                .unwrap_or_else(|| "the trip".to_string());
-            let what = match a.kind {
-                AssetKind::Video => "a favorite clip",
-                AssetKind::LivePhoto => "a living moment",
-                AssetKind::Photo => "a favorite photo",
+            let text = match (
+                a.taken_at
+                    .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
+                trip_start,
+            ) {
+                (Some(dt), Some(start)) => {
+                    let day = (dt.date_naive() - start).num_days() + 1;
+                    format!("Day {day} · {}", dateline(&dt))
+                }
+                (Some(dt), None) => dateline(&dt),
+                _ => "From the trip".to_string(),
             };
-            (a.id.clone(), format!("{what} from {when}"))
+            (a.id.clone(), text)
         })
         .collect();
 
@@ -302,6 +350,12 @@ pub fn check_source_integrity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dateline_is_weekday_date_and_clock() {
+        let dt = chrono::DateTime::from_timestamp(1_714_557_600, 0).unwrap();
+        assert_eq!(dateline(&dt), "Wed, May 1 · 10:00 AM");
+    }
     use crate::types::AssetKind;
     use std::path::PathBuf;
 
@@ -346,6 +400,18 @@ mod tests {
         assert_eq!(plan.hero[0].asset_id, "a", "hero keeps story order");
         assert_eq!(plan.chapters.len(), 2);
         assert_eq!(plan.captions.len(), 3);
+        // Auto captions are factual datelines (trip day + date + time),
+        // never invented prose.
+        assert_eq!(
+            plan.captions["a"], "Day 1 · Wed, May 1 · 10:00 AM",
+            "got: {}",
+            plan.captions["a"]
+        );
+        assert!(
+            plan.captions.values().all(|c| !c.contains("favorite")),
+            "no template prose in captions: {:?}",
+            plan.captions
+        );
         assert_eq!(plan.reel_selects.len(), 3, "3 distinct moments -> 3 reels");
         assert!(plan.reel_selects.len() <= 5);
         assert!(!plan.music.rationale.is_empty());
@@ -354,6 +420,57 @@ mod tests {
         // Round-trips through JSON.
         let back = Plan::from_json(&plan.to_json().unwrap()).unwrap();
         assert_eq!(back.hero.len(), 3);
+    }
+
+    #[test]
+    fn reels_are_trip_highlights_not_first_days() {
+        // Six day-clusters; the sharpest shot of the trip is on the last
+        // day. Old selection took the best of the first five clusters and
+        // never reached it.
+        let mut assets = vec![];
+        let mut co = HashMap::new();
+        let mut scores = HashMap::new();
+        for day in 1..=6u32 {
+            for j in 0..2 {
+                let id = format!("d{day}_{j}");
+                let taken = 1_714_557_600 + i64::from(day) * 86_400 + i64::from(j) * 60;
+                assets.push(asset(&id, taken, AssetKind::Photo));
+                co.insert(id.clone(), format!("2024-05-0{day}"));
+                scores.insert(
+                    id,
+                    Score {
+                        total: 0.40 + day as f32 * 0.05 + j as f32 * 0.01,
+                        highlight: false,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        // The trip highlight: last day, best score by far.
+        scores.insert(
+            "d6_1".to_string(),
+            Score {
+                total: 0.99,
+                highlight: true,
+                ..Default::default()
+            },
+        );
+        let plan = build_plan(&assets, &co, &scores);
+        let ids: Vec<&str> = plan
+            .reel_selects
+            .iter()
+            .map(|e| e.asset_id.as_str())
+            .collect();
+        assert_eq!(ids.len(), MAX_REELS, "full pack: {ids:?}");
+        assert!(ids.contains(&"d6_1"), "trip highlight included: {ids:?}");
+        assert!(
+            !ids.contains(&"d1_1"),
+            "weakest day's best is not a trip highlight: {ids:?}"
+        );
+        // Story order in the pack.
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "reels in story order: {ids:?}");
     }
 
     #[test]
@@ -506,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn reels_capped_and_round_robin() {
+    fn reels_capped_at_max() {
         let assets: Vec<Asset> = (0..12)
             .map(|i| asset(&format!("a{i:02}"), 1_714_557_600 + i, AssetKind::Photo))
             .collect();
@@ -517,7 +634,8 @@ mod tests {
             .collect();
         let plan = build_plan(&assets, &co, &HashMap::new());
         assert_eq!(plan.reel_selects.len(), MAX_REELS);
-        // Alternates clusters: c0, c1, c0, ...
+        // Distinct clusters first (a00 from c0, a01 from c1), then best
+        // remaining fills the pack, all in story order.
         assert_eq!(plan.reel_selects[0].asset_id, "a00");
         assert_eq!(plan.reel_selects[1].asset_id, "a01");
         assert_eq!(plan.chapters.len(), 2);

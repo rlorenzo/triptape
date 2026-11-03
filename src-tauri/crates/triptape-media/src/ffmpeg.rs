@@ -12,6 +12,25 @@ use std::process::Command;
 /// Single-pass EBU R128 loudness target shared by every renderer.
 pub const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
 
+/// Filter-graph fragment showing the full `input` photo fitted over its own
+/// blurred fill at `w`x`h` (no crop of the subject, no aspect distortion).
+/// `tag` suffixes the internal labels so several copies can share one graph.
+/// Ends unlabeled after `setsar=1`, ready for `,zoompan`/`,fps` chaining.
+pub fn fit_over_blur(caps: &Capabilities, input: &str, w: u32, h: u32, tag: &str) -> String {
+    let blur = if caps.gblur { ",gblur=sigma=40" } else { "" };
+    format!(
+        "{input}split[a{tag}][b{tag}];[a{tag}]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}{blur}[bg{tag}];[b{tag}]scale={w}:{h}:force_original_aspect_ratio=decrease[fg{tag}];[bg{tag}][fg{tag}]overlay=(W-w)/2:(H-h)/2,setsar=1"
+    )
+}
+
+/// Centered push-in from 1.0 to `1 + dz` over `frames` frames at 30 fps,
+/// output at `w`x`h`. Apply to a finished composite, never a raw photo.
+pub fn push_in(dz: f64, frames: u32, w: u32, h: u32) -> String {
+    format!(
+        "zoompan=z='1+{dz}*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps=30"
+    )
+}
+
 /// Path as an owned FFmpeg CLI argument.
 pub fn path_arg(p: &Path) -> String {
     p.to_string_lossy().into_owned()
@@ -425,6 +444,27 @@ pub fn verify_video(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fit_over_blur_tags_labels_and_gates_blur() {
+        let mut caps = Capabilities {
+            gblur: true,
+            ..Default::default()
+        };
+        let g = fit_over_blur(&caps, "[2:v]", 1080, 1920, "2");
+        assert!(g.starts_with("[2:v]split[a2][b2]"), "{g}");
+        assert!(g.contains("gblur=sigma=40[bg2]"), "{g}");
+        assert!(
+            g.ends_with("[bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1"),
+            "{g}"
+        );
+        caps.gblur = false;
+        assert!(!fit_over_blur(&caps, "[0:v]", 1920, 1080, "").contains("gblur"));
+        assert_eq!(
+            push_in(0.05, 90, 1920, 1080),
+            "zoompan=z='1+0.05*on/90':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=90:s=1920x1080:fps=30"
+        );
+    }
 
     #[test]
     fn flag_matching_is_exact() {

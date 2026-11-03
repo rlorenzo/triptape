@@ -8,6 +8,7 @@
 //! sidecar SRT (burned-in captions need libass, absent on this build).
 
 use crate::ffmpeg::{self, path_arg as s, Capabilities};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use triptape_core::types::{Plan, PlanEntry, Rendition};
 
@@ -23,6 +24,7 @@ pub enum Transition {
     FadeBlack,
     FadeWhite,
     SmoothLeft,
+    SmoothRight,
     CircleOpen,
     CircleClose,
 }
@@ -36,61 +38,138 @@ impl Transition {
             Transition::FadeBlack => "fadeblack",
             Transition::FadeWhite => "fadewhite",
             Transition::SmoothLeft => "smoothleft",
+            Transition::SmoothRight => "smoothright",
             Transition::CircleOpen => "circleopen",
             Transition::CircleClose => "circleclose",
         }
     }
 }
 
-/// Pure xfade timeline math: cut `i` (into segment `i+1`) sits at
-/// `sum(durations[0..=i]) - overlap*(i+1)`. Stepwise assembly must use
-/// these offsets so overlap never compounds.
+/// Pure xfade timeline math (uniform overlap): cut `i` (into segment
+/// `i+1`) sits at `sum(durations[0..=i]) - overlap*(i+1)`. Stepwise assembly
+/// must use these offsets so overlap never compounds.
 pub fn xfade_offsets(durations: &[f64], overlap: f64) -> Vec<f64> {
+    let n = durations.len().saturating_sub(1);
+    xfade_offsets_var(durations, &vec![overlap; n])
+}
+
+/// Per-cut-overlap timeline math: cut `i` sits at
+/// `sum(durations[0..=i]) - sum(overlaps[0..=i])`. A missing overlap entry
+/// falls back to 0.5 s.
+pub fn xfade_offsets_var(durations: &[f64], overlaps: &[f64]) -> Vec<f64> {
     let mut offsets = vec![];
     let mut acc = 0.0;
+    let mut ov = 0.0;
     for (i, d) in durations.iter().enumerate() {
         acc += d;
         if i + 1 < durations.len() {
-            offsets.push(acc - overlap * (i as f64 + 1.0));
+            ov += overlaps.get(i).copied().unwrap_or(0.5);
+            offsets.push(acc - ov);
         }
     }
     offsets
 }
 
+/// Per-cut overlap for a transition: slow fades get room to breathe,
+/// everything else takes the 0.5 s standard.
+pub fn transition_overlap(t: &Transition) -> f64 {
+    match t {
+        Transition::FadeBlack => 0.8,
+        Transition::CircleOpen | Transition::CircleClose => 0.7,
+        _ => 0.5,
+    }
+}
+
+/// What a segment shows, for kind-change transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegKind {
+    Title,
+    Map,
+    Still,
+    Clip,
+}
+
 /// Assign one transition per cut from story position.
 ///
 /// * `chapter_break[i]` — cut into segment `i` starts a new chapter.
+/// * `kinds` — segment kinds; a kind change dissolves (shorter than `n`
+///   is fine: missing entries never count as a change).
 /// * First cut opens with `circleopen`, final cut closes with `circleclose`.
-/// * Chapter breaks use `fadeblack`; other place/day changes `smoothleft`.
-/// * Up to two `dissolve` cuts become the blur-dissolve signature.
-/// * Everything else is the `fade` default.
-pub fn assign_transitions(n_segments: usize, chapter_break: &[bool]) -> Vec<Option<Transition>> {
+/// * Chapter breaks cycle `fadeblack, smoothleft, smoothleft`, so slow
+///   fades stay rare (max ~1 in 3) however many micro-chapters exist.
+/// * The blur-dissolve signature is capped at 3.
+/// * Everything else rotates `fade/dissolve/smoothleft/smoothright/
+///   circleopen`, never repeating the same xfade filter twice in a row
+///   (special picks that would repeat fall back to the rotation).
+pub fn assign_transitions(
+    n_segments: usize,
+    chapter_break: &[bool],
+    kinds: &[SegKind],
+) -> Vec<Option<Transition>> {
+    const ROT: [Transition; 5] = [
+        Transition::Fade,
+        Transition::Dissolve,
+        Transition::SmoothLeft,
+        Transition::SmoothRight,
+        Transition::CircleOpen,
+    ];
     let mut out: Vec<Option<Transition>> = vec![None; n_segments];
-    if n_segments == 0 {
+    if n_segments <= 1 {
         return out;
     }
-    let mut signature_used = 0;
+    let mut prev: Option<&'static str> = None;
+    let mut sig_used = 0u32;
+    let mut break_n = 0u32;
+    let mut rot = 0usize;
+    // Next rotation pick whose filter differs from `prev`.
+    let next_rot = |prev: Option<&str>, rot: &mut usize| -> Transition {
+        for _ in 0..ROT.len() {
+            let t = ROT[*rot % ROT.len()];
+            *rot += 1;
+            if Some(t.xfade_name()) != prev {
+                return t;
+            }
+        }
+        Transition::Fade
+    };
     for (i, slot) in out.iter_mut().enumerate().skip(1) {
-        let t = if i == n_segments - 1 && n_segments > 2 {
-            Transition::CircleClose
-        } else if i == 1 {
-            Transition::CircleOpen
+        // Special pick for this story position; `None` means "rotate".
+        let special = if i == 1 {
+            Some(Transition::CircleOpen)
+        } else if i == n_segments - 1 && n_segments > 2 {
+            Some(Transition::CircleClose)
         } else if chapter_break.get(i).copied().unwrap_or(false) {
-            Transition::FadeBlack
-        } else if i % 4 == 3 {
-            Transition::SmoothLeft
-        } else if signature_used < 2 && i % 3 == 2 {
-            signature_used += 1;
-            Transition::BlurDissolve
-        } else if i % 2 == 0 {
-            Transition::Dissolve
+            break_n += 1;
+            Some(if break_n % 3 == 1 {
+                Transition::FadeBlack
+            } else {
+                Transition::SmoothLeft
+            })
+        } else if kinds.get(i) != kinds.get(i - 1) {
+            Some(Transition::Dissolve)
+        } else if sig_used < 3 && i % 4 == 2 {
+            Some(Transition::BlurDissolve)
         } else {
-            Transition::Fade
+            None
         };
+        // A special pick that would repeat the previous filter rotates too.
+        let t = match special {
+            Some(c) if Some(c.xfade_name()) != prev => c,
+            _ => next_rot(prev, &mut rot),
+        };
+        if t == Transition::BlurDissolve {
+            sig_used += 1;
+        }
         *slot = Some(t);
+        prev = Some(t.xfade_name());
     }
     out
 }
+
+/// Bundled fallback score (`resources/music/triptape-theme.mp3`): the hero
+/// film always has a music bed, even when the user passes no `--music`.
+static DEFAULT_MUSIC_BYTES: &[u8] =
+    include_bytes!("../../../../resources/music/triptape-theme.mp3");
 
 /// Resolved source files for one plan entry (export layer fills this).
 #[derive(Debug, Clone)]
@@ -99,6 +178,8 @@ pub struct ResolvedEntry {
     pub still_path: PathBuf,
     pub motion_path: Option<PathBuf>,
     pub caption: Option<String>,
+    /// Capture time (unix secs) for date lower-thirds; `None` skips the date.
+    pub taken_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +191,11 @@ pub struct VideoOptions {
     pub title_secs: f64,
     pub map_secs: f64,
     pub music_path: Option<PathBuf>,
+    /// Keep the original film audio at 0.12 under a ducked music bed.
+    /// Default (false) mutes it: the music is the primary audio.
+    pub keep_ambience: bool,
+    /// Typst binary for title/lower-third text PNGs.
+    pub typst_bin: String,
 }
 
 impl Default for VideoOptions {
@@ -122,6 +208,8 @@ impl Default for VideoOptions {
             title_secs: 2.5,
             map_secs: 3.0,
             music_path: None,
+            keep_ambience: false,
+            typst_bin: "typst".into(),
         }
     }
 }
@@ -141,6 +229,8 @@ pub struct Edl {
     pub version: u32,
     pub trip_name: String,
     pub overlap_secs: f64,
+    /// Per-cut overlap actually used (len = segments - 1).
+    pub cut_overlaps_secs: Vec<f64>,
     pub segments: Vec<EdlSegment>,
     pub total_secs: f64,
     pub captions_sidecar: Option<String>,
@@ -185,8 +275,12 @@ pub fn render_hero_video(
     if !caps.can_burn_captions() {
         fallbacks.push("libass absent: captions as sidecar SRT, not burned in".into());
     }
-    if !caps.drawtext {
-        fallbacks.push("drawtext absent: solid title card without text".into());
+    let typst_ok = crate::titlecard::typst_available(&opts.typst_bin);
+    if !typst_ok {
+        fallbacks.push(format!(
+            "typst unavailable ({}): solid title card and no overlay text",
+            opts.typst_bin
+        ));
     }
 
     // Chapter breaks: cut into segment i when its chapter differs.
@@ -204,9 +298,37 @@ pub fn render_hero_video(
         opts.still_secs
     };
     let mut segs: Vec<(ResolvedEntry, PathBuf, f64, String)> = vec![];
-    // Title card first.
+    // Title card first: Typst full-frame card (trip name + date range)
+    // when available, else the styled solid.
     let title_png = work_dir.join("title.png");
-    crate::titlecard::save_title_card(&opts.trip_name, 1920, 1080, &title_png)?;
+    let date_range = crate::titlecard::format_date_range(
+        &resolved
+            .iter()
+            .filter_map(|r| r.taken_at)
+            .collect::<Vec<_>>(),
+    );
+    let title_is_text = if typst_ok {
+        let doc = crate::titlecard::title_card_doc(&opts.trip_name, date_range.as_deref());
+        match crate::titlecard::render_text_png(&opts.typst_bin, &doc, &title_png, 72) {
+            Ok(()) => true,
+            Err(e) => {
+                fallbacks.push(format!("title text failed ({e}); solid card"));
+                crate::titlecard::save_title_card(&opts.trip_name, 1920, 1080, &title_png)?;
+                false
+            }
+        }
+    } else {
+        crate::titlecard::save_title_card(&opts.trip_name, 1920, 1080, &title_png)?;
+        false
+    };
+    if title_is_text {
+        fallbacks.push(format!(
+            "title card shows trip name{}",
+            date_range
+                .as_deref()
+                .map_or(String::new(), |d| format!(" + {d}"))
+        ));
+    }
     let title_mp4 = work_dir.join("seg_title.mp4");
     render_hold_segment(caps, &title_png, opts.title_secs, 0, &title_mp4)?;
     segs.push((
@@ -221,6 +343,7 @@ pub fn render_hero_video(
             still_path: title_png,
             motion_path: None,
             caption: None,
+            taken_at: None,
         },
         title_mp4,
         opts.title_secs,
@@ -244,6 +367,7 @@ pub fn render_hero_video(
                         still_path: card.to_path_buf(),
                         motion_path: None,
                         caption: None,
+                        taken_at: None,
                     },
                     map_mp4,
                     opts.map_secs,
@@ -299,7 +423,7 @@ pub fn render_hero_video(
         ));
     }
 
-    // 2. Transitions + offsets.
+    // 2. Chapter starts: cut into segment i when its chapter differs.
     let mut chapter_break = vec![false; segs.len()];
     for i in 1..segs.len() {
         let (a, b) = (&segs[i - 1].0.entry.asset_id, &segs[i].0.entry.asset_id);
@@ -309,14 +433,79 @@ pub fn render_hero_video(
             chapter_break[i] = chapter_of(a) != chapter_of(b);
         }
     }
-    let transitions = assign_transitions(segs.len(), &chapter_break);
-    let durations: Vec<f64> = segs.iter().map(|s| s.2).collect();
-    let offsets = xfade_offsets(&durations, opts.overlap_secs);
 
-    // 3. Stepwise pairwise assembly.
+    // A segment opens its chapter when the previous content segment (title
+    // and map cards skipped) is in another chapter or there is none. Kept
+    // apart from `chapter_break`, which is false for the cut out of the
+    // title card, so the first chapter still gets its title overlay.
+    let mut chapter_start = vec![false; segs.len()];
+    let mut prev_chapter: Option<usize> = None;
+    for (i, seg) in segs.iter().enumerate() {
+        let id = seg.0.entry.asset_id.as_str();
+        if id == "title" || id == "map" {
+            continue;
+        }
+        let ch = chapter_of(id);
+        chapter_start[i] = prev_chapter != Some(ch);
+        prev_chapter = Some(ch);
+    }
+
+    // 3. Per-segment context overlays (Typst lower-thirds baked per segment
+    // so they ride through the xfade chain): chapter title on the chapter's
+    // first segment, else date + caption. Title/map cards carry no overlay.
+    if typst_ok {
+        let chapter_title: HashMap<&str, &str> = plan
+            .chapters
+            .iter()
+            .flat_map(|c| c.asset_ids.iter().map(|id| (id.as_str(), c.title.as_str())))
+            .collect();
+        for (i, (r, seg_mp4, dur, _)) in segs.iter().enumerate() {
+            let id = r.entry.asset_id.as_str();
+            if id == "title" || id == "map" {
+                continue;
+            }
+            let ch_title = chapter_start[i]
+                .then(|| chapter_title.get(id).copied())
+                .flatten();
+            let Some((top, bottom)) =
+                crate::titlecard::overlay_lines(ch_title, r.taken_at, r.caption.as_deref())
+            else {
+                continue;
+            };
+            let doc = crate::titlecard::lower_third_doc(&top, bottom.as_deref());
+            let png = work_dir.join(format!("ov_{i:03}.png"));
+            if let Err(e) = crate::titlecard::render_text_png(&opts.typst_bin, &doc, &png, 72)
+                .and_then(|()| apply_lower_third(caps, seg_mp4, &png, *dur))
+            {
+                fallbacks.push(format!("overlay skipped for {id}: {e}"));
+            }
+        }
+    }
+
+    // 4. Transitions + per-cut overlaps.
+    let kinds: Vec<SegKind> = segs
+        .iter()
+        .map(|s| match s.3.as_str() {
+            "title" => SegKind::Title,
+            "map" => SegKind::Map,
+            "clip" => SegKind::Clip,
+            _ => SegKind::Still,
+        })
+        .collect();
+    let transitions = assign_transitions(segs.len(), &chapter_break, &kinds);
+    let durations: Vec<f64> = segs.iter().map(|s| s.2).collect();
+    let cut_overlaps: Vec<f64> = transitions
+        .iter()
+        .skip(1)
+        .map(|t| transition_overlap(&t.unwrap_or(Transition::Fade)))
+        .collect();
+    let offsets = xfade_offsets_var(&durations, &cut_overlaps);
+
+    // 5. Stepwise pairwise assembly.
     let mut acc = segs[0].1.clone();
     for i in 1..segs.len() {
         let t = transitions[i].unwrap_or(Transition::Fade);
+        let ov = cut_overlaps[i - 1];
         let next = &segs[i].1;
         let chained = work_dir.join(format!("chain_{i:03}.mp4"));
         let offset = offsets[i - 1];
@@ -330,9 +519,9 @@ pub fn render_hero_video(
             format!(
                 "[0:v][1:v]xfade=transition={}:duration={:.3}:offset={:.3}[v];[0:a][1:a]acrossfade=d={:.3}:c1=tri:c2=tri[a]",
                 t.xfade_name(),
-                opts.overlap_secs,
+                ov,
                 offset.max(0.0),
-                opts.overlap_secs
+                ov
             ),
             "-map".into(),
             "[v]".into(),
@@ -345,58 +534,71 @@ pub fn render_hero_video(
         acc = chained;
     }
 
-    // 4. Final pass: loudnorm single pass (+ optional ducked music mix).
-    let total = durations.iter().sum::<f64>() - opts.overlap_secs * offsets.len() as f64;
-    let film_af = if caps.loudnorm {
-        ffmpeg::LOUDNORM.to_string()
+    // 6. Final pass: the music bed is the PRIMARY audio (looped, trimmed to
+    // the film, faded in/out); the original film audio is muted, or kept at
+    // 0.12 ducked under the music with --keep-ambience. Loudnorm lands on
+    // the mix, never on raw clip noise.
+    let total = durations.iter().sum::<f64>() - cut_overlaps.iter().sum::<f64>();
+    let norm = if caps.loudnorm {
+        ffmpeg::LOUDNORM
     } else {
         fallbacks.push("loudnorm absent: flat resample, no loudness pass".into());
-        "aresample=48000,aformat=channel_layouts=stereo".to_string()
+        "anull"
     };
-    let final_args = |music: Option<&Path>, audio_filter: String| -> Vec<String> {
-        let mut args: Vec<String> = vec!["-y".into(), "-i".into(), s(&acc)];
-        if let Some(m) = music {
-            // Multi-input graph: needs -filter_complex + explicit maps.
-            args.extend(["-stream_loop".into(), "-1".into(), "-i".into(), s(m)]);
-            args.extend([
-                "-filter_complex".into(),
-                audio_filter,
-                "-map".into(),
-                "0:v".into(),
-                "-map".into(),
-                "[aout]".into(),
-            ]);
-        } else {
-            args.extend(["-filter:a".into(), audio_filter]);
+    // Resolve the music file: an existing --music wins; otherwise the
+    // bundled theme track is materialized into the work dir.
+    let music_path = match opts.music_path.as_deref().filter(|m| m.exists()) {
+        Some(m) => m.to_path_buf(),
+        None => {
+            if let Some(m) = &opts.music_path {
+                fallbacks.push(format!(
+                    "music file {} missing; bundled theme instead",
+                    m.display()
+                ));
+            }
+            let bundled = work_dir.join("triptape-theme.mp3");
+            std::fs::write(&bundled, DEFAULT_MUSIC_BYTES)
+                .map_err(|e| crate::MediaError::Io(e.to_string()))?;
+            fallbacks.push("bundled triptape-theme music bed".into());
+            bundled
         }
-        args.extend(ffmpeg::x264_aac("medium", 19));
-        args.extend(["-r".into(), "30".into(), "-shortest".into(), s(out_mp4)]);
-        args
     };
-    let music = opts.music_path.as_deref().filter(|m| {
-        let ok = m.exists();
-        if !ok {
-            fallbacks.push("music file missing; film audio only".into());
-        }
-        ok
-    });
-    let first = match music {
-        // Music ducks under the (loudnormed when available) film audio.
-        Some(m) => final_args(
-            Some(m),
-            format!("[0:a]{film_af},asplit=2[film][key];[1:a]volume=0.25,aresample=48000,aformat=channel_layouts=stereo[m];[m][key]sidechaincompress=threshold=0.02:ratio=8:attack=200:release=800[duck];[film][duck]amix=inputs=2:duration=first:dropout_transition=0[aout]"),
-        ),
-        None => final_args(None, film_af.clone()),
+    let fade_out_start = (total - 1.5).max(0.0);
+    let music_chain = format!(
+        "[1:a]atrim=0:{total:.3},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,afade=t=in:st=0:d=1,afade=t=out:st={fade_out_start:.3}:d=1.5"
+    );
+    let audio_graph = if opts.keep_ambience {
+        format!(
+            "[0:a]volume=0.12,aresample=48000,aformat=channel_layouts=stereo[film];{music_chain}[m0];[m0][film]sidechaincompress=threshold=0.02:ratio=8:attack=200:release=800[duck];[film][duck]amix=inputs=2:duration=first:dropout_transition=0,{norm}[aout]"
+        )
+    } else {
+        // Muted film audio: the music bed alone is the soundtrack.
+        format!("{music_chain},{norm}[aout]")
     };
-    if let Err(e) = ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &first, out_mp4) {
-        if music.is_none() {
-            return Err(e);
-        }
-        fallbacks.push(format!("music mix failed ({e}); retrying film audio only"));
-        ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &final_args(None, film_af), out_mp4)?;
+    let mut final_args: Vec<String> = vec![
+        "-y".into(),
+        "-i".into(),
+        s(&acc),
+        "-stream_loop".into(),
+        "-1".into(),
+        "-i".into(),
+        s(&music_path),
+        "-filter_complex".into(),
+        audio_graph,
+        "-map".into(),
+        "0:v".into(),
+        "-map".into(),
+        "[aout]".into(),
+    ];
+    final_args.extend(ffmpeg::x264_aac("medium", 19));
+    final_args.extend(["-r".into(), "30".into(), s(out_mp4)]);
+    if let Err(e) = ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &final_args, out_mp4) {
+        // Music bed is mandatory: a failed mix fails the film (the old
+        // film-audio-only path is exactly the raw-clip-noise bug).
+        return Err(crate::MediaError::Ffmpeg(format!("music mix failed: {e}")));
     }
 
-    // 5. Verify + EDL + sidecar SRT.
+    // 7. Verify + EDL + sidecar SRT.
     let probed = ffmpeg::verify_video(&caps.ffprobe_bin, out_mp4, 1920, 1080)?;
     // Segment 0 starts at 0; every later segment starts at its xfade cut.
     let starts: Vec<f64> = std::iter::once(0.0)
@@ -414,6 +616,10 @@ pub fn render_hero_video(
         version: 1,
         trip_name: opts.trip_name.clone(),
         overlap_secs: opts.overlap_secs,
+        cut_overlaps_secs: cut_overlaps
+            .iter()
+            .map(|o| (o * 1000.0).round() / 1000.0)
+            .collect(),
         segments: segs
             .iter()
             .enumerate()
@@ -445,6 +651,40 @@ pub fn render_hero_video(
         duration_secs: probed.duration_secs,
         fallbacks,
     })
+}
+
+/// Bake a 1200x200 lower-third PNG onto `seg` in place (`overlay=48:H-160`,
+/// visible `between(t,0.3,segdur)`). `run_ffmpeg` writes a partial sibling
+/// and renames, so a failure never leaves a torn segment.
+fn apply_lower_third(
+    caps: &Capabilities,
+    seg: &Path,
+    png: &Path,
+    seg_dur: f64,
+) -> Result<(), crate::MediaError> {
+    let args: Vec<String> = vec![
+        "-y".into(),
+        "-i".into(),
+        s(seg),
+        "-loop".into(),
+        "1".into(),
+        "-i".into(),
+        s(png),
+        "-filter_complex".into(),
+        format!(
+            "[0:v][1:v]overlay=48:H-160:format=yuv420:enable='between(t,0.3,{:.3})'[v]",
+            seg_dur
+        ),
+        "-map".into(),
+        "[v]".into(),
+        "-map".into(),
+        "0:a".into(),
+    ]
+    .into_iter()
+    .chain(ffmpeg::x264_aac("veryfast", 16))
+    .chain(["-shortest".into(), s(seg)])
+    .collect();
+    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, seg)
 }
 
 fn write_captions_srt(
@@ -519,13 +759,18 @@ fn render_entry_segment(
             // Live motion (≤3 s class) may run short; reels/video allow that.
             let out = work_dir.join(format!("seg_{idx:03}.mp4"));
             // HDR check on the real source.
-            let mut vf =
-                "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1,fps=30"
-                    .to_string();
             let probe = ffmpeg::ffprobe_file(&caps.ffprobe_bin, src).ok();
             // Muted/camera-silent clips get a matching silent track so the
             // acrossfade assembly always has `[n:a]` to consume.
             let has_audio = probe.as_ref().is_none_or(|i| i.has_audio);
+            // Upscaled first so the zoompan push-in samples, not smears.
+            let mut vf = if caps.zoompan {
+                "scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,setsar=1"
+                    .to_string()
+            } else {
+                "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1"
+                    .to_string()
+            };
             if let Some(info) = &probe {
                 if let Some(chain) = ffmpeg::tonemap_chain(caps, &info.color_transfer) {
                     vf.push(',');
@@ -535,6 +780,14 @@ fn render_entry_segment(
                         r.entry.asset_id, info.color_transfer
                     ));
                 }
+            }
+            // Slow push-in on clips (1.0 -> 1.07), matching the stills' Ken
+            // Burns drift so cuts don't sit static.
+            let frames = (len * 30.0).round().max(1.0) as u32;
+            if caps.zoompan {
+                vf.push_str(&format!(",zoompan=z='1+0.07*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1920x1080:fps=30"));
+            } else {
+                vf.push_str(",fps=30");
             }
             vf.push_str(",format=yuv420p");
             let mut args: Vec<String> = vec![
@@ -587,7 +840,26 @@ pub(crate) fn silent_input(secs: f64) -> Vec<String> {
     ]
 }
 
-/// Still Ken Burns hold: upscale first (jitter guard), vary move by index.
+/// Filter graph for a still hold: the full photo fitted over its own
+/// blurred fill at 16:9, then a gentle Ken Burns move (≤1.05×) on the
+/// finished composite, varied by index. Zooming the raw photo instead
+/// both crops the subject and distorts non-16:9 sources.
+fn hold_graph(caps: &Capabilities, idx: usize, frames: u32) -> String {
+    let composite = ffmpeg::fit_over_blur(caps, "[0:v]", 1920, 1080, "");
+    if caps.zoompan {
+        let zoompan = match idx % 4 {
+            0 => ffmpeg::push_in(0.05, frames, 1920, 1080),
+            1 => format!("zoompan=z='1.05-0.05*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1920x1080:fps=30"),
+            2 => format!("zoompan=z=1.05:x='(iw-iw/zoom)*on/{frames}':y='ih/2-(ih/zoom/2)':d={frames}:s=1920x1080:fps=30"),
+            _ => format!("zoompan=z=1.05:x='(iw-iw/zoom)*(1-on/{frames})':y='ih/2-(ih/zoom/2)':d={frames}:s=1920x1080:fps=30"),
+        };
+        format!("{composite},{zoompan},format=yuv420p[v]")
+    } else {
+        format!("{composite},fps=30,format=yuv420p[v]")
+    }
+}
+
+/// Still Ken Burns hold.
 fn render_hold_segment(
     caps: &Capabilities,
     img: &Path,
@@ -596,18 +868,7 @@ fn render_hold_segment(
     out: &Path,
 ) -> Result<(), crate::MediaError> {
     let frames = (dur * 30.0).round() as u32;
-    let zoompan = match idx % 4 {
-        0 => format!("zoompan=z='1+0.12*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1920x1080:fps=30"),
-        1 => format!("zoompan=z='1.12-0.12*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1920x1080:fps=30"),
-        2 => format!("zoompan=z=1.1:x='(iw-iw/zoom)*on/{frames}':y='ih/2-(ih/zoom/2)':d={frames}:s=1920x1080:fps=30"),
-        _ => format!("zoompan=z=1.1:x='(iw-iw/zoom)*(1-on/{frames})':y='ih/2-(ih/zoom/2)':d={frames}:s=1920x1080:fps=30"),
-    };
-    let vf = if caps.zoompan {
-        format!("scale=2400:-2,{zoompan},format=yuv420p")
-    } else {
-        "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,fps=30,format=yuv420p"
-            .to_string()
-    };
+    let graph = hold_graph(caps, idx, frames);
     let args: Vec<String> = [
         vec![
             "-y".into(),
@@ -619,8 +880,12 @@ fn render_hold_segment(
             "lavfi".into(),
             "-i".into(),
             format!("anullsrc=r=48000:cl=stereo:d={dur}"),
-            "-vf".into(),
-            vf,
+            "-filter_complex".into(),
+            graph,
+            "-map".into(),
+            "[v]".into(),
+            "-map".into(),
+            "1:a".into(),
             "-frames:v".into(),
             frames.to_string(),
         ],
@@ -636,6 +901,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hold_graph_shows_full_photo_with_gentle_zoom() {
+        let caps = Capabilities {
+            gblur: true,
+            zoompan: true,
+            ..Default::default()
+        };
+        for idx in 0..4 {
+            let g = hold_graph(&caps, idx, 120);
+            // Full photo over blurred fill, zoom on the composite only,
+            // never past 1.05x.
+            assert!(g.contains("[bg][fg]overlay"), "{g}");
+            assert!(
+                g.find("overlay").unwrap() < g.find("zoompan").unwrap(),
+                "{g}"
+            );
+            assert!(!g.contains("0.12"), "zoom capped at 1.05: {g}");
+            assert!(!g.contains("scale=2400"), "no raw-photo zoom: {g}");
+        }
+    }
+
+    #[test]
     fn offsets_account_for_overlap() {
         // 3 x 4 s segments, 0.6 overlap: cuts at 3.4 and 6.8; total 10.8.
         let o = xfade_offsets(&[4.0, 4.0, 4.0], 0.6);
@@ -648,21 +934,218 @@ mod tests {
 
     #[test]
     fn transition_discipline() {
-        // 6 segments, chapter break into #3.
-        let breaks = vec![false, false, false, true, false, false];
-        let t = assign_transitions(6, &breaks);
+        use SegKind::*;
+        // 8 segments, chapter breaks into #3 and #5.
+        let breaks = vec![false, false, false, true, false, true, false, false];
+        let kinds = vec![Title, Still, Still, Still, Clip, Still, Still, Still];
+        let t = assign_transitions(8, &breaks, &kinds);
         assert_eq!(t[0], None);
         assert_eq!(t[1], Some(Transition::CircleOpen));
-        assert_eq!(t[5], Some(Transition::CircleClose));
+        assert_eq!(t[7], Some(Transition::CircleClose));
+        // First chapter break takes the fadeblack slot.
         assert_eq!(t[3], Some(Transition::FadeBlack));
-        // Blur-dissolve signature capped at 2 and mapped to dissolve.
-        let plain = assign_transitions(14, &[false; 14]);
+        // Kind change (still -> clip) dissolves.
+        assert_eq!(t[4], Some(Transition::Dissolve));
+        // Blur-dissolve signature capped at 3 and mapped to dissolve.
+        let plain = assign_transitions(30, &[false; 30], &[Still; 30]);
         let sig = plain
             .iter()
             .filter(|t| **t == Some(Transition::BlurDissolve))
             .count();
-        assert!(sig <= 2, "signature capped, got {sig}");
+        assert!(sig <= 3, "signature capped, got {sig}");
         assert_eq!(Transition::BlurDissolve.xfade_name(), "dissolve");
+    }
+
+    #[test]
+    fn transition_variety_no_consecutive_equal() {
+        use SegKind::*;
+        // Micro-chapter soup: every cut a chapter break (the 104-chapter bug).
+        let n = 40;
+        let breaks = vec![true; n];
+        let kinds = vec![Still; n];
+        let t = assign_transitions(n, &breaks, &kinds);
+        let names: Vec<&str> = t.iter().skip(1).map(|t| t.unwrap().xfade_name()).collect();
+        for w in names.windows(2) {
+            assert_ne!(w[0], w[1], "consecutive equal xfades");
+        }
+        // fadeblack stays rare: at most 1 in 3 cuts.
+        let fb = names.iter().filter(|n| ***n == *"fadeblack").count();
+        assert!(fb * 3 <= n, "fadeblack capped, got {fb}/{n}");
+        // Mixed story: rotation still varies.
+        let kinds2: Vec<SegKind> = (0..24)
+            .map(|i| if i % 3 == 2 { Clip } else { Still })
+            .collect();
+        let t2 = assign_transitions(24, &[false; 24], &kinds2);
+        let names2: Vec<&str> = t2.iter().skip(1).map(|t| t.unwrap().xfade_name()).collect();
+        for w in names2.windows(2) {
+            assert_ne!(w[0], w[1], "consecutive equal xfades (mixed)");
+        }
+        let distinct: std::collections::HashSet<&str> = names2.iter().copied().collect();
+        assert!(distinct.len() >= 4, "rotation varies, got {distinct:?}");
+    }
+
+    #[test]
+    fn offsets_varied_overlaps() {
+        // 3 x 4 s segments, overlaps [0.8, 0.5]: cuts at 3.2 and 6.7.
+        let o = xfade_offsets_var(&[4.0, 4.0, 4.0], &[0.8, 0.5]);
+        assert_eq!(o.len(), 2);
+        assert!((o[0] - 3.2).abs() < 1e-9, "got {}", o[0]);
+        assert!((o[1] - 6.7).abs() < 1e-9, "got {}", o[1]);
+        // Uniform helper agrees with the legacy math.
+        let u = xfade_offsets(&[4.0, 4.0, 4.0], 0.6);
+        assert!((u[0] - 3.4).abs() < 1e-9);
+        assert!((u[1] - 6.8).abs() < 1e-9);
+        // Per-transition overlaps per spec.
+        assert_eq!(transition_overlap(&Transition::FadeBlack), 0.8);
+        assert_eq!(transition_overlap(&Transition::CircleOpen), 0.7);
+        assert_eq!(transition_overlap(&Transition::CircleClose), 0.7);
+        assert_eq!(transition_overlap(&Transition::Fade), 0.5);
+        assert_eq!(transition_overlap(&Transition::BlurDissolve), 0.5);
+    }
+
+    #[test]
+    fn overlay_lines_builder() {
+        use crate::titlecard::{format_date_range, format_day, overlay_lines};
+        // 2026-10-06 12:00 UTC.
+        let day = 1791288000i64;
+        assert_eq!(format_day(day).as_deref(), Some("Oct 6, 2026"));
+        assert_eq!(
+            format_date_range(&[day, day + 3 * 86400]).as_deref(),
+            Some("Oct 6, 2026 – Oct 9, 2026")
+        );
+        assert_eq!(format_date_range(&[day]).as_deref(), Some("Oct 6, 2026"));
+        assert_eq!(format_date_range(&[]), None);
+        // Chapter start leads with the chapter title.
+        assert_eq!(
+            overlay_lines(Some("Day 2 · Coast"), Some(day), Some("Big surf")),
+            Some((
+                "Day 2 · Coast".to_string(),
+                Some("Oct 6, 2026 · Big surf".to_string())
+            ))
+        );
+        // Plain segment: date + caption.
+        assert_eq!(
+            overlay_lines(None, Some(day), Some("Big surf")),
+            Some(("Oct 6, 2026".to_string(), Some("Big surf".to_string())))
+        );
+        // Nothing to show.
+        assert_eq!(overlay_lines(None, None, Some("  ")), None);
+        assert_eq!(overlay_lines(None, None, None), None);
+    }
+
+    /// Full hero pipeline on synthetic stills: Typst title + lower-thirds,
+    /// per-cut transitions, and the bundled music bed (no --music passed).
+    /// Writes to /tmp/hero-smoke so RMS can be measured after the run.
+    /// Skips quietly when ffmpeg/typst are unavailable.
+    #[test]
+    fn hero_smoke_bundled_music_and_overlays() {
+        use triptape_core::types::Plan;
+
+        let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
+        if !caps.libx264 || !caps.xfade || !caps.loudnorm || !caps.zoompan {
+            eprintln!("ffmpeg caps insufficient; skipping hero smoke");
+            return;
+        }
+        if !crate::titlecard::typst_available("typst") {
+            eprintln!("typst missing; skipping hero smoke");
+            return;
+        }
+        let dir = PathBuf::from("/tmp/hero-smoke");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        // Three solid stills (red/green/blue) as PNG sources.
+        let mut entries = vec![];
+        for (i, px) in [[255u8, 0, 0], [0, 255, 0], [0, 0, 255]].iter().enumerate() {
+            let img: image::RgbImage = image::ImageBuffer::from_pixel(640, 480, image::Rgb(*px));
+            let p = dir.join(format!("still_{i}.png"));
+            img.save(&p).unwrap();
+            entries.push(ResolvedEntry {
+                entry: PlanEntry {
+                    asset_id: format!("a{i}"),
+                    content_hash: None,
+                    size_bytes: 0,
+                    mtime: 0,
+                    rendition: Rendition::Still,
+                },
+                still_path: p,
+                motion_path: None,
+                caption: if i == 1 {
+                    Some("Golden Gate at sunset".into())
+                } else {
+                    None
+                },
+                // Oct 6/7/8 2026 12:00 UTC.
+                taken_at: Some(1791288000 + i as i64 * 86400),
+            });
+        }
+        let mut captions = HashMap::new();
+        captions.insert("a1".to_string(), "Golden Gate at sunset".to_string());
+        let plan = Plan {
+            plan_version: 1,
+            schema_version: 1,
+            hero: vec![],
+            reel_selects: vec![],
+            chapters: vec![
+                triptape_core::types::Chapter {
+                    title: "Day 1 · Arrival".into(),
+                    asset_ids: vec!["a0".into(), "a1".into()],
+                },
+                triptape_core::types::Chapter {
+                    title: "Day 2 · Coast".into(),
+                    asset_ids: vec!["a2".into()],
+                },
+            ],
+            captions,
+            map_polyline: vec![],
+            music: triptape_core::types::MusicPick {
+                track: "bundled".into(),
+                rationale: "default".into(),
+            },
+        };
+        let out = dir.join("hero.mp4");
+        let v = render_hero_video(
+            &caps,
+            &plan,
+            &entries,
+            None,
+            &dir.join("work"),
+            &out,
+            &VideoOptions {
+                trip_name: "Smoke Trip".into(),
+                still_secs: 1.5,
+                title_secs: 1.0,
+                music_path: None,
+                keep_ambience: false,
+                typst_bin: "typst".into(),
+                ..Default::default()
+            },
+        )
+        .expect("hero smoke render");
+        assert!(out.is_file());
+        assert!(
+            v.fallbacks
+                .iter()
+                .any(|f| f.contains("bundled triptape-theme")),
+            "music bed fallback recorded: {:?}",
+            v.fallbacks
+        );
+        // EDL: per-cut overlaps recorded, transitions vary, offsets match.
+        let edl_json = std::fs::read_to_string(&v.edl_path).unwrap();
+        let edl: serde_json::Value = serde_json::from_str(&edl_json).unwrap();
+        let cuts = edl["cut_overlaps_secs"].as_array().unwrap();
+        assert_eq!(cuts.len(), 3, "title + 3 stills = 3 cuts");
+        let names: Vec<String> = edl["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .map(|s| s["transition_in"].as_str().unwrap().to_string())
+            .collect();
+        for w in names.windows(2) {
+            assert_ne!(w[0], w[1], "no consecutive equal transitions");
+        }
+        assert_eq!(names[0], "circle_open");
+        assert_eq!(names[names.len() - 1], "circle_close");
     }
 
     #[test]

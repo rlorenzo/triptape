@@ -161,19 +161,15 @@ pub fn flow_pages(
         });
         used += 1;
     }
-    for _ in 0..n_dividers.min(6) {
-        pages.push(FlowPage {
-            kind: PageKind::Divider,
-            take: 0,
-        });
-    }
-    let counted_so_far: usize = pages.iter().map(|p| p.kind.counts()).sum();
+    let n_div = n_dividers.min(6);
+    let counted_so_far: usize = pages.iter().map(|p| p.kind.counts()).sum::<usize>() + n_div;
     let extras = 1 + usize::from(has_map); // closing + map
     let photo_budget = cap.saturating_sub(counted_so_far + extras).max(1);
     let per_page = (n_photos - used).div_ceil(photo_budget).clamp(1, 4);
+    let mut photo_pages: Vec<FlowPage> = vec![];
     while used < n_photos {
         let take = (n_photos - used).min(per_page);
-        pages.push(FlowPage {
+        photo_pages.push(FlowPage {
             kind: if take == 1 {
                 PageKind::PhotoCaption
             } else {
@@ -182,6 +178,30 @@ pub fn flow_pages(
             take,
         });
         used += take;
+    }
+    // Dividers open chapters through the book, never stacked at the front:
+    // insert one before every evenly spaced slice of photo pages.
+    if n_div > 0 && !photo_pages.is_empty() {
+        let mut merged: Vec<FlowPage> = Vec::with_capacity(photo_pages.len() + n_div);
+        let step = photo_pages.len().div_ceil(n_div);
+        for (i, pp) in photo_pages.into_iter().enumerate() {
+            if i % step == 0
+                && merged
+                    .iter()
+                    .filter(|p| p.kind == PageKind::Divider)
+                    .count()
+                    < n_div
+            {
+                merged.push(FlowPage {
+                    kind: PageKind::Divider,
+                    take: 0,
+                });
+            }
+            merged.push(pp);
+        }
+        pages.extend(merged);
+    } else {
+        pages.extend(photo_pages);
     }
     if has_map {
         pages.push(FlowPage {
@@ -281,6 +301,8 @@ pub struct BookOptions {
 #[derive(Debug)]
 pub struct BookOutput {
     pub dir: PathBuf,
+    /// Photo-collage cover (proof/press first page; not a counted page).
+    pub cover: Option<PathBuf>,
     pub jpeg_pages: Vec<PathBuf>,
     pub proof_pdf: Option<PathBuf>,
     pub press_pdf: Option<PathBuf>,
@@ -597,8 +619,17 @@ pub fn render_book(
             }
         }
     }
+    let cover = draw_cover_collage(
+        photos,
+        tw,
+        th,
+        opts,
+        &out_dir.join("cover.jpg"),
+        &mut fallbacks,
+    );
     let mut cursor = 0usize;
     let mut page_no = 0usize;
+    let mut divider_idx = 0usize;
 
     for fp in &flow {
         if fp.kind == PageKind::CoverProxy {
@@ -617,7 +648,10 @@ pub fn render_book(
                 let (sw, sh) = slot_inches(opts.preset, fp.kind, fp.take.max(1));
                 for p in &slot {
                     placements.push((page_no, dpi_verdict(p.width, p.height, sw, sh)));
-                    captions.entry(page_no).or_default().extend(caption_of(p));
+                }
+                let page_caps = page_caption(&slot, fp.kind);
+                if !page_caps.is_empty() {
+                    captions.entry(page_no).or_default().extend(page_caps);
                 }
                 match fp.kind {
                     PageKind::Hero => {
@@ -652,9 +686,32 @@ pub fn render_book(
                 )?;
             }
             PageKind::Map => draw_map_page(route_card.unwrap(), tw, th, &out)?,
-            PageKind::Divider | PageKind::Closing | PageKind::CoverProxy => {
-                draw_text_placeholder(fp.kind, tw, th, &out)?
+            PageKind::Divider => {
+                let title = chapters
+                    .get(divider_idx)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Chapter {}", divider_idx + 1));
+                divider_idx += 1;
+                let peek = order
+                    .get(cursor)
+                    .map(|oi| &photos[*oi])
+                    .unwrap_or(&photos[0]);
+                draw_photo_backed_page(peek, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?;
+                captions.entry(page_no).or_default().push(title);
             }
+            PageKind::Closing => {
+                if photos.is_empty() {
+                    draw_text_placeholder(fp.kind, tw, th, &out)?;
+                } else {
+                    let last = &photos[photos.len() - 1];
+                    draw_photo_backed_page(last, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?;
+                    captions
+                        .entry(page_no)
+                        .or_default()
+                        .push("The End".to_string());
+                }
+            }
+            PageKind::CoverProxy => draw_text_placeholder(fp.kind, tw, th, &out)?,
         }
         // Header-only read: confirms the written page geometry without a decode.
         let (w, h) = image::image_dimensions(&out)
@@ -696,24 +753,26 @@ pub fn render_book(
     }
 
     let counted = count_pages(&kinds);
-    let proof = match write_typst_and_compile(&jpegs, &captions, opts, out_dir, false) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            // Never leave a previous export's PDF beside the new pages.
-            let _ = std::fs::remove_file(out_dir.join("proof.pdf"));
-            fallbacks.push(format!("proof.pdf skipped: {e}"));
-            None
-        }
-    };
-    let press = match write_typst_and_compile(&jpegs, &captions, opts, out_dir, true) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            // Never leave a previous export's PDF beside the new pages.
-            let _ = std::fs::remove_file(out_dir.join("press.pdf"));
-            fallbacks.push(format!("press.pdf skipped: {e}"));
-            None
-        }
-    };
+    let proof =
+        match write_typst_and_compile(&jpegs, &captions, opts, out_dir, false, cover.as_deref()) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                // Never leave a previous export's PDF beside the new pages.
+                let _ = std::fs::remove_file(out_dir.join("proof.pdf"));
+                fallbacks.push(format!("proof.pdf skipped: {e}"));
+                None
+            }
+        };
+    let press =
+        match write_typst_and_compile(&jpegs, &captions, opts, out_dir, true, cover.as_deref()) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                // Never leave a previous export's PDF beside the new pages.
+                let _ = std::fs::remove_file(out_dir.join("press.pdf"));
+                fallbacks.push(format!("press.pdf skipped: {e}"));
+                None
+            }
+        };
 
     // Vendors print the JPEGs, not the PDFs: burn captions into the page
     // JPEGs by rasterizing the matching proof pages. Runs after press.pdf so
@@ -752,6 +811,7 @@ pub fn render_book(
         "version": 1,
         "preset": opts.preset.name(),
         "trim_px": {"w": tw, "h": th},
+        "cover": cover.as_ref().map(|c| c.file_name().unwrap().to_string_lossy().into_owned()),
         "counted_pages": counted,
         "pages": jpegs.iter().enumerate().map(|(i, p)| serde_json::json!({
             "page": i + 1,
@@ -768,6 +828,7 @@ pub fn render_book(
 
     Ok(BookOutput {
         dir: out_dir.to_path_buf(),
+        cover,
         jpeg_pages: jpegs,
         proof_pdf: proof,
         press_pdf: press,
@@ -775,6 +836,61 @@ pub fn render_book(
         counted_pages: counted,
         fallbacks,
     })
+}
+
+/// Caption lines for one photo page. Single-photo pages keep the photo's
+/// full caption. Grid pages collapse to ONE dateline (or day range) so a
+/// page never repeats near-identical per-photo template text; distinct
+/// user prose on a grid keeps at most the first two lines.
+fn page_caption(slot: &[&BookPhoto], kind: PageKind) -> Vec<String> {
+    let mut caps: Vec<String> = vec![];
+    for p in slot {
+        for c in caption_of(p) {
+            if !caps.contains(&c) {
+                caps.push(c);
+            }
+        }
+    }
+    if kind != PageKind::Grid || caps.len() <= 1 {
+        return caps;
+    }
+    if caps.iter().all(|c| is_dateline(c)) {
+        let dates: Vec<String> = caps.iter().map(|c| dateline_date(c)).collect();
+        if dates.iter().all(|d| *d == dates[0]) {
+            return vec![dates[0].clone()];
+        }
+        return vec![format!(
+            "{} – {}",
+            date_only(&caps[0]),
+            date_only(caps.last().unwrap())
+        )];
+    }
+    caps.truncate(2);
+    caps
+}
+
+/// Datelines look like `Day 4 · Sun, Oct 5 · 4:32 PM` (plan builder) or
+/// `Sun, Oct 5 · 4:32 PM`: last segment carries a clock time.
+fn is_dateline(c: &str) -> bool {
+    c.rsplit(" · ")
+        .next()
+        .is_some_and(|t| t.contains(':') && t.chars().any(|ch| ch.is_ascii_digit()))
+        && c.contains(" · ")
+}
+
+fn dateline_date(c: &str) -> String {
+    match c.rsplit_once(" · ") {
+        Some((head, _time)) if is_dateline(c) => head.to_string(),
+        _ => c.to_string(),
+    }
+}
+
+fn date_only(c: &str) -> String {
+    let d = dateline_date(c);
+    match d.split_once(" · ") {
+        Some((head, rest)) if head.starts_with("Day ") => rest.to_string(),
+        _ => d,
+    }
 }
 
 fn caption_of(p: &BookPhoto) -> Vec<String> {
@@ -794,7 +910,30 @@ fn caption_of(p: &BookPhoto) -> Vec<String> {
 
 fn load(photo: &BookPhoto, ffmpeg_bin: &str, fallbacks: &mut Vec<String>) -> RgbImage {
     match image::open(&photo.path) {
-        Ok(d) => d.to_rgb8(),
+        // The image crate ignores EXIF orientation (FFmpeg/sips paths already
+        // auto-rotate), so portrait JPEGs would print sideways without this.
+        Ok(d) => {
+            let exif = triptape_core::metadata::read_image_exif(&photo.path);
+            let t = exif
+                .orientation
+                .map(triptape_core::metadata::orientation_transform)
+                .unwrap_or(triptape_core::metadata::OrientationTransform {
+                    mirror_h: false,
+                    rotate_cw_deg: 0,
+                });
+            let d = if t.mirror_h {
+                image::DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&d.to_rgba8()))
+            } else {
+                d
+            };
+            let d = match t.rotate_cw_deg {
+                90 => d.rotate90(),
+                180 => d.rotate180(),
+                270 => d.rotate270(),
+                _ => d,
+            };
+            d.to_rgb8()
+        }
         Err(e) => match decode_via_ffmpeg(ffmpeg_bin, &photo.path) {
             Some(img) => img,
             None => {
@@ -940,6 +1079,29 @@ fn draw_map_page(card: &Path, tw: u32, th: u32, out: &Path) -> Result<(), crate:
     save_jpg(&cover_fit(&d.to_rgb8(), tw, th), out)
 }
 
+/// Scale every channel of `pixels` to `pct`% brightness.
+fn darken<'a>(pixels: impl Iterator<Item = &'a mut Rgb<u8>>, pct: u16) {
+    for px in pixels {
+        for c in px.0.iter_mut() {
+            *c = (u16::from(*c) * pct / 100) as u8;
+        }
+    }
+}
+
+/// Full-bleed photo darkened to 45% so burned chapter text stays readable.
+fn draw_photo_backed_page(
+    p: &BookPhoto,
+    tw: u32,
+    th: u32,
+    out: &Path,
+    ffmpeg_bin: &str,
+    fallbacks: &mut Vec<String>,
+) -> Result<(), crate::MediaError> {
+    let mut img = cover_fit(&load(p, ffmpeg_bin, fallbacks), tw, th);
+    darken(img.pixels_mut(), 45);
+    save_jpg(&img, out)
+}
+
 fn draw_text_placeholder(
     kind: PageKind,
     tw: u32,
@@ -964,6 +1126,115 @@ fn draw_text_placeholder(
     save_jpg(&page, out)
 }
 
+/// Collage grid (cols, rows) for `n` cover tiles.
+fn cover_grid(n: usize) -> (u32, u32) {
+    match n {
+        0 | 1 => (1, 1),
+        2..=4 => (2, 2),
+        5 | 6 => (3, 2),
+        7..=9 => (3, 3),
+        _ => (4, 3),
+    }
+}
+
+/// White text on transparency via Typst, for compositing over photos.
+/// `scratch_png` is a temporary path, removed once decoded.
+fn typst_text_png(
+    typst_bin: &str,
+    title: &str,
+    sub: &str,
+    scratch_png: &Path,
+) -> Option<image::DynamicImage> {
+    let doc = format!(
+        "#set page(width: 11in, height: auto, fill: none, margin: 0in)\n#set text(font: \"DejaVu Sans\", fill: white)\n#align(center)[#text(size: 44pt, weight: \"bold\")[{}]]\n#align(center)[#text(size: 20pt)[{}]]\n",
+        typ_escape(title),
+        typ_escape(sub)
+    );
+    crate::titlecard::render_text_png(typst_bin, &doc, scratch_png, 200).ok()?;
+    let img = image::open(scratch_png).ok();
+    let _ = std::fs::remove_file(scratch_png);
+    img
+}
+
+/// Build `cover.jpg`: a mosaic of evenly-spaced trip photos with a darkened
+/// title band. Returns None (with a fallback note) when no photo decodes.
+fn draw_cover_collage(
+    photos: &[BookPhoto],
+    tw: u32,
+    th: u32,
+    opts: &BookOptions,
+    out: &Path,
+    fallbacks: &mut Vec<String>,
+) -> Option<PathBuf> {
+    if photos.is_empty() {
+        return None;
+    }
+    let picks = evenly_spaced(photos.len(), photos.len().min(12));
+    let (cols, rows) = cover_grid(picks.len());
+    let gap = 14u32;
+    let tile_w = (tw - gap * (cols + 1)) / cols;
+    let tile_h = (th - gap * (rows + 1)) / rows;
+    let mut canvas = solid(tw, th, Rgb([18, 20, 26]));
+    for (k, pi) in picks.iter().enumerate() {
+        let (cx, cy) = ((k as u32) % cols, (k as u32) / cols);
+        let tile = cover_fit(
+            &load(&photos[*pi], &opts.ffmpeg_bin, fallbacks),
+            tile_w,
+            tile_h,
+        );
+        image::imageops::replace(
+            &mut canvas,
+            &tile,
+            (gap + cx * (tile_w + gap)) as i64,
+            (gap + cy * (tile_h + gap)) as i64,
+        );
+    }
+    // Darken a bottom title band, then composite the Typst title over it.
+    let band_h = th / 5;
+    darken(
+        canvas
+            .enumerate_pixels_mut()
+            .filter(|(_, y, _)| *y >= th - band_h)
+            .map(|(_, _, p)| p),
+        25,
+    );
+    match typst_text_png(
+        &opts.typst_bin,
+        &opts.trip_name,
+        "TripTape Photo Book",
+        &out.with_file_name("cover-title.png"),
+    ) {
+        Some(text) => {
+            let text = text.to_rgba8();
+            let scale = (tw as f32 * 0.86 / text.width() as f32).min(1.6);
+            let nw = (text.width() as f32 * scale) as u32;
+            let nh = (text.height() as f32 * scale) as u32;
+            let text = image::imageops::resize(
+                &text,
+                nw.max(1),
+                nh.max(1),
+                image::imageops::FilterType::Lanczos3,
+            );
+            let mut base = image::DynamicImage::ImageRgb8(canvas.clone()).to_rgba8();
+            image::imageops::overlay(
+                &mut base,
+                &text,
+                ((tw - nw.min(tw)) / 2) as i64,
+                (th - band_h + (band_h.saturating_sub(nh)) / 2) as i64,
+            );
+            canvas = image::DynamicImage::ImageRgba8(base).to_rgb8();
+        }
+        None => fallbacks.push("cover: Typst title unavailable; collage without text".into()),
+    }
+    match save_jpg(&canvas, out) {
+        Ok(()) => Some(out.to_path_buf()),
+        Err(e) => {
+            fallbacks.push(format!("cover collage failed ({e}); text cover kept"));
+            None
+        }
+    }
+}
+
 fn save_jpg(img: &RgbImage, out: &Path) -> Result<(), crate::MediaError> {
     let f = std::fs::File::create(out)
         .map_err(|e| crate::MediaError::Io(format!("save {}: {e}", out.display())))?;
@@ -982,6 +1253,7 @@ fn write_typst_and_compile(
     opts: &BookOptions,
     out_dir: &Path,
     bleed: bool,
+    cover: Option<&Path>,
 ) -> Result<PathBuf, crate::MediaError> {
     let (tw_in, th_in) = match opts.preset {
         BookPreset::P1 => (12.0, 12.0),
@@ -997,10 +1269,16 @@ fn write_typst_and_compile(
     let mut typ = format!(
         "#set page(width: {pw}in, height: {ph}in, margin: 0in)\n#set text(font: \"DejaVu Sans\", size: 14pt, fill: white)\n"
     );
-    typ.push_str(&format!(
-        "#rect(width: 100%, height: 100%, fill: rgb(18, 20, 26))\n#place(center + horizon)[#text(size: 28pt)[{}]]\n#pagebreak()\n",
-        typ_escape(&opts.trip_name)
-    ));
+    match cover {
+        Some(c) => typ.push_str(&format!(
+            "#image(\"{}\", width: 100%, height: 100%, fit: \"cover\")\n#pagebreak()\n",
+            c.file_name().unwrap().to_string_lossy()
+        )),
+        None => typ.push_str(&format!(
+            "#rect(width: 100%, height: 100%, fill: rgb(18, 20, 26))\n#place(center + horizon)[#text(size: 28pt)[{}]]\n#pagebreak()\n",
+            typ_escape(&opts.trip_name)
+        )),
+    }
     for (i, jpg) in jpegs.iter().enumerate() {
         let page_no = i + 1;
         typ.push_str(&format!(
@@ -1114,7 +1392,7 @@ fn guide_text(preset: BookPreset, trip: &str, counted: usize, captions_burned: b
         "TripTape book export — {trip} ({}, {counted} interior pages)\n\
         \n\
         These page JPEGs are rendered at exact trim size ({tw}x{th}px, 300 dpi sRGB, quality ~90).\n\
-        The cover-proxy page in proof.pdf is NOT exported and NOT counted; do the cover in the vendor designer.\n\
+        cover.jpg is a suggested photo-collage cover (not counted); use it as the vendor cover or design your own in the vendor designer.\n\
         \n\
         MIXBOOK / MILK / VISTAPRINT (generic steps; confirm against the vendor gate record):\n\
         1. Create a {} book with {counted} pages (above the 24-page vendor minimum; cover done separately).\n\
@@ -1134,6 +1412,80 @@ fn guide_text(preset: BookPreset, trip: &str, counted: usize, captions_burned: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn darken_scales_channels() {
+        let mut img = RgbImage::from_pixel(2, 2, Rgb([200, 100, 0]));
+        darken(img.pixels_mut(), 45);
+        assert!(img.pixels().all(|p| *p == Rgb([90, 45, 0])));
+        // Bottom-row-only darken (cover title band).
+        let mut img = RgbImage::from_pixel(1, 2, Rgb([100, 100, 100]));
+        darken(
+            img.enumerate_pixels_mut()
+                .filter(|(_, y, _)| *y >= 1)
+                .map(|(_, _, p)| p),
+            25,
+        );
+        assert_eq!(*img.get_pixel(0, 0), Rgb([100, 100, 100]));
+        assert_eq!(*img.get_pixel(0, 1), Rgb([25, 25, 25]));
+    }
+
+    #[test]
+    fn grid_caption_collapses_to_one_dateline() {
+        let mk = |cap: &str| BookPhoto {
+            asset_id: cap.to_string(),
+            path: PathBuf::from("/x.jpg"),
+            width: 100,
+            height: 100,
+            caption: Some(cap.to_string()),
+        };
+        let a = mk("Day 4 · Sun, Oct 5 · 9:00 AM");
+        let b = mk("Day 4 · Sun, Oct 5 · 4:32 PM");
+        let c = mk("Day 5 · Mon, Oct 6 · 8:15 AM");
+        let u = mk("Kids at the market");
+        // Same day: one dateline, no repeated per-photo template text.
+        assert_eq!(
+            page_caption(&[&a, &b], PageKind::Grid),
+            vec!["Day 4 · Sun, Oct 5".to_string()]
+        );
+        // Spanning days: one range line.
+        assert_eq!(
+            page_caption(&[&a, &c], PageKind::Grid),
+            vec!["Sun, Oct 5 – Mon, Oct 6".to_string()]
+        );
+        // Single-photo pages keep the full caption with time.
+        assert_eq!(
+            page_caption(&[&b], PageKind::PhotoCaption),
+            vec!["Day 4 · Sun, Oct 5 · 4:32 PM".to_string()]
+        );
+        // User prose is not dateline-collapsed.
+        assert_eq!(page_caption(&[&u, &a], PageKind::Grid).len(), 2);
+    }
+
+    #[test]
+    fn dividers_interleave_never_stack() {
+        let kinds: Vec<PageKind> = flow_pages(200, false, false, 20, 60)
+            .iter()
+            .map(|p| p.kind)
+            .collect();
+        let divs: Vec<usize> = kinds
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| **k == PageKind::Divider)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !divs.is_empty() && divs.len() <= 6,
+            "dividers capped: {divs:?}"
+        );
+        assert!(
+            divs.windows(2).all(|w| w[1] > w[0] + 1),
+            "dividers never consecutive: {divs:?}"
+        );
+        assert_eq!(cover_grid(1), (1, 1));
+        assert_eq!(cover_grid(4), (2, 2));
+        assert_eq!(cover_grid(12), (4, 3));
+    }
 
     #[test]
     fn tiny_photos_block_even_smallest_slot() {
