@@ -44,11 +44,20 @@ fn strs(xs: &[&str]) -> Vec<String> {
 /// FFmpeg args to decode any still (incl. HEIC) to a JPEG thumbnail.
 /// Keeps aspect ratio; only downsizes (`min()` guard on the long edge).
 pub fn thumb_args(src: &Path, dst: &Path) -> Vec<String> {
-    let vf = format!(
+    // HEIC inputs reach the encoder through FFmpeg's internal tile-merge
+    // filtergraph, which rejects a simple -vf chain ("Simple and complex
+    // filtering cannot be used together"); -filter_complex works for both
+    // stills and video first frames.
+    let fc = format!(
         "scale='if(gt(iw,ih),min(iw,{e}),-2)':'if(gt(iw,ih),-2,min(ih,{e}))'",
         e = THUMB_LONG_EDGE
     );
-    ffmpeg_args(&[], src, &strs(&["-vf", &vf, "-q:v", "4"]), dst)
+    ffmpeg_args(
+        &[],
+        src,
+        &strs(&["-filter_complex", &fc, "-frames:v", "1", "-q:v", "4"]),
+        dst,
+    )
 }
 
 /// FFmpeg args for a 720p H.264/AAC proxy (poster frames: see `poster_args`).
@@ -147,7 +156,11 @@ mod tests {
     #[test]
     fn thumb_args_downscale_only() {
         let args = thumb_args(Path::new("in.HEIC"), Path::new("out.jpg"));
-        let vf = args.iter().skip_while(|a| *a != "-vf").nth(1).unwrap();
+        let vf = args
+            .iter()
+            .skip_while(|a| *a != "-filter_complex")
+            .nth(1)
+            .unwrap();
         assert!(vf.contains("min(iw,320)"), "long edge capped at 320: {vf}");
         assert!(vf.contains("min(ih,320)"), "long edge capped at 320: {vf}");
         assert_eq!(args.first().map(String::as_str), Some("-y"));
