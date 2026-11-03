@@ -1,0 +1,191 @@
+//! Shared domain types: Asset, Cluster, Plan, Job.
+
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// What kind of media an asset is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetKind {
+    Photo,
+    Video,
+    LivePhoto,
+}
+
+/// Which rendition of an asset a plan entry (or renderer) should use.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rendition {
+    /// Full-resolution still (always used for print).
+    Still,
+    /// Live Photo / clip motion with an optional scored trim window (seconds).
+    Motion { trim_start: f64, trim_end: f64 },
+    /// Trimmed video clip (seconds).
+    Clip { trim_start: f64, trim_end: f64 },
+}
+
+/// A single ingested media asset (one Live Photo pair = one asset).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Asset {
+    pub id: String,
+    pub path: PathBuf,
+    /// Second path for Live Photos (the MOV motion file).
+    pub companion_path: Option<PathBuf>,
+    pub kind: AssetKind,
+    pub size_bytes: u64,
+    /// Source file mtime (unix seconds).
+    pub mtime: i64,
+    pub content_hash: Option<String>,
+    /// 64-bit perceptual hash for near-dupe grouping.
+    pub phash: Option<u64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_secs: Option<f64>,
+    /// Capture time (unix seconds) after normalization, if known.
+    pub taken_at: Option<i64>,
+    /// True when `taken_at` fell back to file mtime.
+    pub time_guessed: bool,
+    pub gps: Option<(f64, f64)>,
+    /// EXIF orientation-derived rotation in degrees (0/90/180/270).
+    pub rotation_deg: u16,
+    /// Live Photo pairing confidence, when applicable.
+    pub pairing_confidence: Option<PairingConfidence>,
+}
+
+impl Asset {
+    pub fn new(id: impl Into<String>, path: PathBuf, kind: AssetKind) -> Self {
+        Self {
+            id: id.into(),
+            path,
+            companion_path: None,
+            kind,
+            size_bytes: 0,
+            mtime: 0,
+            content_hash: None,
+            phash: None,
+            width: None,
+            height: None,
+            duration_secs: None,
+            taken_at: None,
+            time_guessed: false,
+            gps: None,
+            rotation_deg: 0,
+            pairing_confidence: None,
+        }
+    }
+}
+
+/// How a Live Photo still+motion pair was matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingConfidence {
+    /// Tier 1: shared content-identifier UUID in both files' metadata.
+    ContentId,
+    /// Tier 2: same stem + short MOV fallback.
+    BasenameOnly,
+}
+
+/// A time/GPS cluster (a day/place group).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cluster {
+    pub id: String,
+    pub asset_ids: Vec<String>,
+    pub start_time: Option<i64>,
+    pub end_time: Option<i64>,
+    pub centroid_gps: Option<(f64, f64)>,
+    pub label: String,
+}
+
+/// One chapter of the story plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Chapter {
+    pub title: String,
+    pub asset_ids: Vec<String>,
+}
+
+/// Music pick with a human-readable rationale ("vibe fit", never fake emotion).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MusicPick {
+    pub track: String,
+    pub rationale: String,
+}
+
+/// One entry in the hero/reel shot lists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanEntry {
+    pub asset_id: String,
+    pub content_hash: Option<String>,
+    pub size_bytes: u64,
+    pub mtime: i64,
+    pub rendition: Rendition,
+}
+
+/// Versioned, reproducible AI plan consumed by all three renderers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Plan {
+    pub plan_version: u32,
+    pub schema_version: u32,
+    pub hero: Vec<PlanEntry>,
+    pub reel_selects: Vec<PlanEntry>,
+    pub chapters: Vec<Chapter>,
+    /// asset_id -> caption draft.
+    pub captions: std::collections::HashMap<String, String>,
+    /// Route polyline (lat, lon) with day markers.
+    pub map_polyline: Vec<(f64, f64)>,
+    pub music: MusicPick,
+}
+
+impl Plan {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(s)
+    }
+}
+
+/// Per-signal quality score with human-readable reasons.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Score {
+    /// 0..1 sharpness estimate.
+    pub sharpness: f32,
+    /// 0..1 exposure quality (1 = well exposed).
+    pub exposure: f32,
+    /// 0..1 blur estimate (1 = very blurry).
+    pub blur: f32,
+    /// Combined 0..1 quality.
+    pub total: f32,
+    /// Whether this asset is a story highlight.
+    pub highlight: bool,
+    /// One short string per contributing signal.
+    pub reasons: Vec<String>,
+}
+
+/// Durable job state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+    Queued,
+    Running,
+    Finalizing,
+    Done,
+    Failed,
+    Cancelled,
+    /// Set only by startup recovery, never by live transitions.
+    Interrupted,
+}
+
+/// A durable job row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Job {
+    pub id: String,
+    pub kind: String,
+    pub state: JobState,
+    pub progress: f32,
+    pub current_step: Option<String>,
+    pub temp_dir: Option<String>,
+    pub error: Option<String>,
+}
