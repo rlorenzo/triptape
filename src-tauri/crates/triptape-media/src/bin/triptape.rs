@@ -71,6 +71,16 @@ fn scan_cmd(flags: &HashMap<String, String>) {
             std::process::exit(2);
         }
     };
+    // Video proxies are opt-in (see the proxy pass below); validated up front
+    // so a typo fails before any scan work.
+    let want_proxies = match flag_or(flags, "proxies", "false").as_str() {
+        "true" => true,
+        "false" => false,
+        other => {
+            eprintln!("invalid --proxies {other:?}; expected true or false");
+            std::process::exit(2);
+        }
+    };
 
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
     let name = folder
@@ -211,9 +221,16 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         die("persist", e);
     }
 
-    // Proxies for videos and Live Photo motion files.
+    // Proxies for videos and Live Photo motion files are generated lazily
+    // (PLAN Sec 8 Stage 4): a scan must stay fast on large folders, so video
+    // proxies are built only with --proxies true; thumbnails/posters above
+    // already cover Library previews. Without --proxies true the pass is
+    // skipped and the reported proxy count is 0, even if cached proxies exist.
     let mut proxies_n = 0usize;
-    for a in final_assets.iter().filter(|a| a.kind != AssetKind::Photo) {
+    for a in final_assets
+        .iter()
+        .filter(|a| a.kind != AssetKind::Photo && want_proxies)
+    {
         let src = a.companion_path.as_ref().unwrap_or(&a.path);
         let key = match &a.companion_path {
             Some(m) => motion_hash.get(m).map(String::as_str),
