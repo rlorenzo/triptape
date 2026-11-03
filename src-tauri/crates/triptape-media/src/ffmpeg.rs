@@ -156,6 +156,80 @@ pub fn tonemap_chain(caps: &Capabilities, color_transfer: &str) -> Option<String
     }
 }
 
+/// A still decoded to PNG inside a private, uniquely named temp directory.
+/// The directory (and PNG) is removed when this value is dropped.
+pub struct DecodedStill {
+    _dir: tempfile::TempDir,
+    pub path: PathBuf,
+}
+
+/// Decode a still to PNG in a private temp dir. Tries FFmpeg first; some
+/// HEIC files (Dolby Vision `tmap` items) defeat FFmpeg entirely, so on
+/// macOS fall back to `sips` (ImageIO). HEIC/HEIF on macOS go to `sips`
+/// first: ImageIO always composes the full tile grid, while older FFmpeg
+/// builds return a single tile.
+pub fn decode_still_to_png(
+    ffmpeg_bin: &str,
+    src: &Path,
+) -> Result<DecodedStill, super::MediaError> {
+    let dir = tempfile::Builder::new()
+        .prefix("triptape-still-")
+        .tempdir()
+        .map_err(|e| super::MediaError::Io(e.to_string()))?;
+    let out = dir.path().join("still.png");
+    let ok = |st: std::io::Result<std::process::ExitStatus>| {
+        if matches!(st, Ok(s) if s.success()) && out.is_file() {
+            true
+        } else {
+            let _ = std::fs::remove_file(&out);
+            false
+        }
+    };
+    let try_ffmpeg = || {
+        ok(Command::new(ffmpeg_bin)
+            .args(["-nostdin", "-i"])
+            .arg(src)
+            .args(["-frames:v", "1"])
+            .arg(&out)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status())
+    };
+    #[cfg(target_os = "macos")]
+    let try_sips = || {
+        ok(Command::new("sips")
+            .args(["-s", "format", "png"])
+            .arg(src)
+            .arg("--out")
+            .arg(&out)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status())
+    };
+    #[cfg(target_os = "macos")]
+    let decoded = {
+        let heif = src
+            .extension()
+            .map(|e| matches!(e.to_ascii_lowercase().to_str(), Some("heic" | "heif")))
+            .unwrap_or(false);
+        // Order matters (side effects): the first decoder to succeed wins.
+        let first_sips = heif && try_sips();
+        first_sips || try_ffmpeg() || (!heif && try_sips())
+    };
+    #[cfg(not(target_os = "macos"))]
+    let decoded = try_ffmpeg();
+    if decoded {
+        return Ok(DecodedStill {
+            _dir: dir,
+            path: out,
+        });
+    }
+    Err(super::MediaError::Ffmpeg(format!(
+        "cannot decode still {}",
+        src.display()
+    )))
+}
+
 /// Run FFmpeg with `args` (whose last element must be `final_out`).
 /// Renders to a `.partial` sibling and atomically renames on success, so a
 /// file at `final_out` is always a complete render. Returns the stderr tail

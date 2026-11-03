@@ -348,6 +348,10 @@ fn fill_photo(a: &mut Asset, img: Option<&image::DynamicImage>) {
         a.width = Some(img.width());
         a.height = Some(img.height());
         a.phash = Some(hash::average_hash_from_image(img));
+    } else if let (Some(w), Some(h)) = (exif.width, exif.height) {
+        // HEIC and other undecodable stills: EXIF carries the true size.
+        a.width = Some(w);
+        a.height = Some(h);
     }
 }
 

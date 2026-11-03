@@ -274,6 +274,8 @@ pub struct BookOptions {
     pub preset: BookPreset,
     pub trip_name: String,
     pub typst_bin: String,
+    /// FFmpeg used to decode stills the `image` crate cannot read (HEIC).
+    pub ffmpeg_bin: String,
 }
 
 #[derive(Debug)]
@@ -366,11 +368,13 @@ pub fn render_book(
                     captions.entry(page_no).or_default().extend(caption_of(p));
                 }
                 match fp.kind {
-                    PageKind::Hero => draw_fullbleed(slot[0], tw, th, &out, &mut fallbacks)?,
-                    PageKind::PhotoCaption => {
-                        draw_caption_page(slot[0], tw, th, &out, &mut fallbacks)?
+                    PageKind::Hero => {
+                        draw_fullbleed(slot[0], tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?
                     }
-                    _ => draw_grid(&slot, tw, th, &out, &mut fallbacks)?,
+                    PageKind::PhotoCaption => {
+                        draw_caption_page(slot[0], tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?
+                    }
+                    _ => draw_grid(&slot, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?,
                 }
             }
             PageKind::SpreadLeft | PageKind::SpreadRight => {
@@ -391,6 +395,7 @@ pub fn render_book(
                     tw,
                     th,
                     &out,
+                    &opts.ffmpeg_bin,
                     &mut fallbacks,
                 )?;
             }
@@ -517,17 +522,27 @@ fn caption_of(p: &BookPhoto) -> Vec<String> {
 
 // -- page painters (photo geometry real; caption text burned in via Typst) -
 
-fn load(photo: &BookPhoto, fallbacks: &mut Vec<String>) -> RgbImage {
+fn load(photo: &BookPhoto, ffmpeg_bin: &str, fallbacks: &mut Vec<String>) -> RgbImage {
     match image::open(&photo.path) {
         Ok(d) => d.to_rgb8(),
-        Err(e) => {
-            fallbacks.push(format!(
-                "{} unreadable ({e}); gray placeholder",
-                photo.asset_id
-            ));
-            solid(800, 600, Rgb([90, 90, 95]))
-        }
+        Err(e) => match decode_via_ffmpeg(ffmpeg_bin, &photo.path) {
+            Some(img) => img,
+            None => {
+                fallbacks.push(format!(
+                    "{} unreadable ({e}); gray placeholder",
+                    photo.asset_id
+                ));
+                solid(800, 600, Rgb([90, 90, 95]))
+            }
+        },
     }
+}
+
+/// Decode a still the `image` crate cannot read (HEIC) through FFmpeg
+/// (with the macOS `sips` fallback for tmap/Dolby Vision items).
+fn decode_via_ffmpeg(ffmpeg_bin: &str, path: &std::path::Path) -> Option<RgbImage> {
+    let png = crate::ffmpeg::decode_still_to_png(ffmpeg_bin, path).ok()?;
+    image::open(&png.path).ok().map(|d| d.to_rgb8())
 }
 
 fn solid(w: u32, h: u32, c: Rgb<u8>) -> RgbImage {
@@ -558,9 +573,10 @@ fn draw_fullbleed(
     tw: u32,
     th: u32,
     out: &Path,
+    ff: &str,
     fb: &mut Vec<String>,
 ) -> Result<(), crate::MediaError> {
-    save_jpg(&cover_fit(&load(p, fb), tw, th), out)
+    save_jpg(&cover_fit(&load(p, ff, fb), tw, th), out)
 }
 
 fn draw_half(
@@ -569,9 +585,10 @@ fn draw_half(
     tw: u32,
     th: u32,
     out: &Path,
+    ff: &str,
     fb: &mut Vec<String>,
 ) -> Result<(), crate::MediaError> {
-    let full = cover_fit(&load(p, fb), tw * 2, th);
+    let full = cover_fit(&load(p, ff, fb), tw * 2, th);
     let x = if left { 0 } else { tw };
     save_jpg(
         &image::imageops::crop_imm(&full, x, 0, tw, th).to_image(),
@@ -584,12 +601,13 @@ fn draw_caption_page(
     tw: u32,
     th: u32,
     out: &Path,
+    ff: &str,
     fb: &mut Vec<String>,
 ) -> Result<(), crate::MediaError> {
     let mut page = solid(tw, th, Rgb([18, 20, 26]));
     let band = (th as f64 * 0.2) as u32;
     let photo_h = th - band;
-    image::imageops::replace(&mut page, &cover_fit(&load(p, fb), tw, photo_h), 0, 0);
+    image::imageops::replace(&mut page, &cover_fit(&load(p, ff, fb), tw, photo_h), 0, 0);
     for y in photo_h..th {
         for x in (tw / 12)..(tw * 11 / 12) {
             page.put_pixel(x, y, Rgb([32, 36, 46]));
@@ -603,6 +621,7 @@ fn draw_grid(
     tw: u32,
     th: u32,
     out: &Path,
+    ff: &str,
     fb: &mut Vec<String>,
 ) -> Result<(), crate::MediaError> {
     let mut page = solid(tw, th, Rgb([18, 20, 26]));
@@ -640,7 +659,7 @@ fn draw_grid(
         }
     };
     for (p, (x, y, w, h)) in slot.iter().zip(cells) {
-        let fit = cover_fit(&load(p, fb), w.max(1), h.max(1));
+        let fit = cover_fit(&load(p, ff, fb), w.max(1), h.max(1));
         image::imageops::replace(&mut page, &fit, x as i64, y as i64);
     }
     save_jpg(&page, out)
@@ -955,6 +974,7 @@ mod tests {
             preset: BookPreset::P1,
             trip_name: "Test".into(),
             typst_bin: "typst".into(),
+            ffmpeg_bin: "ffmpeg".into(),
         };
         let res = render_book(&photos, None, &[], &out, &opts).unwrap();
         assert!(
