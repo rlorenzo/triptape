@@ -18,6 +18,11 @@ const DEFAULT_SCORE: f32 = 0.5;
 /// Hero lists longer than this drop entries below [`HERO_MIN_SCORE`].
 const HERO_TRIM_ABOVE: usize = 40;
 const HERO_MIN_SCORE: f32 = 0.35;
+/// Hard cap on hero entries: a 3-5 minute film at ~4-6 s per still plus
+/// clip trims holds roughly this many moments (PLAN Sec 9 / Sec 5.4).
+/// Above the cap, keep each chapter's best entry, then the best-scored
+/// remainder, restored to story order.
+const HERO_CAP: usize = 60;
 /// Reel pack size and quality bar (the first [`MIN_REELS`] picks skip the bar).
 const MAX_REELS: usize = 5;
 const MIN_REELS: usize = 3;
@@ -51,6 +56,32 @@ pub fn build_plan(
         .collect();
     if hero.len() > HERO_TRIM_ABOVE {
         hero.retain(|e| score_of(&e.asset_id) >= HERO_MIN_SCORE);
+    }
+    if hero.len() > HERO_CAP {
+        let mut ranked: Vec<usize> = (0..hero.len()).collect();
+        ranked.sort_by(|&x, &y| {
+            score_of(&hero[y].asset_id)
+                .total_cmp(&score_of(&hero[x].asset_id))
+                .then(x.cmp(&y))
+        });
+        // Reserve each chapter's best entry first so the cap never erases a
+        // chapter from the film; remaining slots go to the best scores.
+        let label = |i: usize| {
+            cluster_of
+                .get(&hero[i].asset_id)
+                .map_or(UNGROUPED, String::as_str)
+        };
+        let mut seen_label: HashSet<&str> = HashSet::new();
+        let (reps, rest): (Vec<usize>, Vec<usize>) = ranked
+            .into_iter()
+            .partition(|&i| seen_label.insert(label(i)));
+        let keep: HashSet<usize> = reps.into_iter().chain(rest).take(HERO_CAP).collect();
+        let mut i = 0;
+        hero.retain(|_| {
+            let k = keep.contains(&i);
+            i += 1;
+            k
+        });
     }
 
     // Group by cluster label in story order (drives chapters and reels).
@@ -377,6 +408,81 @@ mod tests {
         // Missing file.
         let r = check_source_integrity(&e, &dir.path().join("gone.jpg"), None, None, || None);
         assert!(matches!(r, Integrity::Missing { .. }));
+    }
+
+    #[test]
+    fn hero_caps_at_sixty_keeping_story_order() {
+        let assets: Vec<Asset> = (0..80)
+            .map(|i| {
+                asset(
+                    &format!("a{i:02}"),
+                    1_714_557_600 + i * 60,
+                    AssetKind::Photo,
+                )
+            })
+            .collect();
+        let mut scores = HashMap::new();
+        for i in 0..80 {
+            scores.insert(
+                format!("a{i:02}"),
+                Score {
+                    total: 0.35 + i as f32 / 100.0,
+                    ..Default::default()
+                },
+            );
+        }
+        let plan = build_plan(&assets, &HashMap::new(), &scores);
+        assert_eq!(
+            plan.hero.len(),
+            60,
+            "hero capped at 60: {}",
+            plan.hero.len()
+        );
+        assert!(
+            plan.hero.iter().all(|e| e.asset_id != "a00"),
+            "lowest scorer dropped by cap"
+        );
+        let ids: Vec<&str> = plan.hero.iter().map(|e| e.asset_id.as_str()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "kept entries stay in story order");
+    }
+
+    #[test]
+    fn hero_cap_keeps_every_chapter() {
+        let assets: Vec<Asset> = (0..61)
+            .map(|i| {
+                asset(
+                    &format!("a{i:02}"),
+                    1_714_557_600 + i * 60,
+                    AssetKind::Photo,
+                )
+            })
+            .collect();
+        let mut scores = HashMap::new();
+        let mut clusters = HashMap::new();
+        for i in 0..61 {
+            let id = format!("a{i:02}");
+            let (total, day) = if i < 60 {
+                (0.8, "Day 1")
+            } else {
+                (0.7, "Day 2")
+            };
+            scores.insert(
+                id.clone(),
+                Score {
+                    total,
+                    ..Default::default()
+                },
+            );
+            clusters.insert(id, day.to_string());
+        }
+        let plan = build_plan(&assets, &clusters, &scores);
+        assert_eq!(plan.hero.len(), 60);
+        assert!(
+            plan.hero.iter().any(|e| e.asset_id == "a60"),
+            "lower-scored chapter keeps its best shot"
+        );
     }
 
     #[test]
