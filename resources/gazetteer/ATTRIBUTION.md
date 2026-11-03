@@ -15,8 +15,10 @@ subclass of one of those), with at least 12 Wikidata sitelinks as a
 notability floor. Items that are only tourist attractions and are also
 typed as a city, town, village, municipality, or spa town are left out
 (archaeological sites stay), so those places keep their `City, Country`
-name from `cities.tsv`. It lets chapter and caption naming prefer a place
-a traveler actually visited
+name from `cities.tsv`. Umbrella resorts parenting two or more
+amusement parks are also dropped, so a park keeps its own name
+(`Tokyo DisneySea`, not `Tokyo Disney Resort`). It lets chapter and
+caption naming prefer a place a traveler actually visited
 (`Tokyo DisneySea`, `Gardens by the Bay`, `Hong Kong Disneyland`)
 over the generic surrounding city.
 
