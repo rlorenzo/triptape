@@ -492,6 +492,7 @@ pub fn render_book(
     // it terminates; the post-render preflight stays as guard.
     let mut excluded: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut cap_note: Option<(usize, usize)>;
+    let mut cap_dropped: Vec<String>;
     let pruned: Vec<BookPhoto> = loop {
         let pool: Vec<BookPhoto> = viable
             .iter()
@@ -513,29 +514,20 @@ pub fn render_book(
         );
         let sel: Vec<BookPhoto> = if keep < pool.len() {
             let (sel, dropped) = select_for_cap(&pool, keep);
-            // Captioned photos are user curation: never export a book that
-            // silently omits them; block so the user trims captions instead.
-            if !dropped.is_empty() {
-                let ids: Vec<&str> = dropped.iter().map(|&i| pool[i].asset_id.as_str()).collect();
-                return Err(crate::MediaError::Preflight(format!(
-                    "{} captioned photos do not fit the {cap_pre}-page cap (at most {keep} photos); remove captions or photos to fit: {}",
-                    ids.len(),
-                    ids.join(", ")
-                )));
-            }
+            // Plan captions are auto-generated for every photo, so caption
+            // overflow is reported in the export notes, never a block.
+            // Replaced every pass: only the final selection's omissions are
+            // reported, never a photo a later pass brought back in.
+            cap_dropped = dropped.iter().map(|&i| pool[i].asset_id.clone()).collect();
             cap_note = Some((keep, pool.len()));
             sel.into_iter().map(|i| pool[i].clone()).collect()
         } else {
             cap_note = None;
+            cap_dropped = vec![];
             pool
         };
-        // Captioned photos are exempt (see viability filter above); if only
-        // they block, the post-render preflight reports them.
         let blocked: Vec<String> =
-            planned_blocked(&sel, opts.preset, route_card.is_some(), chapters.len())
-                .into_iter()
-                .filter(|id| !sel.iter().any(|p| &p.asset_id == id && has_caption(p)))
-                .collect();
+            planned_blocked(&sel, opts.preset, route_card.is_some(), chapters.len());
         if blocked.is_empty() {
             break sel;
         }
@@ -546,6 +538,14 @@ pub fn render_book(
             excluded.insert(id);
         }
     };
+    if !cap_dropped.is_empty() {
+        let ids: Vec<&str> = cap_dropped.iter().take(10).map(String::as_str).collect();
+        fallbacks.push(format!(
+            "book: {} captioned photos did not fit the {cap_pre}-page cap (kept an even spread; first omitted: {})",
+            cap_dropped.len(),
+            ids.join(", ")
+        ));
+    }
     if let Some((keep, of)) = cap_note {
         fallbacks.push(format!(
             "book: selected {keep} of {of} photos (captioned photos first, the rest evenly across the trip) to fit the {cap_pre}-page cap"
