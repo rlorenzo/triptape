@@ -1040,6 +1040,39 @@ mod tests {
             overlay_lines(None, Some(day), Some("Big surf")),
             Some(("Oct 6, 2026".to_string(), Some("Big surf".to_string())))
         );
+        // Dateline captions already carry the date: no doubled date, and
+        // without a chapter the time splits onto its own line.
+        assert_eq!(
+            overlay_lines(
+                Some("Mon, Oct 12"),
+                Some(day),
+                Some("Day 10 · Mon, Oct 12 · 3:08 AM")
+            ),
+            Some((
+                "Mon, Oct 12".to_string(),
+                Some("Day 10 · Mon, Oct 12 · 3:08 AM".to_string())
+            ))
+        );
+        assert_eq!(
+            overlay_lines(None, Some(day), Some("Day 10 · Mon, Oct 12 · 3:08 AM")),
+            Some((
+                "Day 10 · Mon, Oct 12".to_string(),
+                Some("3:08 AM".to_string())
+            ))
+        );
+        // Prose mentioning a clock time is not a dateline: date still leads.
+        assert_eq!(
+            overlay_lines(None, Some(day), Some("Ferry at 3:00")),
+            Some(("Oct 6, 2026".to_string(), Some("Ferry at 3:00".to_string())))
+        );
+        // User caption ending in a time is not a dateline either.
+        assert_eq!(
+            overlay_lines(None, Some(day), Some("Dinner · 7:30 PM")),
+            Some((
+                "Oct 6, 2026".to_string(),
+                Some("Dinner · 7:30 PM".to_string())
+            ))
+        );
         // Nothing to show.
         assert_eq!(overlay_lines(None, None, Some("  ")), None);
         assert_eq!(overlay_lines(None, None, None), None);

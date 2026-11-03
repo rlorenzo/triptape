@@ -7,6 +7,7 @@
 //! `press.pdf` (bleed) — when Typst is unavailable the JPEG pack, guide,
 //! and manifest still ship with a recorded fallback.
 
+use crate::titlecard::split_dateline;
 use image::{Rgb, RgbImage};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -869,20 +870,12 @@ fn page_caption(slot: &[&BookPhoto], kind: PageKind) -> Vec<String> {
     caps
 }
 
-/// Datelines look like `Day 4 · Sun, Oct 5 · 4:32 PM` (plan builder) or
-/// `Sun, Oct 5 · 4:32 PM`: last segment carries a clock time.
 fn is_dateline(c: &str) -> bool {
-    c.rsplit(" · ")
-        .next()
-        .is_some_and(|t| t.contains(':') && t.chars().any(|ch| ch.is_ascii_digit()))
-        && c.contains(" · ")
+    split_dateline(c).is_some()
 }
 
 fn dateline_date(c: &str) -> String {
-    match c.rsplit_once(" · ") {
-        Some((head, _time)) if is_dateline(c) => head.to_string(),
-        _ => c.to_string(),
-    }
+    split_dateline(c).map_or(c, |(date, _)| date).to_string()
 }
 
 fn date_only(c: &str) -> String {

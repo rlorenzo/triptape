@@ -125,6 +125,52 @@ pub fn format_date_range(taken: &[i64]) -> Option<String> {
     }
 }
 
+/// Splits a plan caption dateline (`Day 4 · Sun, Oct 5 · 4:32 PM` or
+/// `Sun, Oct 5 · 4:32 PM`, as built by `triptape_core::plan::dateline`)
+/// into (date part, clock time). `None` for anything else, including user
+/// captions that merely end in a time (`Dinner · 7:30 PM`).
+pub(crate) fn split_dateline(c: &str) -> Option<(&str, &str)> {
+    let (head, time) = c.rsplit_once(" · ")?;
+    let day = match head.split_once(" · ") {
+        Some((prefix, day)) => {
+            let n = prefix.strip_prefix("Day ")?;
+            (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(day)?
+        }
+        None => head,
+    };
+    (is_weekday_date(day) && is_clock_time(time)).then_some((head, time))
+}
+
+fn all_digits(s: &str, len: std::ops::RangeInclusive<usize>) -> bool {
+    len.contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `Sun, Oct 5` (chrono `%a, %b %-d`).
+fn is_weekday_date(s: &str) -> bool {
+    const WD: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MO: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let Some((wd, rest)) = s.split_once(", ") else {
+        return false;
+    };
+    let Some((mo, d)) = rest.split_once(' ') else {
+        return false;
+    };
+    WD.contains(&wd) && MO.contains(&mo) && all_digits(d, 1..=2)
+}
+
+/// `4:32 PM` (chrono `%-I:%M %p`).
+fn is_clock_time(s: &str) -> bool {
+    let Some((hm, ampm)) = s.split_once(' ') else {
+        return false;
+    };
+    let Some((h, m)) = hm.split_once(':') else {
+        return false;
+    };
+    matches!(ampm, "AM" | "PM") && all_digits(h, 1..=2) && all_digits(m, 2..=2)
+}
+
 /// (top, bottom) lines for one segment lower-third, or `None` when there is
 /// nothing to show. Chapter starts lead with the chapter title; otherwise
 /// the top line is the capture date (or the caption when dateless).
@@ -135,6 +181,15 @@ pub fn overlay_lines(
 ) -> Option<(String, Option<String>)> {
     let chapter = chapter_title.map(str::trim).filter(|c| !c.is_empty());
     let cap = caption.map(str::trim).filter(|c| !c.is_empty());
+    // Plan datelines (`Day 10 · Mon, Oct 12 · 3:08 AM`) already carry the
+    // date: never prefix it twice. Without a chapter, split the dateline
+    // into a day line and a time line.
+    if let Some((c, (day, time))) = cap.and_then(|c| Some((c, split_dateline(c)?))) {
+        return Some(match chapter {
+            Some(ch) => (ch.to_string(), Some(c.to_string())),
+            None => (day.to_string(), Some(time.to_string())),
+        });
+    }
     let date = taken_at.and_then(format_day);
     match (chapter, date, cap) {
         (None, None, None) => None,
