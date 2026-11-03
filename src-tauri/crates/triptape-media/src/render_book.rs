@@ -910,8 +910,9 @@ fn caption_of(p: &BookPhoto) -> Vec<String> {
 
 fn load(photo: &BookPhoto, ffmpeg_bin: &str, fallbacks: &mut Vec<String>) -> RgbImage {
     match image::open(&photo.path) {
-        // The image crate ignores EXIF orientation (FFmpeg/sips paths already
-        // auto-rotate), so portrait JPEGs would print sideways without this.
+        // The image crate ignores EXIF orientation (the FFmpeg/sips decode
+        // path orients its output), so portrait JPEGs would print sideways
+        // without this.
         Ok(d) => {
             let exif = triptape_core::metadata::read_image_exif(&photo.path);
             let t = exif
@@ -921,18 +922,7 @@ fn load(photo: &BookPhoto, ffmpeg_bin: &str, fallbacks: &mut Vec<String>) -> Rgb
                     mirror_h: false,
                     rotate_cw_deg: 0,
                 });
-            let d = if t.mirror_h {
-                image::DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&d.to_rgba8()))
-            } else {
-                d
-            };
-            let d = match t.rotate_cw_deg {
-                90 => d.rotate90(),
-                180 => d.rotate180(),
-                270 => d.rotate270(),
-                _ => d,
-            };
-            d.to_rgb8()
+            crate::ffmpeg::orient_image(d, t).to_rgb8()
         }
         Err(e) => match decode_via_ffmpeg(ffmpeg_bin, &photo.path) {
             Some(img) => img,

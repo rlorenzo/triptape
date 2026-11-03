@@ -264,7 +264,7 @@ pub fn export_all(
         for r in &resolved {
             let slides =
                 chapter_slideshow(plan, &by_id, r, &mut used_slides, &mut report.fallbacks);
-            if slides.len() == 1 {
+            if slides.len() == 1 && r.motion_path.is_none() {
                 report.fallbacks.push(format!(
                     "reel {}: no chapter neighbors; single-still reel",
                     r.entry.asset_id
@@ -388,11 +388,15 @@ fn chapter_slideshow(
     used: &mut HashSet<PathBuf>,
     fallbacks: &mut Vec<String>,
 ) -> Vec<PathBuf> {
-    if r.motion_path.is_some() || !matches!(r.entry.rendition, Rendition::Still) {
-        return vec![];
+    // Still highlight: slideshow starts with the select itself. Motion
+    // highlight: neighbors only — the reel opens with the motion moment,
+    // then extends into the slideshow when the clip is short.
+    let is_still = r.motion_path.is_none() && matches!(r.entry.rendition, Rendition::Still);
+    let mut slides: Vec<PathBuf> = vec![];
+    if is_still {
+        slides.push(r.still_path.clone());
+        used.insert(r.still_path.clone());
     }
-    let mut slides = vec![r.still_path.clone()];
-    used.insert(r.still_path.clone());
     let id = &r.entry.asset_id;
     let Some((ch, start)) = plan
         .chapters
@@ -504,10 +508,14 @@ mod tests {
         // A second reel in the same chapter keeps its still, reuses nothing.
         let b = chapter_slideshow(&plan, &by_id, &still("p3"), &mut used, &mut fallbacks);
         assert_eq!(stems(&b), ["p3"]);
-        // Motion reels never become slideshows.
+        // Motion highlights take neighbors only, never their own still.
         let mut clip = still("p0");
         clip.motion_path = Some(dir.path().join("p0.mov"));
         assert!(chapter_slideshow(&plan, &by_id, &clip, &mut used, &mut fallbacks).is_empty());
+        let mut fresh: HashSet<PathBuf> = HashSet::new();
+        let c = chapter_slideshow(&plan, &by_id, &clip, &mut fresh, &mut fallbacks);
+        assert_eq!(stems(&c), ["p1", "p3"]);
+        assert!(!fresh.contains(&by_id["p0"].path));
     }
 
     #[test]

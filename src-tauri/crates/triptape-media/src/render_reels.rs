@@ -94,6 +94,94 @@ fn reel_slug(caption: Option<&str>, src: &Path) -> String {
     }
 }
 
+/// Concatenate two same-format reel parts (1080x1920, 30 fps, AAC).
+fn concat_pair(
+    caps: &Capabilities,
+    first: &Path,
+    second: &Path,
+    out: &Path,
+) -> Result<(), crate::MediaError> {
+    let mut args: Vec<String> = vec![
+        "-y".into(),
+        "-i".into(),
+        s(first),
+        "-i".into(),
+        s(second),
+        "-filter_complex".into(),
+        "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]".into(),
+        "-map".into(),
+        "[v]".into(),
+        "-map".into(),
+        "[a]".into(),
+    ];
+    args.extend(quality_tail(out));
+    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out)
+}
+
+/// A motion highlight shorter than this is extended with its chapter
+/// slideshow — a 2 s Live Photo alone is not a reel.
+const SHORT_MOTION_SECS: f64 = 8.0;
+
+/// Extend a just-rendered short motion reel at `out` with the chapter
+/// slideshow; returns the added duration (0 when not extended).
+fn extend_with_slideshow(
+    caps: &Capabilities,
+    out: &Path,
+    motion_len: f64,
+    slides: &[PathBuf],
+    opts: &ReelOptions,
+    fallbacks: &mut Vec<String>,
+) -> Result<f64, crate::MediaError> {
+    if motion_len >= SHORT_MOTION_SECS || slides.is_empty() {
+        return Ok(0.0);
+    }
+    let stem = out
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "reel".to_string());
+    let dir = out.parent().unwrap_or_else(|| Path::new("."));
+    let clip_part = dir.join(format!(".{stem}.clip.mp4"));
+    let show_part = dir.join(format!(".{stem}.slides.mp4"));
+    let joined = dir.join(format!(".{stem}.joined.mp4"));
+    let result: Result<f64, crate::MediaError> = (|| {
+        std::fs::rename(out, &clip_part).map_err(|e| crate::MediaError::Io(e.to_string()))?;
+        render_slideshow_reel(caps, slides, opts, &show_part, fallbacks)?;
+        concat_pair(caps, &clip_part, &show_part, &joined)?;
+        std::fs::rename(&joined, out).map_err(|e| crate::MediaError::Io(e.to_string()))?;
+        Ok(slideshow_duration(
+            slides.len(),
+            opts.slide_secs,
+            opts.fade_secs,
+            caps.xfade,
+        ))
+    })();
+    let added = result.unwrap_or_else(|e| {
+        // Extension is an enhancement: keep the motion-only reel.
+        if !out.exists() && clip_part.exists() {
+            let _ = std::fs::rename(&clip_part, out);
+        }
+        fallbacks.push(format!(
+            "reel {}: slideshow extension failed ({e}); motion only",
+            out.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        0.0
+    });
+    let _ = std::fs::remove_file(&clip_part);
+    let _ = std::fs::remove_file(&show_part);
+    let _ = std::fs::remove_file(&joined);
+    Ok(added)
+}
+
+/// Actual duration of a just-encoded reel part, so a source shorter than its
+/// requested trim is still extended; `planned` when probing fails.
+fn encoded_len(caps: &Capabilities, out: &Path, planned: f64) -> f64 {
+    ffmpeg::ffprobe_file(&caps.ffprobe_bin, out)
+        .ok()
+        .map(|p| p.duration_secs)
+        .filter(|d| *d > 0.0)
+        .unwrap_or(planned)
+}
+
 /// Encode one reel to `out`; returns its planned duration in seconds.
 fn render_one_reel(
     caps: &Capabilities,
@@ -134,7 +222,8 @@ fn render_one_reel(
                 opts.music_path.as_deref(),
                 fallbacks,
             )?;
-            len
+            let len = encoded_len(caps, out, len);
+            len + extend_with_slideshow(caps, out, len, slides, opts, fallbacks)?
         }
         // Still rendition but a motion file exists (Live fallback): use it.
         _ => {
@@ -158,7 +247,8 @@ fn render_one_reel(
                 opts.music_path.as_deref(),
                 fallbacks,
             )?;
-            len
+            let len = encoded_len(caps, out, len);
+            len + extend_with_slideshow(caps, out, len, slides, opts, fallbacks)?
         }
     };
     Ok(dur)

@@ -414,6 +414,16 @@ pub fn render_hero_video(
                 continue;
             }
         };
+        // Record the actual encoded duration: Live Photo trims and short
+        // sources routinely encode shorter than planned, and an xfade offset
+        // past the accumulated length truncates the whole chain (the film's
+        // video ended at the title while music played on). Budget, overlays
+        // and timeline math all read this value.
+        let dur = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &seg_path)
+            .ok()
+            .map(|p| p.duration_secs)
+            .filter(|d| *d > 0.0)
+            .unwrap_or(dur);
         budget -= dur;
         segs.push((r.clone(), seg_path, dur, kind));
     }
@@ -1146,6 +1156,142 @@ mod tests {
         }
         assert_eq!(names[0], "circle_open");
         assert_eq!(names[names.len() - 1], "circle_close");
+    }
+
+    /// Regression: a clip whose planned trim (4 s) exceeds its real length
+    /// (0.5 s) must not truncate the film. Timeline math uses probed
+    /// segment durations; with planned durations the second xfade offset
+    /// lands past the accumulated video and the chain collapses.
+    #[test]
+    fn hero_smoke_short_clip_does_not_truncate() {
+        use triptape_core::types::Plan;
+
+        let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
+        if !caps.libx264 || !caps.xfade || !caps.loudnorm || !caps.zoompan {
+            eprintln!("ffmpeg caps insufficient; skipping short-clip smoke");
+            return;
+        }
+        if !crate::titlecard::typst_available("typst") {
+            eprintln!("typst missing; skipping short-clip smoke");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        // 0.5 s clip source, planned as a 4 s trim.
+        let clip = dir.join("short.mp4");
+        let st = std::process::Command::new(&caps.ffmpeg_bin)
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=0.5:size=640x480:rate=30",
+                "-pix_fmt",
+                "yuv420p",
+                &clip.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            st.status.success(),
+            "make short clip: {}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+        let img: image::RgbImage =
+            image::ImageBuffer::from_pixel(640, 480, image::Rgb([0, 200, 0]));
+        let still = dir.join("still.png");
+        img.save(&still).unwrap();
+        let entries = vec![
+            ResolvedEntry {
+                entry: PlanEntry {
+                    asset_id: "clip0".into(),
+                    content_hash: None,
+                    size_bytes: 0,
+                    mtime: 0,
+                    rendition: Rendition::Clip {
+                        trim_start: 0.0,
+                        trim_end: 4.0,
+                    },
+                },
+                still_path: clip.clone(),
+                motion_path: Some(clip.clone()),
+                caption: None,
+                taken_at: Some(1791288000),
+            },
+            ResolvedEntry {
+                entry: PlanEntry {
+                    asset_id: "still1".into(),
+                    content_hash: None,
+                    size_bytes: 0,
+                    mtime: 0,
+                    rendition: Rendition::Still,
+                },
+                still_path: still,
+                motion_path: None,
+                caption: None,
+                taken_at: Some(1791374400),
+            },
+        ];
+        let plan = Plan {
+            plan_version: 1,
+            schema_version: 1,
+            hero: vec![],
+            reel_selects: vec![],
+            chapters: vec![triptape_core::types::Chapter {
+                title: "Day 1".into(),
+                asset_ids: vec!["clip0".into(), "still1".into()],
+            }],
+            captions: HashMap::new(),
+            map_polyline: vec![],
+            music: triptape_core::types::MusicPick {
+                track: "bundled".into(),
+                rationale: "default".into(),
+            },
+        };
+        let out = dir.join("hero.mp4");
+        render_hero_video(
+            &caps,
+            &plan,
+            &entries,
+            None,
+            &dir.join("work"),
+            &out,
+            &VideoOptions {
+                trip_name: "Short Clip Trip".into(),
+                still_secs: 1.5,
+                title_secs: 1.0,
+                music_path: None,
+                keep_ambience: false,
+                typst_bin: "typst".into(),
+                ..Default::default()
+            },
+        )
+        .expect("short-clip hero render");
+        // Video stream duration (not format, which audio can inflate):
+        // title 1.0 + clip 0.5 + still 1.5 - two overlaps (~1.2) ~= 1.8 s.
+        let probe = std::process::Command::new(&caps.ffprobe_bin)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=duration",
+                "-of",
+                "csv=p=0",
+                &out.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        let vdur: f64 = String::from_utf8_lossy(&probe.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0.0);
+        assert!(
+            vdur > 1.4,
+            "video stream must span all segments, got {vdur:.2}s"
+        );
     }
 
     #[test]
