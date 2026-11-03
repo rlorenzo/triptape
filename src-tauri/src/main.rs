@@ -300,6 +300,7 @@ fn export_blocking(
         trip_name,
         typst_bin: "typst".to_string(),
         music_path: None,
+        keep_ambience: false,
         only: "all".to_string(),
     };
     let rendered = triptape_media::export::export_all(&caps, &plan, &assets, &out_dir, &opts)

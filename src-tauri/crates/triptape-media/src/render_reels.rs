@@ -19,6 +19,15 @@ pub struct ReelOptions {
     pub music_path: Option<PathBuf>,
     pub still_secs: f64,
     pub max_secs: f64,
+    /// Per-reel slideshow stills (index-aligned with the resolved entries
+    /// passed to [`render_reels`]): the selected still plus neighboring
+    /// moments from the same chapter. Empty/short lists fall back to a
+    /// single-still reel.
+    pub slideshows: Vec<Vec<PathBuf>>,
+    /// Seconds each slideshow photo stays on screen.
+    pub slide_secs: f64,
+    /// Crossfade length between slideshow photos.
+    pub fade_secs: f64,
 }
 
 impl Default for ReelOptions {
@@ -27,6 +36,9 @@ impl Default for ReelOptions {
             music_path: None,
             still_secs: 8.0,
             max_secs: 30.0,
+            slideshows: vec![],
+            slide_secs: 3.6,
+            fade_secs: 0.6,
         }
     }
 }
@@ -50,6 +62,38 @@ pub struct ReelOutput {
     pub fallbacks: Vec<String>,
 }
 
+/// Filesystem-safe slug from a reel's context text: lowercased, runs of
+/// non-alphanumerics collapsed to single dashes, capped at 48 chars.
+/// Falls back to the source file stem, then to `reel`.
+fn reel_slug(caption: Option<&str>, src: &Path) -> String {
+    let raw = caption
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .or_else(|| src.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "reel".to_string());
+    let lowered: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let joined = lowered
+        .split('-')
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let capped: String = joined.chars().take(48).collect();
+    match capped.trim_end_matches('-') {
+        "" => "reel".to_string(),
+        slug => slug.to_string(),
+    }
+}
+
 /// Encode one reel to `out`; returns its planned duration in seconds.
 fn render_one_reel(
     caps: &Capabilities,
@@ -57,12 +101,20 @@ fn render_one_reel(
     src: &Path,
     out: &Path,
     opts: &ReelOptions,
+    slides: &[PathBuf],
     fallbacks: &mut Vec<String>,
 ) -> Result<f64, crate::MediaError> {
     let dur = match &r.entry.rendition {
         Rendition::Still if r.motion_path.is_none() => {
-            render_still_reel(caps, &r.still_path, opts.still_secs, out)?;
-            opts.still_secs
+            if slides.len() >= 2 {
+                // A still highlight becomes a slideshow of its chapter
+                // neighbors, never one squashed photo held for seconds.
+                render_slideshow_reel(caps, slides, opts, out, fallbacks)?;
+                slideshow_duration(slides.len(), opts.slide_secs, opts.fade_secs, caps.xfade)
+            } else {
+                render_still_reel(caps, &r.still_path, opts.still_secs, out)?;
+                opts.still_secs
+            }
         }
         Rendition::Motion {
             trim_start,
@@ -140,11 +192,14 @@ pub fn render_reels(
             ));
             continue;
         }
-        let fname = format!("{:02}_{}.mp4", i + 1, r.entry.asset_id);
+        // Human-readable name from the reel's own context (its dateline
+        // caption, else the source file name) — never the internal asset id.
+        let fname = format!("{:02}_{}.mp4", i + 1, reel_slug(r.caption.as_deref(), src));
         let out = out_dir.join(&fname);
         // One bad source (e.g. a Dolby Vision HEIC this FFmpeg cannot decode)
         // skips that reel, never the whole pack.
-        let dur = match render_one_reel(caps, r, src, &out, opts, &mut fallbacks) {
+        let slides: &[PathBuf] = opts.slideshows.get(i).map_or(&[], Vec::as_slice);
+        let dur = match render_one_reel(caps, r, src, &out, opts, slides, &mut fallbacks) {
             Ok(d) => d,
             Err(e) => {
                 fallbacks.push(format!("reel {} failed ({e}); skipped", r.entry.asset_id));
@@ -333,6 +388,143 @@ fn render_clip_reel(
     ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out)
 }
 
+/// Planned slideshow duration: crossfades overlap adjacent slides.
+fn slideshow_duration(n: usize, slide_secs: f64, fade_secs: f64, xfade: bool) -> f64 {
+    if n == 0 {
+        0.0
+    } else if xfade {
+        n as f64 * slide_secs - (n - 1) as f64 * fade_secs
+    } else {
+        n as f64 * slide_secs
+    }
+}
+
+/// One slideshow frame: full photo fitted over its own blurred fill, then
+/// a gentle push-in applied to the finished 9:16 composite. Zooming the
+/// composite (never the raw photo) keeps the aspect honest — zoompan on a
+/// landscape source squashes it into the portrait frame.
+fn slideshow_frame_vf(caps: &Capabilities, i: usize, slide_secs: f64) -> String {
+    let base = ffmpeg::fit_over_blur(caps, &format!("[{i}:v]"), 1080, 1920, &i.to_string());
+    if caps.zoompan {
+        let frames = (slide_secs * 30.0).round().max(1.0) as u32;
+        format!(
+            "{base},{},format=yuv420p[v{i}]",
+            ffmpeg::push_in(0.05, frames, 1080, 1920)
+        )
+    } else {
+        format!("{base},fps=30,format=yuv420p[v{i}]")
+    }
+}
+
+const SLIDE_TRANSITIONS: [&str; 4] = ["fade", "dissolve", "slideleft", "slideright"];
+
+/// Full slideshow filter graph: framed slides joined by rotating
+/// crossfades (concat when xfade is unavailable), plus the audio lane.
+fn slideshow_graph(
+    n: usize,
+    caps: &Capabilities,
+    slide_secs: f64,
+    fade_secs: f64,
+    total: f64,
+    music: bool,
+) -> String {
+    let mut parts: Vec<String> = (0..n)
+        .map(|i| slideshow_frame_vf(caps, i, slide_secs))
+        .collect();
+    if n == 1 {
+        parts.push("[v0]null[vout]".to_string());
+    } else if caps.xfade {
+        let mut prev = "v0".to_string();
+        for k in 1..n {
+            let out_label = if k == n - 1 {
+                "vout".to_string()
+            } else {
+                format!("x{k}")
+            };
+            let offset = k as f64 * slide_secs - k as f64 * fade_secs;
+            parts.push(format!(
+                "[{prev}][v{k}]xfade=transition={}:duration={fade_secs:.3}:offset={offset:.3}[{out_label}]",
+                SLIDE_TRANSITIONS[(k - 1) % SLIDE_TRANSITIONS.len()]
+            ));
+            prev = out_label;
+        }
+    } else {
+        let inputs: String = (0..n).map(|i| format!("[v{i}]")).collect();
+        parts.push(format!("{inputs}concat=n={n}:v=1:a=0[vout]"));
+    }
+    if music {
+        parts.push(format!(
+            "[{n}:a]aresample=48000,volume=0.85,atrim=0:{total:.3},afade=t=out:st={:.3}:d=1[aout]",
+            (total - 1.0).max(0.0)
+        ));
+    } else {
+        parts.push(format!("[{n}:a]atrim=0:{total:.3}[aout]"));
+    }
+    parts.join(";")
+}
+
+fn render_slideshow_reel(
+    caps: &Capabilities,
+    slides: &[PathBuf],
+    opts: &ReelOptions,
+    out: &Path,
+    fallbacks: &mut Vec<String>,
+) -> Result<(), crate::MediaError> {
+    // Decode first: raw HEIC inputs fail or mis-rotate in filter graphs.
+    let mut decoded = vec![];
+    for s in slides {
+        decoded.push(ffmpeg::decode_still_to_png(&caps.ffmpeg_bin, s)?);
+    }
+    let n = decoded.len();
+    let music = opts.music_path.as_deref().filter(|m| m.exists());
+    if opts.music_path.is_some() && music.is_none() {
+        fallbacks.push("reel music missing; slideshow silent".into());
+    }
+    let total = slideshow_duration(n, opts.slide_secs, opts.fade_secs, caps.xfade);
+    let mut args: Vec<String> = vec!["-y".into()];
+    for d in &decoded {
+        if caps.zoompan {
+            args.extend(["-i".into(), s(&d.path)]);
+        } else {
+            args.extend([
+                "-loop".into(),
+                "1".into(),
+                "-t".into(),
+                format!("{:.3}", opts.slide_secs),
+                "-i".into(),
+                s(&d.path),
+            ]);
+        }
+    }
+    if let Some(m) = music {
+        args.extend(["-stream_loop".into(), "-1".into(), "-i".into(), s(m)]);
+    } else {
+        args.extend([
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            "anullsrc=r=48000:cl=stereo".into(),
+        ]);
+    }
+    args.extend([
+        "-filter_complex".into(),
+        slideshow_graph(
+            n,
+            caps,
+            opts.slide_secs,
+            opts.fade_secs,
+            total,
+            music.is_some(),
+        ),
+        "-map".into(),
+        "[vout]".into(),
+        "-map".into(),
+        "[aout]".into(),
+    ]);
+    args.extend(quality_tail(out));
+    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out)
+}
+
 fn render_still_reel(
     caps: &Capabilities,
     img: &Path,
@@ -351,28 +543,29 @@ fn render_still_reel_png(
     out: &Path,
 ) -> Result<(), crate::MediaError> {
     let frames = (dur * 30.0).round() as u32;
-    // Hook-first: gentle push-in so the first frame already fills 9:16.
-    let vf = if caps.zoompan {
-        format!("scale=2160:-2,zoompan=z='1+0.10*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30,format=yuv420p")
-    } else {
-        "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,format=yuv420p"
-            .to_string()
-    };
-    let mut args: Vec<String> = vec![
-        "-y".into(),
-        "-loop".into(),
-        "1".into(),
+    // Same framing as one slideshow slide (input 0, output `[v0]`): full
+    // photo over its blurred fill, push-in on the finished 9:16 composite.
+    let graph = slideshow_frame_vf(caps, 0, dur);
+    let mut args: Vec<String> = vec!["-y".into()];
+    if !caps.zoompan {
+        args.extend(["-loop".into(), "1".into()]);
+    }
+    args.extend([
         "-i".into(),
         s(img),
         "-f".into(),
         "lavfi".into(),
         "-i".into(),
         format!("anullsrc=r=48000:cl=stereo:d={dur}"),
-        "-vf".into(),
-        vf,
+        "-filter_complex".into(),
+        graph,
+        "-map".into(),
+        "[v0]".into(),
+        "-map".into(),
+        "1:a".into(),
         "-frames:v".into(),
         frames.to_string(),
-    ];
+    ]);
     args.extend(quality_tail(out));
     ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out)
 }
@@ -385,6 +578,47 @@ mod tests {
     fn decode_still_fails_closed_on_missing_file() {
         let r = crate::ffmpeg::decode_still_to_png("ffmpeg", Path::new("/nonexistent/x.HEIC"));
         assert!(r.is_err(), "missing still must fail, not fabricate a frame");
+    }
+
+    #[test]
+    fn slideshow_graph_frames_full_photo_and_crossfades() {
+        let caps = Capabilities {
+            gblur: true,
+            xfade: true,
+            zoompan: true,
+            ..Default::default()
+        };
+        let g = slideshow_graph(3, &caps, 3.6, 0.6, 9.6, false);
+        // Every slide: full photo over blurred fill (overlay), and the
+        // push-in zooms the composite AFTER the overlay — never the raw
+        // landscape photo (that squashes it into 9:16).
+        for i in 0..3 {
+            assert!(g.contains(&format!("[bg{i}][fg{i}]overlay")), "{g}");
+        }
+        let overlay_at = g.find("overlay").unwrap();
+        let zoom_at = g.find("zoompan").unwrap();
+        assert!(overlay_at < zoom_at, "zoom applies to composite: {g}");
+        assert_eq!(g.matches("xfade=transition=").count(), 2, "{g}");
+        assert!(g.contains("transition=fade") && g.contains("transition=dissolve"));
+        // Duration math: crossfades overlap slides.
+        assert!((slideshow_duration(3, 3.6, 0.6, true) - 9.6).abs() < 1e-9);
+        assert!((slideshow_duration(3, 3.6, 0.6, false) - 10.8).abs() < 1e-9);
+        assert_eq!(slideshow_duration(0, 3.6, 0.6, true), 0.0);
+    }
+
+    #[test]
+    fn reel_slug_names_context_not_asset_id() {
+        let src = Path::new("/trip/IMG_0131.HEIC");
+        assert_eq!(
+            reel_slug(Some("Day 4 · Sun, Oct 5 · 4:32 PM"), src),
+            "day-4-sun-oct-5-4-32-pm"
+        );
+        // No caption: fall back to the source file name.
+        assert_eq!(reel_slug(None, src), "img-0131");
+        assert_eq!(reel_slug(Some("  "), src), "img-0131");
+        // Never empty, filesystem-safe, capped.
+        let long = reel_slug(Some(&"word ".repeat(30)), src);
+        assert!(long.len() <= 48 && !long.ends_with('-') && !long.is_empty());
     }
 
     #[test]
