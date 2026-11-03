@@ -24,10 +24,12 @@ pub const DUPE_WINDOW_SECS: i64 = 10 * 60;
 /// Max GPS distance between two near-dupe shots when both have a fix (200 m).
 pub const DUPE_RADIUS_METERS: f64 = 200.0;
 
-/// Calendar day (`YYYY-MM-DD`, UTC) of a capture time, or `"unknown-date"`.
-pub fn day_key(taken_at: Option<i64>) -> String {
+/// Calendar day (`YYYY-MM-DD`) in the photo's own timezone, or
+/// `"unknown-date"`. An 8 AM Japan photo is 11 PM UTC the day before —
+/// day grouping must be local or mornings land on the wrong day.
+pub fn day_key(taken_at: Option<i64>, tz_offset_secs: Option<i32>) -> String {
     taken_at
-        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .and_then(|t| crate::metadata::local_datetime(t, tz_offset_secs))
         .map(|d| d.format("%Y-%m-%d").to_string())
         .unwrap_or_else(|| "unknown-date".to_string())
 }
@@ -139,7 +141,7 @@ pub fn cluster_assets(assets: &[Asset]) -> Vec<Cluster> {
     let mut clusters: Vec<Cluster> = vec![];
     let mut acc = Acc::default();
     for a in ordered {
-        let day = day_key(a.taken_at);
+        let day = day_key(a.taken_at, a.tz_offset_secs);
         let gps = a.gps.filter(|_| !outliers.contains(&a.id));
         if acc.ids.is_empty() {
             acc.day = day;
@@ -432,7 +434,10 @@ mod tests {
         ];
         let order: Vec<&str> = story_order(&a).iter().map(|a| a.id.as_str()).collect();
         assert_eq!(order, vec!["a", "x"]);
-        assert_eq!(day_key(None), "unknown-date");
+        assert_eq!(day_key(None, None), "unknown-date");
+        // 2026-10-04 22:50 UTC is Oct 5 in Japan (+09:00).
+        assert_eq!(day_key(Some(1_791_154_200), Some(9 * 3600)), "2026-10-05");
+        assert_eq!(day_key(Some(1_791_154_200), None), "2026-10-04");
         let c = cluster_assets(&a);
         assert_eq!(c.last().unwrap().label, "unknown-date");
     }

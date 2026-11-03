@@ -180,6 +180,8 @@ pub struct ResolvedEntry {
     pub caption: Option<String>,
     /// Capture time (unix secs) for date lower-thirds; `None` skips the date.
     pub taken_at: Option<i64>,
+    /// UTC offset at capture (seconds) for local-time display.
+    pub tz_offset_secs: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -304,7 +306,7 @@ pub fn render_hero_video(
     let date_range = crate::titlecard::format_date_range(
         &resolved
             .iter()
-            .filter_map(|r| r.taken_at)
+            .filter_map(|r| r.taken_at.map(|t| (t, r.tz_offset_secs)))
             .collect::<Vec<_>>(),
     );
     let title_is_text = if typst_ok {
@@ -344,6 +346,7 @@ pub fn render_hero_video(
             motion_path: None,
             caption: None,
             taken_at: None,
+            tz_offset_secs: None,
         },
         title_mp4,
         opts.title_secs,
@@ -368,6 +371,7 @@ pub fn render_hero_video(
                         motion_path: None,
                         caption: None,
                         taken_at: None,
+                        tz_offset_secs: None,
                     },
                     map_mp4,
                     opts.map_secs,
@@ -419,11 +423,23 @@ pub fn render_hero_video(
         // past the accumulated length truncates the whole chain (the film's
         // video ended at the title while music played on). Budget, overlays
         // and timeline math all read this value.
-        let dur = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &seg_path)
+        let probed = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &seg_path)
             .ok()
             .map(|p| p.duration_secs)
             .filter(|d| *d > 0.0)
             .unwrap_or(dur);
+        // Flash frames are unwatchable: a sub-2.5s clip (most Live Photo
+        // motions) is freeze-padded on its last frame to a minimum hold.
+        let dur = match clip_pad_target(probed, budget).filter(|_| kind == "clip") {
+            Some(target) => match pad_segment_freeze(caps, &seg_path, target) {
+                Ok(()) => target,
+                Err(e) => {
+                    fallbacks.push(format!("{} freeze-pad failed ({e})", r.entry.asset_id));
+                    probed
+                }
+            },
+            None => probed,
+        };
         budget -= dur;
         segs.push((r.clone(), seg_path, dur, kind));
     }
@@ -460,28 +476,34 @@ pub fn render_hero_video(
         prev_chapter = Some(ch);
     }
 
-    // 3. Per-segment context overlays (Typst lower-thirds baked per segment
-    // so they ride through the xfade chain): chapter title on the chapter's
-    // first segment, else date + caption. Title/map cards carry no overlay.
+    // 3. Context overlays (Typst lower-thirds baked per segment so they
+    // ride through the xfade chain): the day + place stated ONCE at each
+    // chapter's first segment, and a label on the route card so it reads
+    // as a map. Segments inside a chapter stay clean.
     if typst_ok {
-        let chapter_title: HashMap<&str, &str> = plan
+        let chapter_of_entry: HashMap<&str, &triptape_core::types::Chapter> = plan
             .chapters
             .iter()
-            .flat_map(|c| c.asset_ids.iter().map(|id| (id.as_str(), c.title.as_str())))
+            .flat_map(|c| c.asset_ids.iter().map(move |id| (id.as_str(), c)))
             .collect();
         for (i, (r, seg_mp4, dur, _)) in segs.iter().enumerate() {
             let id = r.entry.asset_id.as_str();
-            if id == "title" || id == "map" {
+            if id == "title" {
                 continue;
             }
-            let ch_title = chapter_start[i]
-                .then(|| chapter_title.get(id).copied())
-                .flatten();
-            let Some((top, bottom)) =
-                crate::titlecard::overlay_lines(ch_title, r.taken_at, r.caption.as_deref())
-            else {
-                continue;
+            let lines = if id == "map" {
+                Some((
+                    crate::titlecard::ROUTE_LABEL.to_string(),
+                    date_range.clone(),
+                ))
+            } else if chapter_start[i] {
+                chapter_of_entry
+                    .get(id)
+                    .and_then(|ch| crate::titlecard::chapter_lines(ch))
+            } else {
+                None
             };
+            let Some((top, bottom)) = lines else { continue };
             let doc = crate::titlecard::lower_third_doc(&top, bottom.as_deref());
             let png = work_dir.join(format!("ov_{i:03}.png"));
             if let Err(e) = crate::titlecard::render_text_png(&opts.typst_bin, &doc, &png, 72)
@@ -672,29 +694,40 @@ fn apply_lower_third(
     png: &Path,
     seg_dur: f64,
 ) -> Result<(), crate::MediaError> {
+    let graph =
+        format!("[0:v][1:v]overlay=48:H-160:format=yuv420:enable='between(t,0.3,{seg_dur:.3})'[v]");
+    burn_png_overlay(caps, seg, png, &graph, 16)
+}
+
+/// Re-encode `video` in place with `png` composited by `filter_graph`
+/// (inputs `[0:v]` and `[1:v]`, output `[v]`); audio is carried over.
+pub(crate) fn burn_png_overlay(
+    caps: &Capabilities,
+    video: &Path,
+    png: &Path,
+    filter_graph: &str,
+    crf: u32,
+) -> Result<(), crate::MediaError> {
     let args: Vec<String> = vec![
         "-y".into(),
         "-i".into(),
-        s(seg),
+        s(video),
         "-loop".into(),
         "1".into(),
         "-i".into(),
         s(png),
         "-filter_complex".into(),
-        format!(
-            "[0:v][1:v]overlay=48:H-160:format=yuv420:enable='between(t,0.3,{:.3})'[v]",
-            seg_dur
-        ),
+        filter_graph.into(),
         "-map".into(),
         "[v]".into(),
         "-map".into(),
         "0:a".into(),
     ]
     .into_iter()
-    .chain(ffmpeg::x264_aac("veryfast", 16))
-    .chain(["-shortest".into(), s(seg)])
+    .chain(ffmpeg::x264_aac("veryfast", crf))
+    .chain(["-shortest".into(), s(video)])
     .collect();
-    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, seg)
+    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, video)
 }
 
 fn write_captions_srt(
@@ -736,6 +769,40 @@ fn srt_ts(t: f64) -> String {
         (ms / 1000) % 60,
         ms % 1000
     )
+}
+
+/// Minimum on-screen time for a hero segment; shorter clips flash by.
+const MIN_SEGMENT_SECS: f64 = 2.5;
+
+/// Seconds to freeze-pad a clip to: the minimum hold, limited by what is left
+/// of the short-mode budget. `None` when the clip already reaches that.
+fn clip_pad_target(probed: f64, budget: f64) -> Option<f64> {
+    let target = MIN_SEGMENT_SECS.min(budget);
+    (probed < target).then_some(target)
+}
+
+/// Freeze-pad `seg` (video + audio) to `target` seconds on its last frame.
+fn pad_segment_freeze(
+    caps: &Capabilities,
+    seg: &Path,
+    target: f64,
+) -> Result<(), crate::MediaError> {
+    let args: Vec<String> = vec![
+        "-y".into(),
+        "-i".into(),
+        s(seg),
+        "-vf".into(),
+        format!("tpad=stop_mode=clone:stop_duration={target:.3}"),
+        "-af".into(),
+        format!("apad=whole_dur={target:.3}"),
+        "-t".into(),
+        format!("{target:.3}"),
+    ]
+    .into_iter()
+    .chain(ffmpeg::x264_aac("veryfast", 16))
+    .chain([s(seg)])
+    .collect();
+    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, seg)
 }
 
 /// Normalize one plan entry to a uniform segment. Returns (path, secs, kind).
@@ -1016,66 +1083,75 @@ mod tests {
     }
 
     #[test]
-    fn overlay_lines_builder() {
-        use crate::titlecard::{format_date_range, format_day, overlay_lines};
+    fn legacy_chapter_falls_back_to_title() {
+        use crate::titlecard::{chapter_book_title, chapter_lines};
+        let legacy: triptape_core::types::Chapter =
+            serde_json::from_str(r#"{"title":"Day 2 · Coast","asset_ids":["a1"]}"#).unwrap();
+        assert_eq!(
+            chapter_lines(&legacy),
+            Some(("Day 2 · Coast".to_string(), None))
+        );
+        assert_eq!(chapter_book_title(&legacy), "Day 2 · Coast");
+        let mut current = legacy.clone();
+        current.day_index = Some(2);
+        current.place = Some("Kyoto, Japan".into());
+        assert_eq!(
+            chapter_lines(&current),
+            Some(("Day 2".to_string(), Some("Kyoto, Japan".to_string())))
+        );
+        current.date_label = Some("Wed, Oct 8".into());
+        assert_eq!(
+            chapter_book_title(&current),
+            "Day 2 · Wed, Oct 8 \u{2014} Kyoto, Japan"
+        );
+        let mut blank = legacy;
+        blank.title = "  ".into();
+        assert_eq!(chapter_lines(&blank), None);
+    }
+
+    #[test]
+    fn chapter_overlay_and_date_range() {
+        use crate::titlecard::{chapter_overlay, format_date_range};
         // 2026-10-06 12:00 UTC.
         let day = 1791288000i64;
-        assert_eq!(format_day(day).as_deref(), Some("Oct 6, 2026"));
+        // Oct 4 22:50 UTC is already Oct 5 in Japan (+09:00).
         assert_eq!(
-            format_date_range(&[day, day + 3 * 86400]).as_deref(),
+            format_date_range(&[(1791154200, Some(9 * 3600))]).as_deref(),
+            Some("Oct 5, 2026")
+        );
+        assert_eq!(
+            format_date_range(&[(day, None), (day + 3 * 86400, None)]).as_deref(),
             Some("Oct 6, 2026 – Oct 9, 2026")
         );
-        assert_eq!(format_date_range(&[day]).as_deref(), Some("Oct 6, 2026"));
+        assert_eq!(
+            format_date_range(&[(day, None)]).as_deref(),
+            Some("Oct 6, 2026")
+        );
         assert_eq!(format_date_range(&[]), None);
-        // Chapter start leads with the chapter title.
+        // Date-line crossing: the earlier instant (Oct 6 12:00 UTC at
+        // +13:00 → Oct 7) has a later local date than the next one
+        // (Oct 6 13:00 UTC at -10:00 → Oct 6 03:00).
         assert_eq!(
-            overlay_lines(Some("Day 2 · Coast"), Some(day), Some("Big surf")),
-            Some((
-                "Day 2 · Coast".to_string(),
-                Some("Oct 6, 2026 · Big surf".to_string())
-            ))
+            format_date_range(&[(day, Some(13 * 3600)), (day + 3600, Some(-10 * 3600))]).as_deref(),
+            Some("Oct 6, 2026 – Oct 7, 2026")
         );
-        // Plain segment: date + caption.
+        // Chapter overlay: day once, place underneath.
         assert_eq!(
-            overlay_lines(None, Some(day), Some("Big surf")),
-            Some(("Oct 6, 2026".to_string(), Some("Big surf".to_string())))
-        );
-        // Dateline captions already carry the date: no doubled date, and
-        // without a chapter the time splits onto its own line.
-        assert_eq!(
-            overlay_lines(
-                Some("Mon, Oct 12"),
-                Some(day),
-                Some("Day 10 · Mon, Oct 12 · 3:08 AM")
-            ),
+            chapter_overlay(Some(3), Some("Wed, Oct 8"), Some("Kyoto, Japan")),
             Some((
-                "Mon, Oct 12".to_string(),
-                Some("Day 10 · Mon, Oct 12 · 3:08 AM".to_string())
+                "Day 3 · Wed, Oct 8".to_string(),
+                Some("Kyoto, Japan".to_string())
             ))
         );
         assert_eq!(
-            overlay_lines(None, Some(day), Some("Day 10 · Mon, Oct 12 · 3:08 AM")),
-            Some((
-                "Day 10 · Mon, Oct 12".to_string(),
-                Some("3:08 AM".to_string())
-            ))
+            chapter_overlay(Some(3), Some("Wed, Oct 8"), None),
+            Some(("Day 3 · Wed, Oct 8".to_string(), None))
         );
-        // Prose mentioning a clock time is not a dateline: date still leads.
         assert_eq!(
-            overlay_lines(None, Some(day), Some("Ferry at 3:00")),
-            Some(("Oct 6, 2026".to_string(), Some("Ferry at 3:00".to_string())))
+            chapter_overlay(None, None, Some("Kyoto, Japan")),
+            Some(("Kyoto, Japan".to_string(), None))
         );
-        // User caption ending in a time is not a dateline either.
-        assert_eq!(
-            overlay_lines(None, Some(day), Some("Dinner · 7:30 PM")),
-            Some((
-                "Oct 6, 2026".to_string(),
-                Some("Dinner · 7:30 PM".to_string())
-            ))
-        );
-        // Nothing to show.
-        assert_eq!(overlay_lines(None, None, Some("  ")), None);
-        assert_eq!(overlay_lines(None, None, None), None);
+        assert_eq!(chapter_overlay(None, None, None), None);
     }
 
     /// Full hero pipeline on synthetic stills: Typst title + lower-thirds,
@@ -1121,6 +1197,7 @@ mod tests {
                 },
                 // Oct 6/7/8 2026 12:00 UTC.
                 taken_at: Some(1791288000 + i as i64 * 86400),
+                tz_offset_secs: None,
             });
         }
         let mut captions = HashMap::new();
@@ -1134,10 +1211,12 @@ mod tests {
                 triptape_core::types::Chapter {
                     title: "Day 1 · Arrival".into(),
                     asset_ids: vec!["a0".into(), "a1".into()],
+                    ..Default::default()
                 },
                 triptape_core::types::Chapter {
                     title: "Day 2 · Coast".into(),
                     asset_ids: vec!["a2".into()],
+                    ..Default::default()
                 },
             ],
             captions,
@@ -1253,6 +1332,7 @@ mod tests {
                 motion_path: Some(clip.clone()),
                 caption: None,
                 taken_at: Some(1791288000),
+                tz_offset_secs: None,
             },
             ResolvedEntry {
                 entry: PlanEntry {
@@ -1266,6 +1346,7 @@ mod tests {
                 motion_path: None,
                 caption: None,
                 taken_at: Some(1791374400),
+                tz_offset_secs: None,
             },
         ];
         let plan = Plan {
@@ -1276,6 +1357,7 @@ mod tests {
             chapters: vec![triptape_core::types::Chapter {
                 title: "Day 1".into(),
                 asset_ids: vec!["clip0".into(), "still1".into()],
+                ..Default::default()
             }],
             captions: HashMap::new(),
             map_polyline: vec![],
@@ -1304,7 +1386,8 @@ mod tests {
         )
         .expect("short-clip hero render");
         // Video stream duration (not format, which audio can inflate):
-        // title 1.0 + clip 0.5 + still 1.5 - two overlaps (~1.2) ~= 1.8 s.
+        // title 1.0 + clip freeze-padded to 2.5 + still 1.5 - overlaps
+        // (~1.2) ~= 3.8 s. Without the pad it would be ~1.8 s.
         let probe = std::process::Command::new(&caps.ffprobe_bin)
             .args([
                 "-v",
@@ -1324,9 +1407,19 @@ mod tests {
             .parse()
             .unwrap_or(0.0);
         assert!(
-            vdur > 1.4,
-            "video stream must span all segments, got {vdur:.2}s"
+            vdur > 3.2,
+            "video stream must span all segments with the clip padded, got {vdur:.2}s"
         );
+    }
+
+    #[test]
+    fn clip_pad_target_respects_budget() {
+        assert_eq!(clip_pad_target(1.0, f64::INFINITY), Some(MIN_SEGMENT_SECS));
+        assert_eq!(clip_pad_target(1.0, 10.0), Some(MIN_SEGMENT_SECS));
+        assert_eq!(clip_pad_target(0.8, 1.5), Some(1.5));
+        // Already capped to the remaining budget: nothing to pad.
+        assert_eq!(clip_pad_target(0.6, 0.6), None);
+        assert_eq!(clip_pad_target(3.0, 10.0), None);
     }
 
     #[test]

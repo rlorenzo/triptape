@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS assets (
     height INTEGER,
     duration_secs REAL,
     taken_at INTEGER,
+    tz_offset INTEGER,
     time_guessed INTEGER NOT NULL DEFAULT 0,
     lat REAL,
     lon REAL,
@@ -147,6 +148,19 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+        // Migration for DBs created before capture timezones were stored.
+        let has_tz_offset = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='tz_offset'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| e.to_string())?
+            > 0;
+        if !has_tz_offset {
+            conn.execute("ALTER TABLE assets ADD COLUMN tz_offset INTEGER", [])
+                .map_err(|e| e.to_string())?;
+        }
         Ok(Self { conn })
     }
 
@@ -222,9 +236,9 @@ impl Db {
             None => None,
         };
         self.conn.prepare_cached(
-            "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,time_guessed,lat,lon,rotation_deg,pair_confidence)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,path=excluded.path,companion_path=excluded.companion_path,kind=excluded.kind,size_bytes=excluded.size_bytes,mtime=excluded.mtime,content_hash=excluded.content_hash,phash=excluded.phash,width=excluded.width,height=excluded.height,duration_secs=excluded.duration_secs,taken_at=excluded.taken_at,time_guessed=excluded.time_guessed,lat=excluded.lat,lon=excluded.lon,rotation_deg=excluded.rotation_deg,pair_confidence=excluded.pair_confidence",
+            "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,path=excluded.path,companion_path=excluded.companion_path,kind=excluded.kind,size_bytes=excluded.size_bytes,mtime=excluded.mtime,content_hash=excluded.content_hash,phash=excluded.phash,width=excluded.width,height=excluded.height,duration_secs=excluded.duration_secs,taken_at=excluded.taken_at,tz_offset=excluded.tz_offset,time_guessed=excluded.time_guessed,lat=excluded.lat,lon=excluded.lon,rotation_deg=excluded.rotation_deg,pair_confidence=excluded.pair_confidence",
         ).and_then(|mut st| st.execute(params![
                 a.id, project_id,
                 a.path.to_string_lossy().to_string(),
@@ -232,7 +246,7 @@ impl Db {
                 kind, a.size_bytes as i64, a.mtime,
                 a.content_hash, a.phash.map(|h| h as i64),
                 a.width.map(|w| w as i64), a.height.map(|h| h as i64),
-                a.duration_secs, a.taken_at, i64::from(a.time_guessed),
+                a.duration_secs, a.taken_at, a.tz_offset_secs, i64::from(a.time_guessed),
                 a.gps.map(|g| g.0), a.gps.map(|g| g.1),
                 a.rotation_deg as i64, conf,
             ]),
@@ -244,14 +258,14 @@ impl Db {
         let mut st = self
             .conn
             .prepare(
-                "SELECT id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,time_guessed,lat,lon,rotation_deg,pair_confidence FROM assets WHERE project_id=?1 ORDER BY taken_at NULLS LAST, id",
+                "SELECT id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence FROM assets WHERE project_id=?1 ORDER BY taken_at NULLS LAST, id",
             )
             .map_err(|e| e.to_string())?;
         let rows = st
             .query_map(params![project_id], |r| {
                 let kind: String = r.get(3)?;
-                let conf: Option<String> = r.get(16)?;
-                let (lat, lon): (Option<f64>, Option<f64>) = (r.get(13)?, r.get(14)?);
+                let conf: Option<String> = r.get(17)?;
+                let (lat, lon): (Option<f64>, Option<f64>) = (r.get(14)?, r.get(15)?);
                 Ok(Asset {
                     id: r.get(0)?,
                     path: PathBuf::from(r.get::<_, String>(1)?),
@@ -269,12 +283,13 @@ impl Db {
                     height: r.get::<_, Option<i64>>(9)?.map(|h| h as u32),
                     duration_secs: r.get(10)?,
                     taken_at: r.get(11)?,
-                    time_guessed: r.get::<_, i64>(12)? != 0,
+                    tz_offset_secs: r.get(12)?,
+                    time_guessed: r.get::<_, i64>(13)? != 0,
                     gps: match (lat, lon) {
                         (Some(a), Some(o)) => Some((a, o)),
                         _ => None,
                     },
-                    rotation_deg: r.get::<_, i64>(15)? as u16,
+                    rotation_deg: r.get::<_, i64>(16)? as u16,
                     pairing_confidence: match conf.as_deref() {
                         Some("content-id") => Some(PairingConfidence::ContentId),
                         Some("basename-only") => Some(PairingConfidence::BasenameOnly),
@@ -476,6 +491,26 @@ mod tests {
 
     fn mem() -> Db {
         Db::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn init_adds_tz_offset_to_older_databases_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        let old_schema = SCHEMA.replace("    tz_offset INTEGER,\n", "");
+        assert_ne!(old_schema, SCHEMA);
+        conn.execute_batch(&old_schema).unwrap();
+        let db = Db::init(conn).unwrap();
+        // Re-running init on the migrated store must not fail.
+        let db = Db::init(db.conn).unwrap();
+        let columns: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='tz_offset'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 1);
     }
 
     fn asset(id: &str) -> Asset {

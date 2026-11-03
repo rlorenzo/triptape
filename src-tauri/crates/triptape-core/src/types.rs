@@ -43,6 +43,9 @@ pub struct Asset {
     pub duration_secs: Option<f64>,
     /// Capture time (unix seconds) after normalization, if known.
     pub taken_at: Option<i64>,
+    /// UTC offset at capture in seconds (EXIF `OffsetTimeOriginal`, or
+    /// filled from a dated neighbor). Display times/days use local time.
+    pub tz_offset_secs: Option<i32>,
     /// True when `taken_at` fell back to file mtime.
     pub time_guessed: bool,
     pub gps: Option<(f64, f64)>,
@@ -67,6 +70,7 @@ impl Asset {
             height: None,
             duration_secs: None,
             taken_at: None,
+            tz_offset_secs: None,
             time_guessed: false,
             gps: None,
             rotation_deg: 0,
@@ -97,10 +101,20 @@ pub struct Cluster {
 }
 
 /// One chapter of the story plan.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Chapter {
     pub title: String,
     pub asset_ids: Vec<String>,
+    /// Nearest populated place to the chapter's GPS medoid
+    /// (`City, Country`), when the gazetteer can name it.
+    #[serde(default)]
+    pub place: Option<String>,
+    /// 1-based day of the trip (local dates) this chapter starts on.
+    #[serde(default)]
+    pub day_index: Option<u32>,
+    /// Local date label of the chapter's first asset, e.g. `Wed, Oct 8`.
+    #[serde(default)]
+    pub date_label: Option<String>,
 }
 
 /// Music pick with a human-readable rationale ("vibe fit", never fake emotion).

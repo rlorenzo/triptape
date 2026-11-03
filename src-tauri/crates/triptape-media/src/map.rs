@@ -63,14 +63,29 @@ pub fn draw_route_card(
             img.put_pixel(x, y, Rgb([232, 236, 241]));
         }
     }
+    // Graticule: faint grid so the card reads as a map, not a black card.
+    let grid = Rgb([31, 44, 63]);
+    for gx in 1..8 {
+        let x = w * gx / 8;
+        for y in 0..(h - bar_h) {
+            img.put_pixel(x, y, grid);
+        }
+    }
+    for gy in 1..6 {
+        let y = (h - bar_h) * gy / 6;
+        for x in 0..w {
+            img.put_pixel(x, y, grid);
+        }
+    }
     if route.is_empty() {
         return img;
     }
     let pts = project(route, w, h - bar_h);
-    // Route line (accent amber), 3-px wide via neighbor splats.
-    let accent = Rgb([245, 178, 66]);
-    for win in pts.windows(2) {
-        draw_seg(&mut img, win[0], win[1], accent);
+    // Route line: dark amber glow under the bright accent core.
+    for (col, r) in [(Rgb([146, 102, 30]), 4), (Rgb([245, 178, 66]), 2)] {
+        for win in pts.windows(2) {
+            draw_seg(&mut img, win[0], win[1], col, r);
+        }
     }
     // Pins: filled dots; day markers: larger rings.
     for (i, &p) in pts.iter().enumerate() {
@@ -86,6 +101,13 @@ pub fn draw_route_card(
                 Rgb([94, 234, 212])
             },
         );
+    }
+    // Start (green) and end (red) pins, larger than day markers.
+    if let (Some(&first), Some(&last)) = (pts.first(), pts.last()) {
+        for (p, col) in [(first, Rgb([52, 199, 123])), (last, Rgb([235, 87, 87]))] {
+            draw_dot(&mut img, p, 11, Rgb([255, 255, 255]));
+            draw_dot(&mut img, p, 8, col);
+        }
     }
     img
 }
@@ -130,13 +152,13 @@ fn draw_dot(img: &mut RgbImage, c: (i32, i32), r: i32, col: Rgb<u8>) {
     }
 }
 
-fn draw_seg(img: &mut RgbImage, a: (i32, i32), b: (i32, i32), col: Rgb<u8>) {
+fn draw_seg(img: &mut RgbImage, a: (i32, i32), b: (i32, i32), col: Rgb<u8>, r: i32) {
     let steps = ((b.0 - a.0).abs().max((b.1 - a.1).abs())).max(1);
     for i in 0..=steps {
         let t = i as f32 / steps as f32;
         let x = (a.0 as f32 + (b.0 - a.0) as f32 * t) as i32;
         let y = (a.1 as f32 + (b.1 - a.1) as f32 * t) as i32;
-        draw_dot(img, (x, y), 2, col);
+        draw_dot(img, (x, y), r, col);
     }
 }
 

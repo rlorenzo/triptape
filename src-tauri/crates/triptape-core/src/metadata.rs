@@ -238,6 +238,8 @@ pub struct ImageExif {
     pub orientation: Option<u32>,
     /// `DateTimeOriginal` as unix seconds.
     pub taken_at: Option<i64>,
+    /// UTC offset at capture (`OffsetTimeOriginal`), seconds east of UTC.
+    pub tz_offset_secs: Option<i32>,
     pub gps: Option<(f64, f64)>,
     /// Full-resolution pixel dimensions (EXIF PixelX/YDimension). The only
     /// reliable source for HEIC, whose ffprobe streams are tiles.
@@ -315,6 +317,7 @@ fn kamadak_fields(exif: &exif::Exif) -> ImageExif {
         exif::Value::Rational(rs) => dms_to_deg(&rs.iter().map(|r| r.to_f64()).collect::<Vec<_>>()),
         _ => None,
     };
+    let offset = ascii(exif::Tag::OffsetTimeOriginal);
     ImageExif {
         orientation: match field(exif::Tag::Orientation) {
             Some(exif::Value::Short(v)) => v.first().map(|&x| x as u32),
@@ -324,9 +327,10 @@ fn kamadak_fields(exif: &exif::Exif) -> ImageExif {
         // Raw ASCII ("YYYY:MM:DD HH:MM:SS"), plus OffsetTimeOriginal
         // ("+09:00") when present so the instant is exact.
         taken_at: ascii(exif::Tag::DateTimeOriginal).and_then(|dt| {
-            let offset = ascii(exif::Tag::OffsetTimeOriginal).unwrap_or_default();
+            let offset = offset.as_deref().unwrap_or_default();
             exif_datetime_to_unix(&format!("{dt}{offset}"))
         }),
+        tz_offset_secs: offset.as_deref().and_then(parse_tz_offset),
         gps: signed_gps(
             deg(exif::Tag::GPSLatitude),
             ascii(exif::Tag::GPSLatitudeRef),
@@ -377,6 +381,115 @@ fn rexif_fields(parsed: &rexif::ExifData) -> ImageExif {
     }
     out.gps = signed_gps(lat, lat_ref, lon, lon_ref);
     out
+}
+
+/// Parse an EXIF UTC offset (`+09:00`, `-0530`, `+09`) to seconds east.
+pub fn parse_tz_offset(s: &str) -> Option<i32> {
+    let s = s.trim();
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(r) => (-1i32, r),
+        None => (1i32, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 2 || digits.len() > 4 {
+        return None;
+    }
+    let (h, m) = if digits.len() <= 2 {
+        (digits.parse::<i32>().ok()?, 0)
+    } else {
+        (
+            digits[..2].parse::<i32>().ok()?,
+            digits[2..].parse::<i32>().ok()?,
+        )
+    };
+    if h > 14 || m > 59 {
+        return None;
+    }
+    Some(sign * (h * 3600 + m * 60))
+}
+
+/// Capture wall-clock in the photo's own timezone: the instant shifted
+/// by its UTC offset, read as a naive datetime. Without an offset the
+/// instant is read as UTC (legacy behavior). `None` when out of range.
+pub fn local_datetime(taken_at: i64, tz_offset_secs: Option<i32>) -> Option<chrono::NaiveDateTime> {
+    let shifted = taken_at.checked_add(i64::from(tz_offset_secs.unwrap_or(0)))?;
+    chrono::DateTime::from_timestamp(shifted, 0).map(|d| d.naive_utc())
+}
+
+/// Calendar date of [`local_datetime`].
+pub fn local_date(taken_at: i64, tz_offset_secs: Option<i32>) -> Option<chrono::NaiveDate> {
+    local_datetime(taken_at, tz_offset_secs).map(|d| d.date())
+}
+
+/// Fill missing capture-timezone offsets from the nearest-in-time asset
+/// that has one (same trip, usually same timezone block). Assets with no
+/// dated neighbor keep `None`. Deterministic (ties go to the earlier
+/// neighbor); the input slice order is untouched.
+///
+/// Photo/Live Photo times read from EXIF without an offset are naive wall
+/// clock encoded as UTC (see `exif_datetime_to_unix`); once an offset is
+/// inferred for one, `taken_at` is shifted back by it so it becomes a true
+/// instant and `local_datetime` reproduces the original wall clock. Video
+/// `creation_time` (RFC 3339) and mtime fallbacks are already instants.
+///
+/// A naive wall clock is not comparable to a known instant until it has an
+/// offset, so its nearest neighbor is found per candidate offset: the time
+/// is normalized with that offset, then compared to the assets carrying it.
+pub fn fill_tz_offsets(assets: &mut [crate::types::Asset]) {
+    let mut known: Vec<(i64, i32)> = assets
+        .iter()
+        .filter_map(|a| Some((a.taken_at?, a.tz_offset_secs?)))
+        .collect();
+    if known.is_empty() {
+        return;
+    }
+    known.sort_unstable();
+    let mut by_offset: std::collections::BTreeMap<i32, Vec<i64>> = Default::default();
+    for &(kt, o) in &known {
+        by_offset.entry(o).or_default().push(kt);
+    }
+    for a in assets.iter_mut().filter(|a| a.tz_offset_secs.is_none()) {
+        let Some(t) = a.taken_at else { continue };
+        let wall_clock = a.kind != crate::types::AssetKind::Video && !a.time_guessed;
+        a.tz_offset_secs = if wall_clock {
+            nearest_wall_clock_offset(t, &by_offset)
+        } else {
+            // Nearest by time: the neighbors either side of `t`'s sorted slot.
+            let i = known.partition_point(|&(kt, _)| kt < t);
+            let before = i.checked_sub(1).map(|j| known[j]);
+            let after = known.get(i).copied();
+            match (before, after) {
+                (Some(b), Some(n)) if n.0 - t < t - b.0 => Some(n.1),
+                (Some(b), _) => Some(b.1),
+                (None, n) => n.map(|n| n.1),
+            }
+        };
+        if let Some(o) = a.tz_offset_secs.filter(|_| wall_clock) {
+            a.taken_at = t.checked_sub(i64::from(o));
+        }
+    }
+}
+
+/// Offset under which naive wall clock `t` lands closest to a known instant
+/// with that same offset. Ties go to the earlier neighbor.
+fn nearest_wall_clock_offset(
+    t: i64,
+    by_offset: &std::collections::BTreeMap<i32, Vec<i64>>,
+) -> Option<i32> {
+    by_offset
+        .iter()
+        .filter_map(|(&o, times)| {
+            let instant = t.saturating_sub(i64::from(o));
+            let i = times.partition_point(|&k| k < instant);
+            let before = i.checked_sub(1).map(|j| times[j]);
+            let nearest = [before, times.get(i).copied()]
+                .into_iter()
+                .flatten()
+                .min_by_key(|&k| (k.abs_diff(instant), k))?;
+            Some((nearest.abs_diff(instant), nearest, o))
+        })
+        .min()
+        .map(|(_, _, o)| o)
 }
 
 /// Parse an EXIF/ISO capture time to unix seconds.
@@ -433,6 +546,147 @@ fn signed_gps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_tz_offset_forms() {
+        assert_eq!(parse_tz_offset("+09:00"), Some(9 * 3600));
+        assert_eq!(parse_tz_offset("-0530"), Some(-(5 * 3600 + 30 * 60)));
+        assert_eq!(parse_tz_offset("+09"), Some(9 * 3600));
+        assert_eq!(parse_tz_offset(" 00:00 "), Some(0));
+        assert_eq!(parse_tz_offset("+15:00"), None);
+        assert_eq!(parse_tz_offset("+09:75"), None);
+        assert_eq!(parse_tz_offset(""), None);
+    }
+
+    #[test]
+    fn local_datetime_shifts_by_offset() {
+        // 2026-10-04 22:50 UTC is 07:50 next day in Japan.
+        let t = 1_791_154_200;
+        let jp = local_datetime(t, Some(9 * 3600)).unwrap();
+        assert_eq!(jp.format("%Y-%m-%d %H:%M").to_string(), "2026-10-05 07:50");
+        let utc = local_datetime(t, None).unwrap();
+        assert_eq!(utc.format("%Y-%m-%d %H:%M").to_string(), "2026-10-04 22:50");
+        assert_eq!(local_datetime(i64::MAX, Some(3600)), None);
+    }
+
+    #[test]
+    fn fill_tz_offsets_uses_nearest_neighbor() {
+        use crate::types::{Asset, AssetKind};
+        let mk = |id: &str, t: Option<i64>, o: Option<i32>| {
+            // Video: a true instant, directly comparable to known instants.
+            let mut a = Asset::new(id, std::path::PathBuf::from(id), AssetKind::Video);
+            a.taken_at = t;
+            a.tz_offset_secs = o;
+            a
+        };
+        let mut assets = vec![
+            mk("late", Some(1_000), Some(9 * 3600)),
+            mk("near-early", Some(120), None),
+            mk("early", Some(100), Some(-5 * 3600)),
+            mk("tie", Some(550), None),
+            mk("near-late", Some(990), None),
+            mk("undated", None, None),
+            mk("own", Some(500), Some(3600)),
+        ];
+        fill_tz_offsets(&mut assets);
+        let off = |id: &str| assets.iter().find(|a| a.id == id).unwrap().tz_offset_secs;
+        assert_eq!(off("near-early"), Some(-5 * 3600));
+        assert_eq!(off("near-late"), Some(9 * 3600));
+        // 550 is 50 s after `own` (500): nearest wins over the far neighbors.
+        assert_eq!(off("tie"), Some(3600));
+        assert_eq!(off("own"), Some(3600), "known offsets are kept");
+        assert_eq!(off("undated"), None);
+        assert_eq!(assets[0].id, "late", "input order untouched");
+
+        // Equidistant neighbors: the earlier one wins.
+        let mut eq = vec![
+            mk("a", Some(0), Some(1)),
+            mk("b", Some(10), None),
+            mk("c", Some(20), Some(2)),
+        ];
+        fill_tz_offsets(&mut eq);
+        assert_eq!(eq[1].tz_offset_secs, Some(1));
+
+        // Nothing known: nothing filled.
+        let mut none = vec![mk("x", Some(0), None)];
+        fill_tz_offsets(&mut none);
+        assert_eq!(none[0].tz_offset_secs, None);
+    }
+
+    #[test]
+    fn fill_tz_offsets_normalizes_naive_wall_clock_per_candidate() {
+        use crate::types::{Asset, AssetKind};
+        let wall = |s: &str| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M")
+                .unwrap()
+                .and_utc()
+                .timestamp()
+        };
+        let known = |id: &str, utc: &str, o: i32| {
+            let mut a = Asset::new(id, id.into(), AssetKind::Photo);
+            a.taken_at = Some(wall(utc));
+            a.tz_offset_secs = Some(o);
+            a
+        };
+        let naive = |id: &str, w: &str| {
+            let mut a = Asset::new(id, id.into(), AssetKind::Photo);
+            a.taken_at = Some(wall(w));
+            a
+        };
+        let (jst, hst) = (9 * 3600, -10 * 3600);
+        let mut assets = vec![
+            known("japan", "2026-10-04 14:30", jst),
+            // Closer to the Japan photo's 23:00 encoding, but hours later.
+            known("hawaii", "2026-10-04 23:10", hst),
+            // 23:00 JST is 14:00 UTC, 30 min from the Japan photo.
+            naive("shot-in-japan", "2026-10-04 23:00"),
+            // 13:00 HST is 23:00 UTC, 10 min from the Hawaii photo.
+            naive("shot-in-hawaii", "2026-10-04 13:00"),
+        ];
+        fill_tz_offsets(&mut assets);
+        assert_eq!(assets[2].tz_offset_secs, Some(jst));
+        assert_eq!(assets[2].taken_at, Some(wall("2026-10-04 14:00")));
+        assert_eq!(assets[3].tz_offset_secs, Some(hst));
+        assert_eq!(assets[3].taken_at, Some(wall("2026-10-04 23:00")));
+    }
+
+    #[test]
+    fn fill_tz_offsets_keeps_naive_wall_clock_near_midnight() {
+        use crate::types::{Asset, AssetKind};
+        let wall = |s: &str| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M")
+                .unwrap()
+                .and_utc()
+                .timestamp()
+        };
+        let local = |a: &Asset| {
+            local_datetime(a.taken_at.unwrap(), a.tz_offset_secs)
+                .unwrap()
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        };
+        let jst = 9 * 3600;
+        // Offset-bearing photo: 22:30 JST as an exact instant.
+        let mut known = Asset::new("k", "k".into(), AssetKind::Photo);
+        known.taken_at = Some(wall("2026-10-04 22:30") - i64::from(jst));
+        known.tz_offset_secs = Some(jst);
+        // Offset-free EXIF photo: 23:00 wall clock encoded as UTC.
+        let mut naive = Asset::new("n", "n".into(), AssetKind::LivePhoto);
+        naive.taken_at = Some(wall("2026-10-04 23:00"));
+        // mtime fallback and video creation_time are true instants.
+        let instant = wall("2026-10-04 14:10");
+        let mut guessed = Asset::new("g", "g".into(), AssetKind::Photo);
+        guessed.taken_at = Some(instant);
+        guessed.time_guessed = true;
+        let mut video = Asset::new("v", "v".into(), AssetKind::Video);
+        video.taken_at = Some(instant);
+        let mut assets = vec![known, naive, guessed, video];
+        fill_tz_offsets(&mut assets);
+        assert!(assets.iter().all(|a| a.tz_offset_secs == Some(jst)));
+        assert_eq!(local(&assets[1]), "2026-10-04 23:00", "wall clock kept");
+        assert_eq!(local(&assets[2]), "2026-10-04 23:10");
+        assert_eq!(local(&assets[3]), "2026-10-04 23:10");
+    }
 
     #[test]
     fn iso6709_parses_apple_style() {

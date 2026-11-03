@@ -24,6 +24,8 @@ pub struct ReelOptions {
     /// moments from the same chapter. Empty/short lists fall back to a
     /// single-still reel.
     pub slideshows: Vec<Vec<PathBuf>>,
+    /// Typst binary for the burned-in place overlay.
+    pub typst_bin: String,
     /// Seconds each slideshow photo stays on screen.
     pub slide_secs: f64,
     /// Crossfade length between slideshow photos.
@@ -37,6 +39,7 @@ impl Default for ReelOptions {
             still_secs: 8.0,
             max_secs: 30.0,
             slideshows: vec![],
+            typst_bin: "typst".to_string(),
             slide_secs: 3.6,
             fade_secs: 0.6,
         }
@@ -92,6 +95,29 @@ fn reel_slug(caption: Option<&str>, src: &Path) -> String {
         "" => "reel".to_string(),
         slug => slug.to_string(),
     }
+}
+
+/// Burn a place lower-third into `out` for the first ~4 s, in place.
+fn burn_place_overlay(
+    caps: &Capabilities,
+    out: &Path,
+    place: &str,
+    typst_bin: &str,
+) -> Result<(), crate::MediaError> {
+    let dir = out.parent().unwrap_or_else(|| Path::new("."));
+    let png = dir.join(".place-overlay.png");
+    let doc = crate::titlecard::lower_third_doc(place, None);
+    let result = crate::titlecard::render_text_png(typst_bin, &doc, &png, 72).and_then(|()| {
+        crate::render_video::burn_png_overlay(
+            caps,
+            out,
+            &png,
+            "[1:v]scale=972:-2[png];[0:v][png]overlay=54:H-300:format=yuv420:enable='between(t,0.3,4.2)'[v]",
+            20,
+        )
+    });
+    let _ = std::fs::remove_file(&png);
+    result
 }
 
 /// Concatenate two same-format reel parts (1080x1920, 30 fps, AAC).
@@ -338,6 +364,22 @@ pub fn render_reels(
                     format!("1\n00:00:00,300 --> 00:00:03,800\n{}\n", c.trim()),
                 )
                 .map_err(|e| crate::MediaError::Io(e.to_string()))?;
+            }
+        }
+        // Mention where we are, in the video itself: burned-in place
+        // overlay over the first seconds (the SRT only helps players
+        // that show subtitles).
+        if let Some(place) = r
+            .caption
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            if let Err(e) = burn_place_overlay(caps, &out, place, &opts.typst_bin) {
+                fallbacks.push(format!(
+                    "reel {} place overlay skipped ({e})",
+                    r.entry.asset_id
+                ));
             }
         }
         reels.push(ReelFile {
@@ -717,6 +759,51 @@ mod tests {
             SHARE_DISCLOSURE,
             "Reels are made for sharing. Watch them first and post only what you're comfortable sharing, especially videos with kids or other people in them."
         );
+    }
+
+    /// The overlay rewrites the reel in place: same streams and length, the
+    /// text visible early on, and no temp files left beside it.
+    #[test]
+    fn place_overlay_burns_in_place() {
+        let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
+        if !caps.libx264 || !crate::titlecard::typst_available("typst") {
+            eprintln!("ffmpeg/typst unavailable; skipping reel overlay");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let reel = temp.path().join("reel.mp4");
+        let made = std::process::Command::new(&caps.ffmpeg_bin)
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=1080x1920:r=30:d=2",
+            ])
+            .args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "2"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+            .arg(&reel)
+            .output()
+            .unwrap();
+        assert!(made.status.success());
+        let bright_bytes = |path: &Path| {
+            let out = std::process::Command::new(&caps.ffmpeg_bin)
+                .args(["-v", "error", "-ss", "1", "-i"])
+                .arg(path)
+                .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+                .output()
+                .unwrap();
+            out.stdout.iter().filter(|&&b| b > 128).count()
+        };
+        assert_eq!(bright_bytes(&reel), 0);
+
+        burn_place_overlay(&caps, &reel, "Kyoto, Japan", "typst").unwrap();
+
+        assert!(bright_bytes(&reel) > 0, "place text visible at 1 s");
+        let probe = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &reel).unwrap();
+        assert!((probe.duration_secs - 2.0).abs() < 0.2, "{probe:?}");
+        let files = std::fs::read_dir(temp.path()).unwrap().count();
+        assert_eq!(files, 1, "no overlay or partial files left behind");
     }
 
     #[test]

@@ -236,21 +236,20 @@ impl Captioner for HeuristicPipeline {
 
 /// Template caption from plan context (local-VLM fallback).
 ///
-/// Never empty, and factual only: `{place} · {Weekday, Mon D · h:MM AM}` /
-/// `{Weekday, Mon D · h:MM AM}` / `From the trip`. No invented prose —
-/// without a pinned VLM we cannot say what a photo shows. Mirrors the
-/// core plan builder's dateline wording.
+/// Never empty, and factual only: `{place}` / `{Weekday, Mon D · h:MM AM}` /
+/// `From the trip`. No invented prose — without a pinned VLM we cannot say
+/// what a photo shows. Location is the caption when known; day/time live on
+/// the chapter.
 pub fn template_caption(ctx: &CaptionContext) -> String {
-    let when = ctx
-        .taken_at
-        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-        .map(|d| triptape_core::plan::dateline(&d));
-    match (ctx.place_label, when) {
-        (Some(place), Some(w)) => format!("{place} · {w}"),
-        (Some(place), None) => place.to_string(),
-        (None, Some(w)) => w,
-        (None, None) => "From the trip".to_string(),
+    if let Some(place) = ctx.place_label {
+        return place.to_string();
     }
+    ctx.taken_at
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map_or_else(
+            || "From the trip".to_string(),
+            |d| triptape_core::plan::dateline(&d),
+        )
 }
 
 // -- Music fit ("vibe fit", never fake emotion) -------------------------------------

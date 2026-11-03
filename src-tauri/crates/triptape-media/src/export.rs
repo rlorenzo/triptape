@@ -67,6 +67,7 @@ fn resolve_entry(
         motion_path,
         caption: plan.captions.get(asset_id).cloned(),
         taken_at: a.taken_at,
+        tz_offset_secs: a.tz_offset_secs,
     })
 }
 
@@ -288,6 +289,7 @@ pub fn export_all(
                 &ReelOptions {
                     music_path: opts.music_path.clone(),
                     slideshows,
+                    typst_bin: opts.typst_bin.clone(),
                     ..Default::default()
                 },
             ) {
@@ -315,6 +317,12 @@ pub fn export_all(
             reason: elig.book_reason.clone(),
         });
     } else {
+        let chapter_of: HashMap<&str, usize> = plan
+            .chapters
+            .iter()
+            .enumerate()
+            .flat_map(|(i, c)| c.asset_ids.iter().map(move |id| (id.as_str(), i)))
+            .collect();
         let mut book_photos: Vec<BookPhoto> = vec![];
         for a in assets.iter().filter(|a| a.kind != AssetKind::Video) {
             if let Err(reason) = verify_source(&asset_snapshot(a), &a.path) {
@@ -339,11 +347,17 @@ pub fn export_all(
                 width: w,
                 height: h,
                 caption: plan.captions.get(&a.id).cloned(),
+                chapter: chapter_of.get(a.id.as_str()).copied(),
             });
         }
         // Story order: keep db order (taken_at, id).
         let book_dir = out_dir.join("book");
-        let chapter_titles: Vec<String> = plan.chapters.iter().map(|c| c.title.clone()).collect();
+        // Day-marker titles: day once, with the location.
+        let chapter_titles: Vec<String> = plan
+            .chapters
+            .iter()
+            .map(crate::titlecard::chapter_book_title)
+            .collect();
         match render_book::render_book(
             &book_photos,
             map_card.as_deref(),
@@ -470,6 +484,7 @@ mod tests {
         plan.chapters.push(triptape_core::types::Chapter {
             title: "Day 1".into(),
             asset_ids: ["p0", "p1", "v2", "p3", "p4"].map(String::from).to_vec(),
+            ..Default::default()
         });
         let still = |id: &str| ResolvedEntry {
             entry: PlanEntry {
@@ -483,6 +498,7 @@ mod tests {
             motion_path: None,
             caption: None,
             taken_at: None,
+            tz_offset_secs: None,
         };
         // Both selected stills are reserved up front, as export_all does.
         let mut used: HashSet<PathBuf> = [&by_id["p1"].path, &by_id["p3"].path]

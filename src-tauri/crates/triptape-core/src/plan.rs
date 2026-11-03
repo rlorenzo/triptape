@@ -14,8 +14,8 @@ use std::path::Path;
 /// Weekday + date as shown to viewers, `Wed, May 1`.
 const DAY_FORMAT: &str = "%a, %b %-d";
 
-/// Factual caption dateline, `Wed, May 1 · 10:00 AM` (UTC). Shared by the
-/// plan builder (which prefixes `Day N · `) and the local caption fallback.
+/// Factual caption dateline, `Wed, May 1 · 10:00 AM` (UTC), used by the
+/// local caption fallback when no place is known.
 pub fn dateline(dt: &chrono::DateTime<chrono::Utc>) -> String {
     format!("{} · {}", dt.format(DAY_FORMAT), dt.format("%-I:%M %p"))
 }
@@ -24,6 +24,8 @@ pub const PLAN_VERSION: u32 = 1;
 
 /// Score assumed for assets missing from the score map.
 const DEFAULT_SCORE: f32 = 0.5;
+/// Most GPS fixes compared when picking a chapter's medoid.
+const MEDOID_MAX_FIXES: usize = 256;
 /// Hero lists longer than this drop entries below [`HERO_MIN_SCORE`].
 const HERO_TRIM_ABOVE: usize = 40;
 const HERO_MIN_SCORE: f32 = 0.35;
@@ -156,44 +158,43 @@ pub fn build_plan(
         .collect();
     reel_selects.sort_by_key(|e| story_pos[e.asset_id.as_str()]);
 
-    // Chapters: one per cluster label, in story order. Titles are
-    // human-facing (hero overlays, book dividers, Story review), so the
-    // machine label `2026-10-12 · place 21` becomes `Mon, Oct 12`; the
-    // place counter says nothing a viewer can use.
+    // Chapters: one per cluster label, in story order, named by place
+    // when the chapter's GPS medoid lands near a populated place
+    // (bundled gazetteer, never a network lookup). The day is shown once
+    // per chapter (overlays, book day-marker pages) — photos inside a
+    // chapter need no per-photo timestamp.
+    let local_date = |a: &Asset| crate::metadata::local_date(a.taken_at?, a.tz_offset_secs);
+    let trip_start = ordered.iter().filter_map(|a| local_date(a)).min();
     let chapters: Vec<Chapter> = groups
         .into_iter()
-        .map(|(label, members)| Chapter {
-            title: human_chapter_title(label),
-            asset_ids: members.iter().map(|a| a.id.clone()).collect(),
+        .map(|(label, members)| {
+            let gps: Vec<(f64, f64)> = members.iter().filter_map(|a| a.gps).collect();
+            let place = chapter_place(&gps);
+            let first_date = members.iter().filter_map(|a| local_date(a)).min();
+            Chapter {
+                title: place.clone().unwrap_or_else(|| human_chapter_title(label)),
+                asset_ids: members.iter().map(|a| a.id.clone()).collect(),
+                place,
+                day_index: match (first_date, trip_start) {
+                    (Some(d), Some(s)) => Some(((d - s).num_days() + 1).max(1) as u32),
+                    _ => None,
+                },
+                date_label: first_date.map(|d| d.format(DAY_FORMAT).to_string()),
+            }
         })
         .collect();
 
-    // Auto captions (local-VLM fallback): factual datelines only. No VLM
-    // is pinned yet, so a caption may state only what metadata proves —
-    // trip day, weekday/date, and time of day — never invented prose like
-    // "a favorite photo". Always editable in Story review.
-    let trip_start = ordered
+    // Auto captions: the photo's chapter place, nothing else. Day/time
+    // live on the chapter, not on every photo; without a pinned VLM we
+    // never invent what a photo shows. Photos in unnamed places get no
+    // auto caption (empty in Story review, ready for the user's words).
+    let captions: HashMap<String, String> = chapters
         .iter()
-        .filter_map(|a| a.taken_at)
-        .filter_map(|t| chrono::DateTime::from_timestamp(t, 0))
-        .map(|d| d.date_naive())
-        .min();
-    let captions: HashMap<String, String> = ordered
-        .iter()
-        .map(|a| {
-            let text = match (
-                a.taken_at
-                    .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
-                trip_start,
-            ) {
-                (Some(dt), Some(start)) => {
-                    let day = (dt.date_naive() - start).num_days() + 1;
-                    format!("Day {day} · {}", dateline(&dt))
-                }
-                (Some(dt), None) => dateline(&dt),
-                _ => "From the trip".to_string(),
-            };
-            (a.id.clone(), text)
+        .filter_map(|c| c.place.as_deref().map(|p| (c, p)))
+        .flat_map(|(c, p)| {
+            c.asset_ids
+                .iter()
+                .map(move |id| (id.clone(), p.to_string()))
         })
         .collect();
 
@@ -214,6 +215,23 @@ pub fn build_plan(
                 .to_string(),
         },
     }
+}
+
+/// Place name for a chapter from its GPS fixes: the geographic medoid
+/// (the fix minimizing total distance to the others) names the place.
+/// A raw mean breaks at the antimeridian and is dragged by outliers. The
+/// search is quadratic, so large chapters use an even sample of their fixes.
+fn chapter_place(gps: &[(f64, f64)]) -> Option<String> {
+    let step = gps.len().div_ceil(MEDOID_MAX_FIXES).max(1);
+    let sample: Vec<(f64, f64)> = gps.iter().copied().step_by(step).collect();
+    let (_, medoid) = sample
+        .iter()
+        .map(|&p| {
+            let total: f64 = sample.iter().map(|&g| crate::geo::haversine_m(p, g)).sum();
+            (total, p)
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))?;
+    crate::geo::place_name(medoid)
 }
 
 /// Display title for a cluster label: `2026-10-12 · place 21` (or a bare
@@ -413,19 +431,14 @@ mod tests {
         assert_eq!(plan.hero.len(), 3);
         assert_eq!(plan.hero[0].asset_id, "a", "hero keeps story order");
         assert_eq!(plan.chapters.len(), 2);
-        assert_eq!(plan.captions.len(), 3);
-        // Auto captions are factual datelines (trip day + date + time),
-        // never invented prose.
-        assert_eq!(
-            plan.captions["a"], "Day 1 · Wed, May 1 · 10:00 AM",
-            "got: {}",
-            plan.captions["a"]
-        );
-        assert!(
-            plan.captions.values().all(|c| !c.contains("favorite")),
-            "no template prose in captions: {:?}",
-            plan.captions
-        );
+        // No GPS in this fixture: no place captions, but chapters still
+        // carry trip-day context (shown once per chapter, not per photo).
+        assert!(plan.captions.is_empty(), "got: {:?}", plan.captions);
+        assert_eq!(plan.chapters[0].day_index, Some(1));
+        assert_eq!(plan.chapters[0].date_label.as_deref(), Some("Wed, May 1"));
+        // (Fixture timestamps all land on May 1 local; cluster labels differ.)
+        assert_eq!(plan.chapters[1].day_index, Some(1));
+        assert_eq!(plan.chapters[0].place, None);
         assert_eq!(plan.reel_selects.len(), 3, "3 distinct moments -> 3 reels");
         assert!(plan.reel_selects.len() <= 5);
         assert!(!plan.music.rationale.is_empty());
@@ -434,6 +447,47 @@ mod tests {
         // Round-trips through JSON.
         let back = Plan::from_json(&plan.to_json().unwrap()).unwrap();
         assert_eq!(back.hero.len(), 3);
+    }
+
+    #[test]
+    fn chapter_place_uses_medoid_not_mean() {
+        // Kyoto cluster plus one far outlier: still Kyoto.
+        let mut gps: Vec<(f64, f64)> = (0..8)
+            .map(|i| (34.9671 + i as f64 * 0.001, 135.7727))
+            .collect();
+        gps.push((-33.8688, 151.2093)); // Sydney outlier
+        assert_eq!(chapter_place(&gps).as_deref(), Some("Kyoto, Japan"));
+        // Both sides of the antimeridian (Fiji): a raw mean would land
+        // near longitude 0 and name nothing (or the wrong continent).
+        let fiji = [(-16.81, -179.9), (-16.82, 179.9), (-16.80, -179.8)];
+        let name = chapter_place(&fiji).expect("Fiji place");
+        assert!(name.contains("Fiji"), "got {name}");
+        assert_eq!(chapter_place(&[]), None);
+        // Past the sampling cap, the dense cluster still wins.
+        let mut many = vec![(34.9671, 135.7727); 1_000];
+        many.extend([(-33.8688, 151.2093); 20]);
+        assert_eq!(chapter_place(&many).as_deref(), Some("Kyoto, Japan"));
+    }
+
+    #[test]
+    fn chapters_name_places_and_captions_follow() {
+        // Kyoto GPS on every asset: chapter is named by place, captions
+        // carry the place, and the title prefers the place over the date.
+        let mut assets = vec![
+            asset("a", 1_714_557_600, AssetKind::Photo),
+            asset("b", 1_714_557_900, AssetKind::Photo),
+        ];
+        for a in &mut assets {
+            a.gps = Some((34.9671, 135.7727));
+        }
+        let mut co = HashMap::new();
+        co.insert("a".into(), "2024-05-01 · place 1".into());
+        co.insert("b".into(), "2024-05-01 · place 1".into());
+        let plan = build_plan(&assets, &co, &scored(&["a", "b"]));
+        assert_eq!(plan.chapters[0].place.as_deref(), Some("Kyoto, Japan"));
+        assert_eq!(plan.chapters[0].title, "Kyoto, Japan");
+        assert_eq!(plan.captions["a"], "Kyoto, Japan");
+        assert_eq!(plan.captions["b"], "Kyoto, Japan");
     }
 
     #[test]
