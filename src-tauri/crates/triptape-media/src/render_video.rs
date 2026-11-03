@@ -751,7 +751,9 @@ fn render_entry_segment(
     match &r.entry.rendition {
         Rendition::Still => {
             let out = work_dir.join(format!("seg_{idx:03}.mp4"));
-            render_hold_segment(caps, &r.still_path, still_secs, idx, &out)?;
+            // Decode first: looping a raw HEIC fails on tmap/Dolby Vision items.
+            let png = ffmpeg::decode_still_to_png(&caps.ffmpeg_bin, &r.still_path)?;
+            render_hold_segment(caps, &png.path, still_secs, idx, &out)?;
             Ok((out, still_secs, "still".into()))
         }
         Rendition::Motion {
