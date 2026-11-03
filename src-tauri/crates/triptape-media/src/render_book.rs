@@ -289,9 +289,163 @@ pub struct BookOutput {
     pub fallbacks: Vec<String>,
 }
 
+/// Largest photo count whose flowed book fits `cap` counted pages.
+fn fitting_count(
+    total: usize,
+    has_wide: bool,
+    has_map: bool,
+    n_dividers: usize,
+    cap: usize,
+) -> usize {
+    let fits = |n: usize| {
+        count_pages(
+            &flow_pages(n, has_wide, has_map, n_dividers, cap)
+                .iter()
+                .map(|p| p.kind)
+                .collect::<Vec<_>>(),
+        ) <= cap
+    };
+    if fits(total) {
+        return total;
+    }
+    let (mut lo, mut hi) = (0usize, total);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+/// Evenly spaced indices into `total`, always including the first item,
+/// so a trimmed book still spans the whole trip in story order.
+fn evenly_spaced(total: usize, keep: usize) -> Vec<usize> {
+    if keep >= total {
+        return (0..total).collect();
+    }
+    if keep == 0 {
+        return vec![];
+    }
+    // i * total / keep is strictly increasing when keep < total.
+    (0..keep).map(|i| i * total / keep).collect()
+}
+
+/// Pick `keep` indices for the cap: captioned (user-curated) photos are
+/// reserved first, then the opener if a slot remains, and the remaining
+/// slots are spread evenly over the other photos. Returns the sorted selection plus any captioned
+/// indices that still could not fit (more captions than slots).
+fn select_for_cap(photos: &[BookPhoto], keep: usize) -> (Vec<usize>, Vec<usize>) {
+    let total = photos.len();
+    if keep >= total {
+        return ((0..total).collect(), vec![]);
+    }
+    if keep == 0 {
+        return (
+            vec![],
+            (0..total).filter(|&i| has_caption(&photos[i])).collect(),
+        );
+    }
+    // Captioned photos reserve first; the opener joins only if a slot
+    // remains after every captioned photo is in.
+    let captioned: Vec<usize> = (0..total).filter(|&i| has_caption(&photos[i])).collect();
+    if captioned.len() > keep {
+        let picked: Vec<usize> = evenly_spaced(captioned.len(), keep)
+            .into_iter()
+            .map(|j| captioned[j])
+            .collect();
+        let dropped = captioned
+            .iter()
+            .copied()
+            .filter(|i| !picked.contains(i))
+            .collect();
+        return (picked, dropped);
+    }
+    let mut reserved = captioned;
+    if !reserved.contains(&0) && reserved.len() < keep {
+        reserved.push(0);
+    }
+    reserved.sort_unstable();
+    let others: Vec<usize> = (0..total).filter(|i| !reserved.contains(i)).collect();
+    let mut sel = reserved.clone();
+    sel.extend(
+        evenly_spaced(others.len(), keep - reserved.len())
+            .into_iter()
+            .map(|j| others[j]),
+    );
+    sel.sort_unstable();
+    (sel, vec![])
+}
+
+fn has_caption(p: &BookPhoto) -> bool {
+    p.caption.as_deref().is_some_and(|c| !c.trim().is_empty())
+}
+
+/// Simulate the renderer's page assignment and return asset ids whose
+/// dpi verdict blocks at their assigned slot (hero/spread/caption/grid).
+fn planned_blocked(
+    photos: &[BookPhoto],
+    preset: BookPreset,
+    has_map: bool,
+    n_dividers: usize,
+) -> Vec<String> {
+    if photos.is_empty() {
+        return vec![];
+    }
+    let (_, cap) = preset.page_range();
+    let wide_idx = photos
+        .iter()
+        .skip(1)
+        .position(|p| p.height > 0 && p.width as f64 / p.height as f64 >= 1.5)
+        .map(|i| i + 1);
+    let flow = flow_pages(photos.len(), wide_idx.is_some(), has_map, n_dividers, cap);
+    let has_spread = flow.iter().any(|p| p.kind == PageKind::SpreadLeft);
+    let mut order: Vec<usize> = vec![0];
+    if has_spread {
+        if let Some(wi) = wide_idx {
+            order.push(wi);
+        }
+    }
+    for i in 1..photos.len() {
+        if Some(i) != wide_idx || !has_spread {
+            order.push(i);
+        }
+    }
+    let mut blocked = vec![];
+    let mut cursor = 0usize;
+    for fp in &flow {
+        match fp.kind {
+            PageKind::CoverProxy => {}
+            PageKind::Hero | PageKind::PhotoCaption | PageKind::Grid => {
+                let slot = &order[cursor..(cursor + fp.take).min(order.len())];
+                cursor += slot.len();
+                let (sw, sh) = slot_inches(preset, fp.kind, fp.take.max(1));
+                for oi in slot {
+                    let p = &photos[*oi];
+                    if dpi_verdict(p.width, p.height, sw, sh) == DpiVerdict::Block {
+                        blocked.push(p.asset_id.clone());
+                    }
+                }
+            }
+            PageKind::SpreadLeft => {
+                let p = &photos[*order.get(1).unwrap_or(&0)];
+                let (sw, sh) = slot_inches(preset, fp.kind, 1);
+                if dpi_verdict(p.width, p.height, sw, sh) == DpiVerdict::Block {
+                    blocked.push(p.asset_id.clone());
+                }
+                cursor += 1;
+            }
+            _ => {}
+        }
+    }
+    blocked
+}
+
 /// Render the full book pack.
 pub fn render_book(
-    photos: &[BookPhoto],
+    photos_in: &[BookPhoto],
     route_card: Option<&Path>,
     chapters: &[String],
     out_dir: &Path,
@@ -300,6 +454,104 @@ pub fn render_book(
     let (tw, th) = opts.preset.trim_px();
     std::fs::create_dir_all(out_dir).map_err(|e| crate::MediaError::Io(e.to_string()))?;
     let mut fallbacks: Vec<String> = vec![];
+    // Auto-select for the preset cap: a big trip flows past the cap even at
+    // 4 photos/page, so sample evenly across story order instead of
+    // blocking the export (PLAN Sec 11: preflight blocks, curation selects).
+    let (_, cap_pre) = opts.preset.page_range();
+    // Drop photos that cannot reach 200 dpi even in the smallest slot
+    // (screenshots, tiny renders): preflight would block the whole pack on
+    // them, and the plan's fix for that slot is "replace or remove".
+    let (min_slot_w, min_slot_h) = match opts.preset {
+        BookPreset::P1 => (5.5, 5.5),
+        BookPreset::P2 => (5.0, 3.8),
+    };
+    let viable: Vec<BookPhoto> = photos_in
+        .iter()
+        .filter(|p| {
+            // Captioned (user-kept) photos are never dropped silently: they
+            // stay in and surface as a blocking preflight issue instead.
+            let ok = has_caption(p)
+                || (p.width > 0
+                    && p.height > 0
+                    && dpi_verdict(p.width, p.height, min_slot_w, min_slot_h) != DpiVerdict::Block);
+            if !ok {
+                fallbacks.push(format!(
+                    "book: {} excluded (below 200 dpi even in the smallest slot)",
+                    p.asset_id
+                ));
+            }
+            ok
+        })
+        .cloned()
+        .collect();
+    // Cap selection + placement-aware prune, iterated: a photo that blocks
+    // at its assigned slot (a mid-size photo can pass the smallest slot yet
+    // block as hero) is excluded and the selection is redone from the
+    // remaining viable photos, so unselected photos refill the gap instead
+    // of the book shrinking. Each pass excludes at least one new photo, so
+    // it terminates; the post-render preflight stays as guard.
+    let mut excluded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut cap_note: Option<(usize, usize)>;
+    let pruned: Vec<BookPhoto> = loop {
+        let pool: Vec<BookPhoto> = viable
+            .iter()
+            .filter(|p| !excluded.contains(&p.asset_id))
+            .cloned()
+            .collect();
+        // Cap math runs on the survivors: dropping the only wide photo
+        // removes the spread, which can let more photos fit.
+        let has_wide_pre = pool
+            .iter()
+            .skip(1)
+            .any(|p| p.height > 0 && p.width as f64 / p.height as f64 >= 1.5);
+        let keep = fitting_count(
+            pool.len(),
+            has_wide_pre,
+            route_card.is_some(),
+            chapters.len(),
+            cap_pre,
+        );
+        let sel: Vec<BookPhoto> = if keep < pool.len() {
+            let (sel, dropped) = select_for_cap(&pool, keep);
+            // Captioned photos are user curation: never export a book that
+            // silently omits them; block so the user trims captions instead.
+            if !dropped.is_empty() {
+                let ids: Vec<&str> = dropped.iter().map(|&i| pool[i].asset_id.as_str()).collect();
+                return Err(crate::MediaError::Preflight(format!(
+                    "{} captioned photos do not fit the {cap_pre}-page cap (at most {keep} photos); remove captions or photos to fit: {}",
+                    ids.len(),
+                    ids.join(", ")
+                )));
+            }
+            cap_note = Some((keep, pool.len()));
+            sel.into_iter().map(|i| pool[i].clone()).collect()
+        } else {
+            cap_note = None;
+            pool
+        };
+        // Captioned photos are exempt (see viability filter above); if only
+        // they block, the post-render preflight reports them.
+        let blocked: Vec<String> =
+            planned_blocked(&sel, opts.preset, route_card.is_some(), chapters.len())
+                .into_iter()
+                .filter(|id| !sel.iter().any(|p| &p.asset_id == id && has_caption(p)))
+                .collect();
+        if blocked.is_empty() {
+            break sel;
+        }
+        for id in blocked {
+            fallbacks.push(format!(
+                "book: {id} excluded (below 200 dpi at its assigned slot)"
+            ));
+            excluded.insert(id);
+        }
+    };
+    if let Some((keep, of)) = cap_note {
+        fallbacks.push(format!(
+            "book: selected {keep} of {of} photos (captioned photos first, the rest evenly across the trip) to fit the {cap_pre}-page cap"
+        ));
+    }
+    let photos: &[BookPhoto] = &pruned;
 
     let wide_idx = photos
         .iter()
@@ -425,6 +677,20 @@ pub fn render_book(
             .join("; ");
         return Err(crate::MediaError::Preflight(msg));
     }
+    // The new pages rendered and passed preflight: only now drop page JPEGs
+    // left over from a larger previous book, so a failed re-export never
+    // deletes the prior pack's pages up front.
+    if let Ok(entries) = std::fs::read_dir(out_dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("page_") && name.ends_with(".jpg") && !jpegs.contains(&path) {
+                std::fs::remove_file(&path)
+                    .map_err(|err| crate::MediaError::Io(format!("remove stale {name}: {err}")))?;
+            }
+        }
+    }
     for w in issues.iter().filter(|i| i.level == "warn") {
         fallbacks.push(format!("page {}: {}", w.page.unwrap_or(0), w.message));
     }
@@ -433,6 +699,8 @@ pub fn render_book(
     let proof = match write_typst_and_compile(&jpegs, &captions, opts, out_dir, false) {
         Ok(p) => Some(p),
         Err(e) => {
+            // Never leave a previous export's PDF beside the new pages.
+            let _ = std::fs::remove_file(out_dir.join("proof.pdf"));
             fallbacks.push(format!("proof.pdf skipped: {e}"));
             None
         }
@@ -440,6 +708,8 @@ pub fn render_book(
     let press = match write_typst_and_compile(&jpegs, &captions, opts, out_dir, true) {
         Ok(p) => Some(p),
         Err(e) => {
+            // Never leave a previous export's PDF beside the new pages.
+            let _ = std::fs::remove_file(out_dir.join("press.pdf"));
             fallbacks.push(format!("press.pdf skipped: {e}"));
             None
         }
@@ -864,6 +1134,55 @@ fn guide_text(preset: BookPreset, trip: &str, counted: usize, captions_burned: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiny_photos_block_even_smallest_slot() {
+        // A 1000x800 screenshot cannot print at 200 dpi in a 5.5in slot.
+        assert_eq!(dpi_verdict(1000, 800, 5.5, 5.5), DpiVerdict::Block);
+        // A phone HEIC at full res clears it comfortably.
+        assert_eq!(dpi_verdict(5712, 4284, 5.5, 5.5), DpiVerdict::Ok);
+    }
+
+    #[test]
+    fn cap_selection_fits_and_spans_trip() {
+        let keep = fitting_count(901, true, true, 6, 60);
+        assert!(keep < 901, "901 photos cannot fit 60 pages untrimmed");
+        let kinds: Vec<PageKind> = flow_pages(keep, true, true, 6, 60)
+            .iter()
+            .map(|p| p.kind)
+            .collect();
+        assert!(count_pages(&kinds) <= 60, "selected set must fit the cap");
+        let idx = evenly_spaced(901, 10);
+        assert_eq!(idx.first(), Some(&0), "keeps the opener");
+        assert!(idx.windows(2).all(|w| w[0] < w[1]), "story order preserved");
+        assert!(*idx.last().unwrap() > 800, "spans to the end of the trip");
+    }
+
+    #[test]
+    fn cap_selection_reserves_captioned_photos() {
+        let mk = |i: usize, cap: bool| BookPhoto {
+            asset_id: format!("a{i}"),
+            path: PathBuf::new(),
+            width: 4000,
+            height: 3000,
+            caption: cap.then(|| "note".to_string()),
+        };
+        let photos: Vec<BookPhoto> = (0..100).map(|i| mk(i, i == 37 || i == 38)).collect();
+        let (sel, dropped) = select_for_cap(&photos, 10);
+        assert_eq!(sel.len(), 10);
+        assert!(sel.contains(&0) && sel.contains(&37) && sel.contains(&38));
+        assert!(sel.windows(2).all(|w| w[0] < w[1]), "story order preserved");
+        assert!(dropped.is_empty());
+
+        let all_cap: Vec<BookPhoto> = (0..20).map(|i| mk(i, true)).collect();
+        let (sel, dropped) = select_for_cap(&all_cap, 5);
+        assert_eq!(sel.len(), 5);
+        assert_eq!(
+            sel.len() + dropped.len(),
+            20,
+            "every captioned omission reported"
+        );
+    }
 
     #[test]
     fn page_counting_rules() {
