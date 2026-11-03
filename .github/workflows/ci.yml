@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: ["main", "sprint/**"]
+  pull_request:
+
+# A PR push from a sprint branch triggers both events; keep only the latest run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg typst exiftool
+      - name: Install system deps (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg typst exiftool -y
+      - run: cargo test --workspace
+      # Bash scripts: force Git Bash on Windows (default shell is PowerShell).
+      - name: FFmpeg capability check
+        shell: bash
+        run: ./scripts/check-ffmpeg.sh
+      - name: Fixture render smoke (tiny synthetic trip)
+        shell: bash
+        run: |
+          ./scripts/make-fixture.sh "$RUNNER_TEMP/fixture"
+          ./scripts/spike-render.sh
+
+  frontend:
+    name: npm build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build

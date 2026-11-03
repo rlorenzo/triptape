@@ -17,6 +17,20 @@ No `--enable-nonfree` build may ever ship (not redistributable).
   `vidstabdetect`/`vidstabtransform`, `libass` all missing from this
   Homebrew build.
 
+## Download attempt (2026-11-03, Sprint 6, macOS arm64 dev machine)
+
+- URL followed (302 → `https://e.deolaha.ca:4242/pub/ffmpeg/ffmpeg-8.0.1.7z`):
+  downloaded 17,770,148 bytes, SHA-256
+  `845140e046f7abbfcf480d70eb1657ca09eb8fa775834518a1f43a5b867c96f9`.
+- `file` reports **Mach-O 64-bit executable x86_64** — an Intel-only build.
+  It does not execute on this arm64 machine (`Bad CPU type in executable`;
+  Rosetta not installed). Capability probing (`-buildconf`, `-encoders`,
+  `-filters`) was therefore **not possible**, and the hash above is the
+  hash of the downloaded archive, **not** a verified sidecar pin.
+- NOT pinned: `scripts/fetch-ffmpeg` placeholders stay in place. Either
+  install Rosetta and re-probe, or source a native arm64 static build
+  (evermeet publishes Intel-only builds), then pin per the procedure below.
+
 ## Pinned sidecar (what ships)
 
 | Target | Source | Version | SHA-256 |
