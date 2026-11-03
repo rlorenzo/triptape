@@ -253,17 +253,15 @@ pub fn flow_pages(
 pub fn slot_inches(preset: BookPreset, kind: PageKind, take: usize) -> (f64, f64) {
     match preset {
         BookPreset::P1 => match kind {
-            PageKind::Hero => (12.0, 12.0),
+            PageKind::Hero | PageKind::PhotoCaption => (12.0, 12.0),
             PageKind::SpreadLeft | PageKind::SpreadRight => (24.0, 12.0),
-            PageKind::PhotoCaption => (11.0, 9.0),
             PageKind::Grid if take <= 2 => (11.0, 5.5),
             PageKind::Grid => (5.5, 5.5),
             _ => (12.0, 12.0),
         },
         BookPreset::P2 => match kind {
-            PageKind::Hero => (11.0, 8.5),
+            PageKind::Hero | PageKind::PhotoCaption => (11.0, 8.5),
             PageKind::SpreadLeft | PageKind::SpreadRight => (22.0, 8.5),
-            PageKind::PhotoCaption => (10.0, 6.0),
             PageKind::Grid if take <= 2 => (10.0, 3.8),
             PageKind::Grid => (5.0, 3.8),
             _ => (11.0, 8.5),
@@ -344,11 +342,18 @@ pub struct BookOutput {
     pub fallbacks: Vec<String>,
 }
 
-/// First wide (≥1.5:1) photo after the hero: the spread candidate.
+/// How many photos after the hero may supply the opening spread.
+const SPREAD_WINDOW: usize = 11;
+
+/// First wide (≥1.5:1) photo in the opening stretch after the hero: the
+/// spread candidate. Pulling the first wide shot of the whole trip (say,
+/// an Osaka landscape from day 8) to page 2 would break the book's
+/// chronology, so no early wide photo means no spread.
 fn wide_index(photos: &[BookPhoto]) -> Option<usize> {
     photos
         .iter()
         .skip(1)
+        .take(SPREAD_WINDOW)
         .position(|p| p.height > 0 && p.width as f64 / p.height as f64 >= 1.5)
         .map(|i| i + 1)
 }
@@ -653,11 +658,10 @@ pub fn render_book(
                     captions.entry(page_no).or_default().extend(page_caps);
                 }
                 match fp.kind {
-                    PageKind::Hero => {
+                    // Caption pages are full-bleed too: the caption burn lays
+                    // its strip over the photo's lower edge.
+                    PageKind::Hero | PageKind::PhotoCaption => {
                         draw_fullbleed(slot[0], tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?
-                    }
-                    PageKind::PhotoCaption => {
-                        draw_caption_page(slot[0], tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?
                     }
                     _ => draw_grid(&slot, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?,
                 }
@@ -1035,26 +1039,6 @@ fn draw_half(
         &image::imageops::crop_imm(&full, x, 0, tw, th).to_image(),
         out,
     )
-}
-
-fn draw_caption_page(
-    p: &BookPhoto,
-    tw: u32,
-    th: u32,
-    out: &Path,
-    ff: &str,
-    fb: &mut Vec<String>,
-) -> Result<(), crate::MediaError> {
-    let mut page = solid(tw, th, Rgb([18, 20, 26]));
-    let band = (th as f64 * 0.2) as u32;
-    let photo_h = th - band;
-    image::imageops::replace(&mut page, &cover_fit(&load(p, ff, fb), tw, photo_h), 0, 0);
-    for y in photo_h..th {
-        for x in (tw / 12)..(tw * 11 / 12) {
-            page.put_pixel(x, y, Rgb([32, 36, 46]));
-        }
-    }
-    save_jpg(&page, out)
 }
 
 fn draw_grid(
@@ -1569,6 +1553,35 @@ mod tests {
     }
 
     #[test]
+    fn spread_wide_photo_comes_from_the_opening_only() {
+        let bp = |w: u32, h: u32| BookPhoto {
+            asset_id: format!("{w}x{h}"),
+            path: PathBuf::from("/x.jpg"),
+            width: w,
+            height: h,
+            caption: None,
+            chapter: None,
+        };
+        // Wide shot at index 20 (a later chapter): no spread.
+        let mut photos: Vec<BookPhoto> = (0..25).map(|_| bp(100, 100)).collect();
+        photos[20] = bp(200, 100);
+        assert_eq!(wide_index(&photos), None);
+        // Window boundary: the last eligible index is chosen, the next is not.
+        let mut edge: Vec<BookPhoto> = (0..25).map(|_| bp(100, 100)).collect();
+        edge[SPREAD_WINDOW + 1] = bp(200, 100);
+        assert_eq!(wide_index(&edge), None);
+        edge[SPREAD_WINDOW] = bp(200, 100);
+        assert_eq!(wide_index(&edge), Some(SPREAD_WINDOW));
+        // Wide shot inside the opening stretch: chosen.
+        photos[5] = bp(200, 100);
+        assert_eq!(wide_index(&photos), Some(5));
+        // The hero (index 0) is never the spread.
+        let mut first_wide: Vec<BookPhoto> = (0..15).map(|_| bp(100, 100)).collect();
+        first_wide[0] = bp(200, 100);
+        assert_eq!(wide_index(&first_wide), None);
+    }
+
+    #[test]
     fn dividers_open_each_chapter_at_its_first_photo() {
         // Uneven chapters: even spacing would stack dividers in the long
         // first chapter and leave the short ones with no title.
@@ -1829,6 +1842,28 @@ mod tests {
     }
 
     #[test]
+    fn planned_blocked_checks_caption_pages_at_full_trim() {
+        let photo = |id: &str, w: u32, h: u32| BookPhoto {
+            asset_id: id.into(),
+            path: PathBuf::from(id),
+            width: w,
+            height: h,
+            caption: None,
+            chapter: None,
+        };
+        // Flow: hero, then one caption page. Each size clears 200 dpi inside
+        // the photo area an inset layout would have, but not at full bleed.
+        for (preset, w, h, inset) in [
+            (BookPreset::P1, 2400, 2000, (11.0, 9.0)),
+            (BookPreset::P2, 2000, 1500, (10.0, 6.0)),
+        ] {
+            assert_ne!(dpi_verdict(w, h, inset.0, inset.1), DpiVerdict::Block);
+            let photos = [photo("hero", 8000, 8000), photo("soft", w, h)];
+            assert_eq!(planned_blocked(&photos, preset, false), vec!["soft"]);
+        }
+    }
+
+    #[test]
     fn flow_packs_large_sets_into_grids() {
         let flow = flow_pages(&[None; 200], None, false, 60);
         let kinds: Vec<PageKind> = flow.iter().map(|p| p.kind).collect();
@@ -1919,6 +1954,13 @@ mod tests {
             "caption text missing from JPEG"
         );
         assert_eq!(bright("page_003.jpg"), 0, "uncaptioned page gained text");
+        // Caption pages are full-bleed: no dark band under the photo.
+        let page3 = image::open(out.join("page_003.jpg")).unwrap().to_rgb8();
+        let (w, h) = page3.dimensions();
+        assert!(
+            page3.get_pixel(w / 2, h - 1).0.iter().all(|&c| c > 80),
+            "photo does not reach the page's bottom edge"
+        );
         let guide = std::fs::read_to_string(&res.guide_path).unwrap();
         assert!(guide.contains("burned into the page JPEGs"));
         assert!(!out.join(".caption_raster").exists());
