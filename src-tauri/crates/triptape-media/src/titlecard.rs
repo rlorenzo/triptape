@@ -2,14 +2,15 @@
 //!
 //! Location/time context is rendered as pixels via Typst (`typst compile
 //! --format png --ppi 72`, DejaVu/Helvetica stack): a full-frame title card
-//! with the trip name + date range, and 1200x200 lower-thirds (chapter title
-//! and/or `Oct 6, 2026` date + caption) overlaid per segment. When Typst is
+//! with the trip name + date range, and 1200x200 lower-thirds (chapter day
+//! and place) overlaid at chapter starts. When Typst is
 //! missing the renderers fall back to the text-free solid card and record a
 //! note, never failing the export.
 
 use image::{Rgb, RgbImage};
 use std::path::Path;
 use std::process::Command;
+use triptape_core::types::Chapter;
 
 /// Font stack for Typst text: Helvetica on macOS, DejaVu on Linux.
 /// Unknown families only warn; Typst falls through to the next entry.
@@ -100,33 +101,29 @@ pub fn lower_third_doc(top: &str, bottom: Option<&str>) -> String {
     )
 }
 
-/// `taken_at` (unix secs, UTC) as `Oct 6, 2026`.
-pub fn format_day(unix_secs: i64) -> Option<String> {
-    use chrono::{DateTime, Utc};
-    DateTime::<Utc>::from_timestamp(unix_secs, 0).map(|d| d.format("%b %-d, %Y").to_string())
-}
+/// Label on the route-map card (hero overlay and book page caption).
+pub const ROUTE_LABEL: &str = "Our route";
 
 /// Date range over `taken_at`s as `Oct 3, 2026 – Oct 9, 2026`
 /// (single day collapses to one date; empty input yields `None`).
-pub fn format_date_range(taken: &[i64]) -> Option<String> {
-    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
-    for &t in taken {
-        lo = lo.min(t);
-        hi = hi.max(t);
-    }
-    if lo == i64::MAX {
-        return None;
-    }
-    let (lo_s, hi_s) = (format_day(lo)?, format_day(hi)?);
-    if lo_s == hi_s {
-        Some(lo_s)
+pub fn format_date_range(taken: &[(i64, Option<i32>)]) -> Option<String> {
+    // Compare local calendar dates, not UTC instants: across the date line
+    // a later instant can fall on an earlier local date.
+    let dates: Vec<chrono::NaiveDate> = taken
+        .iter()
+        .filter_map(|&(t, off)| triptape_core::metadata::local_date(t, off))
+        .collect();
+    let (lo, hi) = (dates.iter().min()?, dates.iter().max()?);
+    let fmt = |d: &chrono::NaiveDate| d.format("%b %-d, %Y").to_string();
+    Some(if lo == hi {
+        fmt(lo)
     } else {
-        Some(format!("{lo_s} – {hi_s}"))
-    }
+        format!("{} – {}", fmt(lo), fmt(hi))
+    })
 }
 
-/// Splits a plan caption dateline (`Day 4 · Sun, Oct 5 · 4:32 PM` or
-/// `Sun, Oct 5 · 4:32 PM`, as built by `triptape_core::plan::dateline`)
+/// Splits a caption dateline (`Day 4 · Sun, Oct 5 · 4:32 PM` from older saved
+/// plans, or `Sun, Oct 5 · 4:32 PM` from `triptape_core::plan::dateline`)
 /// into (date part, clock time). `None` for anything else, including user
 /// captions that merely end in a time (`Dinner · 7:30 PM`).
 pub(crate) fn split_dateline(c: &str) -> Option<(&str, &str)> {
@@ -171,40 +168,41 @@ fn is_clock_time(s: &str) -> bool {
     matches!(ampm, "AM" | "PM") && all_digits(h, 1..=2) && all_digits(m, 2..=2)
 }
 
-/// (top, bottom) lines for one segment lower-third, or `None` when there is
-/// nothing to show. Chapter starts lead with the chapter title; otherwise
-/// the top line is the capture date (or the caption when dateless).
-pub fn overlay_lines(
-    chapter_title: Option<&str>,
-    taken_at: Option<i64>,
-    caption: Option<&str>,
+/// (top, bottom) lines for a chapter-start lower-third: the day shown
+/// once (`Day 3 · Wed, Oct 8`), with the place underneath. Segments
+/// inside a chapter get no overlay at all — the day is stated once and
+/// the photos speak. `None` when nothing is known.
+pub fn chapter_overlay(
+    day_index: Option<u32>,
+    date_label: Option<&str>,
+    place: Option<&str>,
 ) -> Option<(String, Option<String>)> {
-    let chapter = chapter_title.map(str::trim).filter(|c| !c.is_empty());
-    let cap = caption.map(str::trim).filter(|c| !c.is_empty());
-    // Plan datelines (`Day 10 · Mon, Oct 12 · 3:08 AM`) already carry the
-    // date: never prefix it twice. Without a chapter, split the dateline
-    // into a day line and a time line.
-    if let Some((c, (day, time))) = cap.and_then(|c| Some((c, split_dateline(c)?))) {
-        return Some(match chapter {
-            Some(ch) => (ch.to_string(), Some(c.to_string())),
-            None => (day.to_string(), Some(time.to_string())),
-        });
-    }
-    let date = taken_at.and_then(format_day);
-    match (chapter, date, cap) {
-        (None, None, None) => None,
-        (Some(ch), d, c) => {
-            let bottom = match (d, c) {
-                (Some(d), Some(c)) => Some(format!("{d} · {c}")),
-                (Some(d), None) => Some(d),
-                (None, Some(c)) => Some(c.to_string()),
-                (None, None) => None,
-            };
-            Some((ch.to_string(), bottom))
-        }
-        (None, Some(d), Some(c)) => Some((d, Some(c.to_string()))),
-        (None, Some(d), None) => Some((d, None)),
-        (None, None, Some(c)) => Some((c.to_string(), None)),
+    let place = place.map(str::trim).filter(|s| !s.is_empty());
+    let top = match (day_index, date_label) {
+        (Some(n), Some(d)) => format!("Day {n} · {d}"),
+        (Some(n), None) => format!("Day {n}"),
+        (None, Some(d)) => d.to_string(),
+        (None, None) => return place.map(|p| (p.to_string(), None)),
+    };
+    Some((top, place.map(str::to_string)))
+}
+
+/// Chapter heading as lower-third lines. Plans saved before chapters carried
+/// day/date/place deserialize with those fields `None`; they fall back to
+/// the stored chapter title so re-exports keep their chapter context.
+pub(crate) fn chapter_lines(ch: &Chapter) -> Option<(String, Option<String>)> {
+    chapter_overlay(ch.day_index, ch.date_label.as_deref(), ch.place.as_deref()).or_else(|| {
+        let t = ch.title.trim();
+        (!t.is_empty()).then(|| (t.to_string(), None))
+    })
+}
+
+/// Chapter heading on one line, for book day-marker pages.
+pub(crate) fn chapter_book_title(ch: &Chapter) -> String {
+    match chapter_lines(ch) {
+        Some((top, Some(bottom))) => format!("{top} \u{2014} {bottom}"),
+        Some((top, None)) => top,
+        None => ch.title.clone(),
     }
 }
 

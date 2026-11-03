@@ -194,6 +194,11 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         final_assets.push(a);
     }
 
+    // Capture timezones: assets without an EXIF offset inherit the
+    // nearest dated neighbor's, so day grouping and displayed times are
+    // in the photo's local time, not UTC.
+    metadata::fill_tz_offsets(&mut final_assets);
+
     // Cluster + near-dupe hero picks.
     // Cluster ids restart per scan; prefix with the project id so they stay
     // unique across projects sharing one database.
@@ -348,6 +353,7 @@ fn fill_photo(a: &mut Asset, img: Option<&image::DynamicImage>) {
     let ct = metadata::resolve_capture_time(exif.taken_at, a.mtime);
     a.taken_at = Some(ct.unix_secs);
     a.time_guessed = ct.time_guessed;
+    a.tz_offset_secs = exif.tz_offset_secs;
     a.gps = exif.gps;
     a.rotation_deg = exif
         .orientation
