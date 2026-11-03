@@ -352,17 +352,30 @@ impl Db {
     /// Latest plan for `project_id`, or across all projects when `None`
     /// (CLI convenience for single-project DBs).
     pub fn latest_plan(&self, project_id: Option<&str>) -> Result<Option<Plan>, String> {
-        let json: Option<String> = self
+        Ok(self.latest_plan_with_project(project_id)?.map(|(_, p)| p))
+    }
+
+    /// Latest plan plus its project id (export convenience for
+    /// single-project DBs). Returns `None` when no plan exists.
+    pub fn latest_plan_with_project(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Option<(String, Plan)>, String> {
+        let row: Option<(String, String)> = self
             .conn
             .query_row(
-                "SELECT plan_json FROM plans WHERE ?1 IS NULL OR project_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                "SELECT project_id, plan_json FROM plans WHERE ?1 IS NULL OR project_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 params![project_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        json.map(|j| Plan::from_json(&j).map_err(|e| e.to_string()))
-            .transpose()
+        row.map(|(pid, j)| {
+            Plan::from_json(&j)
+                .map(|p| (pid, p))
+                .map_err(|e| e.to_string())
+        })
+        .transpose()
     }
 
     // -- jobs -------------------------------------------------------------
@@ -533,6 +546,8 @@ mod tests {
             "any-project lookup"
         );
         assert!(db.latest_plan(Some("prj_missing")).unwrap().is_none());
+        let (pid, _) = db.latest_plan_with_project(None).unwrap().unwrap();
+        assert_eq!(pid, p.id, "any-project lookup reports the owning project");
 
         // Newest insert wins even with a lower plan_version and the same
         // created_at second.
