@@ -50,6 +50,68 @@ pub struct ReelOutput {
     pub fallbacks: Vec<String>,
 }
 
+/// Encode one reel to `out`; returns its planned duration in seconds.
+fn render_one_reel(
+    caps: &Capabilities,
+    r: &ResolvedEntry,
+    src: &Path,
+    out: &Path,
+    opts: &ReelOptions,
+    fallbacks: &mut Vec<String>,
+) -> Result<f64, crate::MediaError> {
+    let dur = match &r.entry.rendition {
+        Rendition::Still if r.motion_path.is_none() => {
+            render_still_reel(caps, &r.still_path, opts.still_secs, out)?;
+            opts.still_secs
+        }
+        Rendition::Motion {
+            trim_start,
+            trim_end,
+        }
+        | Rendition::Clip {
+            trim_start,
+            trim_end,
+        } => {
+            let len = (trim_end - trim_start).clamp(0.5, opts.max_secs);
+            render_clip_reel(
+                caps,
+                src,
+                *trim_start,
+                len,
+                out,
+                opts.music_path.as_deref(),
+                fallbacks,
+            )?;
+            len
+        }
+        // Still rendition but a motion file exists (Live fallback): use it.
+        _ => {
+            let info = ffmpeg::ffprobe_file(&caps.ffprobe_bin, src).ok();
+            let len = info
+                .and_then(|p| {
+                    if p.duration_secs > 0.5 {
+                        Some(p.duration_secs)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(opts.still_secs)
+                .clamp(0.5, opts.max_secs);
+            render_clip_reel(
+                caps,
+                src,
+                0.0,
+                len,
+                out,
+                opts.music_path.as_deref(),
+                fallbacks,
+            )?;
+            len
+        }
+    };
+    Ok(dur)
+}
+
 /// Render the reels pack (at most 5, in plan order = story order).
 pub fn render_reels(
     caps: &Capabilities,
@@ -80,57 +142,27 @@ pub fn render_reels(
         }
         let fname = format!("{:02}_{}.mp4", i + 1, r.entry.asset_id);
         let out = out_dir.join(&fname);
-        let dur = match &r.entry.rendition {
-            Rendition::Still if r.motion_path.is_none() => {
-                render_still_reel(caps, &r.still_path, opts.still_secs, &out)?;
-                opts.still_secs
-            }
-            Rendition::Motion {
-                trim_start,
-                trim_end,
-            }
-            | Rendition::Clip {
-                trim_start,
-                trim_end,
-            } => {
-                let len = (trim_end - trim_start).clamp(0.5, opts.max_secs);
-                render_clip_reel(
-                    caps,
-                    src,
-                    *trim_start,
-                    len,
-                    &out,
-                    opts.music_path.as_deref(),
-                    &mut fallbacks,
-                )?;
-                len
-            }
-            // Still rendition but a motion file exists (Live fallback): use it.
-            _ => {
-                let info = ffmpeg::ffprobe_file(&caps.ffprobe_bin, src).ok();
-                let len = info
-                    .and_then(|p| {
-                        if p.duration_secs > 0.5 {
-                            Some(p.duration_secs)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(opts.still_secs)
-                    .clamp(0.5, opts.max_secs);
-                render_clip_reel(
-                    caps,
-                    src,
-                    0.0,
-                    len,
-                    &out,
-                    opts.music_path.as_deref(),
-                    &mut fallbacks,
-                )?;
-                len
+        // One bad source (e.g. a Dolby Vision HEIC this FFmpeg cannot decode)
+        // skips that reel, never the whole pack.
+        let dur = match render_one_reel(caps, r, src, &out, opts, &mut fallbacks) {
+            Ok(d) => d,
+            Err(e) => {
+                fallbacks.push(format!("reel {} failed ({e}); skipped", r.entry.asset_id));
+                let _ = std::fs::remove_file(&out);
+                continue;
             }
         };
-        let probed = ffmpeg::verify_video(&caps.ffprobe_bin, &out, 1080, 1920)?;
+        let probed = match ffmpeg::verify_video(&caps.ffprobe_bin, &out, 1080, 1920) {
+            Ok(p) => p,
+            Err(e) => {
+                fallbacks.push(format!(
+                    "reel {} verify failed ({e}); skipped",
+                    r.entry.asset_id
+                ));
+                let _ = std::fs::remove_file(&out);
+                continue;
+            }
+        };
         if (probed.duration_secs - dur).abs() > 1.0 + 1.0 / 30.0 {
             // 1 s + 1 frame of container rounding slack; informational only.
             fallbacks.push(format!(
@@ -171,6 +203,15 @@ pub fn render_reels(
             duration_secs: (probed.duration_secs * 100.0).round() / 100.0,
             caption: r.caption.clone(),
         });
+    }
+
+    // Per-reel failures are tolerated, but a pack with zero reels from a
+    // nonempty selection is a render failure, not a success.
+    if reels.is_empty() && !resolved.is_empty() {
+        return Err(crate::MediaError::Ffmpeg(format!(
+            "no reels produced: {}",
+            fallbacks.join("; ")
+        )));
     }
 
     // Non-blocking disclosure on the pack (PLAN.md Sec 14).
@@ -298,6 +339,17 @@ fn render_still_reel(
     dur: f64,
     out: &Path,
 ) -> Result<(), crate::MediaError> {
+    // Decode first: looping a raw HEIC fails on tmap/Dolby Vision items.
+    let png = ffmpeg::decode_still_to_png(&caps.ffmpeg_bin, img)?;
+    render_still_reel_png(caps, &png.path, dur, out)
+}
+
+fn render_still_reel_png(
+    caps: &Capabilities,
+    img: &Path,
+    dur: f64,
+    out: &Path,
+) -> Result<(), crate::MediaError> {
     let frames = (dur * 30.0).round() as u32;
     // Hook-first: gentle push-in so the first frame already fills 9:16.
     let vf = if caps.zoompan {
@@ -328,6 +380,12 @@ fn render_still_reel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_still_fails_closed_on_missing_file() {
+        let r = crate::ffmpeg::decode_still_to_png("ffmpeg", Path::new("/nonexistent/x.HEIC"));
+        assert!(r.is_err(), "missing still must fail, not fabricate a frame");
+    }
 
     #[test]
     fn disclosure_is_verbatim_sec14() {

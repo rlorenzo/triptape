@@ -239,6 +239,10 @@ pub struct ImageExif {
     /// `DateTimeOriginal` as unix seconds.
     pub taken_at: Option<i64>,
     pub gps: Option<(f64, f64)>,
+    /// Full-resolution pixel dimensions (EXIF PixelX/YDimension). The only
+    /// reliable source for HEIC, whose ffprobe streams are tiles.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// Upper bound on bytes buffered from one image for metadata parsing.
@@ -294,6 +298,12 @@ pub fn read_image_exif(path: &Path) -> ImageExif {
 
 fn kamadak_fields(exif: &exif::Exif) -> ImageExif {
     let field = |tag| exif.get_field(tag, exif::In::PRIMARY).map(|f| &f.value);
+    let dim = |tag| match field(tag)? {
+        exif::Value::Long(v) => v.first().copied(),
+        exif::Value::Short(v) => v.first().map(|&x| x as u32),
+        exif::Value::Rational(rs) => rs.first().map(|r| r.to_f64() as u32),
+        _ => None,
+    };
     let ascii = |tag| match field(tag)? {
         exif::Value::Ascii(rows) => rows
             .iter()
@@ -323,6 +333,8 @@ fn kamadak_fields(exif: &exif::Exif) -> ImageExif {
             deg(exif::Tag::GPSLongitude),
             ascii(exif::Tag::GPSLongitudeRef),
         ),
+        width: dim(exif::Tag::PixelXDimension),
+        height: dim(exif::Tag::PixelYDimension),
     }
 }
 

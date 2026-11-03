@@ -229,23 +229,32 @@ pub fn export_all(
             .filter_map(|e| resolve_verified(plan, &by_id, e, "reels", &mut report.fallbacks))
             .collect();
         let reels_dir = out_dir.join("reels");
-        match render_reels::render_reels(
-            caps,
-            &resolved,
-            &reels_dir,
-            &ReelOptions {
-                music_path: opts.music_path.clone(),
-                ..Default::default()
-            },
-        ) {
-            Ok(r) => {
-                report.reels = r.reels.iter().map(|f| f.path.clone()).collect();
-                report.fallbacks.extend(r.fallbacks);
-            }
-            Err(e) => report.skipped.push(Skipped {
+        if resolved.is_empty() {
+            // Every selected reel was filtered out (missing/changed source);
+            // details are already in report.fallbacks.
+            report.skipped.push(Skipped {
                 keepsake: "reels".into(),
-                reason: format!("render failed: {e}"),
-            }),
+                reason: "no reel sources available (missing or changed); see fallbacks".into(),
+            });
+        } else {
+            match render_reels::render_reels(
+                caps,
+                &resolved,
+                &reels_dir,
+                &ReelOptions {
+                    music_path: opts.music_path.clone(),
+                    ..Default::default()
+                },
+            ) {
+                Ok(r) => {
+                    report.reels = r.reels.iter().map(|f| f.path.clone()).collect();
+                    report.fallbacks.extend(r.fallbacks);
+                }
+                Err(e) => report.skipped.push(Skipped {
+                    keepsake: "reels".into(),
+                    reason: format!("render failed: {e}"),
+                }),
+            }
         }
     }
 
@@ -294,6 +303,7 @@ pub fn export_all(
                 preset: opts.preset,
                 trip_name: opts.trip_name.clone(),
                 typst_bin: opts.typst_bin.clone(),
+                ffmpeg_bin: caps.ffmpeg_bin.clone(),
             },
         ) {
             Ok(b) => {
