@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "src-tauri",
   "src-tauri/crates/triptape-core",
   "src-tauri/crates/triptape-media",
   "src-tauri/crates/triptape-ai-local",

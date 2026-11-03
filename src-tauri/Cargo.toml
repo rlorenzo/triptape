@@ -1,0 +1,32 @@
+[package]
+name = "triptape-app"
+version = "0.1.0"
+edition = "2021"
+
+# Tauri v2 glue crate: commands, events, app state only.
+# No business logic here — that lives in triptape-core / triptape-media.
+
+[[bin]]
+name = "triptape-app"
+path = "src/main.rs"
+
+[lib]
+name = "triptape_app"
+path = "src/lib.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-updater = "2"
+serde = { version = "1", features = ["derive"] }
+# Required by `tauri::generate_context!` expansion.
+serde_json = "1"
+triptape-core = { path = "crates/triptape-core" }
+triptape-media = { path = "crates/triptape-media" }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
