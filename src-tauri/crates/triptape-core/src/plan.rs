@@ -463,6 +463,12 @@ mod tests {
         let name = chapter_place(&fiji).expect("Fiji place");
         assert!(name.contains("Fiji"), "got {name}");
         assert_eq!(chapter_place(&[]), None);
+        // A nearby attraction beats the city; open water names nothing.
+        assert_eq!(
+            chapter_place(&[(35.6267, 139.8881)]).as_deref(),
+            Some("Tokyo DisneySea")
+        );
+        assert_eq!(chapter_place(&[(2.221, 105.205)]), None);
         // Past the sampling cap, the dense cluster still wins.
         let mut many = vec![(34.9671, 135.7727); 1_000];
         many.extend([(-33.8688, 151.2093); 20]);
