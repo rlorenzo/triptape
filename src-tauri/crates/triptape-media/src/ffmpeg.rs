@@ -175,6 +175,35 @@ pub fn tonemap_chain(caps: &Capabilities, color_transfer: &str) -> Option<String
     }
 }
 
+/// Apply a source file's EXIF orientation to a decoded PNG in place.
+/// Best effort: any failure leaves the decoded pixels untouched.
+fn apply_exif_orientation(png: &Path, src: &Path) {
+    let Some(o) = triptape_core::metadata::read_image_exif(src).orientation else {
+        return;
+    };
+    let t = triptape_core::metadata::orientation_transform(o);
+    if !t.mirror_h && t.rotate_cw_deg == 0 {
+        return;
+    }
+    let Ok(d) = image::open(png) else { return };
+    let d = orient_image(d, t);
+    let _ = d.save(png);
+}
+
+/// Mirror-then-rotate a decoded image per an EXIF orientation transform.
+pub(crate) fn orient_image(
+    d: image::DynamicImage,
+    t: triptape_core::metadata::OrientationTransform,
+) -> image::DynamicImage {
+    let d = if t.mirror_h { d.fliph() } else { d };
+    match t.rotate_cw_deg {
+        90 => d.rotate90(),
+        180 => d.rotate180(),
+        270 => d.rotate270(),
+        _ => d,
+    }
+}
+
 /// A still decoded to PNG inside a private, uniquely named temp directory.
 /// The directory (and PNG) is removed when this value is dropped.
 pub struct DecodedStill {
@@ -226,18 +255,31 @@ pub fn decode_still_to_png(
             .status())
     };
     #[cfg(target_os = "macos")]
-    let decoded = {
+    let (decoded, via_sips) = {
         let heif = src
             .extension()
             .map(|e| matches!(e.to_ascii_lowercase().to_str(), Some("heic" | "heif")))
             .unwrap_or(false);
         // Order matters (side effects): the first decoder to succeed wins.
-        let first_sips = heif && try_sips();
-        first_sips || try_ffmpeg() || (!heif && try_sips())
+        if heif && try_sips() {
+            (true, true)
+        } else if try_ffmpeg() {
+            (true, false)
+        } else if !heif && try_sips() {
+            (true, true)
+        } else {
+            (false, false)
+        }
     };
     #[cfg(not(target_os = "macos"))]
-    let decoded = try_ffmpeg();
+    let (decoded, via_sips) = (try_ffmpeg(), false);
     if decoded {
+        // sips writes stored pixels without applying EXIF orientation
+        // (FFmpeg auto-rotates); portrait HEICs would render sideways
+        // everywhere this decoder feeds (book, hero stills, reels).
+        if via_sips {
+            apply_exif_orientation(&out, src);
+        }
         return Ok(DecodedStill {
             _dir: dir,
             path: out,
@@ -444,6 +486,33 @@ pub fn verify_video(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orient_image_rotates_pixels_not_metadata() {
+        // 2x1 red|blue; EXIF 6 (rotate 90 CW) -> 1x2 with red on top.
+        let mut img = image::RgbImage::new(2, 1);
+        img.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        img.put_pixel(1, 0, image::Rgb([0, 0, 255]));
+        let t = triptape_core::metadata::orientation_transform(6);
+        let out = orient_image(image::DynamicImage::ImageRgb8(img), t).to_rgb8();
+        assert_eq!(out.dimensions(), (1, 2));
+        assert_eq!(out.get_pixel(0, 0).0, [255, 0, 0]);
+        assert_eq!(out.get_pixel(0, 1).0, [0, 0, 255]);
+        // EXIF 2 (mirror only) swaps left and right.
+        let mut img3 = image::RgbImage::new(2, 1);
+        img3.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        let t2 = triptape_core::metadata::orientation_transform(2);
+        let flipped = orient_image(image::DynamicImage::ImageRgb8(img3), t2).to_rgb8();
+        assert_eq!(flipped.get_pixel(1, 0).0, [255, 0, 0]);
+        // Identity leaves pixels alone.
+        let img2 = image::RgbImage::from_pixel(2, 1, image::Rgb([9, 9, 9]));
+        let same = orient_image(
+            image::DynamicImage::ImageRgb8(img2),
+            triptape_core::metadata::orientation_transform(1),
+        )
+        .to_rgb8();
+        assert_eq!(same.dimensions(), (2, 1));
+    }
 
     #[test]
     fn fit_over_blur_tags_labels_and_gates_blur() {
