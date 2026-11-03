@@ -11,10 +11,13 @@ use crate::types::{Asset, AssetKind, Chapter, MusicPick, Plan, PlanEntry, Rendit
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// Weekday + date as shown to viewers, `Wed, May 1`.
+const DAY_FORMAT: &str = "%a, %b %-d";
+
 /// Factual caption dateline, `Wed, May 1 · 10:00 AM` (UTC). Shared by the
 /// plan builder (which prefixes `Day N · `) and the local caption fallback.
 pub fn dateline(dt: &chrono::DateTime<chrono::Utc>) -> String {
-    format!("{} · {}", dt.format("%a, %b %-d"), dt.format("%-I:%M %p"))
+    format!("{} · {}", dt.format(DAY_FORMAT), dt.format("%-I:%M %p"))
 }
 
 pub const PLAN_VERSION: u32 = 1;
@@ -153,11 +156,14 @@ pub fn build_plan(
         .collect();
     reel_selects.sort_by_key(|e| story_pos[e.asset_id.as_str()]);
 
-    // Chapters: one per cluster label, in story order.
+    // Chapters: one per cluster label, in story order. Titles are
+    // human-facing (hero overlays, book dividers, Story review), so the
+    // machine label `2026-10-12 · place 21` becomes `Mon, Oct 12`; the
+    // place counter says nothing a viewer can use.
     let chapters: Vec<Chapter> = groups
         .into_iter()
         .map(|(label, members)| Chapter {
-            title: label.to_string(),
+            title: human_chapter_title(label),
             asset_ids: members.iter().map(|a| a.id.clone()).collect(),
         })
         .collect();
@@ -208,6 +214,14 @@ pub fn build_plan(
                 .to_string(),
         },
     }
+}
+
+/// Display title for a cluster label: `2026-10-12 · place 21` (or a bare
+/// `2026-10-12`) becomes `Mon, Oct 12`; anything else passes through.
+fn human_chapter_title(label: &str) -> String {
+    let date_part = label.split_once(" · ").map_or(label, |(d, _)| d);
+    chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d")
+        .map_or_else(|_| label.to_string(), |d| d.format(DAY_FORMAT).to_string())
 }
 
 fn plan_entry(a: &Asset) -> PlanEntry {
@@ -420,6 +434,14 @@ mod tests {
         // Round-trips through JSON.
         let back = Plan::from_json(&plan.to_json().unwrap()).unwrap();
         assert_eq!(back.hero.len(), 3);
+    }
+
+    #[test]
+    fn chapter_titles_are_human_dates() {
+        assert_eq!(human_chapter_title("2026-10-12 · place 21"), "Mon, Oct 12");
+        assert_eq!(human_chapter_title("2024-05-01"), "Wed, May 1");
+        assert_eq!(human_chapter_title(UNGROUPED), UNGROUPED);
+        assert_eq!(human_chapter_title("unknown-date"), "unknown-date");
     }
 
     #[test]
