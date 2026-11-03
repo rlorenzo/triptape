@@ -497,6 +497,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             trip_name,
             typst_bin,
             music_path: music,
+            only: flag_or(flags, "only", "all"),
         },
     )
     .unwrap_or_else(|e| die("export", e));

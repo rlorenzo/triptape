@@ -19,6 +19,8 @@ pub struct ExportOptions {
     pub trip_name: String,
     pub typst_bin: String,
     pub music_path: Option<PathBuf>,
+    /// "all" (default), or one keepsake: "video" | "reels" | "book".
+    pub only: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -132,6 +134,14 @@ pub fn export_all(
     out_dir: &Path,
     opts: &ExportOptions,
 ) -> Result<ExportReport, crate::MediaError> {
+    // Validate the keepsake selector before touching the output dir, so a
+    // typo (e.g. "reel") fails loudly instead of exporting nothing.
+    if !matches!(opts.only.as_str(), "all" | "video" | "reels" | "book") {
+        return Err(crate::MediaError::InvalidArg(format!(
+            "--only must be one of all|video|reels|book, got {:?}",
+            opts.only
+        )));
+    }
     let by_id: HashMap<String, triptape_core::types::Asset> =
         assets.iter().map(|a| (a.id.clone(), a.clone())).collect();
     let usable = plan.hero.len();
@@ -176,7 +186,12 @@ pub fn export_all(
     .map_err(|e| crate::MediaError::Io(e.to_string()))?;
 
     // Keepsake 1 — Trip Video.
-    if elig.video == "disabled" {
+    if opts.only != "all" && opts.only != "video" {
+        report.skipped.push(Skipped {
+            keepsake: "video".into(),
+            reason: format!("not selected (--only {})", opts.only),
+        });
+    } else if elig.video == "disabled" {
         report.skipped.push(Skipped {
             keepsake: "video".into(),
             reason: elig.video_reason.clone(),
@@ -214,7 +229,12 @@ pub fn export_all(
     }
 
     // Keepsake 2 — Reels Pack.
-    if elig.reels == 0 {
+    if opts.only != "all" && opts.only != "reels" {
+        report.skipped.push(Skipped {
+            keepsake: "reels".into(),
+            reason: format!("not selected (--only {})", opts.only),
+        });
+    } else if elig.reels == 0 {
         report.skipped.push(Skipped {
             keepsake: "reels".into(),
             reason: elig.reels_reason.clone(),
@@ -259,7 +279,12 @@ pub fn export_all(
     }
 
     // Keepsake 3 — Photo Book.
-    if !elig.book_enabled {
+    if opts.only != "all" && opts.only != "book" {
+        report.skipped.push(Skipped {
+            keepsake: "book".into(),
+            reason: format!("not selected (--only {})", opts.only),
+        });
+    } else if !elig.book_enabled {
         report.skipped.push(Skipped {
             keepsake: "book".into(),
             reason: elig.book_reason.clone(),

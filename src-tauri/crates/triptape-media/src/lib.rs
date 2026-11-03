@@ -14,6 +14,8 @@ pub enum MediaError {
     Ffmpeg(String),
     #[error("io: {0}")]
     Io(String),
+    #[error("invalid argument: {0}")]
+    InvalidArg(String),
     #[error("book preflight blocked: {0}")]
     Preflight(String),
     #[error(transparent)]
