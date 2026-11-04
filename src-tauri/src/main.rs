@@ -14,9 +14,9 @@ use std::path::PathBuf;
 use tauri::{Emitter, Manager, State};
 use triptape_app::{
     default_export_dir, paginate, valid_job_kind, AppState, AssetView, ExportSummary, JobView,
-    ScanSummary,
+    ScanSummary, StoryData, StoryEntryView, StoryView,
 };
-use triptape_core::{cluster, hash, jobs, plan as planmod, scan, types::*};
+use triptape_core::{cluster, db::Db, hash, jobs, plan as planmod, scan, types::*};
 
 fn job_view(job: &Job) -> JobView {
     JobView {
@@ -31,25 +31,6 @@ fn job_view(job: &Job) -> JobView {
 
 fn emit(app: &tauri::AppHandle, job: &Job) {
     let _ = app.emit("job://progress", job_view(job));
-}
-
-fn asset_view(a: &Asset) -> AssetView {
-    AssetView {
-        id: a.id.clone(),
-        kind: match a.kind {
-            AssetKind::Photo => "photo",
-            AssetKind::Video => "video",
-            AssetKind::LivePhoto => "live-photo",
-        }
-        .to_string(),
-        width: a.width,
-        height: a.height,
-        duration_secs: a.duration_secs,
-        taken_at: a.taken_at,
-        time_guessed: a.time_guessed,
-        has_gps: a.gps.is_some(),
-        is_live_photo: a.kind == AssetKind::LivePhoto,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +176,7 @@ async fn get_assets(
     Ok(
         paginate(&assets, page.unwrap_or(0), per_page.unwrap_or(100))
             .iter()
-            .map(asset_view)
+            .map(AssetView::from)
             .collect(),
     )
 }
@@ -245,15 +226,14 @@ fn load_plan_assets(
 ) -> Result<(Plan, Vec<Asset>, String), String> {
     state.require_project(project_id)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let (pid, plan) = db
-        .latest_plan_with_project(Some(project_id))?
+    let plan = db
+        .edited_plan(Some(project_id))?
         .ok_or_else(|| "no plan for project yet — scan first".to_string())?;
-    let assets = db.list_assets(&pid)?;
     let name = db
-        .get_project(&pid)?
+        .get_project(&plan.project_id)?
         .map(|p| p.name)
         .unwrap_or_else(|| "trip".to_string());
-    Ok((plan, assets, name))
+    Ok((plan.edited, plan.assets, name))
 }
 
 /// Renders run on a blocking worker so ffmpeg/typst never stall the async
@@ -333,6 +313,110 @@ fn export_blocking(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Story editor: view the plan by chapter, rename places, edit captions,
+// drop or restore picks, and swap a pick for a same-chapter alternative.
+// Every change persists as PlanEdits, applied on read, so exports and any
+// newer plan of the project honor the edits.
+// ---------------------------------------------------------------------------
+
+/// Mutate the stored edits and return the resulting story.
+fn with_edits(
+    state: &AppState,
+    project_id: &str,
+    f: impl FnOnce(&mut planmod::PlanEdits),
+) -> Result<StoryView, String> {
+    state.require_project(project_id)?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    save_edits(&db, project_id, f)
+}
+
+fn save_edits(
+    db: &Db,
+    project_id: &str,
+    f: impl FnOnce(&mut planmod::PlanEdits),
+) -> Result<StoryView, String> {
+    let mut edits = db.get_plan_edits(project_id)?;
+    f(&mut edits);
+    db.save_plan_edits(project_id, &edits)?;
+    Ok(StoryData::load(db, project_id)?.view())
+}
+
+#[tauri::command]
+async fn get_story(state: State<'_, AppState>, project_id: String) -> Result<StoryView, String> {
+    state.require_project(&project_id)?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    Ok(StoryData::load(&db, &project_id)?.view())
+}
+
+#[tauri::command]
+async fn get_alternatives(
+    state: State<'_, AppState>,
+    project_id: String,
+    asset_id: String,
+) -> Result<Vec<StoryEntryView>, String> {
+    state.require_project(&project_id)?;
+    AppState::check_id(&asset_id)?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    StoryData::load(&db, &project_id)?.alternatives(&asset_id)
+}
+
+#[tauri::command]
+async fn set_chapter_place(
+    state: State<'_, AppState>,
+    project_id: String,
+    chapter_key: String,
+    place: Option<String>,
+) -> Result<StoryView, String> {
+    AppState::check_id(&chapter_key)?;
+    with_edits(&state, &project_id, |edits| {
+        edits.set_place(chapter_key, place)
+    })
+}
+
+#[tauri::command]
+async fn set_asset_caption(
+    state: State<'_, AppState>,
+    project_id: String,
+    asset_id: String,
+    caption: Option<String>,
+) -> Result<StoryView, String> {
+    AppState::check_id(&asset_id)?;
+    with_edits(&state, &project_id, |edits| {
+        edits.set_caption(asset_id, caption)
+    })
+}
+
+#[tauri::command]
+async fn set_asset_excluded(
+    state: State<'_, AppState>,
+    project_id: String,
+    asset_id: String,
+    excluded: bool,
+) -> Result<StoryView, String> {
+    AppState::check_id(&asset_id)?;
+    with_edits(&state, &project_id, |edits| {
+        edits.set_excluded(asset_id, excluded)
+    })
+}
+
+#[tauri::command]
+async fn swap_asset(
+    state: State<'_, AppState>,
+    project_id: String,
+    from_asset_id: String,
+    to_asset_id: String,
+) -> Result<StoryView, String> {
+    AppState::check_id(&from_asset_id)?;
+    AppState::check_id(&to_asset_id)?;
+    state.require_project(&project_id)?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    StoryData::load(&db, &project_id)?.check_swap(&from_asset_id, &to_asset_id)?;
+    save_edits(&db, &project_id, |edits| {
+        edits.swap(from_asset_id, to_asset_id)
+    })
+}
+
 #[tauri::command]
 async fn export_video(app: tauri::AppHandle, project_id: String) -> Result<ExportSummary, String> {
     run_export(app, project_id, "render-video").await
@@ -394,7 +478,13 @@ fn main() {
             export_video,
             export_reels,
             export_book,
-            export_all
+            export_all,
+            get_story,
+            get_alternatives,
+            set_chapter_place,
+            set_asset_caption,
+            set_asset_excluded,
+            swap_asset
         ])
         .run(tauri::generate_context!())
         .expect("error while running TripTape");

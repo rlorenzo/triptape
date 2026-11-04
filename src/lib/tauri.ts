@@ -89,6 +89,117 @@ export async function exportKeepsake(
   };
 }
 
+// --- Story editor ---------------------------------------------------------
+
+export interface StoryEntryView extends AssetView {
+  caption?: string;
+  inHero: boolean;
+  inReels: boolean;
+}
+
+export interface ChapterView {
+  key: string;
+  title: string;
+  place?: string;
+  dayIndex?: number;
+  dateLabel?: string;
+  entries: StoryEntryView[];
+}
+
+export interface StoryView {
+  chapters: ChapterView[];
+  excluded: StoryEntryView[];
+  heroCount: number;
+  reelCount: number;
+}
+
+// Demo story for the browser preview: three days of the demo assets.
+function buildDemoStory(): StoryView {
+  const chapters: ChapterView[] = [0, 1, 2].map((c) => {
+    const items = demoAssets.slice(c * 4, c * 4 + 4);
+    const place = ["Kyoto, Japan", "Osaka, Japan", undefined][c];
+    return {
+      key: items[0]?.id ?? `demo_c${c}`,
+      title: place ?? "At sea",
+      place,
+      dayIndex: c + 1,
+      dateLabel: ["Mon, Oct 5", "Tue, Oct 6", "Wed, Oct 7"][c],
+      entries: items.map((a, i) => ({ ...a, caption: place, inHero: i < 3, inReels: i === 0 }))
+    };
+  }).filter((c) => c.entries.length > 0);
+  return { chapters, excluded: [], heroCount: 9, reelCount: 3 };
+}
+const demoStory: StoryView = buildDemoStory();
+
+export async function getStory(projectId: string): Promise<StoryView> {
+  if (isTauri()) return invoke("get_story", { projectId });
+  return structuredClone(demoStory);
+}
+
+export async function getAlternatives(projectId: string, assetId: string): Promise<StoryEntryView[]> {
+  if (isTauri()) return invoke("get_alternatives", { projectId, assetId });
+  const ch = demoStory.chapters.find((c) => c.entries.some((e) => e.id === assetId));
+  return structuredClone(ch?.entries ?? []);
+}
+
+async function demoEdit(mutate: (s: StoryView) => void): Promise<StoryView> {
+  mutate(demoStory);
+  return structuredClone(demoStory);
+}
+
+export async function setChapterPlace(projectId: string, chapterKey: string, place: string | null): Promise<StoryView> {
+  if (isTauri()) return invoke("set_chapter_place", { projectId, chapterKey, place });
+  return demoEdit((s) => {
+    const ch = s.chapters.find((c) => c.key === chapterKey);
+    if (ch && place) {
+      const old = ch.place;
+      ch.place = place;
+      ch.title = place;
+      for (const e of ch.entries) if (e.caption === old) e.caption = place;
+    }
+  });
+}
+
+export async function setAssetCaption(projectId: string, assetId: string, caption: string | null): Promise<StoryView> {
+  if (isTauri()) return invoke("set_asset_caption", { projectId, assetId, caption });
+  return demoEdit((s) => {
+    for (const ch of s.chapters) for (const e of ch.entries) if (e.id === assetId) e.caption = caption ?? undefined;
+  });
+}
+
+export async function setAssetExcluded(projectId: string, assetId: string, excluded: boolean): Promise<StoryView> {
+  if (isTauri()) return invoke("set_asset_excluded", { projectId, assetId, excluded });
+  return demoEdit((s) => {
+    if (excluded) {
+      for (const ch of s.chapters) {
+        const i = ch.entries.findIndex((e) => e.id === assetId);
+        if (i >= 0) s.excluded.push(...ch.entries.splice(i, 1));
+      }
+    } else {
+      const i = s.excluded.findIndex((e) => e.id === assetId);
+      if (i >= 0 && s.chapters[0]) s.chapters[0].entries.push(...s.excluded.splice(i, 1));
+    }
+  });
+}
+
+export async function swapAsset(projectId: string, fromAssetId: string, toAssetId: string): Promise<StoryView> {
+  if (isTauri()) return invoke("swap_asset", { projectId, fromAssetId, toAssetId });
+  return demoEdit((s) => {
+    for (const ch of s.chapters) {
+      const from = ch.entries.find((e) => e.id === fromAssetId);
+      const to = ch.entries.find((e) => e.id === toAssetId);
+      if (from && to) {
+        const wasHero = from.inHero;
+        const wasReels = from.inReels;
+        from.inHero = false;
+        from.inReels = false;
+        to.inHero = wasHero;
+        to.inReels = wasReels;
+      }
+    }
+  });
+}
+
 /** Mirrors the backend `JobView` payload of `job://progress`. */
 export interface ProgressEvent {
   id: string;

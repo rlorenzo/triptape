@@ -19,6 +19,10 @@ CREATE TABLE IF NOT EXISTS projects (
     book_preset TEXT,
     music_pick TEXT
 );
+CREATE TABLE IF NOT EXISTS plan_edits (
+    project_id TEXT PRIMARY KEY REFERENCES projects(id),
+    edits_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS assets (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
@@ -129,6 +133,16 @@ fn job_from_row(r: &Row) -> rusqlite::Result<Job> {
 
 pub fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
+}
+
+/// A project's latest plan before and after its Story-editor edits, with the
+/// edits and assets it was resolved from.
+pub struct EditedPlan {
+    pub project_id: String,
+    pub base: Plan,
+    pub edited: Plan,
+    pub edits: crate::plan::PlanEdits,
+    pub assets: Vec<Asset>,
 }
 
 impl Db {
@@ -362,6 +376,40 @@ impl Db {
     }
 
     // -- plans ------------------------------------------------------------
+    /// Stored Story-editor edits for a project (empty when never edited).
+    pub fn get_plan_edits(&self, project_id: &str) -> Result<crate::plan::PlanEdits, String> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT edits_json FROM plan_edits WHERE project_id=?1",
+                params![project_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        match json {
+            Some(j) => serde_json::from_str(&j).map_err(|e| e.to_string()),
+            None => Ok(crate::plan::PlanEdits::default()),
+        }
+    }
+
+    /// Persist Story-editor edits for a project.
+    pub fn save_plan_edits(
+        &self,
+        project_id: &str,
+        edits: &crate::plan::PlanEdits,
+    ) -> Result<(), String> {
+        let json = serde_json::to_string(edits).map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "INSERT INTO plan_edits (project_id, edits_json) VALUES (?1, ?2)
+                 ON CONFLICT(project_id) DO UPDATE SET edits_json=excluded.edits_json",
+                params![project_id, json],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn insert_plan(
         &self,
         project_id: &str,
@@ -406,6 +454,25 @@ impl Db {
                 .map_err(|e| e.to_string())
         })
         .transpose()
+    }
+
+    /// Latest plan with the project's Story-editor edits applied: `edited`
+    /// is what every keepsake renders. The stored plan stays pristine, so
+    /// edits can be undone and carry over to newer plans of the project.
+    pub fn edited_plan(&self, project_id: Option<&str>) -> Result<Option<EditedPlan>, String> {
+        let Some((project_id, base)) = self.latest_plan_with_project(project_id)? else {
+            return Ok(None);
+        };
+        let edits = self.get_plan_edits(&project_id)?;
+        let assets = self.list_assets(&project_id)?;
+        let edited = crate::plan::apply_edits(&base, &assets, &edits);
+        Ok(Some(EditedPlan {
+            project_id,
+            base,
+            edited,
+            edits,
+            assets,
+        }))
     }
 
     // -- jobs -------------------------------------------------------------
@@ -506,6 +573,61 @@ mod tests {
 
     fn mem() -> Db {
         Db::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn plan_edits_round_trip_and_survive_rescan() {
+        let db = Db::open_in_memory().unwrap();
+        let p = db.create_project("trip", "/tmp/trip").unwrap();
+        let edits = crate::plan::PlanEdits {
+            excluded: vec!["a1".into()],
+            swaps: vec![("a2".into(), "a3".into())],
+            place_overrides: [("a1".to_string(), "Our Hotel".to_string())].into(),
+            caption_overrides: [("a3".to_string(), "Sunset".to_string())].into(),
+        };
+        assert!(db.get_plan_edits(&p.id).unwrap().is_empty());
+        db.save_plan_edits(&p.id, &edits).unwrap();
+        assert_eq!(db.get_plan_edits(&p.id).unwrap(), edits);
+
+        let assets: Vec<Asset> = ["a1", "a2"]
+            .iter()
+            .map(|id| {
+                let mut a = Asset::new(
+                    *id,
+                    PathBuf::from(format!("/t/{id}.jpg")),
+                    crate::types::AssetKind::Photo,
+                );
+                a.taken_at = Some(1_714_557_600);
+                a
+            })
+            .collect();
+        for a in &assets {
+            db.upsert_asset(&p.id, a).unwrap();
+        }
+        let cluster_of = assets
+            .iter()
+            .map(|a| (a.id.clone(), "2024-05-01".to_string()))
+            .collect();
+        let plan = crate::plan::build_plan(&assets, &cluster_of, &Default::default());
+        let members = |p: &Plan| p.chapters.iter().map(|c| c.asset_ids.len()).sum::<usize>();
+        assert_eq!(members(&plan), 2);
+        db.insert_plan(&p.id, &plan, "local").unwrap();
+
+        let excluded = crate::plan::PlanEdits {
+            excluded: vec!["a1".into()],
+            ..Default::default()
+        };
+        db.save_plan_edits(&p.id, &excluded).unwrap();
+        // A newer plan is a fresh base; the edit still applies on read.
+        db.insert_plan(&p.id, &plan, "local").unwrap();
+        let edited = db.edited_plan(Some(&p.id)).unwrap().unwrap();
+        assert_eq!(edited.project_id, p.id);
+        assert_eq!(members(&edited.edited), 1);
+        // The stored plan stays pristine, so the removal can be undone.
+        assert_eq!(members(&edited.base), 2);
+        db.save_plan_edits(&p.id, &Default::default()).unwrap();
+        let restored = db.edited_plan(Some(&p.id)).unwrap().unwrap();
+        assert_eq!(members(&restored.edited), 2);
     }
 
     #[test]

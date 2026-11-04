@@ -10,11 +10,13 @@
 //!   invoke per file. Thumbnails are served over the `asset://` protocol
 //!   scoped to the cache dir; originals are never exposed to the webview.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::Serialize;
-use triptape_core::db::Db;
+use triptape_core::db::{Db, EditedPlan};
+use triptape_core::types::{Asset, AssetKind, Chapter, PlanEntry};
 use triptape_media::export::Skipped;
 
 // ---------------------------------------------------------------------------
@@ -88,6 +90,22 @@ pub struct AssetView {
     pub is_live_photo: bool,
 }
 
+impl From<&Asset> for AssetView {
+    fn from(a: &Asset) -> Self {
+        Self {
+            id: a.id.clone(),
+            kind: a.kind.as_str().to_string(),
+            width: a.width,
+            height: a.height,
+            duration_secs: a.duration_secs,
+            taken_at: a.taken_at,
+            time_guessed: a.time_guessed,
+            has_gps: a.gps.is_some(),
+            is_live_photo: a.kind == AssetKind::LivePhoto,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanSummary {
@@ -106,6 +124,166 @@ pub struct JobView {
     pub progress: f32,
     pub current_step: Option<String>,
     pub error: Option<String>,
+}
+
+/// One keepsake pick inside a chapter, for the Story editor.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoryEntryView {
+    #[serde(flatten)]
+    pub asset: AssetView,
+    pub caption: Option<String>,
+    pub in_hero: bool,
+    pub in_reels: bool,
+}
+
+/// One day/place chapter in the Story editor. `key` is the chapter's
+/// first asset id in the stored plan and keys place renames.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChapterView {
+    pub key: String,
+    pub title: String,
+    pub place: Option<String>,
+    pub day_index: Option<u32>,
+    pub date_label: Option<String>,
+    pub entries: Vec<StoryEntryView>,
+}
+
+/// The whole editable story: chapters plus every excluded asset
+/// (restorable), with pick counts for the header.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoryView {
+    pub chapters: Vec<ChapterView>,
+    pub excluded: Vec<StoryEntryView>,
+    pub hero_count: usize,
+    pub reel_count: usize,
+}
+
+/// Everything the Story editor reads for one project, loaded once.
+pub struct StoryData(EditedPlan);
+
+impl StoryData {
+    pub fn load(db: &Db, project_id: &str) -> Result<Self, String> {
+        db.edited_plan(Some(project_id))?
+            .map(Self)
+            .ok_or_else(|| "no plan for project yet — scan first".to_string())
+    }
+
+    fn entry_builder(&self) -> impl Fn(&str) -> Option<StoryEntryView> + '_ {
+        fn ids(picks: &[PlanEntry]) -> HashSet<&str> {
+            picks.iter().map(|e| e.asset_id.as_str()).collect()
+        }
+        let by_id: HashMap<&str, &Asset> =
+            self.0.assets.iter().map(|a| (a.id.as_str(), a)).collect();
+        let hero = ids(&self.0.edited.hero);
+        let reels = ids(&self.0.edited.reel_selects);
+        move |id| {
+            Some(StoryEntryView {
+                asset: AssetView::from(*by_id.get(id)?),
+                caption: self.0.edited.captions.get(id).cloned(),
+                in_hero: hero.contains(id),
+                in_reels: reels.contains(id),
+            })
+        }
+    }
+
+    pub fn view(&self) -> StoryView {
+        let entry = self.entry_builder();
+        // Keys come from the pristine plan so excluding a chapter's first
+        // asset doesn't orphan its place rename.
+        let mut key_of: HashMap<&str, &str> = HashMap::new();
+        for c in &self.0.base.chapters {
+            if let Some(key) = c.asset_ids.first() {
+                for id in &c.asset_ids {
+                    key_of.insert(id, key);
+                }
+            }
+        }
+        let chapters = self
+            .0
+            .edited
+            .chapters
+            .iter()
+            .map(|c| ChapterView {
+                key: c
+                    .asset_ids
+                    .first()
+                    .and_then(|id| key_of.get(id.as_str()))
+                    .map(|k| k.to_string())
+                    .unwrap_or_default(),
+                title: c.title.clone(),
+                place: c.place.clone(),
+                day_index: c.day_index,
+                date_label: c.date_label.clone(),
+                entries: c.asset_ids.iter().filter_map(|id| entry(id)).collect(),
+            })
+            .collect();
+        StoryView {
+            chapters,
+            excluded: self
+                .0
+                .edits
+                .excluded
+                .iter()
+                .filter_map(|id| entry(id))
+                .collect(),
+            hero_count: self.0.edited.hero.len(),
+            reel_count: self.0.edited.reel_selects.len(),
+        }
+    }
+
+    /// Every asset of `asset_id`'s scan-time chapter, removed ones included
+    /// (choosing a removed asset as a replacement restores it).
+    pub fn alternatives(&self, asset_id: &str) -> Result<Vec<StoryEntryView>, String> {
+        let chapter = self
+            .0
+            .base
+            .chapters
+            .iter()
+            .find(|c| c.asset_ids.iter().any(|id| id == asset_id))
+            .ok_or_else(|| "asset is not in any chapter".to_string())?;
+        let entry = self.entry_builder();
+        Ok(chapter
+            .asset_ids
+            .iter()
+            .filter_map(|id| entry(id))
+            .collect())
+    }
+
+    /// A swap replaces a current video/reel pick with a different asset of
+    /// the same scan-time chapter, not yet picked in a keepsake `from` is in;
+    /// anything else would do nothing, shorten that keepsake, or move a pick
+    /// to another day.
+    pub fn check_swap(&self, from: &str, to: &str) -> Result<(), String> {
+        if from == to {
+            return Err("an asset can't replace itself".to_string());
+        }
+        let plan = &self.0.edited;
+        let picked = |picks: &[PlanEntry], id: &str| picks.iter().any(|e| e.asset_id == id);
+        let keepsakes = [&plan.hero, &plan.reel_selects];
+        if !keepsakes.iter().any(|picks| picked(picks, from)) {
+            return Err("only video and reel picks can be replaced".to_string());
+        }
+        if keepsakes
+            .iter()
+            .any(|picks| picked(picks, from) && picked(picks, to))
+        {
+            return Err("the replacement is already in that keepsake".to_string());
+        }
+        let member = |c: &Chapter, id: &str| c.asset_ids.iter().any(|a| a == id);
+        if !self
+            .0
+            .base
+            .chapters
+            .iter()
+            .any(|c| member(c, from) && member(c, to))
+        {
+            return Err("the replacement must come from the same chapter".to_string());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -181,6 +359,146 @@ pub fn valid_job_kind(kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use triptape_core::plan::{build_plan, PlanEdits};
+
+    fn story_db(ids: &[&str]) -> (Db, String) {
+        let db = Db::open_in_memory().unwrap();
+        let project = db.create_project("trip", "/tmp/trip").unwrap();
+        let assets: Vec<Asset> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let path = PathBuf::from(format!("/t/{id}.jpg"));
+                let mut a = Asset::new(*id, path, AssetKind::Photo);
+                a.taken_at = Some(1_714_557_600 + i as i64 * 300);
+                a
+            })
+            .collect();
+        for a in &assets {
+            db.upsert_asset(&project.id, a).unwrap();
+        }
+        let cluster_of = assets
+            .iter()
+            .map(|a| (a.id.clone(), "2024-05-01".to_string()))
+            .collect();
+        let plan = build_plan(&assets, &cluster_of, &HashMap::new());
+        db.insert_plan(&project.id, &plan, "local").unwrap();
+        (db, project.id)
+    }
+
+    #[test]
+    fn story_chapter_key_is_stable_when_first_asset_is_excluded() {
+        let (db, pid) = story_db(&["a", "b", "c"]);
+        let edits = PlanEdits {
+            excluded: vec!["a".into()],
+            ..Default::default()
+        };
+        db.save_plan_edits(&pid, &edits).unwrap();
+        let view = StoryData::load(&db, &pid).unwrap().view();
+        assert_eq!(view.chapters[0].key, "a");
+        let ids: Vec<&str> = view.chapters[0]
+            .entries
+            .iter()
+            .map(|e| e.asset.id.as_str())
+            .collect();
+        assert_eq!(ids, ["b", "c"]);
+        assert_eq!(view.excluded[0].asset.id, "a");
+        assert_eq!(view.excluded[0].asset.kind, "photo");
+    }
+
+    #[test]
+    fn story_alternatives_include_removed_assets_of_the_chapter() {
+        let (db, pid) = story_db(&["a", "b"]);
+        let edits = PlanEdits {
+            excluded: vec!["a".into()],
+            ..Default::default()
+        };
+        db.save_plan_edits(&pid, &edits).unwrap();
+        let data = StoryData::load(&db, &pid).unwrap();
+        let ids: Vec<String> = data
+            .alternatives("b")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.asset.id)
+            .collect();
+        assert_eq!(ids, ["a", "b"]);
+        assert!(data.alternatives("missing").is_err());
+    }
+
+    #[test]
+    fn story_entry_serializes_flat_for_the_webview() {
+        let (db, pid) = story_db(&["a"]);
+        let view = StoryData::load(&db, &pid).unwrap().view();
+        let json = serde_json::to_value(&view.chapters[0].entries[0]).unwrap();
+        assert_eq!(json["id"], "a");
+        assert_eq!(json["kind"], "photo");
+        assert_eq!(json["takenAt"], 1_714_557_600);
+        assert!(json.get("inHero").is_some());
+    }
+
+    #[test]
+    fn story_swap_requires_a_current_pick_and_same_chapter_target() {
+        let (db, pid) = story_db(&["a", "b", "c", "d"]);
+        let (_, mut plan) = db.latest_plan_with_project(Some(&pid)).unwrap().unwrap();
+        plan.chapters[0].asset_ids = vec!["a".into(), "b".into(), "c".into()];
+        let mut other = plan.chapters[0].clone();
+        other.asset_ids = vec!["d".into()];
+        plan.chapters.push(other);
+        plan.hero.retain(|e| e.asset_id == "a");
+        plan.reel_selects.clear();
+        db.insert_plan(&pid, &plan, "local").unwrap();
+
+        let data = StoryData::load(&db, &pid).unwrap();
+        assert!(data.check_swap("a", "b").is_ok());
+        assert!(data.check_swap("a", "a").is_err()); // itself
+        assert!(data.check_swap("b", "c").is_err()); // not a pick
+        assert!(data.check_swap("a", "d").is_err()); // another chapter
+        assert!(data.check_swap("a", "missing").is_err());
+    }
+
+    #[test]
+    fn story_swap_rejects_a_target_already_picked_in_the_same_keepsake() {
+        let (db, pid) = story_db(&["a", "b", "c", "d"]);
+        let (_, mut plan) = db.latest_plan_with_project(Some(&pid)).unwrap().unwrap();
+        plan.hero.retain(|e| e.asset_id == "a" || e.asset_id == "b");
+        plan.reel_selects = plan
+            .hero
+            .iter()
+            .filter(|e| e.asset_id == "b")
+            .cloned()
+            .collect();
+        db.insert_plan(&pid, &plan, "local").unwrap();
+
+        let data = StoryData::load(&db, &pid).unwrap();
+        assert!(data.check_swap("a", "b").is_err()); // both in the video
+        assert!(data.check_swap("b", "a").is_err()); // both in the video
+        assert!(data.check_swap("a", "c").is_ok());
+
+        // A removed pick is no longer selected, so it can come back.
+        let mut edits = PlanEdits::default();
+        edits.set_excluded("b".into(), true);
+        db.save_plan_edits(&pid, &edits).unwrap();
+        let data = StoryData::load(&db, &pid).unwrap();
+        data.check_swap("a", "b").unwrap();
+        edits.swap("a".into(), "b".into());
+        db.save_plan_edits(&pid, &edits).unwrap();
+        let view = StoryData::load(&db, &pid).unwrap().view();
+        assert_eq!(view.hero_count, 1);
+        let picked: Vec<&str> = view.chapters[0]
+            .entries
+            .iter()
+            .filter(|e| e.in_hero)
+            .map(|e| e.asset.id.as_str())
+            .collect();
+        assert_eq!(picked, ["b"]);
+    }
+
+    #[test]
+    fn story_load_requires_a_plan() {
+        let db = Db::open_in_memory().unwrap();
+        let project = db.create_project("trip", "/tmp/trip").unwrap();
+        assert!(StoryData::load(&db, &project.id).is_err());
+    }
 
     #[test]
     fn rejects_path_traversal_ids() {

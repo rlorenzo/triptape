@@ -8,7 +8,7 @@
 
 use crate::cluster::{gps_outliers, story_order};
 use crate::types::{Asset, AssetKind, Chapter, MusicPick, Plan, PlanEntry, Rendition, Score};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 /// Weekday + date as shown to viewers, `Wed, May 1`.
@@ -83,6 +83,160 @@ pub fn parse_place_overrides(spec: &str) -> Result<Vec<PlaceOverride>, String> {
         });
     }
     Ok(out)
+}
+
+/// User edits to an auto-generated plan, made in the Story editor. The
+/// stored plan is never mutated: edits live separately and are applied on
+/// read (`Db::edited_plan`), so they can be undone. They belong to one
+/// project; importing a folder again creates a new project without them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlanEdits {
+    /// Assets removed from every keepsake pick (hero, reels, book flow),
+    /// oldest removal first.
+    #[serde(default)]
+    pub excluded: Vec<String>,
+    /// Hero/reel entry asset id -> replacement asset id (same chapter), in
+    /// the order the user made them: a later swap can replace an earlier
+    /// swap's replacement, so this is a list rather than a map.
+    #[serde(default)]
+    pub swaps: Vec<(String, String)>,
+    /// Asset id of any chapter member -> user place label for that chapter.
+    #[serde(default)]
+    pub place_overrides: BTreeMap<String, String>,
+    /// Asset id -> user caption (beats embedded and place captions).
+    #[serde(default)]
+    pub caption_overrides: BTreeMap<String, String>,
+}
+
+impl PlanEdits {
+    pub fn is_empty(&self) -> bool {
+        self.excluded.is_empty()
+            && self.swaps.is_empty()
+            && self.place_overrides.is_empty()
+            && self.caption_overrides.is_empty()
+    }
+
+    /// Set or (when blank) clear the place label for a chapter.
+    pub fn set_place(&mut self, chapter_key: String, place: Option<String>) {
+        set_override(&mut self.place_overrides, chapter_key, place);
+    }
+
+    /// Set or (when blank) clear the caption for an asset.
+    pub fn set_caption(&mut self, asset_id: String, caption: Option<String>) {
+        set_override(&mut self.caption_overrides, asset_id, caption);
+    }
+
+    /// Remove an asset from the keepsakes, or restore it.
+    pub fn set_excluded(&mut self, asset_id: String, excluded: bool) {
+        self.excluded.retain(|id| *id != asset_id);
+        if excluded {
+            self.excluded.push(asset_id);
+        }
+    }
+
+    /// Replace a pick, superseding the earlier swap of the same pick. That
+    /// swap stays if a later one brought the asset back: replay needs it to
+    /// vacate its original slot first. Using an excluded asset as the
+    /// replacement restores it.
+    pub fn swap(&mut self, from: String, to: String) {
+        if let Some(i) = self.swaps.iter().rposition(|(f, _)| *f == from) {
+            if !self.swaps[i + 1..].iter().any(|(_, t)| *t == from) {
+                self.swaps.remove(i);
+            }
+        }
+        self.set_excluded(to.clone(), false);
+        self.swaps.push((from, to));
+    }
+}
+
+fn set_override(map: &mut BTreeMap<String, String>, key: String, value: Option<String>) {
+    match value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => map.insert(key, v.to_string()),
+        None => map.remove(&key),
+    };
+}
+
+/// Rename a chapter; members captioned with the old place follow the rename.
+fn rename_chapter(ch: &mut Chapter, label: &str, captions: &mut HashMap<String, String>) {
+    if let Some(old) = ch.place.replace(label.to_string()) {
+        for id in &ch.asset_ids {
+            if captions.get(id).is_some_and(|c| *c == old) {
+                captions.insert(id.clone(), label.to_string());
+            }
+        }
+    }
+    ch.title = label.to_string();
+}
+
+/// Apply user edits to a stored plan. Pure and deterministic:
+/// place overrides first (they rename whole chapters), then swaps,
+/// then exclusions, then caption overrides on top.
+pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
+    if edits.is_empty() {
+        return plan.clone();
+    }
+    let by_id: HashMap<&str, &Asset> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
+    let dead: HashSet<&str> = edits.excluded.iter().map(String::as_str).collect();
+    // Swaps and captions only land on assets in this plan's book flow.
+    let in_plan: HashSet<&str> = plan
+        .chapters
+        .iter()
+        .flat_map(|c| &c.asset_ids)
+        .map(String::as_str)
+        .collect();
+    let mut out = plan.clone();
+
+    // Place overrides: key matches any member of the chapter.
+    for (key, label) in &edits.place_overrides {
+        for ch in out
+            .chapters
+            .iter_mut()
+            .filter(|c| c.asset_ids.contains(key))
+        {
+            rename_chapter(ch, label, &mut out.captions);
+        }
+    }
+
+    // Swaps: replace a hero/reel pick with the user's chosen asset. A removed
+    // replacement still applies here and drops out with the exclusions below,
+    // so removing it can't bring back the pick it replaced.
+    for (from, to) in &edits.swaps {
+        if !in_plan.contains(to.as_str()) {
+            continue;
+        }
+        let Some(asset) = by_id.get(to.as_str()) else {
+            continue;
+        };
+        // Never duplicate an asset in one keepsake: a replacement the stored
+        // plan already picks takes over, and the old pick goes. This is how
+        // a removed pick is restored as a replacement; `check_swap` rejects
+        // replacements that are still picked.
+        for picks in [&mut out.hero, &mut out.reel_selects] {
+            if picks.iter().any(|e| e.asset_id == *to) {
+                picks.retain(|e| e.asset_id != *from);
+            } else if let Some(entry) = picks.iter_mut().find(|e| e.asset_id == *from) {
+                *entry = plan_entry(asset);
+            }
+        }
+    }
+
+    // Exclusions: out of every pick and out of the book flow.
+    out.hero.retain(|e| !dead.contains(e.asset_id.as_str()));
+    out.reel_selects
+        .retain(|e| !dead.contains(e.asset_id.as_str()));
+    for ch in &mut out.chapters {
+        ch.asset_ids.retain(|id| !dead.contains(id.as_str()));
+    }
+    out.chapters.retain(|c| !c.asset_ids.is_empty());
+    out.captions.retain(|id, _| !dead.contains(id.as_str()));
+
+    // Caption overrides last: the user's words win.
+    for (id, caption) in &edits.caption_overrides {
+        if in_plan.contains(id.as_str()) && !dead.contains(id.as_str()) {
+            out.captions.insert(id.clone(), caption.clone());
+        }
+    }
+    out
 }
 
 /// Build the plan from scored, clustered assets.
@@ -584,6 +738,187 @@ mod tests {
         assert_eq!(plan.chapters[0].title, "Kyoto, Japan");
         assert_eq!(plan.captions["a"], "Kyoto, Japan");
         assert_eq!(plan.captions["b"], "Kyoto, Japan");
+    }
+
+    #[test]
+    fn edits_exclude_swap_rename_and_recaption() {
+        let mk = |id: &str, t: i64| {
+            let mut a = asset(id, t, AssetKind::Photo);
+            a.gps = Some((34.9671, 135.7727)); // Kyoto
+            a
+        };
+        let assets = vec![
+            mk("a", 1_714_557_600),
+            mk("b", 1_714_557_900),
+            mk("c", 1_714_558_200),
+        ];
+        let mut co = HashMap::new();
+        for id in ["a", "b", "c"] {
+            co.insert(id.into(), "2024-05-01 · place 1".into());
+        }
+        let base = build_plan(&assets, &co, &scored(&["a", "b", "c"]));
+        assert_eq!(base.chapters[0].place.as_deref(), Some("Kyoto, Japan"));
+
+        let edits = PlanEdits {
+            excluded: vec!["b".into()],
+            swaps: vec![("a".into(), "c".into())],
+            place_overrides: [("a".to_string(), "Our Ryokan".to_string())].into(),
+            caption_overrides: [("c".to_string(), "Breakfast view".to_string())].into(),
+        };
+        let out = apply_edits(&base, &assets, &edits);
+        // Rename hit the chapter and its place-derived captions.
+        assert_eq!(out.chapters[0].place.as_deref(), Some("Our Ryokan"));
+        assert_eq!(out.chapters[0].title, "Our Ryokan");
+        // Swap replaced the hero pick in place; exclusion removed b.
+        assert!(out
+            .hero
+            .iter()
+            .all(|e| e.asset_id != "a" && e.asset_id != "b"));
+        assert!(out.hero.iter().any(|e| e.asset_id == "c"));
+        assert_eq!(
+            out.chapters[0].asset_ids,
+            vec!["a".to_string(), "c".to_string()]
+        );
+        // Caption override wins over the renamed place.
+        assert_eq!(out.captions["c"], "Breakfast view");
+        // Empty edits are a clone.
+        assert_eq!(
+            apply_edits(&base, &assets, &PlanEdits::default())
+                .hero
+                .len(),
+            base.hero.len()
+        );
+        // A swap target outside the plan (e.g. suppressed on rescan) is ignored.
+        let stray = PlanEdits {
+            swaps: vec![("a".into(), "gone".into())],
+            ..Default::default()
+        };
+        let mut with_stray = assets.clone();
+        with_stray.push(mk("gone", 1_714_558_500));
+        let out = apply_edits(&base, &with_stray, &stray);
+        assert!(out.hero.iter().all(|e| e.asset_id != "gone"));
+        assert!(out.hero.iter().any(|e| e.asset_id == "a"));
+    }
+
+    #[test]
+    fn edit_setters_replace_and_clear_blank_values() {
+        let mut edits = PlanEdits::default();
+        edits.set_caption("a".into(), Some(" first ".into()));
+        edits.set_caption("a".into(), Some("second".into()));
+        assert_eq!(edits.caption_overrides["a"], "second");
+        edits.set_caption("a".into(), Some("   ".into()));
+        assert!(edits.caption_overrides.is_empty());
+        edits.set_place("k".into(), Some("Hotel".into()));
+        edits.set_place("k".into(), None);
+        assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn set_excluded_keeps_one_entry_in_removal_order() {
+        let mut edits = PlanEdits::default();
+        edits.set_excluded("b".into(), true);
+        edits.set_excluded("a".into(), true);
+        edits.set_excluded("b".into(), true);
+        assert_eq!(edits.excluded, ["a", "b"]);
+        edits.set_excluded("a".into(), false);
+        assert_eq!(edits.excluded, ["b"]);
+    }
+
+    #[test]
+    fn swap_supersedes_same_pick_and_restores_replacement() {
+        let mut edits = PlanEdits::default();
+        edits.set_excluded("d".into(), true);
+        edits.swap("a".into(), "c".into());
+        edits.swap("a".into(), "d".into());
+        assert_eq!(edits.swaps, [("a".to_string(), "d".to_string())]);
+        assert!(edits.excluded.is_empty());
+    }
+
+    #[test]
+    fn swap_keeps_earlier_swap_when_the_pick_came_back() {
+        let assets: Vec<Asset> = ["a", "b", "x", "y"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| asset(id, 1_714_557_600 + i as i64 * 300, AssetKind::Photo))
+            .collect();
+        let co = ["a", "b", "x", "y"]
+            .iter()
+            .map(|id| (id.to_string(), "2024-05-01".to_string()))
+            .collect();
+        let mut base = build_plan(&assets, &co, &scored(&["a", "b", "x", "y"]));
+        base.hero = vec![plan_entry(&assets[0]), plan_entry(&assets[1])];
+        let mut edits = PlanEdits::default();
+        edits.swap("a".into(), "x".into()); // [x, b]
+        edits.swap("b".into(), "a".into()); // [x, a]
+        edits.swap("a".into(), "y".into()); // [x, y]
+        let out = apply_edits(&base, &assets, &edits);
+        let ids: Vec<&str> = out.hero.iter().map(|e| e.asset_id.as_str()).collect();
+        assert_eq!(ids, ["x", "y"]);
+    }
+
+    #[test]
+    fn swaps_apply_in_the_order_they_were_made() {
+        let assets: Vec<Asset> = ["a", "z", "c", "d"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| asset(id, 1_714_557_600 + i as i64 * 300, AssetKind::Photo))
+            .collect();
+        let co = ["a", "z", "c", "d"]
+            .iter()
+            .map(|id| (id.to_string(), "2024-05-01".to_string()))
+            .collect();
+        let mut base = build_plan(&assets, &co, &scored(&["a", "z", "c", "d"]));
+        base.hero = vec![plan_entry(&assets[1])]; // only "z" is picked
+        let edits = PlanEdits {
+            swaps: vec![("z".into(), "c".into()), ("c".into(), "d".into())],
+            ..Default::default()
+        };
+        let out = apply_edits(&base, &assets, &edits);
+        let ids: Vec<&str> = out.hero.iter().map(|e| e.asset_id.as_str()).collect();
+        assert_eq!(ids, ["d"]);
+    }
+
+    #[test]
+    fn removing_a_replacement_does_not_restore_the_pick_it_replaced() {
+        let assets: Vec<Asset> = ["a", "b", "c", "keep"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| asset(id, 1_714_557_600 + i as i64 * 300, AssetKind::Photo))
+            .collect();
+        let co = ["a", "b", "c", "keep"]
+            .iter()
+            .map(|id| (id.to_string(), "2024-05-01".to_string()))
+            .collect();
+        let mut base = build_plan(&assets, &co, &scored(&["a", "b", "c", "keep"]));
+        base.hero = vec![plan_entry(&assets[0]), plan_entry(&assets[3])];
+        base.reel_selects = base.hero.clone();
+        let picks = |edits: &PlanEdits| {
+            let out = apply_edits(&base, &assets, edits);
+            let ids =
+                |p: &[PlanEntry]| -> Vec<String> { p.iter().map(|e| e.asset_id.clone()).collect() };
+            assert_eq!(ids(&out.hero), ids(&out.reel_selects));
+            ids(&out.hero)
+        };
+
+        // Swap, then remove the replacement; restoring it brings the swap back.
+        let mut edits = PlanEdits::default();
+        edits.swap("a".into(), "b".into());
+        edits.set_excluded("b".into(), true);
+        assert_eq!(picks(&edits), ["keep"]);
+        edits.set_excluded("b".into(), false);
+        assert_eq!(picks(&edits), ["b", "keep"]);
+
+        // Removing the last target of a chain drops the whole chain.
+        edits.swap("b".into(), "c".into());
+        edits.set_excluded("c".into(), true);
+        assert_eq!(picks(&edits), ["keep"]);
+
+        // Swapping back to the original and removing it stays removed too.
+        let mut edits = PlanEdits::default();
+        edits.swap("a".into(), "b".into());
+        edits.swap("b".into(), "a".into());
+        edits.set_excluded("a".into(), true);
+        assert_eq!(picks(&edits), ["keep"]);
     }
 
     #[test]
