@@ -362,7 +362,10 @@ fn fill_photo(a: &mut Asset, img: Option<&image::DynamicImage>) {
     a.taken_at = Some(ct.unix_secs);
     a.time_guessed = ct.time_guessed;
     a.tz_offset_secs = exif.tz_offset_secs;
-    a.user_caption = exif.caption.clone();
+    a.user_caption = exif
+        .caption
+        .clone()
+        .or_else(|| metadata::read_sidecar_caption(&a.path));
     a.gps = exif.gps;
     a.rotation_deg = exif
         .orientation

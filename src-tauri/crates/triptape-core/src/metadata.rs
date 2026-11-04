@@ -269,12 +269,26 @@ pub fn clean_caption(raw: &str) -> Option<String> {
 /// Photos/Lightroom put user captions there more often than in EXIF;
 /// this is a tolerant byte scan, not an XML parse.
 fn xmp_description(data: &[u8]) -> Option<String> {
-    const TAG: &[u8] = b"dc:description";
-    let start = data.windows(TAG.len()).position(|w| w == TAG)?;
+    // No closing `>`: the opening tag may carry attributes (`xml:lang`).
+    const TAG: &[u8] = b"<dc:description";
+    let start = data.windows(TAG.len()).position(|w| w == TAG)? + TAG.len();
     let rest = String::from_utf8_lossy(&data[start..]);
-    let li = rest.find("<rdf:li")?;
-    let gt = rest[li..].find('>')? + li + 1;
-    let body = &rest[gt..];
+    let open_end = rest.find('>')?;
+    if rest[..open_end].ends_with('/') {
+        return None; // Self-closed: empty, and what follows isn't its text.
+    }
+    let inner = &rest[open_end + 1..];
+    // Photos writes the caption as plain element text; Lightroom wraps
+    // it in rdf:Alt/rdf:li. Handle both. The rdf:li must be this element's:
+    // a later one could be a dc:subject keyword, not a caption.
+    let body = if inner.trim_start().starts_with('<') {
+        let close = inner.find("</dc:description>").unwrap_or(inner.len());
+        let li = inner[..close].find("<rdf:li")?;
+        let gt = inner[li..].find('>')? + li + 1;
+        &inner[gt..]
+    } else {
+        inner
+    };
     let end = body.find('<')?;
     let raw = body[..end]
         .replace("&lt;", "<")
@@ -283,6 +297,22 @@ fn xmp_description(data: &[u8]) -> Option<String> {
         .replace("&apos;", "'")
         .replace("&amp;", "&"); // Last, so `&amp;lt;` stays a literal `&lt;`.
     clean_caption(&raw)
+}
+
+/// Caption from an XMP sidecar next to `path` (`IMG_1.heic.xmp`, `IMG_1.xmp`,
+/// or `IMG_1.XMP`). Photos exports write one sidecar per photo and put the
+/// user's caption inside; the image itself may carry none.
+///
+/// `IMG_1.heic.xmp` names exactly this photo, so when it exists it is the
+/// answer even if captionless. `IMG_1.xmp` may belong to a same-stem sibling
+/// (RAW + HEIC), and its caption must not land on this photo instead.
+pub fn read_sidecar_caption(path: &Path) -> Option<String> {
+    if let Ok(data) = read_prefix(&path.with_added_extension("xmp")) {
+        return xmp_description(&data);
+    }
+    [path.with_extension("xmp"), path.with_extension("XMP")]
+        .iter()
+        .find_map(|c| xmp_description(&read_prefix(c).ok()?))
 }
 
 /// Upper bound on bytes buffered from one image for metadata parsing.
@@ -622,6 +652,66 @@ mod tests {
             xmp_description(escaped).as_deref(),
             Some("Learning &lt;html&gt;")
         );
+        // Photos' plain-text form (what its XMP sidecars carry).
+        let plain = b"<x:xmpmeta><rdf:RDF><rdf:Description><dc:description>Won trophy for winning trivia</dc:description></rdf:Description></rdf:RDF></x:xmpmeta>";
+        assert_eq!(
+            xmp_description(plain).as_deref(),
+            Some("Won trophy for winning trivia")
+        );
+        // Pretty-printed rdf:Alt: whitespace before the first child.
+        let indented = b"<dc:description>\n  <rdf:Alt>\n    <rdf:li xml:lang=\"x-default\">On the ferry</rdf:li>\n  </rdf:Alt>\n</dc:description>";
+        assert_eq!(xmp_description(indented).as_deref(), Some("On the ferry"));
+        // Attributes on the opening tag, in both body forms.
+        let attr_plain = br#"<dc:description xml:lang="en">At the summit</dc:description>"#;
+        assert_eq!(
+            xmp_description(attr_plain).as_deref(),
+            Some("At the summit")
+        );
+        let attr_alt = br#"<dc:description xml:lang="en"><rdf:Alt><rdf:li>At the lake</rdf:li></rdf:Alt></dc:description>"#;
+        assert_eq!(xmp_description(attr_alt).as_deref(), Some("At the lake"));
+        // Empty descriptions must not borrow a later element's text.
+        let keywords = "<rdf:Bag><rdf:li>keyword</rdf:li></rdf:Bag>";
+        for empty in ["<dc:description/>", "<dc:description></dc:description>"] {
+            let xmp = format!("{empty}<dc:subject>{keywords}</dc:subject>");
+            assert_eq!(xmp_description(xmp.as_bytes()), None, "{empty}");
+        }
+    }
+
+    #[test]
+    fn sidecar_caption_reads_next_to_photo() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = |name: &str, words: &str| {
+            let body = format!(
+                "<x:xmpmeta><rdf:Description><dc:description>{words}</dc:description></rdf:Description></x:xmpmeta>"
+            );
+            std::fs::write(dir.path().join(name), body).unwrap();
+        };
+        let caption = |photo: &str| read_sidecar_caption(&dir.path().join(photo));
+
+        // Every supported sidecar naming.
+        sidecar("IMG_1.xmp", "Replaced extension");
+        sidecar("IMG_2.XMP", "Upper-case extension");
+        sidecar("IMG_3.heic.xmp", "Appended extension");
+        assert_eq!(caption("IMG_1.heic").as_deref(), Some("Replaced extension"));
+        assert_eq!(
+            caption("IMG_2.heic").as_deref(),
+            Some("Upper-case extension")
+        );
+        assert_eq!(caption("IMG_3.heic").as_deref(), Some("Appended extension"));
+
+        // No sidecar, and a sidecar that carries no caption.
+        assert_eq!(caption("IMG_4.heic"), None);
+        std::fs::write(dir.path().join("IMG_5.xmp"), "<x:xmpmeta/>").unwrap();
+        assert_eq!(caption("IMG_5.heic"), None);
+
+        // The photo's own sidecar beats a same-stem sibling's, even when
+        // it has no caption to offer.
+        sidecar("IMG_6.xmp", "The RAW's words");
+        sidecar("IMG_6.heic.xmp", "The HEIC's words");
+        assert_eq!(caption("IMG_6.heic").as_deref(), Some("The HEIC's words"));
+        sidecar("IMG_7.xmp", "The RAW's words");
+        std::fs::write(dir.path().join("IMG_7.heic.xmp"), "<x:xmpmeta/>").unwrap();
+        assert_eq!(caption("IMG_7.heic"), None);
     }
 
     #[test]
