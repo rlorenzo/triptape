@@ -73,7 +73,7 @@ const COAST_BUFFER_CELLS: i64 = 2;
 /// buffer for shoreline GPS error, beaches, and harbors. Open water
 /// fails: a cruise ship under way is not "in" the nearest port town,
 /// so sea days honestly get no place name.
-fn is_land(gps: (f64, f64)) -> bool {
+pub fn is_land(gps: (f64, f64)) -> bool {
     let col = ((gps.1 + 180.0) * CELLS_PER_DEG as f64) as i64;
     let row = ((gps.0 + 90.0) * CELLS_PER_DEG as f64) as i64;
     for dr in -COAST_BUFFER_CELLS..=COAST_BUFFER_CELLS {
@@ -224,6 +224,11 @@ mod tests {
         assert_eq!(
             attraction_name((22.3133, 114.0433)).as_deref(),
             Some("Hong Kong Disneyland")
+        );
+        // Jewel Changi Airport (a shopping center, but a destination).
+        assert_eq!(
+            attraction_name((1.3602, 103.9898)).as_deref(),
+            Some("Jewel Changi Airport")
         );
     }
 

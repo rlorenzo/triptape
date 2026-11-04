@@ -264,6 +264,7 @@ Petit Palais	48.866028	2.314555
 Purnululu National Park	-17.448789	128.546055
 Pushkin Museum of Fine Arts	55.747029	37.606029
 Qazan Kremlin	55.797442	49.10724
+Rockefeller Center	40.758611	-73.979194
 Spiš Castle	49.000556	20.768333
 Tuileries Garden	48.863889	2.326111
 Valley of Flowers National Park	30.73	79.6175
@@ -281,6 +282,7 @@ Bwindi Impenetrable National Park	-1.05	29.716667
 Djoudj National Bird Sanctuary	16.358495	-16.274102
 Galleria Borghese	41.91421	12.492144
 Grand Egyptian Museum	29.993611	31.119722
+Harrods	51.499586	-0.163517
 Hohenzollern Castle	48.323561	8.9674
 Kilimanjaro National Park	-3.066667	37.366667
 Matenadaran	40.19207	44.52113
@@ -396,6 +398,7 @@ Chełmno extermination camp	52.153889	18.723056
 Dormition Cathedral	55.750926	37.617053
 Egyptian Museum of Berlin	52.520239	13.397742
 Europa-Park	48.268333	7.720833
+Galleria Vittorio Emanuele II	45.465639	9.19
 Gallerie dell'Accademia	45.431078	12.328139
 Getty Center	34.0775	-118.475
 Huanglong	32.740756	103.831077
@@ -524,6 +527,7 @@ Băile Herculane	44.877222	22.4175
 Cité des Sciences et de l'Industrie	48.895556	2.388056
 Classical Gardens of Suzhou	31.326667	120.625556
 Desembarco del Granma National Park	19.883333	-77.633333
+Dubai Mall	25.1975	55.279167
 Dubovka	49.05	44.833333
 Dujiangyan	31.00925	103.604417
 Fujian Tulou sites	24.6587	116.975
@@ -783,6 +787,7 @@ New Forest	50.863056	-1.618055
 Nordic Museum	59.329167	18.093333
 Novoslobodskaya	55.779517	37.601167
 Nuremberg Castle	49.4579	11.0759
+Palais des congrès de Paris	48.879162	2.283469
 Pembroke Castle	51.676944	-4.920556
 Peneda-Gerês National Park	41.85	-8.25
 Queen Elizabeth National Park	-0.137222	30.041111
@@ -1124,6 +1129,7 @@ Loch Lomond and The Trossachs National Park	56.25	-4.61667
 Ludlow Castle	52.3672	-2.72301
 Macau Tower	22.179722	113.536667
 Makalu Barun National Park	27.756931	87.113627
+Mall of the Emirates	25.118056	55.200555
 Minimundus	46.61972	14.26444
 Missouri Botanical Garden	38.6141	-90.2589
 Museum of Broken Relationships	45.815167	15.973583
@@ -1200,6 +1206,7 @@ Eretz Israel Museum	32.103153	34.796417
 FC Barcelona Museum	41.38039	2.120636
 Fram Museum	59.903333	10.699444
 Gardens of Bomarzo	42.491633	12.247575
+Gasometer	48.18489	16.41997
 Genoese Fortress	44.841553	34.957853
 Gesäuse National Park	47.5922	14.6489
 Glamis Castle	56.6203	-3.0024
@@ -1276,6 +1283,7 @@ Sibiloi National Park	3.960556	36.3425
 Singapore Zoo	1.404709	103.79105
 Stelvio National Park	46.466	10.506
 Stora Sjöfallet National Park	67.566898	17.99365
+Target Center	44.979445	-93.276111
 Tashilhunpo Monastery	29.26706	88.870511
 The Morgan Library & Museum	40.748803	-73.981556
 Tierpark Hagenbeck	53.596389	9.937778
@@ -1479,6 +1487,7 @@ Lower Oder Valley National Park	53.0472	14.2961
 Lower Saxon Wadden Sea National Park	53.7	7.333333
 M. H. de Young Memorial Museum	37.771469	-122.468676
 MAXXI	41.92807	12.46648
+Mall of America	44.854167	-93.242222
 Matobo National Park	-20.55	28.508
 Megara Hyblaea	37.203717	15.181777
 Memento Park	47.4263	18.9989
@@ -1854,6 +1863,7 @@ Veluwezoom National Park	52.048439	6.019914
 Vesuvius National Park	40.817	14.427
 Vikos–Aoös National Park	39.924722	20.761945
 Walters Art Museum	39.296425	-76.616499
+West Edmonton Mall	53.522778	-113.623056
 Western Pomerania Lagoon Area National Park	54.433333	12.9
 Wild Nephin National Park	54.016667	-9.7
 Woburn Abbey	51.98295	-0.596719
@@ -2068,6 +2078,7 @@ Yuriev Monastery	58.486389	31.284722
 Zagreb Zoo	45.8221	16.021285
 jardins du Trocadéro	48.861392	2.289631
 Ängsö National Park	59.623611	18.763889
+Çiçek Pasajı	41.033944	28.977917
 Øvre Dividal National Park	68.633333	19.866667
 Øvre Pasvik National Park	69.09351	28.95053
 Žemaitija National Park	56.044	21.889
@@ -2112,6 +2123,7 @@ Casa Buonarroti	43.76981	11.263593
 Casa Loma	43.678117	-79.409342
 Casa de Campo Park	40.42291	-3.75595
 Cellular Jail	11.675	92.748
+Center of New Industries and Technologies	48.892778	2.239472
 Chilean National Museum of Fine Arts	-33.435322	-70.643569
 Château de Brissac	47.353055	-0.449722
 Coit Tower	37.8025	-122.405833
@@ -2242,6 +2254,7 @@ Porta Macedonia	41.994444	21.432222
 Qasr Mshatta	31.7375	36.010278
 Qianling Mausoleum	34.569176	108.214733
 Riga Motor Museum	56.97055	24.22766
+Rodeo Drive	34.069231	-118.402989
 Roman Baths	51.381	-2.35949
 Royal Botanic Gardens, Sydney	-33.862222	151.2175
 Royal Chapel of Granada	37.175986	-3.599036
@@ -2251,6 +2264,7 @@ Senckenberg Museum	50.1175	8.651667
 Seoraksan National Park	38.125	128.416
 Sevan National Park	40.346111	45.334445
 Shantar Islands National Park	55.0	137.5
+Siam Paragon	13.746389	100.535
 Sibillini Mountains National Park	42.906	13.195
 Smolenskaya	55.74756	37.58289
 St. Andrew's Church	50.056606	19.9384
@@ -2339,6 +2353,7 @@ Franklin Institute	39.958056	-75.173611
 Friedrichswerder Church	52.515833	13.397222
 Frogner Park	59.926944	10.701111
 Futuroscope	46.669167	0.368889
+Galleria Umberto I	40.838441	14.249482
 Garphyttan National Park	59.280229	14.89284
 Glass House	41.142425	-73.5294
 Grampians (Gariwerd) National Park	-37.2078	142.4
@@ -2468,6 +2483,7 @@ Silent Valley National Park	11.133333	76.466667
 Simon Janashia Museum of Georgia	41.69605	44.80026
 Sirmilik National Park	72.833333	-80.583333
 Six Flags Magic Mountain	34.4238	-118.597
+South China Mall	23.0375	113.720556
 Southwest National Park	-42.933331	146.133331
 St. Florian's Gate	50.064722	19.941389
 Staszic Palace	52.2375	21.018056
@@ -2527,6 +2543,7 @@ Battersea Park	51.4793	-0.1573
 Belgian Comic Strip Center	50.85125	4.36016
 Belgrade Military Museum	44.821944	20.45
 Belvoir Castle	52.8945	-0.78256
+Berjaya Times Square	3.142182	101.710605
 Blackbuck National Park	22.033333	72.0
 Blåfjella–Skjækerfjella National Park	64.2168	13.10929
 BnF Museum	48.8678	2.3384
@@ -2634,6 +2651,7 @@ Loket Castle	50.186971	12.754438
 Machalilla National Park	-1.5625	-80.83
 Maison de Balzac	48.855278	2.280833
 Manchester Museum	53.466389	-2.234445
+Manufaktura	51.778889	19.449722
 Martin Luther King, Jr. Memorial	38.886111	-77.044167
 Marx-Engels Forum	52.5183	13.4042
 Medininkai Castle	54.53942	25.64997
@@ -2973,6 +2991,7 @@ Polish Army Museum	52.264357	20.99949
 Portchester Castle	50.8375	-1.115
 Prespa National Park	40.825556	20.898611
 Qasr Azraq	31.879964	36.827428
+Queen Victoria Building	-33.8718	151.207
 Queen's Hamlet, Versailles	48.818611	2.112778
 Qur'an Gate	29.635619	52.56185
 Rakowicki Cemetery	50.075555	19.953889
@@ -2981,6 +3000,7 @@ Rock Garden of Chandigarh	30.752	76.807
 Rouffignac Cave	45.008805	0.987639
 Royal Palace of Olite	42.481731	-1.649563
 Ruvubu National Park	-3.111	30.373
+SM Mall of Asia	14.535278	120.982222
 SS Nomadic	54.606371	-5.911152
 Saeva dupka cave	43.047611	24.1879
 Saikai National Park	32.669722	128.627222
@@ -3049,8 +3069,10 @@ Zisa Palace	38.116774	13.34106
 Zolochiv Castle	49.802006	24.906242
 Zov Tigra National Park	43.583333	134.266667
 Zwin	51.36696	3.36911
+Złote Tarasy	52.230139	21.002641
 birthplace of Anton Chekhov	47.206945	38.931389
 main building of Moscow State University	55.703055	37.530556
+109	35.659544	139.699011
 21st Century Museum of Contemporary Art	36.5608	136.658
 Abbadia Castle	43.3775	-1.749167
 Abramtsevo	56.23406	37.96861
@@ -3324,6 +3346,7 @@ State Art Museum of Uzbekistan	41.302758	69.277844
 Stele Forest	34.255729	108.948201
 Stroganov Church	56.327406	43.985197
 Sultanpur National Park	28.4623	76.8899
+Suria KLCC	3.156722	101.712
 Suzdal Kremlin	56.4164	40.4431
 Talassemtane National Park	35.18278	-5.235231
 Tara National Park	43.9067	19.305
@@ -3363,6 +3386,7 @@ Wadsworth Atheneum Museum of Art	41.763711	-72.673086
 Wall Museum	52.5078	13.3906
 Warsaw Barbican	52.25057	21.01013
 Washington-on-the-Brazos	30.323986	-96.153542
+Water Tower Place	41.897917	-87.622361
 Weerribben-Wieden National Park	52.7769	5.9489
 Western Qing Tombs	39.36061	115.339809
 Window of the World	22.5375	113.97
@@ -3730,6 +3754,7 @@ Yakushima National Park	30.337306	130.503833
 Yoros Castle	41.178611	29.094444
 Zagreb Botanical Garden	45.804864	15.971782
 Zhongshan Park (Beijing, China)	39.9083	116.388
+galerie Vivienne	48.866667	2.339722
 Żuraw in Gdańsk	54.350556	18.6575
 Žmuidzinavičius Museum	54.900833	23.910556
 Aarburg Castle	47.321505	7.901077
@@ -3863,6 +3888,7 @@ Grodziec Castle	51.177222	15.759222
 Grosvenor Square	51.511389	-0.151389
 Grotta Gigante	45.709217	13.763831
 HMCS Haida	43.2753	-79.8554
+Haas House	48.208333	16.371667
 Hadleigh Farm	51.5439	0.60883
 Hallingskarvet National Park	60.6	7.7
 Hallwyl Museum	59.33296	18.074516
@@ -3888,6 +3914,7 @@ Imperial Castle in Poznań	52.407778	16.918611
 Independence National Historical Park	39.9478	-75.1481
 International Spy Museum	38.883877	-77.02546
 Istanbul Aquarium	40.964167	28.8
+Istanbul Cevahir	41.062778	28.993056
 Ivano-Frankivsk Regional Art Museum	48.923611	24.709167
 Iwamura Castle	35.360333	137.451306
 Jagdschloss Grunewald	52.4672	13.2614
@@ -4060,6 +4087,7 @@ Royal Botanic Gardens, Peradeniya	7.27111	80.5956
 Royal Hospital Chelsea	51.486389	-0.157778
 Royal Museum of the Armed Forces and Military History	50.84082	4.393361
 Royal Palace of La Almudaina	39.5675	2.64722
+Royal Saint-Hubert Galleries	50.84778	4.355
 Ruins of San Domingos Convent	42.431198	-8.646964
 Saint Mary church in Chotyniec	49.953	23.0026
 Saint Paul's Church, Tarsus	36.91414	34.89779
@@ -4103,6 +4131,7 @@ Thiel Gallery	59.322222	18.148611
 Thy National Park	56.947	8.422
 Tikotin Museum of Japanese Art	32.8093	34.9854
 Tokyo Metro Museum	35.6635	139.873861
+Toronto Eaton Centre	43.653889	-79.380278
 Trausnitz Castle	48.531675	12.152122
 Turkmen Carpet Museum	37.924018	58.377882
 Tuzly Lagoons National Nature Park	45.783333	30.0
@@ -4349,6 +4378,7 @@ Langsua National Park	61.278333	9.513333
 Laugharne Castle	51.7696	-4.46205
 Laxenburg castles	48.0647	16.3581
 Ledenika Cave	43.20465	23.493731
+Lee Garden One	22.278333	114.184583
 Lichtenburg concentration camp	51.662467	12.932142
 Lietava Castle	49.160706	18.685078
 Lihué Calel National Park	-37.95	-65.65
@@ -4363,6 +4393,7 @@ Lutherhaus Wittenberg	51.8642	12.6525
 Lviv High Castle	49.848333	24.038889
 Lviv Town Hall	49.841835	24.031326
 M. K. Čiurlionis National Art Museum	54.9	23.911389
+MBK Center	13.745556	100.53
 MOCAK, Museum of Contemporary Art in Kraków	50.047778	19.961111
 MOMus–Thessaloniki Museum of Photography	40.63295	22.935467
 Madeira Botanical Garden	32.662222	-16.895833
@@ -4584,6 +4615,7 @@ Zoological Museum of the Zoological Institute of the Russian Academy of Sciences
 bioparco	41.917472	12.485194
 musée Marc-Chagall	43.709167	7.269536
 parc de la Tête d'Or	45.780556	4.854167
+passage des Panoramas	48.871111	2.341667
 Åland Museum	60.096944	19.944722
 Čabraď Castle	48.244	19.1061
 Čakovec Castle	46.388987	16.431996
@@ -4692,6 +4724,7 @@ Cathedral of Our Lady of Perpetual Succour	42.20775	20.73831
 Cathedral of Saint James and Saint Christopher	39.6236	19.92268
 Caulonia	38.445417	16.57875
 Cawdor Castle	57.524258	-3.926612
+CentralWorld	13.746944	100.539722
 Cerralbo Museum	40.423684	-3.714577
 Cerro Castillo National Park	-46.05	-72.183333
 Chad Basin National Park	11.5	13.0
@@ -4725,6 +4758,7 @@ Crystal Mountains National Park	0.805	10.16
 Crystal Palace Dinosaurs	51.4175	-0.067222
 Cuba Palace	38.107778	13.3425
 Dadohaehaesang National Park	34.191	126.7
+Dalma Garden Mall	40.179906	44.488531
 Danish Film Institute	55.683195	12.578504
 Daout Pacha Hammam	41.998611	21.435833
 Datsan Gunzechoinei	59.983611	30.255833
@@ -4736,8 +4770,10 @@ Despić House	43.857578	18.427353
 Deutsche Guggenheim	52.5168	13.391
 Devetashka cave	43.232944	24.886861
 Dirleton Castle	56.0458	-2.77838
+Disney Springs	28.370254	-81.520985
 Divanbegi Madrasa	39.773163	64.421591
 Doi Khun Tan National Park	18.49052	99.27882
+Downtown Disney	33.8091	-117.924
 Druk Yul Park	48.156231	16.273679
 Drum Castle	57.095	-2.338
 Drumlanrig Castle	55.273651	-3.808705
@@ -4818,6 +4854,7 @@ Jardín Botánico Canario Viera y Clavijo	28.06361	-15.46333
 Jatayu Nature Park	8.865888	76.867306
 Javakheti National Park	41.229637	43.380915
 Jay Pritzker Pavilion	41.883055	-87.621944
+Jewel Changi Airport	1.36022	103.98976
 Jewish Museum and Tolerance Center	55.78966	37.606879
 Jordan Archaeological Museum	31.954	35.9343
 Josselin Castle	47.952361	-2.5475
@@ -4924,7 +4961,6 @@ National Museum of Prehistory in Les Eyzies-de-Tayac-Sireuil	44.935833	1.013333
 National Museum of San Matteo	43.715202	10.407747
 National Museum of Visual Arts	-34.913889	-56.164722
 National Museum of the Republic of Kazakhstan	51.1178	71.4701
-National Museum Тaras Shevchenko	50.443301	30.515782
 National Natural History Museum of China	39.88165	116.39365
 National Nature Park Bug Gard	48.039722	30.946667
 National Nature Park Prypiat-Stokhid	51.828333	25.2825
@@ -4955,6 +4991,7 @@ Osterley House	51.489375	-0.351983
 Otuquis National Park and Integrated Management Natural Area	-19.33333	-58.75
 Palace of Iturbide	19.43352	-99.13906
 Palmengarten	50.123611	8.655556
+Palác Lucerna	50.08113	14.42582
 Pang Sida National Park	14.08	102.26
 Parima-Tapirapecó National Park	3.330242	-64.704666
 Patriarch Ponds	55.763889	37.591944
@@ -5037,6 +5074,7 @@ Sipoonkorpi National Park	60.315	25.218889
 Sir Seewoosagur Ramgoolam Botanical Garden	-20.108153	57.577253
 Six Flags Over Texas	32.7551	-97.0702
 Sokolniki Park	55.800278	37.674167
+South Street Seaport	40.7061	-74.0033
 Soviet submarine S-56	43.11342	131.891221
 Spit of the Vasilievsky Island	59.943556	30.30452
 Srimanta Sankaradeva Kalakshetra	26.1306	91.8224
@@ -5050,6 +5088,7 @@ Sítio Roberto Burle Marx	-23.02385	-43.54474
 Sønderborg Castle	54.906944	9.783611
 Taijiang National Park	23.063	120.055
 Tama Cemetery	35.685278	139.509722
+Taras Shevchenko National Museum	50.443301	30.515782
 Tarasp Castle	46.778889	10.261667
 Tasman National Park	-42.8553	147.976
 Tatra Museum in Zakopane	49.2948	19.9499
@@ -5126,6 +5165,7 @@ Znamenskaya Church	55.441297	37.494408
 Îles Ehotilés National Park	5.17699	-3.22902
 Łódź Jewish Cemetery	51.796806	19.480219
 Ōzu Castle	33.5094	132.541
+Abenobashi Terminal Building	34.646	135.513389
 Academy Museum of Motion Pictures	34.063333	-118.360833
 Aigle Castle	46.315	6.976389
 Akrai	37.058	14.895
@@ -5287,6 +5327,7 @@ El Avila National park	10.533333	-66.866667
 El Capricho Park	40.45611	-3.59867
 Elsey National Park	-14.9531	133.193
 Emirgan Park	41.108333	29.0525
+Emporia	55.564167	12.973056
 Energylandia	50.0	19.409
 Erdmannshöhle	47.64916	7.89592
 Etar Architectural-Ethnographic Complex	42.809444	25.348333
@@ -5372,6 +5413,7 @@ Ik Kil	20.661	-88.5505
 Imperial War Museum North	53.4697	-2.29889
 Inhotim	-20.124128	-44.218785
 International Red Cross and Red Crescent Museum	46.227222	6.136944
+Iran Mall	35.753947	51.191375
 Isla Mágica	37.40833	-6.00028
 Islas de Santa Fé National Park	-32.433	-60.817
 Israel Railway Museum	32.811192	35.006711
@@ -5588,10 +5630,12 @@ Petrovsky Palace, Moscow	55.793195	37.551751
 Pešna Cave	41.5475	21.2525
 Peștera Muierilor	45.191944	23.756944
 Phu Hin Rong Kla National Park	16.976667	101.04
+Pier 39	37.809992	-122.410357
 Pin Valley National Park	31.574167	77.588889
 Pinacoteca Nazionale, Siena	43.315624	11.330517
 Pinacoteca Vaticana	41.90573	12.45277
 Pistoia Mountains Astronomical Observatory	44.06417	10.80385
+Place Ville Marie	45.5015	-73.5684
 Plovdiv Roman Stadium	42.147568	24.748018
 Polar Park	68.6917	18.1098
 Port'Alba, Naples	40.8494	14.2518
@@ -5609,6 +5653,7 @@ Quezon Memorial Circle	14.651389	121.049167
 Quirimbas National Park	-12.127746	40.422048
 Radal Siete Tazas National Park	-35.4588	-71.0306
 Radishchev Art Museum	51.5322	46.0353
+Raffles City Chongqing	29.568222	106.58375
 Red Gate Building	55.769393	37.649534
 Redpath Museum	45.504468	-73.577382
 Regional Archaeological Museum Antonino Salinas	38.12095	13.360072
@@ -5667,6 +5712,7 @@ Skyline Drive	38.5483	-78.4606
 Smailholm Tower	55.604475	-2.576184
 Smallest House in Great Britain	53.282341	-3.82858
 Smolny Cathedral	59.948875	30.395589
+Smáralind	64.101111	-21.884167
 Soberanía National Park	9.074298	-79.659805
 Sochi train station	43.591389	39.728056
 South African National Gallery	-33.928984	18.417174
@@ -5738,6 +5784,7 @@ Walmer Castle	51.2006	1.40201
 Wanping Fortress	39.85	116.22
 Warner Bros. Movie World	-27.9075	153.3125
 Waterfalls Park, Edessa	40.803464	22.055301
+Westfield London	51.5075	-0.221111
 Wexner Center for the Arts	40.0002	-83.0094
 Wisłoujście Fortress	54.395861	18.679139
 Wollemi National Park	-32.998333	150.334444

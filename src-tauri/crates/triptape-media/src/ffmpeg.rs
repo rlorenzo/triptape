@@ -1,7 +1,7 @@
 //! FFmpeg capability probe, process runner, and ffprobe verifier.
 //!
 //! The bundled/static FFmpeg varies per machine (system FFmpeg 9.0.2 here:
-//! `libx264`, `xfade`, `zoompan`, `tonemap`, `loudnorm` present;
+//! `libx264`, `xfade`, `perspective`, `tonemap`, `loudnorm` present;
 //! `zscale`/`drawtext`/`vidstab`/`libass` absent). Every renderer probes
 //! once at startup and picks fallback filters accordingly, so exports
 //! degrade instead of failing.
@@ -15,7 +15,7 @@ pub const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
 /// Filter-graph fragment showing the full `input` photo fitted over its own
 /// blurred fill at `w`x`h` (no crop of the subject, no aspect distortion).
 /// `tag` suffixes the internal labels so several copies can share one graph.
-/// Ends unlabeled after `setsar=1`, ready for `,zoompan`/`,fps` chaining.
+/// Ends unlabeled after `setsar=1`, ready for [`hold_still`] + [`glide`].
 pub fn fit_over_blur(caps: &Capabilities, input: &str, w: u32, h: u32, tag: &str) -> String {
     let blur = if caps.gblur { ",gblur=sigma=40" } else { "" };
     format!(
@@ -23,11 +23,44 @@ pub fn fit_over_blur(caps: &Capabilities, input: &str, w: u32, h: u32, tag: &str
     )
 }
 
-/// Centered push-in from 1.0 to `1 + dz` over `frames` frames at 30 fps,
-/// output at `w`x`h`. Apply to a finished composite, never a raw photo.
-pub fn push_in(dz: f64, frames: u32, w: u32, h: u32) -> String {
+/// Hold a one-frame input for `frames` frames at a true 30 fps. The filters
+/// before this run once, so a costly composite is not rebuilt per frame
+/// the way an input-side `-loop 1` would.
+pub fn hold_still(frames: u32) -> String {
     format!(
-        "zoompan=z='1+{dz}*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps=30"
+        "loop=loop={}:size=1:start=0,settb=1/30,setpts=N,fps=30",
+        frames.saturating_sub(1)
+    )
+}
+
+/// Smooth Ken Burns glide over a supersampled frame: an animated source
+/// window resampled at sub-pixel positions, then lanczos downscaled to
+/// `w`x`h`. Variants (cycling): 0 push-in, 1 pull-out, 2 pan right, 3 pan
+/// left, all within 1.05x (the window never shrinks below 20/21 of the
+/// frame). `perspective` does the animating: `crop` evaluates its size
+/// only once and snaps its position to whole pixels, and `zoompan`
+/// re-crops at coarse integer steps, so stills would freeze or jitter.
+/// Without `perspective` the frame holds static at `w`x`h` instead.
+pub fn glide(caps: &Capabilities, frames: u32, w: u32, h: u32, variant: usize) -> String {
+    if !caps.perspective {
+        return format!("scale={w}:{h}:flags=lanczos,setsar=1");
+    }
+    let denom = frames.saturating_sub(1).max(1);
+    // Frame progress 0..=1; perspective's `in` counts from 1.
+    let p = format!("(min(in-1\\,{denom})/{denom})");
+    // Window size as a fraction of the frame, and where its slack sits.
+    let (size, slack) = match variant % 4 {
+        0 => (format!("(1-{p}/21)"), "0.5".to_string()),
+        1 => (format!("((20+{p})/21)"), "0.5".to_string()),
+        2 => ("(20/21)".to_string(), p),
+        _ => ("(20/21)".to_string(), format!("(1-{p})")),
+    };
+    let left = format!("W*(1-{size})*{slack}");
+    let right = format!("W*((1-{size})*{slack}+{size})");
+    let top = format!("H*(1-{size})/2");
+    let bottom = format!("H*(1+{size})/2");
+    format!(
+        "perspective=x0='{left}':y0='{top}':x1='{right}':y1='{top}':x2='{left}':y2='{bottom}':x3='{right}':y3='{bottom}':interpolation=cubic:eval=frame,scale={w}:{h}:flags=lanczos,setsar=1"
     )
 }
 
@@ -69,7 +102,7 @@ pub struct Capabilities {
     pub libx264: bool,
     pub aac: bool,
     pub xfade: bool,
-    pub zoompan: bool,
+    pub perspective: bool,
     pub tonemap: bool,
     pub zscale: bool,
     pub loudnorm: bool,
@@ -125,7 +158,7 @@ pub fn probe_capabilities(ffmpeg_bin: &str, ffprobe_bin: &str) -> Capabilities {
         libx264: flag_present(&encoders, "libx264"),
         aac: flag_present(&encoders, "aac"),
         xfade: filter("xfade"),
-        zoompan: filter("zoompan"),
+        perspective: filter("perspective"),
         tonemap: filter("tonemap"),
         zscale: filter("zscale"),
         loudnorm: filter("loudnorm"),
@@ -487,6 +520,70 @@ pub fn verify_video(
 mod tests {
     use super::*;
 
+    /// Run `glide` over one synthetic still; returns its gray8 frames.
+    fn glide_frames(caps: &Capabilities, frames: u32, variant: usize) -> Vec<Vec<u8>> {
+        const SIZE: (u32, u32) = (96, 54);
+        let vf = format!(
+            "{},{},format=gray",
+            hold_still(frames),
+            glide(caps, frames, SIZE.0, SIZE.1, variant)
+        );
+        let out = Command::new(&caps.ffmpeg_bin)
+            .args(["-v", "error", "-f", "lavfi", "-i"])
+            .args(["testsrc2=s=288x162:r=1:d=1", "-vf", &vf])
+            .args(["-f", "rawvideo", "-"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+            .chunks((SIZE.0 * SIZE.1) as usize)
+            .map(<[u8]>::to_vec)
+            .collect()
+    }
+
+    fn mean_diff(a: &[u8], b: &[u8]) -> f64 {
+        let sum: u64 = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| u64::from(x.abs_diff(*y)))
+            .sum();
+        sum as f64 / a.len() as f64
+    }
+
+    /// Filter-string checks cannot catch a motion that ffmpeg silently
+    /// ignores, so run the real filter and compare pixels.
+    #[test]
+    fn glide_really_moves_every_variant() {
+        let caps = probe_capabilities("ffmpeg", "ffprobe");
+        if !caps.perspective {
+            eprintln!("ffmpeg lacks perspective; skipping");
+            return;
+        }
+        const FRAMES: u32 = 8;
+        let runs: Vec<_> = (0..4).map(|v| glide_frames(&caps, FRAMES, v)).collect();
+        for (v, frames) in runs.iter().enumerate() {
+            assert_eq!(frames.len(), FRAMES as usize, "variant {v} frame count");
+            let (first, last) = (&frames[0], &frames[FRAMES as usize - 1]);
+            assert!(mean_diff(first, last) > 1.0, "variant {v} did not move");
+        }
+        // Push-in and pull-out mirror each other, as do the two pans.
+        let end = FRAMES as usize - 1;
+        for (a, b) in [(0, 1), (2, 3)] {
+            assert!(
+                mean_diff(&runs[a][0], &runs[b][end]) < 0.5,
+                "{a} start vs {b} end"
+            );
+            assert!(
+                mean_diff(&runs[a][end], &runs[b][0]) < 0.5,
+                "{a} end vs {b} start"
+            );
+        }
+    }
+
     #[test]
     fn orient_image_rotates_pixels_not_metadata() {
         // 2x1 red|blue; EXIF 6 (rotate 90 CW) -> 1x2 with red on top.
@@ -529,9 +626,22 @@ mod tests {
         );
         caps.gblur = false;
         assert!(!fit_over_blur(&caps, "[0:v]", 1920, 1080, "").contains("gblur"));
+        // Motion runs per frame, with progress clamped at the end.
+        caps.perspective = true;
+        let g = glide(&caps, 90, 1920, 1080, 0);
+        assert!(g.contains("min(in-1\\,89)/89"), "{g}");
+        assert!(g.contains("eval=frame"), "{g}");
+        assert!(g.contains("scale=1920:1080:flags=lanczos"), "{g}");
+        assert!(!g.contains("zoompan"), "{g}");
+        // No perspective filter: a static hold, never an unrunnable graph.
+        caps.perspective = false;
         assert_eq!(
-            push_in(0.05, 90, 1920, 1080),
-            "zoompan=z='1+0.05*on/90':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=90:s=1920x1080:fps=30"
+            glide(&caps, 90, 1920, 1080, 0),
+            "scale=1920:1080:flags=lanczos,setsar=1"
+        );
+        assert_eq!(
+            hold_still(1),
+            "loop=loop=0:size=1:start=0,settb=1/30,setpts=N,fps=30"
         );
     }
 

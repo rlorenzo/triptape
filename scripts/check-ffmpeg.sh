@@ -23,7 +23,7 @@ FLT="$("$FF" -hide_banner -filters 2>&1)"
 need "encoder libx264"        "$(echo "$ENC" | grep -o 'libx264' | head -1)"
 need "encoder aac (native)"   "$(echo "$ENC" | grep -o ' AAC ' | head -1)"
 need "filter xfade"           "$(echo "$FLT" | grep -o ' xfade ' | head -1)"
-need "filter zoompan"         "$(echo "$FLT" | grep -o ' zoompan ' | head -1)"
+need "filter perspective"     "$(echo "$FLT" | grep -o ' perspective ' | head -1)"
 need "filter loudnorm"        "$(echo "$FLT" | grep -o ' loudnorm ' | head -1)"
 echo "== gate gaps (warn only) =="
 for f in zscale drawtext vidstabdetect vidstabtransform libass; do

@@ -58,7 +58,7 @@ MIN_LINKS=12
 # at a row boundary, which still parses cleanly. Reset these from a recorded
 # run whenever the class list or endpoint changes; never lower them to make
 # a partial run pass.
-CLASS_FLOORS='Q570116:1400 Q194195:107 Q22746:108 Q22698:2355 Q33506:3306 Q167346:94 Q43501:144 Q23413:821'
+CLASS_FLOORS='Q570116:1400 Q194195:107 Q22746:108 Q22698:2355 Q33506:3306 Q167346:94 Q43501:144 Q23413:821 Q11315:45'
 # Same floor rule. These filter rows out, so a cut-off response here would
 # silently let towns back in.
 TOWN_FLOORS='Q515:12900 Q3957:16004 Q532:34452 Q15284:120942 Q4946461:311'

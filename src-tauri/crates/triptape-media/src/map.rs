@@ -1,15 +1,21 @@
-//! Journey map card: pure-Rust route rasterizer + zoompan push-in segment.
+//! Journey map card: pure-Rust route rasterizer + push-in segment.
 //!
 //! PLAN.md Sec 12 hard rules: never scrape public tile servers, attribution
 //! on every frame/page. The bundled-PMTiles basemap spike is unverified, so
-//! this renderer draws the route + pins over a plain styled background (the
-//! G3 fallback scope: no basemap, so no tile attribution is owed). The
-//! OpenStreetMap attribution is still recorded in `ATTRIBUTION.txt` and in
-//! the EDL/map metadata, and drawn as a solid attribution bar note.
+//! this renderer draws the route + pins over landmasses rasterized from
+//! the bundled Natural Earth land grid (public domain; the same grid that
+//! suppresses place names on open water). No tile basemap, so no tile
+//! attribution is owed. The OpenStreetMap attribution is still recorded
+//! in `ATTRIBUTION.txt` and in the EDL/map metadata, and drawn as a solid
+//! attribution bar note.
 
 use image::{Rgb, RgbImage};
 use std::path::Path;
-use triptape_core::geo::haversine_m;
+use triptape_core::geo::{haversine_m, is_land};
+
+/// Flat water and land tones for the route card.
+pub(crate) const WATER: Rgb<u8> = Rgb([17, 27, 43]);
+pub(crate) const LAND: Rgb<u8> = Rgb([43, 66, 92]);
 
 /// Attribution owed on every map frame and page (PLAN.md Sec 12).
 pub const MAP_ATTRIBUTION: &str = "© OpenStreetMap contributors";
@@ -43,21 +49,12 @@ pub fn draw_route_card(
 ) -> RgbImage {
     let w = width.max(64);
     let h = height.max(64);
-    let mut img = RgbImage::new(w, h);
-    // Styled background: deep slate with a subtle vertical gradient.
-    for y in 0..h {
-        let t = y as f32 / h as f32;
-        let c = Rgb([
-            (16.0 + 10.0 * t) as u8,
-            (24.0 + 12.0 * t) as u8,
-            (38.0 + 16.0 * t) as u8,
-        ]);
-        for x in 0..w {
-            img.put_pixel(x, y, c);
-        }
+    let mut img = RgbImage::from_pixel(w, h, WATER);
+    let bar_h = (h as f32 * 0.045).ceil() as u32;
+    if !route.is_empty() {
+        paint_land(&mut img, &RouteFit::new(route, w, h - bar_h));
     }
     // Attribution bar (bottom 4%): light strip so the note is visible.
-    let bar_h = (h as f32 * 0.045).ceil() as u32;
     for y in (h - bar_h)..h {
         for x in 0..w {
             img.put_pixel(x, y, Rgb([232, 236, 241]));
@@ -80,7 +77,8 @@ pub fn draw_route_card(
     if route.is_empty() {
         return img;
     }
-    let pts = project(route, w, h - bar_h);
+    let fit = RouteFit::new(route, w, h - bar_h);
+    let pts: Vec<(i32, i32)> = route.iter().map(|&gps| fit.project(gps)).collect();
     // Route line: dark amber glow under the bright accent core.
     for (col, r) in [(Rgb([146, 102, 30]), 4), (Rgb([245, 178, 66]), 2)] {
         for win in pts.windows(2) {
@@ -112,30 +110,82 @@ pub fn draw_route_card(
     img
 }
 
-/// Fit lat/lon to the frame with 8% padding; equirectangular (fine for a
-/// trip-scale card). Single-point routes collapse to a pin card.
-fn project(route: &[(f64, f64)], w: u32, h: u32) -> Vec<(i32, i32)> {
-    let (mut min_lat, mut max_lat) = (f64::INFINITY, f64::NEG_INFINITY);
-    let (mut min_lon, mut max_lon) = (f64::INFINITY, f64::NEG_INFINITY);
-    for &(lat, lon) in route {
-        min_lat = min_lat.min(lat);
-        max_lat = max_lat.max(lat);
-        min_lon = min_lon.min(lon);
-        max_lon = max_lon.max(lon);
+/// Equirectangular fit of a route's bounding box into a `w`x`h` plot with
+/// 8% padding (fine for a trip-scale card). Single-point routes collapse
+/// to a pin card. Route, pins, and land all share this one mapping, so
+/// they cannot drift apart.
+struct RouteFit {
+    min_lat: f64,
+    min_lon: f64,
+    span_lat: f64,
+    span_lon: f64,
+    w: f64,
+    h: f64,
+}
+
+impl RouteFit {
+    const PAD: f64 = 0.08;
+    const MIN_SPAN_DEG: f64 = 0.02;
+
+    fn new(route: &[(f64, f64)], w: u32, h: u32) -> Self {
+        let (mut min_lat, mut max_lat) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut min_lon, mut max_lon) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &(lat, lon) in route {
+            min_lat = min_lat.min(lat);
+            max_lat = max_lat.max(lat);
+            min_lon = min_lon.min(lon);
+            max_lon = max_lon.max(lon);
+        }
+        Self {
+            min_lat,
+            min_lon,
+            span_lat: (max_lat - min_lat).max(Self::MIN_SPAN_DEG),
+            span_lon: (max_lon - min_lon).max(Self::MIN_SPAN_DEG),
+            w: f64::from(w),
+            h: f64::from(h),
+        }
     }
-    let pad = 0.08;
-    let span_lat = (max_lat - min_lat).max(0.02);
-    let span_lon = (max_lon - min_lon).max(0.02);
-    route
-        .iter()
-        .map(|&(lat, lon)| {
-            let fx = (lon - min_lon) / span_lon;
-            let fy = 1.0 - (lat - min_lat) / span_lat;
-            let x = (pad + fx * (1.0 - 2.0 * pad)) * w as f64;
-            let y = (pad + fy * (1.0 - 2.0 * pad)) * h as f64;
-            (x as i32, y as i32)
-        })
-        .collect()
+
+    fn project(&self, (lat, lon): (f64, f64)) -> (i32, i32) {
+        let fx = (lon - self.min_lon) / self.span_lon;
+        let fy = 1.0 - (lat - self.min_lat) / self.span_lat;
+        let inner = 1.0 - 2.0 * Self::PAD;
+        (
+            ((Self::PAD + fx * inner) * self.w) as i32,
+            ((Self::PAD + fy * inner) * self.h) as i32,
+        )
+    }
+
+    /// Inverse of [`Self::project`] for a pixel position.
+    fn unproject(&self, x: f64, y: f64) -> (f64, f64) {
+        let inner = 1.0 - 2.0 * Self::PAD;
+        let fx = (x / self.w - Self::PAD) / inner;
+        let fy = (y / self.h - Self::PAD) / inner;
+        (
+            self.min_lat + (1.0 - fy) * self.span_lat,
+            self.min_lon + fx * self.span_lon,
+        )
+    }
+}
+
+/// Paint landmasses from the bundled land grid in small blocks, so the
+/// card reads as a map of the region.
+fn paint_land(img: &mut RgbImage, fit: &RouteFit) {
+    const STEP: u32 = 4;
+    let (w, plot_h) = (fit.w as u32, fit.h as u32);
+    for by in (0..plot_h).step_by(STEP as usize) {
+        for bx in (0..w).step_by(STEP as usize) {
+            let center = fit.unproject(f64::from(bx + STEP / 2), f64::from(by + STEP / 2));
+            if !is_land(center) {
+                continue;
+            }
+            for y in by..(by + STEP).min(plot_h) {
+                for x in bx..(bx + STEP).min(w) {
+                    img.put_pixel(x, y, LAND);
+                }
+            }
+        }
+    }
 }
 
 fn draw_dot(img: &mut RgbImage, c: (i32, i32), r: i32, col: Rgb<u8>) {
@@ -177,31 +227,27 @@ pub fn save_route_card(
     Ok(MAP_ATTRIBUTION.to_string())
 }
 
-/// Render the MVP map segment: slow push-in over the card via zoompan
-/// (3 s class, 30 fps, 1080p with stereo silence for chain compatibility).
-/// Falls back to a static hold when `zoompan` is absent.
+/// Render the MVP map segment: slow glide over the card (3 s class,
+/// 30 fps, 1080p with stereo silence for chain compatibility). `variant`
+/// picks the glide direction (0 push-in, 1 pull-out for the closing
+/// recap). Never zoompan: its integer-step re-cropping jitters.
 pub fn render_map_push_in(
     caps: &super::ffmpeg::Capabilities,
     card_png: &Path,
     out_mp4: &Path,
     duration_secs: f64,
+    variant: usize,
 ) -> Result<(), super::MediaError> {
-    let dur = duration_secs.clamp(2.0, 5.0);
+    let dur = duration_secs.clamp(2.0, 6.0);
     let frames = (dur * 30.0).round() as u32;
-    // Gentle push-in: zoom 1.00 -> 1.10 over the segment.
-    let vf_video = if caps.zoompan {
-        format!(
-            "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,zoompan=z='1+0.10*on/{frames}':d={frames}:s=1920x1080:fps=30,format=yuv420p"
-        )
-    } else {
-        "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,fps=30,format=yuv420p"
-            .to_string()
-    };
+    let vf_video = format!(
+        "scale=2880:1620:flags=lanczos,{},{},format=yuv420p",
+        super::ffmpeg::hold_still(frames),
+        super::ffmpeg::glide(caps, frames, 1920, 1080, variant)
+    );
     let args: Vec<String> = [
         vec![
             "-y".into(),
-            "-loop".into(),
-            "1".into(),
             "-i".into(),
             card_png.to_string_lossy().into_owned(),
             "-f".into(),
@@ -232,6 +278,37 @@ mod tests {
         let single = vec![(35.0, 139.0)];
         assert_eq!(drop_outliers(&single), single, "pin card keeps its point");
         assert!(drop_outliers(&[]).is_empty());
+    }
+
+    #[test]
+    fn route_fit_round_trips_pixels_to_gps() {
+        let fit = RouteFit::new(&[(35.0, 139.0), (36.0, 141.0)], 1000, 500);
+        for gps in [(35.0, 139.0), (35.5, 140.0), (36.0, 141.0)] {
+            let (x, y) = fit.project(gps);
+            let (lat, lon) = fit.unproject(f64::from(x), f64::from(y));
+            assert!((lat - gps.0).abs() < 0.01, "{lat} vs {}", gps.0);
+            assert!((lon - gps.1).abs() < 0.01, "{lon} vs {}", gps.1);
+        }
+    }
+
+    #[test]
+    fn card_shows_landmass_not_black_card() {
+        // Tokyo -> Singapore: Japan, Taiwan, and SE-Asia landmasses must
+        // be visible against the water, not a plain dark card.
+        let route = vec![(35.6, 139.7), (25.0, 121.5), (1.35, 103.8)];
+        let img = draw_route_card(&route, &[], 960, 540);
+        let mut land = 0u32;
+        let mut water = 0u32;
+        for p in img.pixels() {
+            if *p == LAND {
+                land += 1;
+            }
+            if *p == WATER {
+                water += 1;
+            }
+        }
+        assert!(land > 20_000, "landmass missing: {land} land px");
+        assert!(water > 20_000, "water missing: {water} water px");
     }
 
     #[test]

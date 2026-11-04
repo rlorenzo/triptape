@@ -10,7 +10,7 @@ Regenerate with `scripts/make-gazetteer.sh`.
 
 `attractions.tsv` (name, latitude, longitude) is derived
 from Wikidata items typed as tourist attraction, amusement park,
-urban park, park, museum, botanical garden, zoo, or castle (or a
+urban park, park, museum, botanical garden, zoo, castle, or shopping center (or a
 subclass of one of those), with at least 12 Wikidata sitelinks as a
 notability floor. Items that are only tourist attractions and are also
 typed as a city, town, village, municipality, or spa town are left out
