@@ -6,7 +6,7 @@
 //! size, mtime, rendition) feeds the pre-render source-integrity check.
 //! Sec 5.4 degradation eligibility lives here too.
 
-use crate::cluster::story_order;
+use crate::cluster::{gps_outliers, story_order};
 use crate::types::{Asset, AssetKind, Chapter, MusicPick, Plan, PlanEntry, Rendition, Score};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -262,8 +262,14 @@ pub fn build_plan_with_overrides(
         }))
         .collect();
 
-    // Map polyline: GPS fixes in story order.
-    let map_polyline: Vec<(f64, f64)> = ordered.iter().filter_map(|a| a.gps).collect();
+    // Map polyline: GPS fixes in story order, minus fixes that imply
+    // impossible speed. Capture times separate those from real flights.
+    let outliers = gps_outliers(assets);
+    let map_polyline: Vec<(f64, f64)> = ordered
+        .iter()
+        .filter(|a| !outliers.contains(&a.id))
+        .filter_map(|a| a.gps)
+        .collect();
 
     Plan {
         plan_version: PLAN_VERSION,
@@ -511,6 +517,26 @@ mod tests {
         // Round-trips through JSON.
         let back = Plan::from_json(&plan.to_json().unwrap()).unwrap();
         assert_eq!(back.hero.len(), 3);
+    }
+
+    #[test]
+    fn map_polyline_keeps_flights_drops_impossible_jumps() {
+        let fix = |id: &str, hours: i64, gps: (f64, f64)| {
+            let mut a = asset(id, 1_714_500_000 + hours * 3600, AssetKind::Photo);
+            a.gps = Some(gps);
+            a
+        };
+        let la = (33.94, -118.4);
+        let tokyo = (35.6, 139.7);
+        // 8,800 km in 12 h is a flight; Sydney one hour later is bad GPS.
+        let assets = vec![
+            fix("a", 0, la),
+            fix("b", 12, tokyo),
+            fix("c", 13, (-33.87, 151.21)),
+            fix("d", 14, tokyo),
+        ];
+        let plan = build_plan(&assets, &HashMap::new(), &HashMap::new());
+        assert_eq!(plan.map_polyline, vec![la, tokyo, tokyo]);
     }
 
     #[test]

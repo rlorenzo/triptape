@@ -11,7 +11,7 @@
 
 use image::{Rgb, RgbImage};
 use std::path::Path;
-use triptape_core::geo::{haversine_m, is_land};
+use triptape_core::geo::is_land;
 
 /// Flat water and land tones for the route card.
 pub(crate) const WATER: Rgb<u8> = Rgb([17, 27, 43]);
@@ -19,20 +19,6 @@ pub(crate) const LAND: Rgb<u8> = Rgb([43, 66, 92]);
 
 /// Attribution owed on every map frame and page (PLAN.md Sec 12).
 pub const MAP_ATTRIBUTION: &str = "© OpenStreetMap contributors";
-
-/// Drop consecutive jumps over 1,000 km (GPS outliers, PLAN.md Sec 12).
-/// The shared plan polyline carries no timestamps, so this is distance-only;
-/// callers with timestamps should pre-filter time-qualified jumps.
-pub fn drop_outliers(route: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    let mut out: Vec<(f64, f64)> = vec![];
-    for &p in route {
-        if out.last().is_some_and(|&q| haversine_m(q, p) > 1_000_000.0) {
-            continue;
-        }
-        out.push(p);
-    }
-    out
-}
 
 /// Draw the route card PNG at `width`x`height`.
 ///
@@ -51,6 +37,10 @@ pub fn draw_route_card(
     let h = height.max(64);
     let mut img = RgbImage::from_pixel(w, h, WATER);
     let bar_h = (h as f32 * 0.045).ceil() as u32;
+    // Unwrap longitudes first: Los Angeles -> Tokyo crosses the Pacific
+    // (102° of span). Raw min/max spans 258° the long way round and
+    // crushes the trip into a corner of a half-planet map.
+    let route = &unwrap_longitudes(route);
     if !route.is_empty() {
         paint_land(&mut img, &RouteFit::new(route, w, h - bar_h));
     }
@@ -108,6 +98,20 @@ pub fn draw_route_card(
         }
     }
     img
+}
+
+/// Shift longitudes by ±360° so consecutive points never jump more
+/// than 180°, keeping antimeridian-crossing routes continuous.
+fn unwrap_longitudes(route: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut out: Vec<(f64, f64)> = Vec::with_capacity(route.len());
+    for &(lat, lon) in route {
+        let lon = match out.last() {
+            Some(&(_, prev)) => prev + (lon - prev + 180.0).rem_euclid(360.0) - 180.0,
+            None => lon,
+        };
+        out.push((lat, lon));
+    }
+    out
 }
 
 /// Equirectangular fit of a route's bounding box into a `w`x`h` plot with
@@ -213,6 +217,9 @@ fn draw_seg(img: &mut RgbImage, a: (i32, i32), b: (i32, i32), col: Rgb<u8>, r: i
 }
 
 /// Save the route card PNG; returns the attribution note for logs/EDL.
+/// `route` is drawn as given: GPS outliers need capture times to tell them
+/// from real long-haul legs, so the plan filters them when it builds the
+/// polyline.
 pub fn save_route_card(
     route: &[(f64, f64)],
     day_markers: &[usize],
@@ -220,8 +227,7 @@ pub fn save_route_card(
     height: u32,
     out: &Path,
 ) -> Result<String, super::MediaError> {
-    let clean = drop_outliers(route);
-    let img = draw_route_card(&clean, day_markers, width, height);
+    let img = draw_route_card(route, day_markers, width, height);
     img.save(out)
         .map_err(|e| super::MediaError::Io(format!("save map card: {e}")))?;
     Ok(MAP_ATTRIBUTION.to_string())
@@ -270,14 +276,10 @@ pub fn render_map_push_in(
 mod tests {
     use super::*;
 
-    #[test]
-    fn outliers_dropped_single_pin_kept() {
-        let route = vec![(35.0, 139.0), (35.1, 139.1), (-33.0, 151.0)];
-        let clean = drop_outliers(&route);
-        assert_eq!(clean.len(), 2);
-        let single = vec![(35.0, 139.0)];
-        assert_eq!(drop_outliers(&single), single, "pin card keeps its point");
-        assert!(drop_outliers(&[]).is_empty());
+    /// Pixels painted in the land and water tones.
+    fn land_water_px(img: &RgbImage) -> (usize, usize) {
+        let count = |tone: Rgb<u8>| img.pixels().filter(|&&p| p == tone).count();
+        (count(LAND), count(WATER))
     }
 
     #[test]
@@ -296,19 +298,61 @@ mod tests {
         // Tokyo -> Singapore: Japan, Taiwan, and SE-Asia landmasses must
         // be visible against the water, not a plain dark card.
         let route = vec![(35.6, 139.7), (25.0, 121.5), (1.35, 103.8)];
-        let img = draw_route_card(&route, &[], 960, 540);
-        let mut land = 0u32;
-        let mut water = 0u32;
-        for p in img.pixels() {
-            if *p == LAND {
-                land += 1;
-            }
-            if *p == WATER {
-                water += 1;
-            }
-        }
+        let (land, water) = land_water_px(&draw_route_card(&route, &[], 960, 540));
         assert!(land > 20_000, "landmass missing: {land} land px");
         assert!(water > 20_000, "water missing: {water} water px");
+    }
+
+    #[test]
+    fn transpacific_route_keeps_pacific_water() {
+        // Los Angeles -> Tokyo -> Hong Kong -> Singapore crosses the
+        // antimeridian: the frame must be mostly Pacific water with
+        // Asia at one side, not a half-planet land belt.
+        let route = vec![(33.94, -118.4), (35.6, 139.7), (22.3, 114.0), (1.35, 103.8)];
+        let (land, water) = land_water_px(&draw_route_card(&route, &[], 960, 540));
+        assert!(land > 5_000, "coasts missing: {land}");
+        assert!(
+            water > land,
+            "Pacific should dominate: water {water} vs land {land}"
+        );
+    }
+
+    #[test]
+    fn saved_card_keeps_long_haul_legs() {
+        // The export path: every 1,000+ km leg must reach the card.
+        let route = vec![(33.94, -118.4), (35.6, 139.7), (22.3, 114.0), (1.35, 103.8)];
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("card.png");
+        save_route_card(&route, &[], 960, 540, &out).unwrap();
+        let saved = image::open(&out).unwrap().to_rgb8();
+        assert!(saved == draw_route_card(&route, &[], 960, 540));
+    }
+
+    #[test]
+    fn unwrap_longitudes_shifts_only_across_the_antimeridian() {
+        fn lons(route: &[(f64, f64)]) -> Vec<i32> {
+            let unwrapped = unwrap_longitudes(route);
+            assert_eq!(unwrapped.len(), route.len());
+            for (u, r) in unwrapped.iter().zip(route) {
+                assert_eq!(u.0, r.0, "latitude must pass through");
+            }
+            unwrapped.iter().map(|p| p.1.round() as i32).collect()
+        }
+        // Same-hemisphere hops and empty routes pass through untouched.
+        assert_eq!(
+            lons(&[(35.0, 139.0), (36.0, 141.0), (1.35, 104.0)]),
+            [139, 141, 104]
+        );
+        assert!(lons(&[]).is_empty());
+        // Fiji hops: eastbound lands past +180, westbound past -180, and
+        // the return trip comes back to the raw longitude.
+        assert_eq!(
+            lons(&[(-17.0, 179.0), (-17.0, -179.0), (-17.0, 179.0)]),
+            [179, 181, 179]
+        );
+        assert_eq!(lons(&[(-17.0, -179.0), (-17.0, 179.0)]), [-179, -181]);
+        // Los Angeles -> Tokyo takes the 102° Pacific way, not 258°.
+        assert_eq!(lons(&[(33.94, -118.0), (35.6, 140.0)]), [-118, -220]);
     }
 
     #[test]
