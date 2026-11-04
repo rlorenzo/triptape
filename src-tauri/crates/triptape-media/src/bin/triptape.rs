@@ -11,8 +11,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use triptape_core::{
-    cluster, db::Db, hash, jobs, livephoto, metadata, plan as planmod, privacy, proxies, scan,
-    score, types::*,
+    cluster,
+    db::{Db, EditedPlan},
+    hash, jobs, livephoto, metadata, plan as planmod, privacy, proxies, scan, score,
+    types::*,
 };
 use triptape_media::{export::export_all, export::ExportOptions, ffmpeg, render_book::BookPreset};
 
@@ -432,12 +434,12 @@ fn plan_cmd(flags: &HashMap<String, String>) {
     let out = PathBuf::from(flag_or(flags, "out", "plan.json"));
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
     // Default (no --project): latest plan in the db, for single-project DBs.
-    let p = db
-        .latest_plan(flags.get("project").map(String::as_str))
+    let mut p = db
+        .edited_plan(flags.get("project").map(String::as_str))
         .unwrap_or_else(|e| die("plan", e))
-        .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
+        .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"))
+        .edited;
     // Exported plans fuzz route points near home (PLAN.md Sec 14 privacy).
-    let mut p = p;
     if let Some(h) = flags.get("home") {
         let home = parse_lat_lon(h).unwrap_or_else(|| die("--home", "want LAT,LON"));
         p.map_polyline = privacy::fuzz_home_route(&p.map_polyline, home);
@@ -476,8 +478,13 @@ fn export_cmd(flags: &HashMap<String, String>) {
     }
 
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
-    let (project_id, mut plan) = db
-        .latest_plan_with_project(flags.get("project").map(String::as_str))
+    let EditedPlan {
+        project_id,
+        edited: mut plan,
+        assets,
+        ..
+    } = db
+        .edited_plan(flags.get("project").map(String::as_str))
         .unwrap_or_else(|e| die("plan", e))
         .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
     // Rendered maps get the same home fuzzing as `plan` JSON (Sec 14).
@@ -485,9 +492,6 @@ fn export_cmd(flags: &HashMap<String, String>) {
         let home = parse_lat_lon(h).unwrap_or_else(|| die("--home", "want LAT,LON"));
         plan.map_polyline = privacy::fuzz_home_route(&plan.map_polyline, home);
     }
-    let assets = db
-        .list_assets(&project_id)
-        .unwrap_or_else(|e| die("assets", e));
     let trip_name = db
         .get_project(&project_id)
         .unwrap_or_else(|e| die("project", e))

@@ -12,6 +12,17 @@ pub enum AssetKind {
     LivePhoto,
 }
 
+impl AssetKind {
+    /// Label the webview receives for this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AssetKind::Photo => "photo",
+            AssetKind::Video => "video",
+            AssetKind::LivePhoto => "live-photo",
+        }
+    }
+}
+
 /// Which rendition of an asset a plan entry (or renderer) should use.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
