@@ -8,6 +8,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, PoisonError};
+use triptape_core::proxies;
+use triptape_core::types::AssetKind;
 
 /// Single-pass EBU R128 loudness target shared by every renderer.
 pub const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
@@ -237,6 +240,12 @@ pub(crate) fn orient_image(
     }
 }
 
+fn is_heif(src: &Path) -> bool {
+    src.extension()
+        .map(|e| matches!(e.to_ascii_lowercase().to_str(), Some("heic" | "heif")))
+        .unwrap_or(false)
+}
+
 /// A still decoded to PNG inside a private, uniquely named temp directory.
 /// The directory (and PNG) is removed when this value is dropped.
 pub struct DecodedStill {
@@ -289,10 +298,7 @@ pub fn decode_still_to_png(
     };
     #[cfg(target_os = "macos")]
     let (decoded, via_sips) = {
-        let heif = src
-            .extension()
-            .map(|e| matches!(e.to_ascii_lowercase().to_str(), Some("heic" | "heif")))
-            .unwrap_or(false);
+        let heif = is_heif(src);
         // Order matters (side effects): the first decoder to succeed wins.
         if heif && try_sips() {
             (true, true)
@@ -322,6 +328,59 @@ pub fn decode_still_to_png(
         "cannot decode still {}",
         src.display()
     )))
+}
+
+/// Only one still at a time may hold a full-size decode in memory.
+static FULL_SIZE_THUMB: Mutex<()> = Mutex::new(());
+
+/// Ensure the editor thumbnail exists at `dst`; a cache hit does no work.
+/// Videos use a first frame. Stills let FFmpeg scale directly, which needs no
+/// intermediate PNG. HEICs and stills FFmpeg rejects go through
+/// [`decode_still_to_png`] like renders do, for its `sips` route. Each attempt
+/// writes its own temp sibling, so a file at `dst` is always complete even
+/// when requests for one asset overlap.
+pub fn render_thumb(
+    ffmpeg_bin: &str,
+    src: &Path,
+    kind: AssetKind,
+    dst: &Path,
+) -> Result<(), super::MediaError> {
+    if proxies::cache_hit(dst) {
+        return Ok(());
+    }
+    let scale_directly = || proxies::run_ffmpeg(ffmpeg_bin, &proxies::thumb_args(src, dst), dst);
+    if kind == AssetKind::Video {
+        return scale_directly().map_err(super::MediaError::Ffmpeg);
+    }
+    if !is_heif(src) && scale_directly().is_ok() {
+        return Ok(());
+    }
+    let _full_size = FULL_SIZE_THUMB
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    // An overlapping request may have finished while this one waited.
+    if proxies::cache_hit(dst) {
+        return Ok(());
+    }
+    let io_err = |e: String| super::MediaError::Io(e);
+    let decoded = decode_still_to_png(ffmpeg_bin, src)?;
+    let img = image::open(&decoded.path).map_err(|e| io_err(e.to_string()))?;
+    if let Some(p) = dst.parent() {
+        std::fs::create_dir_all(p).map_err(|e| io_err(e.to_string()))?;
+    }
+    let tmp = proxies::temp_sibling(dst);
+    let edge = proxies::THUMB_LONG_EDGE;
+    // JPEG has no alpha channel; decoded PNGs may carry one.
+    let written = img
+        .thumbnail(edge, edge)
+        .to_rgb8()
+        .save(&tmp)
+        .map_err(|e| io_err(e.to_string()))
+        .and_then(|()| std::fs::rename(&tmp, dst).map_err(|e| io_err(e.to_string())));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Run FFmpeg with `args` (whose last element must be `final_out`).
@@ -687,6 +746,138 @@ mod tests {
         assert_eq!(at("-pix_fmt"), "yuv420p");
         assert_eq!((at("-ar"), at("-ac")), ("48000", "2"));
         assert_eq!(at("-movflags"), "+faststart");
+    }
+
+    fn has_ffmpeg() -> bool {
+        Command::new("ffmpeg").arg("-version").output().is_ok()
+    }
+
+    fn assert_is_thumb(path: &Path, want: (u32, u32)) {
+        let img = image::open(path).unwrap();
+        assert_eq!((img.width(), img.height()), want);
+        assert_eq!(
+            image::ImageFormat::from_path(path).unwrap(),
+            image::guess_format(&std::fs::read(path).unwrap()).unwrap()
+        );
+        assert_eq!(
+            dir_entries(path.parent().unwrap()),
+            1,
+            "temp file left behind"
+        );
+    }
+
+    fn dir_entries(dir: &Path) -> usize {
+        std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
+    }
+
+    #[test]
+    fn render_thumb_cache_hit_does_no_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("a.jpg");
+        std::fs::write(&dst, b"cached").unwrap();
+        render_thumb("false", Path::new("/missing"), AssetKind::Video, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"cached");
+    }
+
+    #[test]
+    fn render_thumb_failure_leaves_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("thumb").join("a.jpg");
+        for kind in [AssetKind::Video, AssetKind::Photo] {
+            assert!(render_thumb("false", Path::new("/missing"), kind, &dst).is_err());
+            assert_eq!(dir_entries(dst.parent().unwrap()), 0);
+        }
+    }
+
+    #[test]
+    fn render_thumb_downscales_a_still_with_alpha() {
+        if !has_ffmpeg() {
+            eprintln!("ffmpeg missing; skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("rgba.png");
+        image::RgbaImage::new(640, 480).save(&src).unwrap();
+        let dst = dir.path().join("thumb").join("a.jpg");
+        render_thumb("ffmpeg", &src, AssetKind::Photo, &dst).unwrap();
+        assert_is_thumb(&dst, (320, 240));
+    }
+
+    #[test]
+    fn render_thumb_takes_the_full_size_route_for_heif() {
+        if !has_ffmpeg() {
+            eprintln!("ffmpeg missing; skipping");
+            return;
+        }
+        // PNG bytes under a HEIC name: both decoders sniff the content.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("photo.heic");
+        image::RgbaImage::new(640, 480)
+            .save_with_format(&src, image::ImageFormat::Png)
+            .unwrap();
+        let dst = dir.path().join("thumb").join("a.jpg");
+        render_thumb("ffmpeg", &src, AssetKind::Photo, &dst).unwrap();
+        assert_is_thumb(&dst, (320, 240));
+    }
+
+    #[test]
+    fn render_thumb_applies_exif_orientation_when_scaling_directly() {
+        if !has_ffmpeg() {
+            eprintln!("ffmpeg missing; skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.jpg");
+        image::RgbImage::new(640, 480).save(&plain).unwrap();
+        // Big-endian APP1 holding a single tag: Orientation = 6 (rotate 90 CW).
+        let mut app1 = b"\xFF\xE1\x00\x22Exif\0\0MM\0\x2A\0\0\0\x08\0\x01".to_vec();
+        app1.extend_from_slice(b"\x01\x12\0\x03\0\0\0\x01\0\x06\0\0\0\0\0\0");
+        let jpeg = std::fs::read(&plain).unwrap();
+        let src = dir.path().join("portrait.jpg");
+        std::fs::write(&src, [&jpeg[..2], &app1[..], &jpeg[2..]].concat()).unwrap();
+        let dst = dir.path().join("thumb").join("a.jpg");
+        render_thumb("ffmpeg", &src, AssetKind::Photo, &dst).unwrap();
+        assert_is_thumb(&dst, (240, 320));
+    }
+
+    #[test]
+    fn render_thumb_survives_overlapping_requests() {
+        if !has_ffmpeg() {
+            eprintln!("ffmpeg missing; skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("big.png");
+        image::RgbImage::new(1600, 1200).save(&src).unwrap();
+        let dst = dir.path().join("thumb").join("a.jpg");
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| scope.spawn(|| render_thumb("ffmpeg", &src, AssetKind::Photo, &dst)))
+                .collect();
+            for worker in workers {
+                worker.join().unwrap().unwrap();
+            }
+        });
+        assert_is_thumb(&dst, (320, 240));
+    }
+
+    #[test]
+    fn render_thumb_uses_a_video_first_frame() {
+        if !has_ffmpeg() {
+            eprintln!("ffmpeg missing; skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        let made = Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc2=s=640x360:d=1"])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let dst = dir.path().join("thumb").join("a.jpg");
+        render_thumb("ffmpeg", &src, AssetKind::Video, &dst).unwrap();
+        assert_is_thumb(&dst, (320, 180));
     }
 
     #[test]

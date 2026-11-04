@@ -8,6 +8,14 @@ use crate::types::{Asset, AssetKind, Cluster, Job, JobState, PairingConfidence, 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::path::{Path, PathBuf};
 
+fn asset_kind_from_db(kind: &str) -> AssetKind {
+    match kind {
+        "video" => AssetKind::Video,
+        "livephoto" => AssetKind::LivePhoto,
+        _ => AssetKind::Photo,
+    }
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -282,6 +290,27 @@ impl Db {
         Ok(())
     }
 
+    /// Source path and kind of one asset, without loading the project's list.
+    pub fn asset_source(
+        &self,
+        project_id: &str,
+        asset_id: &str,
+    ) -> Result<Option<(PathBuf, AssetKind)>, String> {
+        self.conn
+            .query_row(
+                "SELECT path,kind FROM assets WHERE project_id=?1 AND id=?2",
+                params![project_id, asset_id],
+                |r| {
+                    Ok((
+                        PathBuf::from(r.get::<_, String>(0)?),
+                        asset_kind_from_db(&r.get::<_, String>(1)?),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
     pub fn list_assets(&self, project_id: &str) -> Result<Vec<Asset>, String> {
         let mut st = self
             .conn
@@ -291,18 +320,13 @@ impl Db {
             .map_err(|e| e.to_string())?;
         let rows = st
             .query_map(params![project_id], |r| {
-                let kind: String = r.get(3)?;
                 let conf: Option<String> = r.get(17)?;
                 let (lat, lon): (Option<f64>, Option<f64>) = (r.get(14)?, r.get(15)?);
                 Ok(Asset {
                     id: r.get(0)?,
                     path: PathBuf::from(r.get::<_, String>(1)?),
                     companion_path: r.get::<_, Option<String>>(2)?.map(PathBuf::from),
-                    kind: match kind.as_str() {
-                        "video" => AssetKind::Video,
-                        "livephoto" => AssetKind::LivePhoto,
-                        _ => AssetKind::Photo,
-                    },
+                    kind: asset_kind_from_db(&r.get::<_, String>(3)?),
                     size_bytes: r.get::<_, i64>(4)? as u64,
                     mtime: r.get(5)?,
                     content_hash: r.get(6)?,
@@ -665,6 +689,20 @@ mod tests {
         a.gps = Some((37.7, -122.4));
         a.taken_at = Some(1_714_557_600);
         a
+    }
+
+    #[test]
+    fn asset_source_is_scoped_to_project() {
+        let db = mem();
+        let p = db.create_project("trip", "/tmp/trip").unwrap();
+        let other = db.create_project("other", "/tmp/other").unwrap();
+        db.upsert_asset(&p.id, &asset("a1")).unwrap();
+        assert_eq!(
+            db.asset_source(&p.id, "a1").unwrap(),
+            Some((PathBuf::from("/tmp/a1.jpg"), AssetKind::LivePhoto))
+        );
+        assert_eq!(db.asset_source(&other.id, "a1").unwrap(), None);
+        assert_eq!(db.asset_source(&p.id, "missing").unwrap(), None);
     }
 
     #[test]

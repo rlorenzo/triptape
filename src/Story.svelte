@@ -1,5 +1,6 @@
 <script lang="ts">
   import { project } from "./lib/store";
+  import Thumb from "./lib/Thumb.svelte";
   import {
     getAlternatives,
     getStory,
@@ -161,7 +162,8 @@
           {#each ch.entries as e (e.id)}
             {@const when = fmtWhen(e)}
             <div class="border rounded p-2 text-sm {e.inHero || e.inReels ? 'bg-white' : 'bg-gray-50'}">
-              <div class="flex items-center justify-between gap-2">
+              <Thumb projectId={pid} assetId={e.id} kind={e.kind} />
+              <div class="flex items-center justify-between gap-2 mt-1">
                 <span class="font-mono text-xs truncate" title={e.id}>{e.id}</span>
                 <span class="flex gap-1">
                   {#if e.inHero}<span class="text-[10px] px-1 rounded bg-gray-900 text-white">video</span>{/if}
@@ -200,7 +202,8 @@
                   </p>
                   {#each alternatives as alt (alt.id)}
                     <div class="flex items-center justify-between gap-2 py-1">
-                      <span class="text-xs">
+                      <Thumb projectId={pid} assetId={alt.id} kind={alt.kind} small />
+                      <span class="text-xs flex-1">
                         <span class="font-mono">{alt.id}</span>
                         <span class="text-gray-500">{meta(alt)}</span>
                         {#if alt.inHero}<span class="text-[10px] px-1 rounded bg-gray-900 text-white">in video</span>{/if}

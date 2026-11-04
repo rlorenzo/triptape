@@ -16,6 +16,19 @@ pub fn cache_path(cache_dir: &Path, kind: &str, content_hash: &str, suffix: &str
     cache_dir.join(kind).join(format!("{content_hash}{suffix}"))
 }
 
+/// Cache key for a rendition of `src`: asset id plus the source's current size
+/// and mtime, so editing or replacing the file misses the old entry. Fails when
+/// the source can't be read.
+pub fn source_cache_key(asset_id: &str, src: &Path) -> std::io::Result<String> {
+    let meta = std::fs::metadata(src)?;
+    let mtime_nanos = meta
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Ok(format!("{asset_id}-{}-{mtime_nanos}", meta.len()))
+}
+
 /// True when a cached rendition already exists and is non-empty.
 pub fn cache_hit(path: &Path) -> bool {
     std::fs::metadata(path)
@@ -89,7 +102,7 @@ pub fn poster_args(src: &Path, dst: &Path, at_secs: f64) -> Vec<String> {
 
 /// Unique sibling temp path that keeps `out`'s extension (FFmpeg picks the
 /// muxer from it): `<dir>/.<stem>.tmp-<pid>-<n>.<ext>`.
-fn temp_sibling(out: &Path) -> PathBuf {
+pub fn temp_sibling(out: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -125,6 +138,7 @@ pub fn run_ffmpeg(ffmpeg_bin: &str, args: &[String], out: &Path) -> Result<(), S
     let result = std::process::Command::new(ffmpeg_bin)
         .args(head)
         .arg(&tmp)
+        .stdin(std::process::Stdio::null())
         .status()
         .map_err(|e| format!("ffmpeg spawn failed: {e}"))
         .and_then(|status| {
@@ -151,6 +165,35 @@ mod tests {
         let dir = Path::new("/cache");
         let a = cache_path(dir, "thumb", "abc123", ".jpg");
         assert_eq!(a, PathBuf::from("/cache/thumb/abc123.jpg"));
+    }
+
+    #[test]
+    fn source_cache_key_tracks_source_changes() {
+        let dir = std::env::temp_dir().join(format!("triptape-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("a.jpg");
+        std::fs::write(&src, b"one").unwrap();
+        let file = std::fs::File::options().write(true).open(&src).unwrap();
+        let t0 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        file.set_modified(t0).unwrap();
+        let key = source_cache_key("a1", &src).unwrap();
+        assert_eq!(key, source_cache_key("a1", &src).unwrap());
+        assert!(key.starts_with("a1-3-"), "{key}");
+
+        // Same size, new mtime: an in-place edit.
+        file.set_modified(t0 + std::time::Duration::from_secs(1))
+            .unwrap();
+        let touched = source_cache_key("a1", &src).unwrap();
+        assert_ne!(key, touched);
+
+        // Same mtime, new size: a replacement that preserved the timestamp.
+        file.set_len(4).unwrap();
+        file.set_modified(t0 + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_ne!(touched, source_cache_key("a1", &src).unwrap());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(source_cache_key("a1", &src).is_err());
     }
 
     #[test]
