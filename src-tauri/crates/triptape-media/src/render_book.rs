@@ -999,7 +999,7 @@ fn solid(w: u32, h: u32, c: Rgb<u8>) -> RgbImage {
 }
 
 /// Cover-fit `src` into (tw, th), centered.
-fn cover_fit(src: &RgbImage, tw: u32, th: u32) -> RgbImage {
+pub(crate) fn cover_fit(src: &RgbImage, tw: u32, th: u32) -> RgbImage {
     let (sw, sh) = (src.width().max(1) as f64, src.height().max(1) as f64);
     let scale = (tw as f64 / sw).max(th as f64 / sh);
     let (nw, nh) = ((sw * scale).round() as u32, (sh * scale).round() as u32);

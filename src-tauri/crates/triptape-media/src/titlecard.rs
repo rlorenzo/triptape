@@ -101,6 +101,30 @@ pub fn lower_third_doc(top: &str, bottom: Option<&str>) -> String {
     )
 }
 
+/// Full-frame closing card: the places the trip went, wrapped and
+/// centered, with the trip name and date range as a footer. Gives the
+/// film an ending instead of stopping on the last photo.
+pub fn places_card_doc(trip_name: &str, places: &[String], date_range: Option<&str>) -> String {
+    let list = places.join("  ·  ");
+    let footer = match date_range {
+        Some(d) => format!("{} · {}", esc(trip_name), esc(d)),
+        None => esc(trip_name),
+    };
+    format!(
+        r##"#set page(width: 1920pt, height: 1080pt, fill: rgb(13, 20, 32), margin: 0pt)
+#set text(font: {fonts}, fill: white)
+#place(center + horizon, stack(dir: ttb, spacing: 26pt,
+  text(size: 72pt, weight: "bold", "The places we went"),
+  line(length: 340pt, stroke: 6pt + rgb("#f5b242")),
+  box(width: 1560pt, text(size: 40pt, fill: rgb("#c8cfdb"), align(center, "{list}"))),
+  text(size: 34pt, fill: rgb("#8b95a8"), "{footer}"),
+))"##,
+        fonts = FONT_STACK,
+        list = esc(&list),
+        footer = footer,
+    )
+}
+
 /// Label on the route-map card (hero overlay and book page caption).
 pub const ROUTE_LABEL: &str = "Our route";
 

@@ -232,7 +232,7 @@ pub fn probe_video(ffprobe_bin: &str, path: &Path) -> Result<FfprobeOutput, Stri
 }
 
 /// EXIF fields we read from stills.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ImageExif {
     /// Raw EXIF orientation (1-8).
     pub orientation: Option<u32>,
@@ -245,6 +245,44 @@ pub struct ImageExif {
     /// reliable source for HEIC, whose ffprobe streams are tiles.
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Caption the user wrote into the file itself (EXIF `ImageDescription`
+    /// or XMP `dc:description`), cleaned. Their own words outrank every
+    /// auto-generated caption downstream.
+    pub caption: Option<String>,
+}
+
+/// Clean a raw embedded caption: collapse whitespace, drop empties and
+/// camera-software placeholders, cap at 240 chars.
+pub fn clean_caption(raw: &str) -> Option<String> {
+    let joined = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cleaned = joined.trim_matches('"').trim();
+    if cleaned.len() < 2
+        || cleaned.eq_ignore_ascii_case("default")
+        || cleaned.chars().all(|c| !c.is_alphanumeric())
+    {
+        return None;
+    }
+    Some(cleaned.chars().take(240).collect())
+}
+
+/// Extract XMP `dc:description` text from a file prefix. Exports from
+/// Photos/Lightroom put user captions there more often than in EXIF;
+/// this is a tolerant byte scan, not an XML parse.
+fn xmp_description(data: &[u8]) -> Option<String> {
+    const TAG: &[u8] = b"dc:description";
+    let start = data.windows(TAG.len()).position(|w| w == TAG)?;
+    let rest = String::from_utf8_lossy(&data[start..]);
+    let li = rest.find("<rdf:li")?;
+    let gt = rest[li..].find('>')? + li + 1;
+    let body = &rest[gt..];
+    let end = body.find('<')?;
+    let raw = body[..end]
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&"); // Last, so `&amp;lt;` stays a literal `&lt;`.
+    clean_caption(&raw)
 }
 
 /// Upper bound on bytes buffered from one image for metadata parsing.
@@ -272,6 +310,16 @@ fn is_tiff_magic(head: &[u8]) -> bool {
 /// most RAWs) and the `rexif` fallback parse a prefix bounded by
 /// `EXIF_READ_CAP`, so memory never scales with full file size.
 pub fn read_image_exif(path: &Path) -> ImageExif {
+    let mut out = read_image_exif_fields(path);
+    if out.caption.is_none() {
+        if let Ok(data) = read_prefix(path) {
+            out.caption = xmp_description(&data);
+        }
+    }
+    out
+}
+
+fn read_image_exif_fields(path: &Path) -> ImageExif {
     use std::io::{Read, Seek};
     let reader = exif::Reader::new();
     let Ok(mut file) = std::fs::File::open(path) else {
@@ -339,6 +387,7 @@ fn kamadak_fields(exif: &exif::Exif) -> ImageExif {
         ),
         width: dim(exif::Tag::PixelXDimension),
         height: dim(exif::Tag::PixelYDimension),
+        caption: ascii(exif::Tag::ImageDescription).and_then(|s| clean_caption(&s)),
     }
 }
 
@@ -366,6 +415,12 @@ fn rexif_fields(parsed: &rexif::ExifData) -> ImageExif {
                     rexif::TagValue::U8(v) => v.first().map(|&x| x as u32),
                     _ => None,
                 };
+            }
+            rexif::ExifTag::ImageDescription => {
+                out.caption = out
+                    .caption
+                    .take()
+                    .or_else(|| ascii().and_then(|s| clean_caption(&s)));
             }
             rexif::ExifTag::DateTimeOriginal => {
                 out.taken_at = out
@@ -546,6 +601,28 @@ fn signed_gps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captions_clean_and_extract_from_xmp() {
+        assert_eq!(
+            clean_caption("  Mia's   first\n shinkansen  ").as_deref(),
+            Some("Mia's first shinkansen")
+        );
+        assert_eq!(clean_caption(""), None);
+        assert_eq!(clean_caption("default"), None);
+        assert_eq!(clean_caption(" - "), None);
+        let xmp = br#"<x:xmpmeta><rdf:RDF><rdf:Description><dc:description><rdf:Alt><rdf:li xml:lang="x-default">Tom &amp; Jerry at the park</rdf:li></rdf:Alt></dc:description></rdf:Description></rdf:RDF></x:xmpmeta>"#;
+        assert_eq!(
+            xmp_description(xmp).as_deref(),
+            Some("Tom & Jerry at the park")
+        );
+        assert_eq!(xmp_description(b"no xmp here"), None);
+        let escaped = br#"<dc:description><rdf:li>Learning &amp;lt;html&amp;gt;</rdf:li>"#;
+        assert_eq!(
+            xmp_description(escaped).as_deref(),
+            Some("Learning &lt;html&gt;")
+        );
+    }
 
     #[test]
     fn parse_tz_offset_forms() {

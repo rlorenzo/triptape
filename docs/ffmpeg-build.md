@@ -12,7 +12,7 @@ No `--enable-nonfree` build may ever ship (not redistributable).
   Key flags: `--enable-gpl --enable-version3 --enable-libx264
   --enable-videotoolbox --enable-audiotoolbox`. No `--enable-nonfree`.
 - `scripts/check-ffmpeg.sh` result today: PASS on all required items
-  (`libx264`, native `aac`, `xfade`, `zoompan`, `loudnorm`).
+  (`libx264`, native `aac`, `xfade`, `perspective`, `loudnorm`).
 - Reported gaps (warn-only, see Gates G1): `zscale`, `drawtext`,
   `vidstabdetect`/`vidstabtransform`, `libass` all missing from this
   Homebrew build.

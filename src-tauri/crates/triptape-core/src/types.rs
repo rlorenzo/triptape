@@ -53,6 +53,9 @@ pub struct Asset {
     pub rotation_deg: u16,
     /// Live Photo pairing confidence, when applicable.
     pub pairing_confidence: Option<PairingConfidence>,
+    /// Caption embedded in the file by the user (EXIF/XMP), if any.
+    /// Wins over auto-generated place captions in plans.
+    pub user_caption: Option<String>,
 }
 
 impl Asset {
@@ -75,6 +78,7 @@ impl Asset {
             gps: None,
             rotation_deg: 0,
             pairing_confidence: None,
+            user_caption: None,
         }
     }
 }

@@ -14,7 +14,7 @@ start until G2 has a recorded outcome.
 ## Evidence (Sprint 0, 2026-11-03, macOS arm64 dev machine)
 
 - G1 (local, system ffmpeg — NOT the sidecar): `scripts/check-ffmpeg.sh`
-  PASS on required (`libx264`, native `aac`, `xfade`, `zoompan`,
+  PASS on required (`libx264`, native `aac`, `xfade`, `perspective`,
   `loudnorm`); gaps reported: `zscale`, `drawtext`, `vidstab`,
   `libass` missing. `scripts/spike-render.sh` PASS: Ken Burns
   (`zoompan`) + `xfade` + `acrossfade` + `loudnorm` render from lavfi

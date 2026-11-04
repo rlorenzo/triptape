@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS assets (
     lon REAL,
     rotation_deg INTEGER NOT NULL DEFAULT 0,
     pair_confidence TEXT,
+    user_caption TEXT,
     thumb_path TEXT,
     proxy_path TEXT,
     score_json TEXT
@@ -161,6 +162,19 @@ impl Db {
             conn.execute("ALTER TABLE assets ADD COLUMN tz_offset INTEGER", [])
                 .map_err(|e| e.to_string())?;
         }
+        // Migration for DBs created before embedded user captions were read.
+        let has_caption = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='user_caption'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| e.to_string())?
+            > 0;
+        if !has_caption {
+            conn.execute("ALTER TABLE assets ADD COLUMN user_caption TEXT", [])
+                .map_err(|e| e.to_string())?;
+        }
         Ok(Self { conn })
     }
 
@@ -236,9 +250,9 @@ impl Db {
             None => None,
         };
         self.conn.prepare_cached(
-            "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,path=excluded.path,companion_path=excluded.companion_path,kind=excluded.kind,size_bytes=excluded.size_bytes,mtime=excluded.mtime,content_hash=excluded.content_hash,phash=excluded.phash,width=excluded.width,height=excluded.height,duration_secs=excluded.duration_secs,taken_at=excluded.taken_at,tz_offset=excluded.tz_offset,time_guessed=excluded.time_guessed,lat=excluded.lat,lon=excluded.lon,rotation_deg=excluded.rotation_deg,pair_confidence=excluded.pair_confidence",
+            "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,path=excluded.path,companion_path=excluded.companion_path,kind=excluded.kind,size_bytes=excluded.size_bytes,mtime=excluded.mtime,content_hash=excluded.content_hash,phash=excluded.phash,width=excluded.width,height=excluded.height,duration_secs=excluded.duration_secs,taken_at=excluded.taken_at,tz_offset=excluded.tz_offset,time_guessed=excluded.time_guessed,lat=excluded.lat,lon=excluded.lon,rotation_deg=excluded.rotation_deg,pair_confidence=excluded.pair_confidence,user_caption=excluded.user_caption",
         ).and_then(|mut st| st.execute(params![
                 a.id, project_id,
                 a.path.to_string_lossy().to_string(),
@@ -248,7 +262,7 @@ impl Db {
                 a.width.map(|w| w as i64), a.height.map(|h| h as i64),
                 a.duration_secs, a.taken_at, a.tz_offset_secs, i64::from(a.time_guessed),
                 a.gps.map(|g| g.0), a.gps.map(|g| g.1),
-                a.rotation_deg as i64, conf,
+                a.rotation_deg as i64, conf, a.user_caption,
             ]),
         ).map_err(|e| e.to_string())?;
         Ok(())
@@ -258,7 +272,7 @@ impl Db {
         let mut st = self
             .conn
             .prepare(
-                "SELECT id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence FROM assets WHERE project_id=?1 ORDER BY taken_at NULLS LAST, id",
+                "SELECT id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption FROM assets WHERE project_id=?1 ORDER BY taken_at NULLS LAST, id",
             )
             .map_err(|e| e.to_string())?;
         let rows = st
@@ -295,6 +309,7 @@ impl Db {
                         Some("basename-only") => Some(PairingConfidence::BasenameOnly),
                         _ => None,
                     },
+                    user_caption: r.get(18)?,
                 })
             })
             .map_err(|e| e.to_string())?;

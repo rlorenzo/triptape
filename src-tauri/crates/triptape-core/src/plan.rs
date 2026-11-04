@@ -29,11 +29,12 @@ const MEDOID_MAX_FIXES: usize = 256;
 /// Hero lists longer than this drop entries below [`HERO_MIN_SCORE`].
 const HERO_TRIM_ABOVE: usize = 40;
 const HERO_MIN_SCORE: f32 = 0.35;
-/// Hard cap on hero entries: a 3-5 minute film at ~4-6 s per still plus
-/// clip trims holds roughly this many moments (PLAN Sec 9 / Sec 5.4).
+/// Hard cap on hero entries. At ~4 s per still plus clip trims this
+/// holds a roughly 4-6 minute film; same-chapter stills are also grouped
+/// into collages at render time, so each day can show several photos.
 /// Above the cap, keep each chapter's best entry, then the best-scored
 /// remainder, restored to story order.
-const HERO_CAP: usize = 60;
+const HERO_CAP: usize = 110;
 /// Reel pack size and quality bar (the first [`MIN_REELS`] picks skip the bar).
 const MAX_REELS: usize = 5;
 const MIN_REELS: usize = 3;
@@ -44,6 +45,46 @@ const REEL_MOTION_BONUS: f32 = 0.08;
 /// Chapter label for assets with no cluster.
 const UNGROUPED: &str = "Ungrouped";
 
+/// A user-supplied place label for a date range, applied only when GPS
+/// names nothing — e.g. a cruise ship's name for days at sea, which no
+/// gazetteer can know. Supplied at scan time (`--place-override`), never
+/// hardcoded in the app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaceOverride {
+    pub start: chrono::NaiveDate,
+    pub end: chrono::NaiveDate,
+    pub label: String,
+}
+
+/// Parse `YYYY-MM-DD..YYYY-MM-DD=Label` entries separated by `;`.
+pub fn parse_place_overrides(spec: &str) -> Result<Vec<PlaceOverride>, String> {
+    let mut out = vec![];
+    for part in spec.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+        let (range, label) = part
+            .split_once('=')
+            .ok_or_else(|| format!("place override {part:?} is missing =Label"))?;
+        let (a, b) = range
+            .split_once("..")
+            .ok_or_else(|| format!("place override {part:?} is missing a .. date range"))?;
+        let parse = |s: &str| {
+            chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+                .map_err(|e| format!("place override {part:?}: bad date: {e}"))
+        };
+        let (start, end) = (parse(a)?, parse(b)?);
+        if end < start || label.trim().is_empty() {
+            return Err(format!(
+                "place override {part:?} has an empty range or label"
+            ));
+        }
+        out.push(PlaceOverride {
+            start,
+            end,
+            label: label.trim().to_string(),
+        });
+    }
+    Ok(out)
+}
+
 /// Build the plan from scored, clustered assets.
 ///
 /// `cluster_of` maps asset id → cluster label; `scores` maps asset id →
@@ -52,6 +93,16 @@ pub fn build_plan(
     assets: &[Asset],
     cluster_of: &HashMap<String, String>,
     scores: &HashMap<String, Score>,
+) -> Plan {
+    build_plan_with_overrides(assets, cluster_of, scores, &[])
+}
+
+/// [`build_plan`] plus user place overrides for GPS-unnamed chapters.
+pub fn build_plan_with_overrides(
+    assets: &[Asset],
+    cluster_of: &HashMap<String, String>,
+    scores: &HashMap<String, Score>,
+    overrides: &[PlaceOverride],
 ) -> Plan {
     let ordered = story_order(assets);
     let score_of = |id: &str| scores.get(id).map_or(DEFAULT_SCORE, |s| s.total);
@@ -169,8 +220,16 @@ pub fn build_plan(
         .into_iter()
         .map(|(label, members)| {
             let gps: Vec<(f64, f64)> = members.iter().filter_map(|a| a.gps).collect();
-            let place = chapter_place(&gps);
             let first_date = members.iter().filter_map(|a| local_date(a)).min();
+            // GPS naming first; a user override (e.g. the ship's name for
+            // days at sea) only fills what GPS honestly cannot name.
+            let place = chapter_place(&gps).or_else(|| {
+                let d = first_date?;
+                overrides
+                    .iter()
+                    .find(|o| o.start <= d && d <= o.end)
+                    .map(|o| o.label.clone())
+            });
             Chapter {
                 title: place.clone().unwrap_or_else(|| human_chapter_title(label)),
                 asset_ids: members.iter().map(|a| a.id.clone()).collect(),
@@ -188,6 +247,7 @@ pub fn build_plan(
     // live on the chapter, not on every photo; without a pinned VLM we
     // never invent what a photo shows. Photos in unnamed places get no
     // auto caption (empty in Story review, ready for the user's words).
+    // A caption the user embedded in the file itself always wins.
     let captions: HashMap<String, String> = chapters
         .iter()
         .filter_map(|c| c.place.as_deref().map(|p| (c, p)))
@@ -196,6 +256,10 @@ pub fn build_plan(
                 .iter()
                 .map(move |id| (id.clone(), p.to_string()))
         })
+        .chain(ordered.iter().filter_map(|a| {
+            let caption = a.user_caption.clone()?;
+            Some((a.id.clone(), caption))
+        }))
         .collect();
 
     // Map polyline: GPS fixes in story order.
@@ -497,6 +561,63 @@ mod tests {
     }
 
     #[test]
+    fn user_caption_beats_place_caption() {
+        let mut a = asset("a", 1_714_557_600, AssetKind::Photo);
+        a.gps = Some((34.9671, 135.7727)); // Kyoto
+        a.user_caption = Some("Mia's first shinkansen ride".into());
+        let mut b = asset("b", 1_714_557_900, AssetKind::Photo);
+        b.gps = Some((34.9671, 135.7727));
+        let assets = vec![a, b];
+        let mut co = HashMap::new();
+        co.insert("a".into(), "2024-05-01 · place 1".into());
+        co.insert("b".into(), "2024-05-01 · place 1".into());
+        let plan = build_plan(&assets, &co, &scored(&["a", "b"]));
+        assert_eq!(plan.captions["a"], "Mia's first shinkansen ride");
+        assert_eq!(plan.captions["b"], "Kyoto, Japan");
+    }
+
+    #[test]
+    fn place_overrides_fill_only_unnamed_chapters() {
+        // Sea day (open-water GPS) inside the override range takes the
+        // user's label; a GPS-named day in range keeps its place; a sea
+        // day outside the range stays unnamed.
+        let overrides = parse_place_overrides("2024-05-01..2024-05-03=SS Test Ship").unwrap();
+        assert_eq!(overrides.len(), 1);
+        assert!(parse_place_overrides("2024-05-03..2024-05-01=X").is_err());
+        assert!(parse_place_overrides("May 1=X").is_err());
+        let ts = |date: &str| {
+            chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp()
+        };
+        let mut sea = asset("sea", ts("2024-05-02"), AssetKind::Photo);
+        sea.gps = Some((2.221, 105.205)); // open water: names nothing
+        let mut port = asset("port", ts("2024-05-02"), AssetKind::Photo);
+        port.gps = Some((34.9671, 135.7727)); // Kyoto
+        let mut far = asset("far", ts("2024-06-02"), AssetKind::Photo);
+        far.gps = Some((2.221, 105.205));
+        let assets = vec![sea, port, far];
+        let mut co = HashMap::new();
+        co.insert("sea".into(), "2024-05-02 · place 1".into());
+        co.insert("port".into(), "2024-05-02 · place 2".into());
+        co.insert("far".into(), "2024-06-02 · place 3".into());
+        let plan =
+            build_plan_with_overrides(&assets, &co, &scored(&["sea", "port", "far"]), &overrides);
+        let place_of = |id: &str| {
+            plan.chapters
+                .iter()
+                .find(|c| c.asset_ids.iter().any(|a| a == id))
+                .and_then(|c| c.place.as_deref())
+        };
+        assert_eq!(place_of("sea"), Some("SS Test Ship"));
+        assert_eq!(place_of("port"), Some("Kyoto, Japan"));
+        assert_eq!(place_of("far"), None);
+    }
+
+    #[test]
     fn chapter_titles_are_human_dates() {
         assert_eq!(human_chapter_title("2026-10-12 · place 21"), "Mon, Oct 12");
         assert_eq!(human_chapter_title("2024-05-01"), "Wed, May 1");
@@ -610,8 +731,8 @@ mod tests {
     }
 
     #[test]
-    fn hero_caps_at_sixty_keeping_story_order() {
-        let assets: Vec<Asset> = (0..80)
+    fn hero_caps_keeping_story_order() {
+        let assets: Vec<Asset> = (0..130)
             .map(|i| {
                 asset(
                     &format!("a{i:02}"),
@@ -621,7 +742,7 @@ mod tests {
             })
             .collect();
         let mut scores = HashMap::new();
-        for i in 0..80 {
+        for i in 0..130 {
             scores.insert(
                 format!("a{i:02}"),
                 Score {
@@ -633,8 +754,8 @@ mod tests {
         let plan = build_plan(&assets, &HashMap::new(), &scores);
         assert_eq!(
             plan.hero.len(),
-            60,
-            "hero capped at 60: {}",
+            110,
+            "hero capped at 110: {}",
             plan.hero.len()
         );
         assert!(
@@ -643,13 +764,13 @@ mod tests {
         );
         let ids: Vec<&str> = plan.hero.iter().map(|e| e.asset_id.as_str()).collect();
         let mut sorted = ids.clone();
-        sorted.sort_unstable();
+        sorted.sort_by_key(|id| id[1..].parse::<usize>().unwrap());
         assert_eq!(ids, sorted, "kept entries stay in story order");
     }
 
     #[test]
     fn hero_cap_keeps_every_chapter() {
-        let assets: Vec<Asset> = (0..61)
+        let assets: Vec<Asset> = (0..111)
             .map(|i| {
                 asset(
                     &format!("a{i:02}"),
@@ -660,9 +781,9 @@ mod tests {
             .collect();
         let mut scores = HashMap::new();
         let mut clusters = HashMap::new();
-        for i in 0..61 {
+        for i in 0..111 {
             let id = format!("a{i:02}");
-            let (total, day) = if i < 60 {
+            let (total, day) = if i < 110 {
                 (0.8, "Day 1")
             } else {
                 (0.7, "Day 2")
@@ -677,9 +798,9 @@ mod tests {
             clusters.insert(id, day.to_string());
         }
         let plan = build_plan(&assets, &clusters, &scores);
-        assert_eq!(plan.hero.len(), 60);
+        assert_eq!(plan.hero.len(), 110);
         assert!(
-            plan.hero.iter().any(|e| e.asset_id == "a60"),
+            plan.hero.iter().any(|e| e.asset_id == "a110"),
             "lower-scored chapter keeps its best shot"
         );
     }

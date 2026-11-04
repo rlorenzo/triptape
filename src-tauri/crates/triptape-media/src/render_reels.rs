@@ -297,6 +297,9 @@ pub fn render_reels(
     if !caps.gblur {
         fallbacks.push("gblur absent: portrait reels use plain dark bars".into());
     }
+    if !caps.perspective {
+        fallbacks.push("perspective absent: slideshow stills hold without motion".into());
+    }
 
     let mut reels: Vec<ReelFile> = vec![];
     for (i, r) in resolved.iter().take(5).enumerate() {
@@ -532,20 +535,18 @@ fn slideshow_duration(n: usize, slide_secs: f64, fade_secs: f64, xfade: bool) ->
 }
 
 /// One slideshow frame: full photo fitted over its own blurred fill, then
-/// a gentle push-in applied to the finished 9:16 composite. Zooming the
+/// a gentle glide applied to the finished 9:16 composite. Moving the
 /// composite (never the raw photo) keeps the aspect honest — zoompan on a
-/// landscape source squashes it into the portrait frame.
+/// landscape source squashes it into the portrait frame, and its
+/// integer-step re-cropping makes stills jitter.
 fn slideshow_frame_vf(caps: &Capabilities, i: usize, slide_secs: f64) -> String {
-    let base = ffmpeg::fit_over_blur(caps, &format!("[{i}:v]"), 1080, 1920, &i.to_string());
-    if caps.zoompan {
-        let frames = (slide_secs * 30.0).round().max(1.0) as u32;
-        format!(
-            "{base},{},format=yuv420p[v{i}]",
-            ffmpeg::push_in(0.05, frames, 1080, 1920)
-        )
-    } else {
-        format!("{base},fps=30,format=yuv420p[v{i}]")
-    }
+    let base = ffmpeg::fit_over_blur(caps, &format!("[{i}:v]"), 1620, 2880, &i.to_string());
+    let frames = (slide_secs * 30.0).round().max(1.0) as u32;
+    format!(
+        "{base},{},{},format=yuv420p[v{i}]",
+        ffmpeg::hold_still(frames),
+        ffmpeg::glide(caps, frames, 1080, 1920, i)
+    )
 }
 
 const SLIDE_TRANSITIONS: [&str; 4] = ["fade", "dissolve", "slideleft", "slideright"];
@@ -615,18 +616,7 @@ fn render_slideshow_reel(
     let total = slideshow_duration(n, opts.slide_secs, opts.fade_secs, caps.xfade);
     let mut args: Vec<String> = vec!["-y".into()];
     for d in &decoded {
-        if caps.zoompan {
-            args.extend(["-i".into(), s(&d.path)]);
-        } else {
-            args.extend([
-                "-loop".into(),
-                "1".into(),
-                "-t".into(),
-                format!("{:.3}", opts.slide_secs),
-                "-i".into(),
-                s(&d.path),
-            ]);
-        }
+        args.extend(["-i".into(), s(&d.path)]);
     }
     if let Some(m) = music {
         args.extend(["-stream_loop".into(), "-1".into(), "-i".into(), s(m)]);
@@ -676,12 +666,9 @@ fn render_still_reel_png(
 ) -> Result<(), crate::MediaError> {
     let frames = (dur * 30.0).round() as u32;
     // Same framing as one slideshow slide (input 0, output `[v0]`): full
-    // photo over its blurred fill, push-in on the finished 9:16 composite.
+    // photo over its blurred fill, glide on the finished 9:16 composite.
     let graph = slideshow_frame_vf(caps, 0, dur);
     let mut args: Vec<String> = vec!["-y".into()];
-    if !caps.zoompan {
-        args.extend(["-loop".into(), "1".into()]);
-    }
     args.extend([
         "-i".into(),
         s(img),
@@ -717,19 +704,20 @@ mod tests {
         let caps = Capabilities {
             gblur: true,
             xfade: true,
-            zoompan: true,
+            perspective: true,
             ..Default::default()
         };
         let g = slideshow_graph(3, &caps, 3.6, 0.6, 9.6, false);
         // Every slide: full photo over blurred fill (overlay), and the
-        // push-in zooms the composite AFTER the overlay — never the raw
+        // glide moves the composite AFTER the overlay — never the raw
         // landscape photo (that squashes it into 9:16).
         for i in 0..3 {
             assert!(g.contains(&format!("[bg{i}][fg{i}]overlay")), "{g}");
         }
         let overlay_at = g.find("overlay").unwrap();
-        let zoom_at = g.find("zoompan").unwrap();
-        assert!(overlay_at < zoom_at, "zoom applies to composite: {g}");
+        let zoom_at = g.find("perspective=").unwrap();
+        assert!(overlay_at < zoom_at, "glide applies to composite: {g}");
+        assert!(!g.contains("zoompan"), "no zoompan jitter: {g}");
         assert_eq!(g.matches("xfade=transition=").count(), 2, "{g}");
         assert!(g.contains("transition=fade") && g.contains("transition=dissolve"));
         // Duration math: crossfades overlap slides.

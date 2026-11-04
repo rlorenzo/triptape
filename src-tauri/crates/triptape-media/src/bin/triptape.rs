@@ -268,7 +268,15 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         .filter(|a| !suppressed.contains(a.id.as_str()))
         .cloned()
         .collect();
-    let p = planmod::build_plan(&plan_assets, &cluster_of, &scores);
+    // Optional user place labels for GPS-unnamed days (e.g. a ship name
+    // for days at sea): `YYYY-MM-DD..YYYY-MM-DD=Label` entries split by `;`.
+    let overrides = match flags.get("place-override") {
+        Some(spec) => {
+            planmod::parse_place_overrides(spec).unwrap_or_else(|e| die("place-override", e))
+        }
+        None => vec![],
+    };
+    let p = planmod::build_plan_with_overrides(&plan_assets, &cluster_of, &scores, &overrides);
     let elig = planmod::plan_eligibility(
         plan_assets.len(),
         plan_assets
@@ -354,6 +362,7 @@ fn fill_photo(a: &mut Asset, img: Option<&image::DynamicImage>) {
     a.taken_at = Some(ct.unix_secs);
     a.time_guessed = ct.time_guessed;
     a.tz_offset_secs = exif.tz_offset_secs;
+    a.user_caption = exif.caption.clone();
     a.gps = exif.gps;
     a.rotation_deg = exif
         .orientation
@@ -484,10 +493,10 @@ fn export_cmd(flags: &HashMap<String, String>) {
 
     let caps = ffmpeg::probe_capabilities(&ffmpeg_bin, &ffprobe_bin);
     println!(
-        "ffmpeg caps: libx264={} xfade={} zoompan={} tonemap={} zscale={} loudnorm={} drawtext={} libass={} vidstab={}",
+        "ffmpeg caps: libx264={} xfade={} perspective={} tonemap={} zscale={} loudnorm={} drawtext={} libass={} vidstab={}",
         caps.libx264,
         caps.xfade,
-        caps.zoompan,
+        caps.perspective,
         caps.tonemap,
         caps.zscale,
         caps.loudnorm,
