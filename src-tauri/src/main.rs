@@ -417,6 +417,37 @@ async fn swap_asset(
     })
 }
 
+/// Editor thumbnail: generated once per source version into the app cache dir,
+/// returned as a path the webview loads over `asset://` (scoped to that dir).
+/// Originals are never exposed. Returns None when no frame can be made,
+/// including when the source file is gone.
+#[tauri::command]
+async fn get_thumbnail(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+    asset_id: String,
+) -> Result<Option<String>, String> {
+    state.require_project(&project_id)?;
+    AppState::check_id(&asset_id)?;
+    let (src, kind) = state
+        .db
+        .lock()
+        .map_err(|e| e.to_string())?
+        .asset_source(&project_id, &asset_id)?
+        .ok_or_else(|| "unknown asset".to_string())?;
+    let cache = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let key = triptape_core::proxies::source_cache_key(&asset_id, &src).ok()?;
+        let dst = triptape_core::proxies::cache_path(&cache, "thumb", &key, ".jpg");
+        triptape_media::ffmpeg::render_thumb("ffmpeg", &src, kind, &dst)
+            .ok()
+            .map(|()| dst.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn export_video(app: tauri::AppHandle, project_id: String) -> Result<ExportSummary, String> {
     run_export(app, project_id, "render-video").await
@@ -484,7 +515,8 @@ fn main() {
             set_chapter_place,
             set_asset_caption,
             set_asset_excluded,
-            swap_asset
+            swap_asset,
+            get_thumbnail
         ])
         .run(tauri::generate_context!())
         .expect("error while running TripTape");

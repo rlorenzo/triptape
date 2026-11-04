@@ -1,4 +1,4 @@
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 // Tauri IPC layer with a graceful browser-preview fallback.
@@ -198,6 +198,43 @@ export async function swapAsset(projectId: string, fromAssetId: string, toAssetI
       }
     }
   });
+}
+
+const MAX_THUMB_JOBS = 4;
+let activeThumbJobs = 0;
+const thumbQueue: (() => void)[] = [];
+
+/** Run `job` once a slot is free: each cold thumbnail spawns a decoder. */
+async function withThumbSlot<T>(job: () => Promise<T>): Promise<T> {
+  if (activeThumbJobs < MAX_THUMB_JOBS) activeThumbJobs++;
+  else await new Promise<void>((resolve) => thumbQueue.push(resolve));
+  try {
+    return await job();
+  } finally {
+    const next = thumbQueue.shift();
+    if (next) next(); // hands this slot over
+    else activeThumbJobs--;
+  }
+}
+
+const thumbsInFlight = new Map<string, Promise<string | null>>();
+
+/**
+ * 320 px editor thumbnail as an `asset://` URL, or null. Only in-flight requests
+ * are shared: the backend re-checks the source each time, so edits show up.
+ */
+export function getThumbnail(projectId: string, assetId: string): Promise<string | null> {
+  if (!isTauri()) return Promise.resolve(null);
+  const key = `${projectId}/${assetId}`;
+  let hit = thumbsInFlight.get(key);
+  if (!hit) {
+    hit = withThumbSlot(() => invoke<string | null>("get_thumbnail", { projectId, assetId }))
+      .then((path) => (path ? convertFileSrc(path) : null))
+      .catch(() => null)
+      .finally(() => thumbsInFlight.delete(key));
+    thumbsInFlight.set(key, hit);
+  }
+  return hit;
 }
 
 /** Mirrors the backend `JobView` payload of `job://progress`. */
