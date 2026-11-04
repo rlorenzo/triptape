@@ -41,7 +41,6 @@
       "active": false,
       "pubkey": "<FILL: minisign public key for the update channel — BLOCKER, see docs/gates.md G5>",
       "endpoints": ["https://updates.triptape.app/{{target}}/{{current_version}}"]
-    },
-    "dialog": {}
+    }
   }
 }
