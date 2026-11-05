@@ -16,6 +16,7 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 use triptape_core::db::{Db, EditedPlan};
+use triptape_core::metadata;
 use triptape_core::types::{Asset, AssetKind, Chapter, PlanEntry};
 use triptape_media::export::Skipped;
 
@@ -88,6 +89,11 @@ pub struct AssetView {
     pub time_guessed: bool,
     pub has_gps: bool,
     pub is_live_photo: bool,
+    pub place: Option<String>,
+    /// Combined 0..1 quality score, once background scoring has run.
+    pub score: Option<f32>,
+    /// Whether the stored score marks this asset a story highlight.
+    pub highlight: bool,
 }
 
 impl From<&Asset> for AssetView {
@@ -102,6 +108,12 @@ impl From<&Asset> for AssetView {
             time_guessed: a.time_guessed,
             has_gps: a.gps.is_some(),
             is_live_photo: a.kind == AssetKind::LivePhoto,
+            place: a
+                .gps
+                .and_then(triptape_core::geo::place_name)
+                .filter(|s| !s.is_empty()),
+            score: a.score.as_ref().map(|s| s.total),
+            highlight: a.score.as_ref().is_some_and(|s| s.highlight),
         }
     }
 }
@@ -301,6 +313,139 @@ pub struct ExportSummary {
 // Pure helpers (unit-tested without a Tauri runtime)
 // ---------------------------------------------------------------------------
 
+/// Foreground metadata fill for desktop ingest (the Tauri shell's
+/// `scan_folder`): EXIF capture time / TZ / GPS / rotation / dims / caption
+/// for photos, ffprobe duration / dims / rotation / GPS / capture time for
+/// videos. Mirrors the CLI mapping in `triptape-media`'s `triptape` binary
+/// minus pixel-decode work (no phash, no decoded-image dimensions): EXIF
+/// reads are header-only and each video costs one ffprobe spawn.
+///
+/// Per-file fault-tolerant: unreadable EXIF or a failed probe falls back to
+/// file mtime with `time_guessed = true` and never fails the scan.
+pub fn fill_foreground_metadata(a: &mut Asset) {
+    if a.kind == AssetKind::Video {
+        let probe = metadata::probe_video("ffprobe", &a.path).ok();
+        let Some(p) = probe else {
+            a.taken_at = Some(a.mtime);
+            a.time_guessed = true;
+            return;
+        };
+        a.duration_secs = p.duration_secs();
+        if let Some((w, h)) = p.video_dims() {
+            a.width = Some(w);
+            a.height = Some(h);
+        }
+        a.rotation_deg = p.rotation_deg();
+        a.gps = p.gps();
+        let ct = metadata::resolve_capture_time(p.creation_time(), a.mtime);
+        a.taken_at = Some(ct.unix_secs);
+        a.time_guessed = ct.time_guessed;
+    } else {
+        let exif = metadata::read_image_exif(&a.path);
+        let ct = metadata::resolve_capture_time(exif.taken_at, a.mtime);
+        a.taken_at = Some(ct.unix_secs);
+        a.time_guessed = ct.time_guessed;
+        a.tz_offset_secs = exif.tz_offset_secs;
+        a.user_caption = exif
+            .caption
+            .clone()
+            .or_else(|| metadata::read_sidecar_caption(&a.path));
+        a.gps = exif.gps;
+        a.rotation_deg = exif
+            .orientation
+            .map(metadata::orientation_to_degrees)
+            .unwrap_or(0);
+        // Undecoded stills (e.g. HEIC): EXIF carries the true size.
+        if let (Some(w), Some(h)) = (exif.width, exif.height) {
+            a.width = Some(w);
+            a.height = Some(h);
+        }
+    }
+}
+
+/// Live Photo pairing for desktop ingest (`scan_folder`): fold each still +
+/// short same-stem motion pair into one [`AssetKind::LivePhoto`] row.
+///
+/// Mirrors the CLI (`triptape-media`'s `triptape` binary) semantics: the
+/// still absorbs its motion file (kind becomes LivePhoto, `companion_path`
+/// set, `pairing_confidence` set, `duration_secs` taken from the motion
+/// asset when the still lacks one) and the motion-only row is dropped.
+/// Capture time and every other still field are preserved, as is the
+/// original asset order.
+///
+/// Inputs come from already-probed assets, not disk: Photo-kind assets are
+/// stills, Video-kind assets are motions with `has_video_stream` true only
+/// when a duration was probed (an unknown duration must never merge, per
+/// the engine rules). Still content ids are unavailable here, so Tier 2
+/// (same directory + same stem + MOV at most 3.5 s) is the effective path;
+/// the engine's duration/conflict rules are relied on exactly, never
+/// loosened.
+pub fn apply_live_photo_pairing(assets: Vec<Asset>) -> Vec<Asset> {
+    use triptape_core::livephoto::{self, MotionFile, StillFile};
+
+    let stills: Vec<StillFile> = assets
+        .iter()
+        .filter(|a| a.kind == AssetKind::Photo)
+        .map(|a| StillFile {
+            path: a.path.clone(),
+            content_id: None,
+        })
+        .collect();
+    let motions: Vec<MotionFile> = assets
+        .iter()
+        .filter(|a| a.kind == AssetKind::Video)
+        .map(|a| MotionFile {
+            path: a.path.clone(),
+            content_id: None,
+            duration_secs: a.duration_secs,
+            // No stream table on `Asset`: a probed duration is the only
+            // motion evidence we have; unknown duration must never merge.
+            has_video_stream: a.duration_secs.is_some(),
+        })
+        .collect();
+    if stills.is_empty() || motions.is_empty() {
+        return assets;
+    }
+    let pairing = livephoto::pair_live_photos(stills, motions);
+    if pairing.pairs.is_empty() {
+        return assets;
+    }
+    let motion_duration: HashMap<&std::path::Path, Option<f64>> = pairing
+        .pairs
+        .iter()
+        .map(|p| {
+            let duration = assets
+                .iter()
+                .find(|a| a.path == p.motion)
+                .and_then(|a| a.duration_secs);
+            (p.motion.as_path(), duration)
+        })
+        .collect();
+    let paired_motion: HashMap<PathBuf, (&PathBuf, triptape_core::types::PairingConfidence)> =
+        pairing
+            .pairs
+            .iter()
+            .map(|p| (p.still.clone(), (&p.motion, p.confidence)))
+            .collect();
+    assets
+        .into_iter()
+        .filter_map(|mut a| {
+            if a.kind == AssetKind::Video && motion_duration.contains_key(a.path.as_path()) {
+                return None;
+            }
+            if let Some((motion, confidence)) = paired_motion.get(&a.path) {
+                a.kind = AssetKind::LivePhoto;
+                a.companion_path = Some((*motion).clone());
+                a.pairing_confidence = Some(*confidence);
+                if a.duration_secs.is_none() {
+                    a.duration_secs = motion_duration.get(motion.as_path()).copied().flatten();
+                }
+            }
+            Some(a)
+        })
+        .collect()
+}
+
 /// Borrow one page of `items`; page is 0-based, `per_page` clamped to 1..=500.
 pub fn paginate<T>(items: &[T], page: usize, per_page: usize) -> &[T] {
     let per = per_page.clamp(1, 500);
@@ -434,6 +579,24 @@ mod tests {
         assert_eq!(json["kind"], "photo");
         assert_eq!(json["takenAt"], 1_714_557_600);
         assert!(json.get("inHero").is_some());
+        // `place` is an Option like the other nullable fields: absent GPS
+        // serializes as null, never as an empty string.
+        assert!(json.get("place").is_some());
+        assert!(json["place"].is_null());
+    }
+
+    #[test]
+    fn asset_view_place_names_nearby_gps() {
+        let mut a = Asset::new("kyoto", PathBuf::from("/t/kyoto.jpg"), AssetKind::Photo);
+        a.gps = Some((34.9671, 135.7727));
+        let view = AssetView::from(&a);
+        assert!(view.has_gps);
+        assert_eq!(view.place.as_deref(), Some("Kyoto, Japan"));
+
+        let mut b = Asset::new("nogps", PathBuf::from("/t/nogps.jpg"), AssetKind::Photo);
+        b.gps = None;
+        let plain = AssetView::from(&b);
+        assert_eq!(plain.place, None);
     }
 
     #[test]
@@ -534,6 +697,52 @@ mod tests {
         assert_eq!(paginate(&v, 3, 0), [3]);
     }
 
+    /// Scratch dir for foreground-fill tests (`tempfile` is not a
+    /// dependency of this crate, so plain `std::fs` + the process id keeps
+    /// the names unique without a new dependency).
+    fn fill_scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "triptape-fill-test-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn foreground_fill_without_exif_falls_back_to_mtime() {
+        let dir = fill_scratch("noexif");
+        let path = dir.join("nometa.jpg");
+        std::fs::write(&path, b"not an image at all").unwrap();
+        let mut a = Asset::new("a1", path.clone(), AssetKind::Photo);
+        a.size_bytes = 19;
+        a.mtime = 1_700_000_000;
+        fill_foreground_metadata(&mut a);
+        assert_eq!(a.taken_at, Some(1_700_000_000));
+        assert!(a.time_guessed);
+        assert_eq!(a.gps, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn foreground_fill_unprobeable_video_falls_back_to_mtime() {
+        // Missing file: ffprobe (present or not) cannot probe it, exactly
+        // like the CLI's unprobeable-video path.
+        let dir = fill_scratch("novideo");
+        let mut a = Asset::new(
+            "v1",
+            dir.join("gone.mp4"),
+            AssetKind::Video,
+        );
+        a.size_bytes = 10;
+        a.mtime = 1_700_000_001;
+        fill_foreground_metadata(&mut a);
+        assert_eq!(a.taken_at, Some(1_700_000_001));
+        assert!(a.time_guessed);
+        assert_eq!(a.duration_secs, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn export_dir_falls_back_for_blank_trip_name() {
         assert!(default_export_dir("   ", "prj_1").ends_with("TripTape/trip (prj_1)"));
@@ -563,5 +772,59 @@ mod tests {
         assert!(valid_job_kind("export-all"));
         assert!(!valid_job_kind("rm -rf"));
         assert!(!valid_job_kind(""));
+    }
+
+    fn pairing_asset(id: &str, path: &str, kind: AssetKind, duration: Option<f64>) -> Asset {
+        let mut a = Asset::new(id, PathBuf::from(path), kind);
+        a.taken_at = Some(1_714_557_600);
+        a.duration_secs = duration;
+        a
+    }
+
+    #[test]
+    fn pairing_folds_short_mov_into_live_photo() {
+        let still = pairing_asset("s", "/t/IMG_101.HEIC", AssetKind::Photo, None);
+        let mov = pairing_asset("m", "/t/IMG_101.MOV", AssetKind::Video, Some(2.0));
+        let out = apply_live_photo_pairing(vec![still, mov]);
+        assert_eq!(out.len(), 1, "motion row must be dropped");
+        let lp = &out[0];
+        assert_eq!(lp.id, "s", "the surviving row is the still");
+        assert_eq!(lp.kind, AssetKind::LivePhoto);
+        assert_eq!(
+            lp.companion_path.as_deref(),
+            Some(std::path::Path::new("/t/IMG_101.MOV"))
+        );
+        assert!(lp.pairing_confidence.is_some());
+        assert_eq!(lp.duration_secs, Some(2.0), "duration comes from the motion");
+        assert_eq!(lp.taken_at, Some(1_714_557_600), "still capture time kept");
+    }
+
+    #[test]
+    fn pairing_keeps_long_mov_as_separate_video() {
+        let still = pairing_asset("s", "/t/IMG_102.HEIC", AssetKind::Photo, None);
+        let mov = pairing_asset("m", "/t/IMG_102.MOV", AssetKind::Video, Some(30.0));
+        let out = apply_live_photo_pairing(vec![still, mov]);
+        assert_eq!(out.len(), 2, "a 30s same-stem MOV is a real video");
+        assert_eq!(out[0].kind, AssetKind::Photo);
+        assert_eq!(out[1].kind, AssetKind::Video);
+        assert_eq!(out[1].companion_path, None);
+    }
+
+    #[test]
+    fn pairing_keeps_different_stem_mov_separate() {
+        let still = pairing_asset("s", "/t/IMG_103.HEIC", AssetKind::Photo, None);
+        let mov = pairing_asset("m", "/t/IMG_104.MOV", AssetKind::Video, Some(2.0));
+        let out = apply_live_photo_pairing(vec![still, mov]);
+        assert_eq!(out.len(), 2, "different stems never pair");
+        assert!(out.iter().all(|a| a.kind != AssetKind::LivePhoto));
+    }
+
+    #[test]
+    fn pairing_keeps_unknown_duration_mov_separate() {
+        let still = pairing_asset("s", "/t/IMG_105.HEIC", AssetKind::Photo, None);
+        let mov = pairing_asset("m", "/t/IMG_105.MOV", AssetKind::Video, None);
+        let out = apply_live_photo_pairing(vec![still, mov]);
+        assert_eq!(out.len(), 2, "unknown-duration MOV must never merge");
+        assert!(out.iter().all(|a| a.kind != AssetKind::LivePhoto));
     }
 }
