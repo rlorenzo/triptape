@@ -1116,20 +1116,14 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn scratch_dir(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("triptape-score-test-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     /// The parallel driver must cover every asset exactly once and agree
     /// with serial scoring. Videos score without touching disk or decoders;
     /// photos run against a warmed cache holding undecodable bytes, so they
     /// deterministically take the neutral fallback — no ffmpeg needed.
     #[test]
     fn parallel_scoring_agrees_with_serial() {
-        let dir = scratch_dir("agree");
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path();
         let cache = dir.join("cache");
         let mut assets = vec![];
         for i in 0..12 {
@@ -1167,6 +1161,5 @@ mod tests {
         let mut expected: Vec<String> = assets.iter().map(|a| a.id.clone()).collect();
         expected.sort_unstable();
         assert_eq!(covered, expected);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

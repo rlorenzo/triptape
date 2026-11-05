@@ -29,6 +29,9 @@ serde_json = "1"
 triptape-core = { path = "crates/triptape-core" }
 triptape-media = { path = "crates/triptape-media" }
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
