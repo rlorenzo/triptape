@@ -258,14 +258,19 @@ const MAX_THUMB_JOBS = 4;
 let activeThumbJobs = 0;
 const thumbQueue: (() => void)[] = [];
 
-/** Run `job` once a slot is free: each cold thumbnail spawns a decoder. */
+/**
+ * Run `job` once a slot is free: each cold thumbnail spawns a decoder.
+ * Queued requests run newest-first, so tiles scrolled into view jump ahead
+ * of stale requests queued while scrolling past. Running jobs are never
+ * preempted; every queued request still runs once scrolling settles.
+ */
 async function withThumbSlot<T>(job: () => Promise<T>): Promise<T> {
   if (activeThumbJobs < MAX_THUMB_JOBS) activeThumbJobs++;
   else await new Promise<void>((resolve) => thumbQueue.push(resolve));
   try {
     return await job();
   } finally {
-    const next = thumbQueue.shift();
+    const next = thumbQueue.pop();
     if (next) next(); // hands this slot over
     else activeThumbJobs--;
   }
