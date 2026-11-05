@@ -701,10 +701,8 @@ mod tests {
     /// dependency of this crate, so plain `std::fs` + the process id keeps
     /// the names unique without a new dependency).
     fn fill_scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "triptape-fill-test-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("triptape-fill-test-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -729,11 +727,7 @@ mod tests {
         // Missing file: ffprobe (present or not) cannot probe it, exactly
         // like the CLI's unprobeable-video path.
         let dir = fill_scratch("novideo");
-        let mut a = Asset::new(
-            "v1",
-            dir.join("gone.mp4"),
-            AssetKind::Video,
-        );
+        let mut a = Asset::new("v1", dir.join("gone.mp4"), AssetKind::Video);
         a.size_bytes = 10;
         a.mtime = 1_700_000_001;
         fill_foreground_metadata(&mut a);
@@ -795,7 +789,11 @@ mod tests {
             Some(std::path::Path::new("/t/IMG_101.MOV"))
         );
         assert!(lp.pairing_confidence.is_some());
-        assert_eq!(lp.duration_secs, Some(2.0), "duration comes from the motion");
+        assert_eq!(
+            lp.duration_secs,
+            Some(2.0),
+            "duration comes from the motion"
+        );
         assert_eq!(lp.taken_at, Some(1_714_557_600), "still capture time kept");
     }
 

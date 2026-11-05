@@ -215,12 +215,7 @@ pub fn score_step_label(done: usize, total: usize) -> String {
 /// (`base`..=`ceiling`, e.g. 0.15..=0.95 after the foreground steps). An
 /// empty file set is trivially complete at the ceiling. The result stays
 /// within the range and is monotonic non-decreasing in `bytes_done`.
-pub fn background_hash_progress(
-    bytes_done: u64,
-    total_bytes: u64,
-    base: f32,
-    ceiling: f32,
-) -> f32 {
+pub fn background_hash_progress(bytes_done: u64, total_bytes: u64, base: f32, ceiling: f32) -> f32 {
     if total_bytes == 0 {
         return ceiling;
     }
@@ -310,12 +305,8 @@ mod tests {
 
     #[test]
     fn background_hash_progress_stays_in_range_and_monotonic() {
-        let near = |got: f32, want: f32| {
-            assert!(
-                (got - want).abs() < 1e-6,
-                "expected {want}, got {got}"
-            )
-        };
+        let near =
+            |got: f32, want: f32| assert!((got - want).abs() < 1e-6, "expected {want}, got {got}");
         near(background_hash_progress(0, 1000, 0.15, 0.95), 0.15);
         near(background_hash_progress(1000, 1000, 0.15, 0.95), 0.95);
         // Empty set is trivially complete at the ceiling.

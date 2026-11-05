@@ -20,8 +20,7 @@ use triptape_app::{
 use triptape_core::{
     cluster,
     db::{Db, Project},
-    hash, jobs, metadata,
-    plan as planmod, proxies, scan, score,
+    hash, jobs, metadata, plan as planmod, proxies, scan, score,
     types::*,
 };
 
@@ -191,31 +190,36 @@ fn background_hash_job(
         // The engine invokes this on its coordinator thread only, so the
         // batched persists and throttled emits need no extra locking beyond
         // the brief Db guard each one takes itself.
-        hash::blake3_files_parallel(&paths, hash::INGEST_HASH_WORKERS, |idx, digest, miss_done, _| {
-            bytes_done += misses[idx].2;
-            pending.push((misses[idx].0.clone(), digest));
-            done = reused + miss_done;
-            let candidate = scan::background_hash_progress(
-                bytes_done,
-                total_bytes,
-                FOREGROUND_DONE_PROGRESS,
-                BACKGROUND_HASH_CEILING_PROGRESS,
-            )
-            .max(last_progress);
-            last_progress = candidate;
-            if pending.len() >= HASH_FLUSH_FILES || last_flush.elapsed() >= HASH_FLUSH_INTERVAL {
-                if flush(&mut pending).is_ok() {
-                    last_flush = std::time::Instant::now();
+        hash::blake3_files_parallel(
+            &paths,
+            hash::INGEST_HASH_WORKERS,
+            |idx, digest, miss_done, _| {
+                bytes_done += misses[idx].2;
+                pending.push((misses[idx].0.clone(), digest));
+                done = reused + miss_done;
+                let candidate = scan::background_hash_progress(
+                    bytes_done,
+                    total_bytes,
+                    FOREGROUND_DONE_PROGRESS,
+                    BACKGROUND_HASH_CEILING_PROGRESS,
+                )
+                .max(last_progress);
+                last_progress = candidate;
+                if pending.len() >= HASH_FLUSH_FILES || last_flush.elapsed() >= HASH_FLUSH_INTERVAL
+                {
+                    if flush(&mut pending).is_ok() {
+                        last_flush = std::time::Instant::now();
+                    }
                 }
-            }
-            let step = scan::hash_step_label(done, total);
-            if last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL || done == total {
-                if let Ok(db) = lock() {
-                    report_ingest(app, &db, job_id, candidate, &step);
+                let step = scan::hash_step_label(done, total);
+                if last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL || done == total {
+                    if let Ok(db) = lock() {
+                        report_ingest(app, &db, job_id, candidate, &step);
+                    }
+                    last_emit = std::time::Instant::now();
                 }
-                last_emit = std::time::Instant::now();
-            }
-        });
+            },
+        );
         flush(&mut pending)?;
         // --- Scoring ------------------------------------------------------
         // Decode/ffmpeg work runs lock-free; persists flush in short
@@ -229,21 +233,20 @@ fn background_hash_job(
             .collect();
         let score_total = unscored.len();
         if score_total > 0 {
-            let flush_scores =
-                |pending: &mut Vec<(String, Score)>| -> Result<(), String> {
-                    if pending.is_empty() {
-                        return Ok(());
+            let flush_scores = |pending: &mut Vec<(String, Score)>| -> Result<(), String> {
+                if pending.is_empty() {
+                    return Ok(());
+                }
+                let db = lock()?;
+                db.in_transaction(|db| {
+                    for (id, s) in pending.iter() {
+                        db.update_asset_score(id, s)?;
                     }
-                    let db = lock()?;
-                    db.in_transaction(|db| {
-                        for (id, s) in pending.iter() {
-                            db.update_asset_score(id, s)?;
-                        }
-                        Ok::<(), String>(())
-                    })?;
-                    pending.clear();
-                    Ok(())
-                };
+                    Ok::<(), String>(())
+                })?;
+                pending.clear();
+                Ok(())
+            };
             let mut pending_scores: Vec<(String, Score)> = vec![];
             let mut scored = 0usize;
             for a in &unscored {
@@ -307,7 +310,13 @@ fn background_hash_job(
     };
     if let Err(e) = work() {
         if let Ok(db) = lock() {
-            let _ = db.update_job(job_id, JobState::Failed, last_progress, Some("failed"), Some(&e));
+            let _ = db.update_job(
+                job_id,
+                JobState::Failed,
+                last_progress,
+                Some("failed"),
+                Some(&e),
+            );
             if let Ok(Some(job)) = db.get_job(job_id) {
                 emit(app, &job);
             }
@@ -419,178 +428,178 @@ async fn run_ingest(
     let worker_job = job_id.clone();
     let outcome = tauri::async_runtime::spawn_blocking(
         move || -> Result<(usize, Vec<(String, PathBuf, u64, i64)>), String> {
-        let state = worker_app.state::<AppState>();
-        let lock = || state.db.lock().map_err(|e| e.to_string());
-        lock()?.update_job(
-            &worker_job,
-            JobState::Running,
-            0.0,
-            Some("Finding files…"),
-            None,
-        )?;
-        // Elapsed-since markers implement the ~5 Hz emit ceiling; the first
-        // emit of each phase is forced so small folders still show movement.
-        // `last_progress` is returned on failure so the terminal Failed row
-        // keeps the bar monotonic instead of dropping back to 0.
-        let mut last_emit = std::time::Instant::now() - PROGRESS_EMIT_INTERVAL;
-        let mut last_progress = 0.0f32;
-        if let Ok(db) = lock() {
-            report_ingest(&worker_app, &db, &worker_job, 0.0, "Finding files…");
-            last_emit = std::time::Instant::now();
-        }
-        let mut work = || -> Result<(usize, Vec<(String, PathBuf, u64, i64)>), String> {
-            // Walk phase: the total is unknown, so progress stays 0
-            // (indeterminate) and only the found-count step text advances.
-            // `scan_folder_batched` invokes the callback per ~500-file batch,
-            // which is already coarser than the 5 Hz ceiling.
-            let mut found = 0usize;
-            let result = scan::scan_folder_batched(&canon, 500, |batch| {
-                found += batch.len();
-                if last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
-                    if let Ok(db) = lock() {
-                        report_ingest(
-                            &worker_app,
-                            &db,
-                            &worker_job,
-                            0.0,
-                            &scan::walk_step_label(found),
-                        );
-                    }
-                    last_emit = std::time::Instant::now();
-                }
-            })
-            .map_err(|e| e.to_string())?;
-            let total = result.files.len();
-            // Progressive ingest: assets persist hash-less so the command
-            // returns (and the library becomes browsable) as soon as the
-            // walk, clustering, and initial plan are saved. The detached
-            // background task fills in content hashes afterwards. Clustering
-            // uses only taken_at/gps and the plan tolerates missing hashes,
-            // so both are valid pre-hash.
-            let mut assets: Vec<Asset> = Vec::with_capacity(total);
-            for (i, f) in result.files.iter().enumerate() {
-                let kind = if scan::VIDEO_EXTS.contains(&f.ext.as_str()) {
-                    AssetKind::Video
-                } else {
-                    AssetKind::Photo
-                };
-                let mut a = Asset::new(format!("{pid}_a{i:06}"), f.path.clone(), kind);
-                a.size_bytes = f.size_bytes;
-                a.mtime = f.mtime_secs;
-                // EXIF capture time / GPS (photos) or ffprobe truth (videos)
-                // when readable; mtime + `time_guessed` otherwise. Never
-                // fails the file: clustering and the initial plan below run
-                // on real times/GPS. No pixel decoding on this path.
-                fill_foreground_metadata(&mut a);
-                assets.push(a);
-            }
-            // Same trip-timezone normalization as the CLI: assets whose EXIF
-            // lacks an offset inherit the nearest dated neighbor's.
-            metadata::fill_tz_offsets(&mut assets);
-            // Live Photo pairing before clustering/plan/persist: each still
-            // + short same-stem motion pair becomes one LivePhoto row and
-            // the motion-only row is dropped, so clusters, the plan, the
-            // persisted rows, and the background hashing file list below
-            // all see the paired set. The motion file is not hashed as its
-            // own asset (the Live Photo row hashes its still).
-            assets = apply_live_photo_pairing(assets);
-            // Short foreground phases; the background task continues from
-            // `FOREGROUND_DONE_PROGRESS` once the command returns.
-            if let Ok(db) = lock() {
-                report_ingest(&worker_app, &db, &worker_job, 0.05, "Grouping photos…");
-                last_progress = 0.05;
-            }
-            let mut clusters = cluster::cluster_assets(&assets);
-            for c in &mut clusters {
-                c.id = format!("{pid}_{}", c.id);
-            }
-            let cluster_of: HashMap<String, String> = clusters
-                .iter()
-                .flat_map(|c| c.asset_ids.iter().map(|id| (id.clone(), c.label.clone())))
-                .collect();
-            // The foreground plan is unscored by design (no pixel decode on
-            // this path, so the library opens fast); the background task
-            // scores every asset and rebuilds the plan before marking Done.
-            let plan = planmod::build_plan(&assets, &cluster_of, &HashMap::new());
-            if let Ok(db) = lock() {
-                report_ingest(&worker_app, &db, &worker_job, 0.10, "Building story plan…");
-                last_progress = 0.10;
-            }
-            let db = lock()?;
-            db.in_transaction(|db| {
-                if refresh {
-                    // In-place refresh: drop the previous cluster graph
-                    // before re-inserting (cluster ids are project-scoped,
-                    // so the old links/clusters would otherwise linger
-                    // next to the rebuilt ones).
-                    db.clear_project_clusters(&pid)?;
-                }
-                for a in &assets {
-                    db.upsert_asset(&pid, a)?;
-                }
-                if refresh {
-                    // Prune rows whose files left the folder. Kept ids
-                    // upsert in place above (identical ids for unchanged
-                    // folders), so `plan_edits` keep applying.
-                    let keep: Vec<String> =
-                        assets.iter().map(|a| a.id.clone()).collect();
-                    db.delete_stale_assets(&pid, &keep)?;
-                }
-                for c in &clusters {
-                    db.insert_cluster(&pid, "day", c)?;
-                    for id in &c.asset_ids {
-                        let hero = c.asset_ids.first().is_some_and(|h| h == id);
-                        db.link_asset_cluster(id, &c.id, hero)?;
-                    }
-                }
-                Ok::<(), String>(())
-            })?;
-            db.insert_plan(&pid, &plan, "local")?;
-            // Hand off to the background hashing task: the row stays Running
-            // so the global indicator keeps driving until Done. The hashed
-            // set is the paired assets (motion halves ride along inside
-            // their Live Photo row, unhashed); `files_seen` above stays the
-            // enumerated total.
-            let paired_total = assets.len();
-            db.update_job(
+            let state = worker_app.state::<AppState>();
+            let lock = || state.db.lock().map_err(|e| e.to_string());
+            lock()?.update_job(
                 &worker_job,
                 JobState::Running,
-                FOREGROUND_DONE_PROGRESS,
-                Some(&scan::hash_step_label(0, paired_total)),
+                0.0,
+                Some("Finding files…"),
                 None,
             )?;
-            if let Ok(Some(job)) = db.get_job(&worker_job) {
-                emit(&worker_app, &job);
-            }
-            last_progress = FOREGROUND_DONE_PROGRESS;
-            let files: Vec<(String, PathBuf, u64, i64)> = assets
-                .iter()
-                .map(|a| (a.id.clone(), a.path.clone(), a.size_bytes, a.mtime))
-                .collect();
-            Ok((total, files))
-        };
-        let result = work();
-        // A foreground failure ends the job Failed here; success hands the
-        // still-Running row to the detached background task, which always
-        // ends it in a terminal state. The Failed row keeps the last emitted
-        // progress so the bar stays monotonic; the outer emit below re-sends
-        // the terminal row as well.
-        if let Err(e) = &result {
+            // Elapsed-since markers implement the ~5 Hz emit ceiling; the first
+            // emit of each phase is forced so small folders still show movement.
+            // `last_progress` is returned on failure so the terminal Failed row
+            // keeps the bar monotonic instead of dropping back to 0.
+            let mut last_emit = std::time::Instant::now() - PROGRESS_EMIT_INTERVAL;
+            let mut last_progress = 0.0f32;
             if let Ok(db) = lock() {
-                let _ = db.update_job(
+                report_ingest(&worker_app, &db, &worker_job, 0.0, "Finding files…");
+                last_emit = std::time::Instant::now();
+            }
+            let mut work = || -> Result<(usize, Vec<(String, PathBuf, u64, i64)>), String> {
+                // Walk phase: the total is unknown, so progress stays 0
+                // (indeterminate) and only the found-count step text advances.
+                // `scan_folder_batched` invokes the callback per ~500-file batch,
+                // which is already coarser than the 5 Hz ceiling.
+                let mut found = 0usize;
+                let result = scan::scan_folder_batched(&canon, 500, |batch| {
+                    found += batch.len();
+                    if last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
+                        if let Ok(db) = lock() {
+                            report_ingest(
+                                &worker_app,
+                                &db,
+                                &worker_job,
+                                0.0,
+                                &scan::walk_step_label(found),
+                            );
+                        }
+                        last_emit = std::time::Instant::now();
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+                let total = result.files.len();
+                // Progressive ingest: assets persist hash-less so the command
+                // returns (and the library becomes browsable) as soon as the
+                // walk, clustering, and initial plan are saved. The detached
+                // background task fills in content hashes afterwards. Clustering
+                // uses only taken_at/gps and the plan tolerates missing hashes,
+                // so both are valid pre-hash.
+                let mut assets: Vec<Asset> = Vec::with_capacity(total);
+                for (i, f) in result.files.iter().enumerate() {
+                    let kind = if scan::VIDEO_EXTS.contains(&f.ext.as_str()) {
+                        AssetKind::Video
+                    } else {
+                        AssetKind::Photo
+                    };
+                    let mut a = Asset::new(format!("{pid}_a{i:06}"), f.path.clone(), kind);
+                    a.size_bytes = f.size_bytes;
+                    a.mtime = f.mtime_secs;
+                    // EXIF capture time / GPS (photos) or ffprobe truth (videos)
+                    // when readable; mtime + `time_guessed` otherwise. Never
+                    // fails the file: clustering and the initial plan below run
+                    // on real times/GPS. No pixel decoding on this path.
+                    fill_foreground_metadata(&mut a);
+                    assets.push(a);
+                }
+                // Same trip-timezone normalization as the CLI: assets whose EXIF
+                // lacks an offset inherit the nearest dated neighbor's.
+                metadata::fill_tz_offsets(&mut assets);
+                // Live Photo pairing before clustering/plan/persist: each still
+                // + short same-stem motion pair becomes one LivePhoto row and
+                // the motion-only row is dropped, so clusters, the plan, the
+                // persisted rows, and the background hashing file list below
+                // all see the paired set. The motion file is not hashed as its
+                // own asset (the Live Photo row hashes its still).
+                assets = apply_live_photo_pairing(assets);
+                // Short foreground phases; the background task continues from
+                // `FOREGROUND_DONE_PROGRESS` once the command returns.
+                if let Ok(db) = lock() {
+                    report_ingest(&worker_app, &db, &worker_job, 0.05, "Grouping photos…");
+                    last_progress = 0.05;
+                }
+                let mut clusters = cluster::cluster_assets(&assets);
+                for c in &mut clusters {
+                    c.id = format!("{pid}_{}", c.id);
+                }
+                let cluster_of: HashMap<String, String> = clusters
+                    .iter()
+                    .flat_map(|c| c.asset_ids.iter().map(|id| (id.clone(), c.label.clone())))
+                    .collect();
+                // The foreground plan is unscored by design (no pixel decode on
+                // this path, so the library opens fast); the background task
+                // scores every asset and rebuilds the plan before marking Done.
+                let plan = planmod::build_plan(&assets, &cluster_of, &HashMap::new());
+                if let Ok(db) = lock() {
+                    report_ingest(&worker_app, &db, &worker_job, 0.10, "Building story plan…");
+                    last_progress = 0.10;
+                }
+                let db = lock()?;
+                db.in_transaction(|db| {
+                    if refresh {
+                        // In-place refresh: drop the previous cluster graph
+                        // before re-inserting (cluster ids are project-scoped,
+                        // so the old links/clusters would otherwise linger
+                        // next to the rebuilt ones).
+                        db.clear_project_clusters(&pid)?;
+                    }
+                    for a in &assets {
+                        db.upsert_asset(&pid, a)?;
+                    }
+                    if refresh {
+                        // Prune rows whose files left the folder. Kept ids
+                        // upsert in place above (identical ids for unchanged
+                        // folders), so `plan_edits` keep applying.
+                        let keep: Vec<String> = assets.iter().map(|a| a.id.clone()).collect();
+                        db.delete_stale_assets(&pid, &keep)?;
+                    }
+                    for c in &clusters {
+                        db.insert_cluster(&pid, "day", c)?;
+                        for id in &c.asset_ids {
+                            let hero = c.asset_ids.first().is_some_and(|h| h == id);
+                            db.link_asset_cluster(id, &c.id, hero)?;
+                        }
+                    }
+                    Ok::<(), String>(())
+                })?;
+                db.insert_plan(&pid, &plan, "local")?;
+                // Hand off to the background hashing task: the row stays Running
+                // so the global indicator keeps driving until Done. The hashed
+                // set is the paired assets (motion halves ride along inside
+                // their Live Photo row, unhashed); `files_seen` above stays the
+                // enumerated total.
+                let paired_total = assets.len();
+                db.update_job(
                     &worker_job,
-                    JobState::Failed,
-                    last_progress,
-                    Some("failed"),
-                    Some(e),
-                );
+                    JobState::Running,
+                    FOREGROUND_DONE_PROGRESS,
+                    Some(&scan::hash_step_label(0, paired_total)),
+                    None,
+                )?;
                 if let Ok(Some(job)) = db.get_job(&worker_job) {
                     emit(&worker_app, &job);
                 }
+                last_progress = FOREGROUND_DONE_PROGRESS;
+                let files: Vec<(String, PathBuf, u64, i64)> = assets
+                    .iter()
+                    .map(|a| (a.id.clone(), a.path.clone(), a.size_bytes, a.mtime))
+                    .collect();
+                Ok((total, files))
+            };
+            let result = work();
+            // A foreground failure ends the job Failed here; success hands the
+            // still-Running row to the detached background task, which always
+            // ends it in a terminal state. The Failed row keeps the last emitted
+            // progress so the bar stays monotonic; the outer emit below re-sends
+            // the terminal row as well.
+            if let Err(e) = &result {
+                if let Ok(db) = lock() {
+                    let _ = db.update_job(
+                        &worker_job,
+                        JobState::Failed,
+                        last_progress,
+                        Some("failed"),
+                        Some(e),
+                    );
+                    if let Ok(Some(job)) = db.get_job(&worker_job) {
+                        emit(&worker_app, &job);
+                    }
+                }
             }
-        }
-        result
-    })
+            result
+        },
+    )
     .await
     .map_err(|e| e.to_string())
     .and_then(|r| r);
@@ -689,12 +698,7 @@ async fn restore_latest_project(
         )?;
         job.id.clone()
     };
-    if let Ok(Some(job)) = state
-        .db
-        .lock()
-        .map_err(|e| e.to_string())?
-        .get_job(&job_id)
-    {
+    if let Ok(Some(job)) = state.db.lock().map_err(|e| e.to_string())?.get_job(&job_id) {
         emit(&app, &job);
     }
     let bg_app = app.clone();

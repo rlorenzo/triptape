@@ -287,10 +287,7 @@ impl Db {
             Some(PairingConfidence::BasenameOnly) => Some("basename-only"),
             None => None,
         };
-        let score_json = a
-            .score
-            .as_ref()
-            .and_then(|s| serde_json::to_string(s).ok());
+        let score_json = a.score.as_ref().and_then(|s| serde_json::to_string(s).ok());
         self.conn.prepare_cached(
             "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,score_json)
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -515,8 +512,7 @@ impl Db {
         project_id: &str,
         keep_ids: &[String],
     ) -> Result<usize, String> {
-        let keep: std::collections::HashSet<&str> =
-            keep_ids.iter().map(String::as_str).collect();
+        let keep: std::collections::HashSet<&str> = keep_ids.iter().map(String::as_str).collect();
         let mut st = self
             .conn
             .prepare("SELECT id FROM assets WHERE project_id=?1")
@@ -877,10 +873,7 @@ mod tests {
         assert!(db.assets_missing_score(&p.id).unwrap() == vec!["a2".to_string()]);
         // A corrupt score row reads back as unscored, not as an error.
         db.conn
-            .execute(
-                "UPDATE assets SET score_json='not json' WHERE id='a1'",
-                [],
-            )
+            .execute("UPDATE assets SET score_json='not json' WHERE id='a1'", [])
             .unwrap();
         let got = db.list_assets(&p.id).unwrap();
         assert!(got.iter().find(|x| x.id == "a1").unwrap().score.is_none());
@@ -1083,15 +1076,24 @@ mod tests {
                 .map(String::as_str),
             Some("deadbeef")
         );
-        assert!(cache
-            .get(&("/f/photo.jpg".to_string(), 101, 1000))
-            .is_none(), "changed size misses");
-        assert!(cache
-            .get(&("/f/photo.jpg".to_string(), 100, 1001))
-            .is_none(), "changed mtime misses");
-        assert!(cache
-            .get(&("/f/other.jpg".to_string(), 100, 1000))
-            .is_none(), "changed path misses");
+        assert!(
+            cache
+                .get(&("/f/photo.jpg".to_string(), 101, 1000))
+                .is_none(),
+            "changed size misses"
+        );
+        assert!(
+            cache
+                .get(&("/f/photo.jpg".to_string(), 100, 1001))
+                .is_none(),
+            "changed mtime misses"
+        );
+        assert!(
+            cache
+                .get(&("/f/other.jpg".to_string(), 100, 1000))
+                .is_none(),
+            "changed path misses"
+        );
     }
 
     #[test]
@@ -1110,7 +1112,8 @@ mod tests {
             centroid_gps: None,
             label: "day".into(),
         };
-        db.insert_cluster(&p.id, "day", &cluster("c1", "a1")).unwrap();
+        db.insert_cluster(&p.id, "day", &cluster("c1", "a1"))
+            .unwrap();
         db.link_asset_cluster("a1", "c1", true).unwrap();
         db.insert_cluster(&other.id, "day", &cluster("c9", "b1"))
             .unwrap();
@@ -1119,7 +1122,8 @@ mod tests {
         db.clear_project_clusters(&p.id).unwrap();
         // The same cluster id inserts cleanly again (no PK collision) and
         // the other project's graph is untouched.
-        db.insert_cluster(&p.id, "day", &cluster("c1", "a1")).unwrap();
+        db.insert_cluster(&p.id, "day", &cluster("c1", "a1"))
+            .unwrap();
         db.link_asset_cluster("a1", "c1", false).unwrap();
         assert_eq!(db.hero_ids("c1").unwrap(), Vec::<String>::new());
         assert_eq!(db.hero_ids("c9").unwrap(), vec!["b1".to_string()]);

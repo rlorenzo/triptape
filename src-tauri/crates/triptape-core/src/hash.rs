@@ -163,7 +163,10 @@ mod tests {
         let chunked = blake3_file_chunked(&p, |n| seen.push(n)).unwrap();
         assert_eq!(chunked, blake3::hash(&bytes).to_hex().as_str());
         assert_eq!(chunked, blake3_file(&p).unwrap());
-        assert!(seen.len() >= 3, "expected several chunk ticks, got {seen:?}");
+        assert!(
+            seen.len() >= 3,
+            "expected several chunk ticks, got {seen:?}"
+        );
         assert_eq!(*seen.last().unwrap(), bytes.len() as u64);
         let mut last = 0u64;
         for n in seen {
