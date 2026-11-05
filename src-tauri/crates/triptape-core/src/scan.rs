@@ -180,6 +180,54 @@ pub fn scan_folder(root: &Path) -> Result<ScanResult, String> {
     scan_folder_batched(root, 500, |_| {})
 }
 
+/// Determinate progress for the hashing phase of ingest: the first half of
+/// the job (0.0..=0.5). `done` counts finished files out of `total`. An
+/// empty file set is trivially complete at the phase boundary (0.5).
+/// The result never exceeds 0.5 and is monotonic non-decreasing in `done`.
+pub fn hash_phase_progress(done: usize, total: usize) -> f32 {
+    if total == 0 {
+        return 0.5;
+    }
+    (done as f32 / total as f32).clamp(0.0, 1.0) * 0.5
+}
+
+/// Step label for the enumeration phase, where the file total is unknown.
+/// Callers keep progress at 0 alongside this label so the UI stays
+/// indeterminate-friendly instead of faking a precise percent.
+pub fn walk_step_label(found: usize) -> String {
+    format!("Finding files… {found} found")
+}
+
+/// Step label for the background hashing phase, mirroring the old
+/// foreground format so the progress text keeps working.
+pub fn hash_step_label(done: usize, total: usize) -> String {
+    format!("Hashing files… {done} of {total}")
+}
+
+/// Step label for the background scoring phase, same shape as the hashing
+/// label so the progress text keeps working.
+pub fn score_step_label(done: usize, total: usize) -> String {
+    format!("Scoring photos… {done} of {total}")
+}
+
+/// Determinate progress for the background hashing phase of progressive
+/// ingest: byte-weighted completion mapped into the remaining job range
+/// (`base`..=`ceiling`, e.g. 0.15..=0.95 after the foreground steps). An
+/// empty file set is trivially complete at the ceiling. The result stays
+/// within the range and is monotonic non-decreasing in `bytes_done`.
+pub fn background_hash_progress(
+    bytes_done: u64,
+    total_bytes: u64,
+    base: f32,
+    ceiling: f32,
+) -> f32 {
+    if total_bytes == 0 {
+        return ceiling;
+    }
+    let frac = (bytes_done as f32 / total_bytes as f32).clamp(0.0, 1.0);
+    base + frac * (ceiling - base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +288,55 @@ mod tests {
         let r = scan_folder_batched(dir.path(), 3, |b| sizes.push(b.len())).unwrap();
         assert_eq!(r.files.len(), 7);
         assert_eq!(sizes, vec![3, 3, 1]);
+    }
+
+    #[test]
+    fn hash_phase_progress_maps_first_half_monotonically() {
+        assert_eq!(hash_phase_progress(0, 100), 0.0);
+        assert_eq!(hash_phase_progress(50, 100), 0.25);
+        assert_eq!(hash_phase_progress(100, 100), 0.5);
+        // Empty set is trivially complete at the phase boundary.
+        assert_eq!(hash_phase_progress(0, 0), 0.5);
+        // Over-counts clamp instead of overshooting into later phases.
+        assert_eq!(hash_phase_progress(200, 100), 0.5);
+        let mut last = 0.0f32;
+        for done in 0..=100 {
+            let p = hash_phase_progress(done, 100);
+            assert!(p >= last, "must be non-decreasing at done={done}");
+            assert!(p <= 0.5);
+            last = p;
+        }
+    }
+
+    #[test]
+    fn background_hash_progress_stays_in_range_and_monotonic() {
+        let near = |got: f32, want: f32| {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "expected {want}, got {got}"
+            )
+        };
+        near(background_hash_progress(0, 1000, 0.15, 0.95), 0.15);
+        near(background_hash_progress(1000, 1000, 0.15, 0.95), 0.95);
+        // Empty set is trivially complete at the ceiling.
+        near(background_hash_progress(0, 0, 0.15, 0.95), 0.95);
+        // Over-counts clamp instead of overshooting the ceiling.
+        near(background_hash_progress(9999, 1000, 0.15, 0.95), 0.95);
+        let mut last = 0.15f32;
+        for done in (0..=1000).step_by(7) {
+            let p = background_hash_progress(done, 1000, 0.15, 0.95);
+            assert!(p >= last, "must be non-decreasing at done={done}");
+            assert!((0.15..=0.95).contains(&p), "out of range: {p}");
+            last = p;
+        }
+        assert_eq!(hash_step_label(3, 12), "Hashing files… 3 of 12");
+        assert_eq!(score_step_label(3, 12), "Scoring photos… 3 of 12");
+    }
+
+    #[test]
+    fn walk_step_label_reports_count_without_faking_percent() {
+        assert_eq!(walk_step_label(0), "Finding files… 0 found");
+        assert_eq!(walk_step_label(1200), "Finding files… 1200 found");
     }
 
     #[test]
