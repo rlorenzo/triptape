@@ -2,8 +2,9 @@
   import ErrorNote from "./lib/ErrorNote.svelte";
   import Thumb from "./lib/Thumb.svelte";
   import { assets, exportJob, frameNumbers, project, screen } from "./lib/store";
-  import { friendlyStep } from "./lib/trip";
-  import { runExport } from "./lib/exporter";
+  import ProgressBar from "./lib/ProgressBar.svelte";
+  import { countOf, friendlyStep } from "./lib/trip";
+  import { runExport, wasAttempted } from "./lib/exporter";
   import { cancelJob, openExport, revealExport, REELS_DISCLOSURE, type ExportCmd } from "./lib/tauri";
 
   const KEEPSAKES: { cmd: Exclude<ExportCmd, "export_all">; label: string; blurb: string; button: string; note?: string }[] = [
@@ -18,7 +19,10 @@
     { cmd: "export_book", label: "Photo Book", blurb: "A print-ready PDF proof and a JPEG of every page.", button: "Make only the book" }
   ];
 
-  const SKIPPED_LABELS: Record<string, string> = { video: "Trip Video", reels: "Reels Pack", book: "Photo Book" };
+  function labelFor(cmd: ExportCmd): string {
+    if (cmd === "export_all") return "All three keepsakes";
+    return KEEPSAKES.find((k) => k.cmd === cmd)?.label ?? "Keepsake";
+  }
 
   let openError = "";
 
@@ -28,22 +32,19 @@
   $: hasPercent = job.progress > 0;
   $: summary = job.summary;
   $: madeSomething = !!summary && (!!summary.video || summary.reels.length > 0 || summary.bookPages > 0);
-  // A single-keepsake export reports the other two as "not selected"; that isn't news.
-  $: skipped = summary?.skipped.filter((s) => !s.reason.startsWith("not selected")) ?? [];
+  $: skipped = summary?.skipped.filter(wasAttempted) ?? [];
 
   // A photo from the trip to sit beside the finished film.
   $: poster = $assets.find((a) => a.highlight) ?? $assets[0];
 
-  function retry() {
-    const cmd = job.cmd;
-    if (!cmd) return;
-    start(cmd, cmd === "export_all" ? "All three keepsakes" : (KEEPSAKES.find((k) => k.cmd === cmd)?.label ?? "Keepsake"));
-  }
-
-  function start(cmd: ExportCmd, label: string) {
+  function start(cmd: ExportCmd) {
     if (!$project) return;
     openError = "";
-    runExport(cmd, label, $project.projectId);
+    runExport(cmd, labelFor(cmd), $project.projectId);
+  }
+
+  function retry() {
+    if (job.cmd) start(job.cmd);
   }
 
   async function open(action: (path: string) => Promise<void>, path: string) {
@@ -64,7 +65,7 @@
         <p>{k.blurb}</p>
         {#if k.note && !summary?.reels.length}<p class="note">{k.note}</p>{/if}
       </div>
-      <button class="btn" disabled={busy} on:click={() => start(k.cmd, k.label)}>{k.button}</button>
+      <button class="btn" disabled={busy} on:click={() => start(k.cmd)}>{k.button}</button>
     </div>
   {/each}
 {/snippet}
@@ -78,7 +79,7 @@
       {/if}
     </div>
     {#if $project && !madeSomething}
-      <button class="btn btn-primary" disabled={busy} on:click={() => start("export_all", "All three keepsakes")}>Make all three</button>
+      <button class="btn btn-primary" disabled={busy} on:click={() => start("export_all")}>Make all three</button>
     {/if}
   </div>
 
@@ -95,9 +96,7 @@
           <h2>Making {job.label?.toLowerCase()}</h2>
           {#if hasPercent}<span class="pct">{percent}%</span>{/if}
         </div>
-        <div class="progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={hasPercent ? percent : undefined} aria-label="Export progress">
-          {#if hasPercent}<div style="width: {percent}%"></div>{:else}<div class="indeterminate"></div>{/if}
-        </div>
+        <ProgressBar value={hasPercent ? job.progress : null} label="Export progress" />
         <div class="running-foot">
           <p role="status" aria-live="polite">{friendlyStep(job.step) || "Working on it. This can take a while."}</p>
           <button class="btn" disabled={!job.jobId} on:click={() => cancelJob(job.jobId)}>Cancel</button>
@@ -136,7 +135,7 @@
           <div class="made">
             <div>
               <h2>Reels Pack</h2>
-              <p>{summary.reels.length} {summary.reels.length === 1 ? "clip" : "clips"}. {REELS_DISCLOSURE}</p>
+              <p>{countOf(summary.reels.length, "clip")}. {REELS_DISCLOSURE}</p>
             </div>
             <div class="made-actions">
               <button class="btn" on:click={() => summary && open(revealExport, summary.reels[0])}>Show in folder</button>
@@ -157,7 +156,7 @@
         {#each skipped as s}
           <div class="made not-made">
             <div>
-              <h2>{SKIPPED_LABELS[s.keepsake] ?? s.keepsake}: not made</h2>
+              <h2>{labelFor(`export_${s.keepsake}` as ExportCmd)}: not made</h2>
               <p>{s.reason}</p>
             </div>
           </div>
@@ -174,10 +173,8 @@
       {#if madeSomething}
         <div class="again">
           <h2>Changed the story? Make them again.</h2>
-          <button class="btn" disabled={busy} on:click={() => start("export_all", "All three keepsakes")}>Make all three again</button>
+          <button class="btn" disabled={busy} on:click={() => start("export_all")}>Make all three again</button>
         </div>
-      {/if}
-      {#if madeSomething}
         <details>
           <summary>Make only one</summary>
           {@render rows()}

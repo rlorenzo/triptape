@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { screen, project, assets, ingestJob, exportJob, storyPicks, IDLE_EXPORT } from "./lib/store";
-  import { applyExportProgress, savedExport } from "./lib/exporter";
-  import { friendlyStep } from "./lib/trip";
+  import { screen, project, assets, ingestJob, exportJob, storyPicks, IDLE_EXPORT, type ExportJobState } from "./lib/store";
+  import { applyExportProgress, exportStateFor } from "./lib/exporter";
+  import { countOf, friendlyStep } from "./lib/trip";
+  import ProgressBar from "./lib/ProgressBar.svelte";
   import { getStory, onProgress, restoreLatestProject, loadAllAssets, isTauri } from "./lib/tauri";
   import Import from "./Import.svelte";
   import Library from "./Library.svelte";
@@ -96,12 +97,12 @@
   $: ingestFailed = $ingestJob?.state === "failed";
   $: ingestPercent = Math.round(($ingestJob?.progress ?? 0) * 100);
 
-  // Per-trip status starts over when the trip changes.
+  // Per-trip status follows the trip; an export still rendering keeps its own state.
   let ticketTrip: string | undefined;
   $: if ($project?.projectId !== ticketTrip) {
     ticketTrip = $project?.projectId;
     storyPicks.set(null);
-    exportJob.set({ ...IDLE_EXPORT, summary: ticketTrip ? savedExport(ticketTrip) : null });
+    exportJob.set(ticketTrip ? exportStateFor(ticketTrip) : IDLE_EXPORT);
     if (ticketTrip) loadPicks(ticketTrip);
   }
 
@@ -130,36 +131,26 @@
     });
   }
 
-  function formatCount(n: number): string {
-    return n.toLocaleString();
+  function storyStatusText(picks: number | null, running: boolean): string {
+    if (picks) return countOf(picks, "pick");
+    if (running) return "Still sorting";
+    return picks === 0 ? "No picks yet" : "Not ready";
   }
 
-  $: made = $exportJob.summary
-    ? [
-        $exportJob.summary.video && "Film",
-        $exportJob.summary.reels.length > 0 && "reels",
-        $exportJob.summary.bookPages > 0 && "book"
-      ].filter(Boolean)
-    : [];
-  $: storyStatus =
-    $storyPicks !== null && $storyPicks > 0
-      ? `${formatCount($storyPicks)} picks`
-      : ingestRunning
-        ? "Still sorting"
-        : $storyPicks === 0
-          ? "No picks yet"
-          : "Not ready";
-  $: keepsakeStatus = $exportJob.label
-    ? $exportJob.progress > 0
-      ? `Making, ${Math.round($exportJob.progress * 100)}%`
-      : "Making"
-    : $exportJob.error
-      ? "Stopped"
-      : made.length > 0
-        ? made.length === 3
-          ? "All three"
-          : made.join(", ")
-        : "Not made yet";
+  function keepsakeStatusText(job: ExportJobState): string {
+    if (job.label) return job.progress > 0 ? `Making, ${Math.round(job.progress * 100)}%` : "Making";
+    if (job.error) return "Stopped";
+    const made = [
+      job.summary?.video && "Film",
+      job.summary?.reels.length && "reels",
+      job.summary?.bookPages && "book"
+    ].filter(Boolean);
+    if (made.length === 0) return "Not made yet";
+    return made.length === 3 ? "All three" : made.join(", ");
+  }
+
+  $: storyStatus = storyStatusText($storyPicks, ingestRunning);
+  $: keepsakeStatus = keepsakeStatusText($exportJob);
 </script>
 
 <div class="shell">
@@ -179,7 +170,7 @@
       {#if $project}
         <h2 title={$project.projectName}>{$project.projectName}</h2>
         <dl>
-          <div><dt>Files found</dt><dd>{formatCount($assets.length || $project.filesSeen)}</dd></div>
+          <div><dt>Files found</dt><dd>{($assets.length || $project.filesSeen).toLocaleString()}</dd></div>
           <div><dt>Story</dt><dd>{storyStatus}</dd></div>
           <div><dt>Keepsakes</dt><dd>{keepsakeStatus}</dd></div>
         </dl>
@@ -190,16 +181,7 @@
       {#if ingestRunning || ingestDone || ingestFailed}
         <div class="ingest" role="status" aria-live="polite">
           {#if ingestRunning}
-            <div
-              class="progress"
-              role="progressbar"
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={ingestPercent}
-              aria-label="Checking files"
-            >
-              <div style="width: {ingestPercent}%"></div>
-            </div>
+            <ProgressBar value={$ingestJob?.progress ?? 0} label="Checking files" />
             <p>{ingestPercent}% · {friendlyStep($ingestJob?.step)}</p>
           {:else if ingestDone}
             <p>Library up to date</p>

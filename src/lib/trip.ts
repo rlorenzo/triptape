@@ -23,3 +23,38 @@ export function friendlyStep(step: string | undefined): string {
     .replace(/^Grouping photos/i, "Sorting into days and places")
     .replace(/^(Building|Refreshing) story plan/i, "Building your story");
 }
+
+// Built once: constructing an Intl formatter per call is the slow part, and
+// these run per tile and per filter keystroke.
+const DAY = new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric" });
+const TIME = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
+const WHEN = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+const FULL = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+  hour: "2-digit",
+  minute: "2-digit"
+});
+
+const formatWith = (format: Intl.DateTimeFormat) => (takenAt?: number) =>
+  takenAt ? format.format(takenAt * 1000) : "";
+
+/** "Tue, Nov 3" */
+export const formatDay = formatWith(DAY);
+/** "2:05 PM" */
+export const formatTime = formatWith(TIME);
+/** "Nov 3, 2:05 PM" */
+export const formatWhen = formatWith(WHEN);
+/** "Nov 3, 2026, 02:05 PM": everything the Library's search box can match. */
+export const formatFull = formatWith(FULL);
+
+export function kindLabel(a: { kind: string; isLivePhoto: boolean }): string {
+  if (a.isLivePhoto) return "Live Photo";
+  return a.kind === "video" ? "Video" : "Photo";
+}
+
+/** "1 file", "2,119 files". Regular plurals only. */
+export function countOf(n: number, noun: string): string {
+  return `${n.toLocaleString()} ${noun}${n === 1 ? "" : "s"}`;
+}

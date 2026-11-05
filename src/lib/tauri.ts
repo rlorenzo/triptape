@@ -1,6 +1,7 @@
 import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { simulateDemoIngestBackground } from "./store";
+import { formatDay } from "./trip";
 
 // Tauri IPC layer with a graceful browser-preview fallback.
 //
@@ -192,11 +193,7 @@ function buildDemoStory(): StoryView {
       title: place ?? "At sea",
       place,
       dayIndex: c + 1,
-      dateLabel: new Date((items[0]?.takenAt ?? 0) * 1000).toLocaleDateString(undefined, {
-        weekday: "short",
-        month: "short",
-        day: "numeric"
-      }),
+      dateLabel: formatDay(items[0]?.takenAt),
       entries: items.map((a, i) => ({ ...a, caption: place, inHero: i < 3, inReels: i === 0 }))
     };
   }).filter((c) => c.entries.length > 0);
@@ -334,6 +331,7 @@ export function getThumbnail(projectId: string, assetId: string): Promise<string
 /** Mirrors the backend `JobView` payload of `job://progress`. */
 export interface ProgressEvent {
   id: string;
+  projectId: string;
   kind: string;
   state: string;
   progress: number;

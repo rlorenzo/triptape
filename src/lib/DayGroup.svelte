@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import Thumb from "./Thumb.svelte";
   import type { AssetView } from "./tauri";
+  import { countOf, formatTime, kindLabel } from "./trip";
 
   export let day: {
     key: string;
@@ -32,16 +33,6 @@
     return () => observer.disconnect();
   });
 
-  function kindLabel(a: AssetView): string {
-    if (a.isLivePhoto || a.kind === "live-photo" || a.kind === "livephoto") return "Live Photo";
-    return a.kind === "video" ? "Video" : "Photo";
-  }
-
-  function time(a: AssetView): string {
-    if (!a.takenAt) return "";
-    return new Date(a.takenAt * 1000).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  }
-
   function detail(a: AssetView): string {
     const bits: string[] = [];
     if (a.isLivePhoto || a.kind === "video") {
@@ -52,8 +43,7 @@
   }
 
   function altText(a: AssetView): string {
-    const when = time(a);
-    return [`${kindLabel(a)} ${frameNumbers.get(a.id)}`, day.date, when, a.place].filter(Boolean).join(", ");
+    return [`${kindLabel(a)} ${frameNumbers.get(a.id)}`, day.date, formatTime(a.takenAt), a.place].filter(Boolean).join(", ");
   }
 
   $: estimatedRows = Math.ceil(day.items.length / 5);
@@ -63,18 +53,19 @@
   <div class="day-band">
     <h2>{day.number ? `Day ${day.number}` : "No date found"}</h2>
     {#if day.date}<span class="date">{day.date}</span>{/if}
-    <span class="sub">{day.places.join(" and ")}{day.places.length ? " · " : ""}{day.items.length.toLocaleString()} {day.items.length === 1 ? "file" : "files"}</span>
+    <span class="sub">{day.places.join(" and ")}{day.places.length ? " · " : ""}{countOf(day.items.length, "file")}</span>
   </div>
 
   {#if near}
     <div class="index-grid frames">
       {#each day.items as a (a.id)}
+        {@const extra = detail(a)}
         <figure>
           <Thumb {projectId} assetId={a.id} kind={kindLabel(a)} alt={altText(a)} />
           <figcaption>
             <span class="frame-no">{frameNumbers.get(a.id)}</span>
-            <span class="time">{time(a)}</span>
-            {#if detail(a)}<span class="detail">{detail(a)}</span>{/if}
+            <span class="time">{formatTime(a.takenAt)}</span>
+            {#if extra}<span class="detail">{extra}</span>{/if}
           </figcaption>
         </figure>
       {/each}

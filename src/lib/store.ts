@@ -18,16 +18,19 @@ export const screen = writable<Screen>("import");
 export const project = writable<ScanSummary | null>(null);
 export const assets = writable<AssetView[]>([]);
 
+/** Oldest first. A sorted copy, so the `assets` array is never mutated. */
+export const assetsByTime = derived(assets, ($assets) => [...$assets].sort(byTime));
+
 /** Frame numbers follow the whole trip, so filters and cuts never renumber a photo. */
 export const frameNumbers = derived(
-  assets,
-  ($assets) => new Map([...$assets].sort(byTime).map((a, i) => [a.id, i + 1]))
+  assetsByTime,
+  ($sorted) => new Map($sorted.map((a, i) => [a.id, i + 1]))
 );
 
 /** Day numbers follow the whole trip too. */
-export const dayNumbers = derived(assets, ($assets) => {
+export const dayNumbers = derived(assetsByTime, ($sorted) => {
   const numbers = new Map<string, number>();
-  for (const a of [...$assets].sort(byTime)) {
+  for (const a of $sorted) {
     const key = dayKey(a.takenAt);
     if (key !== "undated" && !numbers.has(key)) numbers.set(key, numbers.size + 1);
   }

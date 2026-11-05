@@ -3,6 +3,7 @@
   import { scanFolder, loadAllAssets, isTauri, onProgress } from "./lib/tauri";
   import { friendlyStep } from "./lib/trip";
   import ErrorNote from "./lib/ErrorNote.svelte";
+  import ProgressBar from "./lib/ProgressBar.svelte";
   import { onMount, onDestroy, tick } from "svelte";
 
   let folder = "";
@@ -15,12 +16,9 @@
   // Determinate once an event (or the demo simulation) reports progress > 0;
   // the walk phase stays at 0 and renders the indeterminate bar instead.
   $: determinate = seenAny && progress > 0;
-  $: percent = Math.round(progress * 100);
   // Sub-percent movement matters during hashing (1 file of 2119 is 0.02%):
-  // one decimal under 10%, integer at/above. `percent` stays the integer
-  // for aria-valuenow and the bar reads the raw value.
+  // one decimal under 10%, integer at/above.
   $: percentLabel = progress * 100 < 10 ? (progress * 100).toFixed(1) : String(Math.round(progress * 100));
-  $: barWidth = (progress * 100).toFixed(2);
 
   // Stray export jobs must not drive the scan bar: only `ingest` events
   // arriving while a scan is in flight count. Svelte runs the returned
@@ -170,24 +168,6 @@
 </script>
 
 <style>
-  @keyframes scan-slide {
-    from {
-      transform: translateX(-100%);
-    }
-    to {
-      transform: translateX(300%);
-    }
-  }
-  .scan-indeterminate {
-    width: 33%;
-    animation: scan-slide 1.2s linear infinite;
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .scan-indeterminate {
-      width: 100%;
-    }
-  }
-
   .import {
     display: flex;
     flex-direction: column;
@@ -307,20 +287,7 @@
   {#if busy}
     <div class="panel">
       <h2>Scanning {folder || "Demo Trip"}</h2>
-      <div
-        class="progress"
-        role="progressbar"
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={determinate ? percent : undefined}
-        aria-label="Scan progress"
-      >
-        {#if determinate}
-          <div style="width: {barWidth}%"></div>
-        {:else}
-          <div class="scan-indeterminate"></div>
-        {/if}
-      </div>
+      <ProgressBar value={determinate ? progress : null} label="Scan progress" />
       <p class="scan-step" aria-live="polite">
         {#if determinate}<span>{percentLabel}%</span>{/if}
         <span>{friendlyStep(step) || "Starting…"}</span>

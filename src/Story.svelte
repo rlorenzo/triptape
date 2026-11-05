@@ -12,9 +12,10 @@
     swapAsset
   } from "./lib/tauri";
   import type { StoryEntryView, StoryView } from "./lib/tauri";
+  import { countOf, formatWhen, kindLabel } from "./lib/trip";
 
   let story: StoryView | null = null;
-  let error = "";
+  let failure: { message: string; detail: string } | null = null;
   let pendingEdits = 0;
   let alternativesFor: string | null = null;
   let alternatives: StoryEntryView[] = [];
@@ -42,7 +43,6 @@
   // Reads the store directly so the markup re-renders when numbers arrive.
   $: frameOf = (id: string): number | undefined => $frameNumbers.get(id);
 
-  let errorMessage = "";
   let alternativesEl: HTMLElement;
 
   /** Editing removes the button that had focus, so hand focus to the nearest frame. */
@@ -84,11 +84,6 @@
     return c.dayIndex ? `Day ${c.dayIndex}` : c.title;
   }
 
-  function kindName(e: { kind: string; isLivePhoto: boolean }): string {
-    if (e.isLivePhoto) return "Live Photo";
-    return e.kind === "video" ? "Video" : "Photo";
-  }
-
   function usedIn(e: StoryEntryView): string {
     const uses = ["book"];
     if (e.inHero) uses.unshift("film");
@@ -98,7 +93,7 @@
   }
 
   function frameAlt(e: StoryEntryView, frame: number | undefined): string {
-    return e.caption || `${kindName(e)}${frame ? ` ${frame}` : ""}${fmtWhen(e) ? `, ${fmtWhen(e)}` : ""}`;
+    return e.caption || [`${kindLabel(e)}${frame ? ` ${frame}` : ""}`, formatWhen(e.takenAt)].filter(Boolean).join(", ");
   }
 
   function switchProject(id: string | undefined) {
@@ -108,7 +103,7 @@
     selectedId = null;
     renaming = false;
     everSaved = false;
-    error = "";
+    failure = null;
     alternativesFor = null;
     alternatives = [];
     if (id) load(id, generation);
@@ -123,8 +118,7 @@
       })
       .catch((e) => {
         if (gen === generation) {
-          error = String(e);
-          errorMessage = "Couldn't open your story. Go to the Library and rescan the folder, then come back.";
+          failure = { message: "Couldn't open your story. Go to the Library and rescan the folder, then come back.", detail: String(e) };
         }
       });
   }
@@ -135,7 +129,7 @@
     if (!id) return;
     const gen = generation;
     pendingEdits += 1;
-    error = "";
+    failure = null;
     editQueue = editQueue
       .then(() => op(id))
       .then((updated) => {
@@ -147,22 +141,20 @@
       })
       .catch((e) => {
         // Shown even after a project change: the user's edit was not saved.
-        error = String(e);
-        errorMessage = "That change didn't save. Try it again.";
+        failure = { message: "That change didn't save. Try it again.", detail: String(e) };
       })
       .finally(() => {
         pendingEdits -= 1;
       });
   }
 
-  function fmtWhen(e: { takenAt?: number }): string {
-    if (!e.takenAt) return "";
-    return new Date(e.takenAt * 1000).toLocaleString(undefined, {
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit"
-    });
+  // Captures the selection now: the edit runs from a queue, and it removes the
+  // button that had focus.
+  function editSelected(op: (id: string, assetId: string) => Promise<StoryView>) {
+    if (!selected) return;
+    const assetId = selected.id;
+    const index = selectedIndex();
+    edit((id) => op(id, assetId), () => focusFrame(index));
   }
 
   // Mirrors the backend's check_swap: replacing a pick with one already in the
@@ -176,7 +168,7 @@
     const gen = generation;
     alternativesFor = assetId;
     alternatives = [];
-    error = "";
+    failure = null;
     const current = () => gen === generation && alternativesFor === assetId;
     try {
       const found = await getAlternatives(pid, assetId);
@@ -187,8 +179,7 @@
       }
     } catch (e) {
       if (current()) {
-        error = String(e);
-        errorMessage = "Couldn't load other photos from this day. Try again.";
+        failure = { message: "Couldn't load other photos from this day. Try again.", detail: String(e) };
       }
     }
   }
@@ -199,7 +190,7 @@
     <div>
       <h1 class="headline" tabindex="-1">Your story</h1>
       {#if story && picks > 0}
-        <p class="lede">TripTape picked {picks.toLocaleString()} from {$assets.length.toLocaleString()} files, across {chapters.length} {chapters.length === 1 ? "day" : "days"}. Change anything, or take it as it is.</p>
+        <p class="lede">TripTape picked {picks.toLocaleString()} from {countOf($assets.length, "file")}, across {countOf(chapters.length, "day")}. Change anything, or take it as it is.</p>
       {/if}
     </div>
     {#if story && picks > 0}
@@ -211,7 +202,7 @@
     {#if busy}Saving…{:else if everSaved}Saved. Your changes apply to the next film, reels and book.{:else if story && picks > 0}Choose a photo to edit its caption, swap it, or leave it out. Changes save on their own.{/if}
   </p>
 
-  {#if error}<ErrorNote message={errorMessage} detail={error} />{/if}
+  {#if failure}<ErrorNote {...failure} />{/if}
 
   {#if !pid}
     <div class="empty">
@@ -220,12 +211,17 @@
       <button class="btn btn-primary" on:click={() => screen.set("import")}>Choose trip folder</button>
     </div>
   {:else if !story}
-    {#if !error}<p class="loading">Loading your story…</p>{/if}
+    {#if !failure}<p class="loading">Loading your story…</p>{/if}
   {:else if chapters.length === 0}
     <div class="empty">
-      <h2>No picks yet</h2>
-      <p>TripTape didn't find enough usable photos for a story. Add more files to the folder, then rescan it from the Library.</p>
-      <button class="btn" on:click={() => screen.set("library")}>Go to Library</button>
+      {#if story.excluded.length > 0}
+        <h2>Everything is left out</h2>
+        <p>Put back a photo below to bring your story back.</p>
+      {:else}
+        <h2>No picks yet</h2>
+        <p>TripTape didn't find enough usable photos for a story. Add more files to the folder, then rescan it from the Library.</p>
+        <button class="btn" on:click={() => screen.set("library")}>Go to Library</button>
+      {/if}
     </div>
   {:else}
     <nav class="days" aria-label="Days">
@@ -274,10 +270,10 @@
         <div class="index-grid">
           {#each day.entries as e (e.id)}
             <button class="frame" class:on={selectedId === e.id} aria-pressed={selectedId === e.id} on:click={(ev) => select(e.id, ev.currentTarget)}>
-              <Thumb projectId={pid} assetId={e.id} kind={kindName(e)} alt={frameAlt(e, frameOf(e.id))} fit="contain" />
+              <Thumb projectId={pid} assetId={e.id} kind={kindLabel(e)} alt={frameAlt(e, frameOf(e.id))} fit="contain" />
               <span class="frame-line">
                 <span class="frame-no">{frameOf(e.id) ?? ""}</span>
-                <span class="frame-caption" class:none={!e.caption}>{e.caption || fmtWhen(e) || kindName(e)}</span>
+                <span class="frame-caption" class:none={!e.caption}>{e.caption || formatWhen(e.takenAt) || kindLabel(e)}</span>
               </span>
             </button>
           {/each}
@@ -286,9 +282,9 @@
         {#if selected}
         <aside class="panel" aria-label="Selected photo">
             {#key selected.id}
-              <Thumb projectId={pid} assetId={selected.id} kind={kindName(selected)} alt={frameAlt(selected, frameOf(selected.id))} fit="full" />
-              <p class="panel-title"><span class="frame-no">{frameOf(selected.id) ?? ""}</span> {kindName(selected)}{#if selected.durationSecs}, {selected.durationSecs.toFixed(0)}s{/if}</p>
-              <p class="panel-meta">{fmtWhen(selected)}{fmtWhen(selected) ? " · " : ""}{usedIn(selected)}</p>
+              <Thumb projectId={pid} assetId={selected.id} kind={kindLabel(selected)} alt={frameAlt(selected, frameOf(selected.id))} fit="full" />
+              <p class="panel-title"><span class="frame-no">{frameOf(selected.id) ?? ""}</span> {kindLabel(selected)}{#if selected.durationSecs}, {selected.durationSecs.toFixed(0)}s{/if}</p>
+              <p class="panel-meta">{[formatWhen(selected.takenAt), usedIn(selected)].filter(Boolean).join(" · ")}</p>
 
               <label class="field-label" for="caption">Caption</label>
               <input
@@ -307,7 +303,7 @@
                 {#if selected.inHero || selected.inReels}
                   <button class="btn" disabled={busy} aria-expanded={alternativesFor === selected.id} on:click={() => (alternativesFor === selected.id ? (alternativesFor = null) : showAlternatives(selected.id))}>Swap photo</button>
                 {/if}
-                <button class="btn btn-danger" disabled={busy} on:click={() => { const assetId = selected.id; const index = selectedIndex(); edit((id) => setAssetExcluded(id, assetId, true), () => focusFrame(index)); }}>Leave out</button>
+                <button class="btn btn-danger" disabled={busy} on:click={() => editSelected((id, from) => setAssetExcluded(id, from, true))}>Leave out</button>
               </div>
 
               {#if alternativesFor === selected.id}
@@ -315,9 +311,9 @@
                   <p>Other photos from this day. The swap changes the {[selected.inHero && "film", selected.inReels && "reels"].filter(Boolean).join(" and ")}, and the book keeps both.</p>
                   {#each alternatives as alt (alt.id)}
                     <div class="alt">
-                      <Thumb projectId={pid} assetId={alt.id} kind={kindName(alt)} alt={alt.caption || `Other ${kindName(alt).toLowerCase()}${fmtWhen(alt) ? `, ${fmtWhen(alt)}` : ""}`} small />
-                      <span><span class="frame-no">{frameOf(alt.id) ?? ""}</span> {fmtWhen(alt) || kindName(alt)}{#if alreadyPicked(selected, alt)}<br /><em>Already picked</em>{/if}</span>
-                      <button class="btn" disabled={busy || alreadyPicked(selected, alt)} on:click={() => { const from = selected.id; const index = selectedIndex(); edit((id) => swapAsset(id, from, alt.id), () => focusFrame(index)); }}>Use this</button>
+                      <Thumb projectId={pid} assetId={alt.id} kind={kindLabel(alt)} alt={alt.caption || [`Other ${kindLabel(alt).toLowerCase()}`, formatWhen(alt.takenAt)].filter(Boolean).join(", ")} small />
+                      <span><span class="frame-no">{frameOf(alt.id) ?? ""}</span> {formatWhen(alt.takenAt) || kindLabel(alt)}{#if alreadyPicked(selected, alt)}<br /><em>Already picked</em>{/if}</span>
+                      <button class="btn" disabled={busy || alreadyPicked(selected, alt)} on:click={() => editSelected((id, from) => swapAsset(id, from, alt.id))}>Use this</button>
                     </div>
                   {:else}
                     <p class="none">No other photos from this day.</p>
@@ -339,21 +335,22 @@
         {/if}
       </div>
     {/if}
+  {/if}
 
-    {#if story.excluded.length > 0}
-      <section class="left-out">
-        <h2>Left out ({story.excluded.length})</h2>
-        <div class="index-grid">
-          {#each story.excluded as e (e.id)}
-            <div>
-              <Thumb projectId={pid} assetId={e.id} kind={kindName(e)} alt={e.caption || `Left out ${kindName(e).toLowerCase()}${fmtWhen(e) ? `, ${fmtWhen(e)}` : ""}`} fit="contain" />
-              <p class="left-no"><span class="frame-no">{frameOf(e.id) ?? ""}</span></p>
-              <button class="btn restore" disabled={busy} on:click={() => edit((id) => setAssetExcluded(id, e.id, false), () => focusFrame(0))}>Put back</button>
-            </div>
-          {/each}
-        </div>
-      </section>
-    {/if}
+  <!-- Outside the branches above: leaving out the last pick empties the story. -->
+  {#if pid && story && story.excluded.length > 0}
+    <section class="left-out">
+      <h2>Left out ({story.excluded.length})</h2>
+      <div class="index-grid">
+        {#each story.excluded as e (e.id)}
+          <div>
+            <Thumb projectId={pid} assetId={e.id} kind={kindLabel(e)} alt={e.caption || [`Left out ${kindLabel(e).toLowerCase()}`, formatWhen(e.takenAt)].filter(Boolean).join(", ")} fit="contain" />
+            <p class="left-no"><span class="frame-no">{frameOf(e.id) ?? ""}</span></p>
+            <button class="btn restore" disabled={busy} on:click={() => edit((id) => setAssetExcluded(id, e.id, false), () => focusFrame(0))}>Put back</button>
+          </div>
+        {/each}
+      </div>
+    </section>
   {/if}
 </div>
 

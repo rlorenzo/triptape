@@ -1,46 +1,35 @@
 <script lang="ts">
   import DayGroup from "./lib/DayGroup.svelte";
   import ErrorNote from "./lib/ErrorNote.svelte";
-  import { assets, dayNumbers, frameNumbers, ingestJob, project, screen } from "./lib/store";
-  import { byTime, dayKey } from "./lib/trip";
+  import { assets, assetsByTime, dayNumbers, frameNumbers, ingestJob, project, screen } from "./lib/store";
+  import { countOf, dayKey, formatDay, formatFull } from "./lib/trip";
 
   import { loadAllAssets, rescanProject } from "./lib/tauri";
   import type { AssetView } from "./lib/tauri";
 
   // "best" shows only highlight assets (stored scores from background
   // scoring); before scores arrive it is empty, after Done it reflects them.
-  const FILTERS: Record<string, (a: AssetView) => boolean> = {
-    all: () => true,
-    best: (a) => a.highlight === true,
-    photo: (a) => a.kind === "photo" || a.isLivePhoto,
-    video: (a) => a.kind === "video" || a.isLivePhoto,
-    gps: (a) => a.hasGps
-  };
-
-  const FILTER_LABELS: Record<string, string> = {
-    all: "All",
-    best: "Best",
-    photo: "Photos",
-    video: "Videos",
-    gps: "Has place"
+  const FILTERS: Record<string, { label: string; test: (a: AssetView) => boolean }> = {
+    all: { label: "All", test: () => true },
+    best: { label: "Best", test: (a) => a.highlight === true },
+    photo: { label: "Photos", test: (a) => a.kind === "photo" || a.isLivePhoto },
+    video: { label: "Videos", test: (a) => a.kind === "video" || a.isLivePhoto },
+    gps: { label: "Has place", test: (a) => a.hasGps }
   };
 
   let filter = "all";
   let dayFilter = "";
 
   $: query = dayFilter.trim().toLowerCase();
-  $: filtered = $assets.filter(FILTERS[filter]).filter((a) => {
+  // "Day 1" means that day exactly, not Days 10–19.
+  $: askedDay = query.match(/^day\s+(\d+)$/);
+  // Filtering keeps the oldest-first order: takenAt ascending, missing last.
+  $: visible = $assetsByTime.filter(FILTERS[filter].test).filter((a) => {
     if (!query) return true;
-    const day = $dayNumbers.get(dayKey(a.takenAt));
-    // "Day 1" means that day exactly, not Days 10–19.
-    const asked = query.match(/^day\s+(\d+)$/);
-    if (asked) return day === Number(asked[1]);
-    const hay = [a.place ?? "", fmtWhen(a.takenAt), a.kind].join(" ").toLowerCase();
+    if (askedDay) return $dayNumbers.get(dayKey(a.takenAt)) === Number(askedDay[1]);
+    const hay = [a.place ?? "", formatFull(a.takenAt), a.kind].join(" ").toLowerCase();
     return hay.includes(query);
   });
-  // Oldest-first display guarantee: takenAt ascending, missing last,
-  // id tie-break. Sorts a copy so the store array is never mutated.
-  $: visible = [...filtered].sort(byTime);
   $: pid = $project?.projectId;
 
   function commonPlaces(items: AssetView[]): string[] {
@@ -63,13 +52,7 @@
     return [...groups.entries()].map(([key, group]) => ({
       key,
       number: $dayNumbers.get(key),
-      date: key === "undated"
-        ? ""
-        : new Date(group[0].takenAt! * 1000).toLocaleDateString(undefined, {
-            weekday: "short",
-            month: "short",
-            day: "numeric"
-          }),
+      date: formatDay(group[0].takenAt),
       places: commonPlaces(group),
       items: group
     }));
@@ -84,21 +67,6 @@
   function clearFilters() {
     filter = "all";
     dayFilter = "";
-  }
-
-  function fmtWhen(takenAt?: number): string {
-    if (!takenAt) return "";
-    const d = new Date(takenAt * 1000);
-    const date = d.toLocaleDateString(undefined, {
-      month: "short",
-      day: "numeric",
-      year: "numeric"
-    });
-    const time = d.toLocaleTimeString(undefined, {
-      hour: "2-digit",
-      minute: "2-digit"
-    });
-    return `${date}, ${time}`;
   }
 
   // In-place refresh of the current trip's folder (no folder picker).
@@ -130,7 +98,7 @@
     <div>
       <h1 class="headline" tabindex="-1">The whole trip</h1>
       {#if $project}
-        <p class="lede">{$project.projectName}: {$assets.length.toLocaleString()} {$assets.length === 1 ? "file" : "files"} across {$dayNumbers.size} {$dayNumbers.size === 1 ? "day" : "days"}.</p>
+        <p class="lede">{$project.projectName}: {countOf($assets.length, "file")} across {countOf($dayNumbers.size, "day")}.</p>
       {/if}
     </div>
     {#if $assets.length > 0}
@@ -150,8 +118,8 @@
   {:else}
     <div class="tools">
       <div class="filters" role="group" aria-label="Show">
-        {#each Object.keys(FILTERS) as f}
-          <button class="filter" class:on={filter === f} on:click={() => (filter = f)} aria-pressed={filter === f}>{FILTER_LABELS[f]}</button>
+        {#each Object.entries(FILTERS) as [f, { label }]}
+          <button class="filter" class:on={filter === f} on:click={() => (filter = f)} aria-pressed={filter === f}>{label}</button>
         {/each}
       </div>
       <input class="input search" placeholder="Find a day or place" bind:value={dayFilter} aria-label="Find a day or place" />
@@ -176,7 +144,7 @@
             <button on:click={() => jumpTo(day.key)}>
               <b>{day.number ? `Day ${day.number}` : "No date"}</b>
               <span>{day.places[0] ?? day.date}</span>
-              <span>{day.items.length.toLocaleString()} {day.items.length === 1 ? "file" : "files"}</span>
+              <span>{countOf(day.items.length, "file")}</span>
             </button>
           {/each}
         </nav>
