@@ -1,0 +1,526 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-05T01:39:21+00:00",
+  "title": "Design System: TripTape",
+  "extensions": {
+    "colorMeta": {
+      "blue": {
+        "role": "primary",
+        "displayName": "Processing Blue",
+        "canonical": "#1546b0",
+        "tonalRamp": [
+          "#000728",
+          "#001966",
+          "#04349e",
+          "#2658c4",
+          "#467ceb",
+          "#74a3ff",
+          "#adcaff",
+          "#e6efff"
+        ]
+      },
+      "blue-deep": {
+        "role": "primary",
+        "displayName": "Deep Processing Blue",
+        "canonical": "#0f3587",
+        "tonalRamp": [
+          "#010923",
+          "#011c5f",
+          "#143a8d",
+          "#335cb2",
+          "#527fd8",
+          "#74a3ff",
+          "#adcaff",
+          "#e6efff"
+        ]
+      },
+      "orange": {
+        "role": "secondary",
+        "displayName": "Signal Orange",
+        "canonical": "#f26a1b",
+        "tonalRamp": [
+          "#1c0300",
+          "#421500",
+          "#6e2b03",
+          "#9d4109",
+          "#d05911",
+          "#fc7a38",
+          "#feb696",
+          "#feeae1"
+        ]
+      },
+      "orange-hover": {
+        "role": "secondary",
+        "displayName": "Lit Orange",
+        "canonical": "#ff7f33",
+        "tonalRamp": [
+          "#1b0400",
+          "#411700",
+          "#6b2d04",
+          "#9a440a",
+          "#cc5d12",
+          "#fb7b2f",
+          "#fdb793",
+          "#feeae0"
+        ]
+      },
+      "orange-deep": {
+        "role": "secondary",
+        "displayName": "Frame Orange",
+        "canonical": "#b8440b",
+        "tonalRamp": [
+          "#1d0200",
+          "#441200",
+          "#712704",
+          "#a23c0b",
+          "#cf5929",
+          "#f77d4f",
+          "#fdb69c",
+          "#fee9e2"
+        ]
+      },
+      "yellow": {
+        "role": "tertiary",
+        "displayName": "Counter Yellow",
+        "canonical": "#ffd22e",
+        "tonalRamp": [
+          "#110a00",
+          "#2f2400",
+          "#504005",
+          "#755f0c",
+          "#9c7f15",
+          "#c6a10d",
+          "#e3c770",
+          "#f6eed5"
+        ]
+      },
+      "yellow-soft": {
+        "role": "tertiary",
+        "displayName": "Pale Yellow",
+        "canonical": "#fff4c2",
+        "tonalRamp": [
+          "#0e0b01",
+          "#2d2500",
+          "#4c4213",
+          "#6c6134",
+          "#8d8355",
+          "#b0a676",
+          "#d1caaa",
+          "#f1efe5"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "#101522",
+        "tonalRamp": [
+          "#090b10",
+          "#202531",
+          "#3c4251",
+          "#5a6171",
+          "#7b8293",
+          "#9da5b7",
+          "#c4c9d5",
+          "#edeef2"
+        ]
+      },
+      "ink-2": {
+        "role": "neutral",
+        "displayName": "Second Ink",
+        "canonical": "#4a5266",
+        "tonalRamp": [
+          "#090b11",
+          "#1f2534",
+          "#3a4255",
+          "#596175",
+          "#798298",
+          "#9ca5bb",
+          "#c3c9d9",
+          "#eceef3"
+        ]
+      },
+      "ink-3": {
+        "role": "neutral",
+        "displayName": "Third Ink",
+        "canonical": "#5e667a",
+        "tonalRamp": [
+          "#090b11",
+          "#1f2533",
+          "#3a4254",
+          "#596175",
+          "#7a8297",
+          "#9ca5bb",
+          "#c3c9d8",
+          "#eceef3"
+        ]
+      },
+      "ink-on-yellow": {
+        "role": "neutral",
+        "displayName": "Ink on Yellow",
+        "canonical": "#3f4556",
+        "tonalRamp": [
+          "#090b10",
+          "#202532",
+          "#3c4152",
+          "#5a6173",
+          "#7b8295",
+          "#9da5b8",
+          "#c4c9d6",
+          "#edeef3"
+        ]
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "#d9dde7",
+        "tonalRamp": [
+          "#0a0b0e",
+          "#22252b",
+          "#3f424a",
+          "#5e616a",
+          "#7f828b",
+          "#a1a5ae",
+          "#c6c9cf",
+          "#edeef0"
+        ]
+      },
+      "edge-control": {
+        "role": "neutral",
+        "displayName": "Control Edge",
+        "canonical": "#aab2c5",
+        "tonalRamp": [
+          "#090b10",
+          "#202531",
+          "#3b4252",
+          "#5a6172",
+          "#7b8294",
+          "#9da5b8",
+          "#c4c9d6",
+          "#edeef2"
+        ]
+      },
+      "edge-input": {
+        "role": "neutral",
+        "displayName": "Input Edge",
+        "canonical": "#8d95a8",
+        "tonalRamp": [
+          "#090b10",
+          "#202532",
+          "#3b4252",
+          "#5a6173",
+          "#7a8295",
+          "#9da5b8",
+          "#c3c9d6",
+          "#edeef3"
+        ]
+      },
+      "wash": {
+        "role": "neutral",
+        "displayName": "Cool Wash",
+        "canonical": "#f3f5fa",
+        "tonalRamp": [
+          "#0b0b0c",
+          "#242528",
+          "#404246",
+          "#5f6165",
+          "#808287",
+          "#a3a5aa",
+          "#c8c9cc",
+          "#eeeeef"
+        ]
+      },
+      "paper": {
+        "role": "neutral",
+        "displayName": "White",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#252525",
+          "#424242",
+          "#616161",
+          "#828282",
+          "#a5a5a5",
+          "#c9c9c9",
+          "#eeeeee"
+        ]
+      },
+      "red": {
+        "role": "error",
+        "displayName": "Stop Red",
+        "canonical": "#b3261e",
+        "tonalRamp": [
+          "#210000",
+          "#4d0101",
+          "#800304",
+          "#b0221b",
+          "#d84c3f",
+          "#fd7565",
+          "#ffb3a8",
+          "#ffe9e5"
+        ]
+      },
+      "red-soft": {
+        "role": "error",
+        "displayName": "Soft Red",
+        "canonical": "#fdecea",
+        "tonalRamp": [
+          "#0e0a09",
+          "#2c2221",
+          "#4c3e3d",
+          "#6c5d5c",
+          "#8d7e7d",
+          "#b1a19f",
+          "#d1c6c5",
+          "#f1eded"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "The tagline on Import."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "The one screen heading on Library, Story, Export and About."
+      },
+      "film-title": {
+        "displayName": "Film Title",
+        "purpose": "The finished Trip Video row."
+      },
+      "wordmark": {
+        "displayName": "Wordmark",
+        "purpose": "The name in the sidebar."
+      },
+      "band": {
+        "displayName": "Band",
+        "purpose": "Day names in yellow bands."
+      },
+      "frame-number": {
+        "displayName": "Frame Number",
+        "purpose": "Beside every identified photo."
+      },
+      "title-lg": {
+        "displayName": "Title Large",
+        "purpose": "Empty-state headings."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Keepsake rows, consent panel and About sections."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "All working text."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Field labels."
+      },
+      "meta": {
+        "displayName": "Meta",
+        "purpose": "Captions, times, day-tab places, ticket rows."
+      }
+    },
+    "shadows": [
+      {
+        "name": "drop-edge",
+        "value": "inset 0 0 0 6px var(--yellow)",
+        "purpose": "Import screen while a folder is dragged over it. An inset edge, not a lift; the system has no drop shadows."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-out",
+        "value": "cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Shared curve for photo development and progress width."
+      },
+      {
+        "name": "state-change",
+        "value": "120ms",
+        "purpose": "Background and border changes on buttons and nav items."
+      },
+      {
+        "name": "progress-width",
+        "value": "240ms var(--ease-out)",
+        "purpose": "Progress fill width."
+      },
+      {
+        "name": "progress-indeterminate",
+        "value": "1.2s linear infinite",
+        "purpose": "Sliding 33% segment for work with no percentage."
+      },
+      {
+        "name": "photo-develop",
+        "value": "filter 700ms var(--ease-out), opacity 200ms linear",
+        "purpose": "First load per session, from brightness(1.7) contrast(0.6) saturate(0.4) to no filter."
+      }
+    ],
+    "breakpoints": []
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The one next step on a screen.",
+      "html": "<button class=\"ds-btn-primary\">Looks good, go to Export</button>",
+      "css": ".ds-btn-primary { font-family: var(--display); display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 10px 18px; border: 1px solid var(--orange); border-radius: var(--radius); background: var(--orange); color: var(--ink); font-size: 15px; font-weight: 700; white-space: nowrap; cursor: pointer; transition: background-color 120ms, border-color 120ms; } .ds-btn-primary:hover { background: var(--orange-hover); border-color: var(--orange-hover); } .ds-btn-primary:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button",
+      "description": "Every other action, including the danger variant by label color.",
+      "html": "<button class=\"ds-btn\">Swap photo</button> <button class=\"ds-btn ds-btn-danger\">Leave out</button> <button class=\"ds-btn\" disabled>Use this</button>",
+      "css": ".ds-btn { font-family: var(--display); display: inline-flex; align-items: center; justify-content: center; min-height: 36px; padding: 7px 14px; border: 1px solid #aab2c5; border-radius: var(--radius); background: var(--paper); color: var(--ink); font-size: 15px; font-weight: 500; white-space: nowrap; cursor: pointer; transition: background-color 120ms, border-color 120ms; } .ds-btn:hover:not(:disabled) { background: var(--wash); border-color: var(--ink-3); } .ds-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; } .ds-btn:disabled { color: var(--ink-3); background: var(--wash); border-color: var(--line); cursor: not-allowed; } .ds-btn-danger { color: var(--red); }"
+    },
+    {
+      "name": "Text Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Captions, place names, search.",
+      "html": "<label class=\"ds-field\"><span class=\"ds-field-label\">Caption</span><input class=\"ds-input\" placeholder=\"Add a caption\" /></label>",
+      "css": ".ds-field { font-family: var(--display); display: block; width: 260px; } .ds-field-label { display: block; margin-bottom: 4px; color: var(--ink-2); font-size: 13px; font-weight: 500; } .ds-input { font-family: var(--display); width: 100%; min-height: 36px; padding: 7px 10px; border: 1px solid #8d95a8; border-radius: var(--radius); background: var(--paper); color: var(--ink); font-size: 15px; } .ds-input::placeholder { color: var(--ink-3); } .ds-input:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }"
+    },
+    {
+      "name": "Sidebar Navigation",
+      "kind": "nav",
+      "refersTo": "nav-item",
+      "description": "Five labeled items on processing blue, current item in yellow.",
+      "html": "<nav class=\"ds-nav\"><div class=\"ds-brand\">TripTape</div><button class=\"ds-nav-item\">Library</button><button class=\"ds-nav-item ds-on\" aria-current=\"page\">Story</button><button class=\"ds-nav-item\">Export</button></nav>",
+      "css": ".ds-nav { font-family: var(--display); display: flex; flex-direction: column; gap: 2px; width: 196px; padding: 18px 12px 12px; background: var(--blue); } .ds-brand { padding: 0 10px 18px; color: #fff; font-size: 22px; font-weight: 800; font-stretch: 125%; letter-spacing: -0.01em; } .ds-nav-item { font-family: var(--display); min-height: 38px; padding: 7px 10px; border: 0; border-radius: var(--radius); background: transparent; color: #fff; font-size: 15px; font-weight: 500; text-align: left; cursor: pointer; transition: background-color 120ms; } .ds-nav-item:hover:not(.ds-on) { background: var(--blue-deep); } .ds-nav-item.ds-on { background: var(--yellow); color: var(--ink); font-weight: 700; } .ds-nav-item:focus-visible { outline: 2px solid var(--yellow); outline-offset: 2px; }"
+    },
+    {
+      "name": "Filter Chips",
+      "kind": "chip",
+      "refersTo": "filter",
+      "description": "Library filters, current one in solid blue.",
+      "html": "<div class=\"ds-filters\"><button class=\"ds-filter ds-on\">All</button><button class=\"ds-filter\">Photos</button><button class=\"ds-filter\">Videos</button></div>",
+      "css": ".ds-filters { display: flex; gap: 2px; } .ds-filter { font-family: var(--display); min-height: 36px; padding: 6px 12px; border: 0; border-radius: var(--radius); background: transparent; color: var(--ink-2); font-size: 15px; font-weight: 500; cursor: pointer; } .ds-filter:hover:not(.ds-on) { background: var(--wash); color: var(--ink); } .ds-filter.ds-on { background: var(--blue); color: #fff; } .ds-filter:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }"
+    },
+    {
+      "name": "Day Tabs and Band",
+      "kind": "custom",
+      "refersTo": "day-band",
+      "description": "The current tab joins the sticky yellow band that names the day.",
+      "html": "<div class=\"ds-days\"><button class=\"ds-tab ds-on\">Day 1<span>Kyoto, Japan</span></button><button class=\"ds-tab\">Day 2<span>Osaka, Japan</span></button></div><div class=\"ds-band\"><h2>Day 1 · Wed, Jul 3</h2><span>Kyoto, Japan</span></div>",
+      "css": ".ds-days { display: flex; gap: 2px; } .ds-tab { font-family: var(--display); display: flex; flex-direction: column; min-height: 48px; padding: 6px 14px; border: 0; border-radius: var(--radius) var(--radius) 0 0; background: transparent; color: var(--ink); font-size: 15px; text-align: left; cursor: pointer; } .ds-tab span { color: var(--ink-2); font-size: 13px; } .ds-tab:hover:not(.ds-on) { background: var(--wash); } .ds-tab.ds-on { background: var(--yellow); } .ds-tab.ds-on span { color: #3f4556; } .ds-tab:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; } .ds-band { font-family: var(--display); display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; padding: 8px 14px; background: var(--yellow); color: var(--ink); font-size: 15px; } .ds-band h2 { margin: 0; font-size: 18px; font-weight: 800; font-stretch: 125%; letter-spacing: -0.01em; } .ds-band span { color: #3f4556; }"
+    },
+    {
+      "name": "Photo Tile",
+      "kind": "custom",
+      "refersTo": "frame-number",
+      "description": "A square-cornered 3:2 photo with its frame number; develops on first load.",
+      "html": "<button class=\"ds-frame\"><div class=\"ds-thumb\"></div><div class=\"ds-line\"><span class=\"ds-no\">12</span><span>Kyoto, Japan</span></div></button><button class=\"ds-frame ds-on\"><div class=\"ds-thumb\"></div><div class=\"ds-line\"><span class=\"ds-no\">13</span><span>Selected</span></div></button>",
+      "css": ".ds-frame { font-family: var(--display); display: inline-block; width: 160px; margin-right: 12px; padding: 0; border: 0; background: transparent; color: var(--ink); text-align: left; cursor: pointer; } .ds-thumb { aspect-ratio: 3 / 2; background: var(--wash); } .ds-frame:hover .ds-thumb { outline: 2px solid var(--ink-3); outline-offset: -2px; } .ds-frame.ds-on .ds-thumb { outline: 3px solid var(--blue); outline-offset: 2px; } .ds-frame:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; } .ds-line { display: flex; gap: 6px; padding-top: 5px; font-size: 13px; line-height: 1.3; } .ds-no { color: var(--orange-deep); font-size: 15px; font-weight: 800; font-stretch: 125%; line-height: 1.15; font-variant-numeric: tabular-nums; }"
+    },
+    {
+      "name": "Trip Ticket",
+      "kind": "card",
+      "refersTo": "trip-ticket",
+      "description": "Real trip status at the foot of the sidebar.",
+      "html": "<section class=\"ds-ticket\"><h2>Demo Trip</h2><dl><div><dt>Files found</dt><dd>12</dd></div><div><dt>Story</dt><dd>12 picks</dd></div><div><dt>Keepsakes</dt><dd>Not made yet</dd></div></dl></section>",
+      "css": ".ds-ticket { font-family: var(--display); width: 172px; padding: 12px; border-top: 6px solid var(--orange); background: var(--paper); color: var(--ink); font-size: 13px; font-variant-numeric: tabular-nums; } .ds-ticket h2 { margin: 0; font-size: 14px; font-weight: 700; } .ds-ticket dl { margin: 6px 0 0; } .ds-ticket dl > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; padding: 4px 0; border-top: 1px solid var(--line); } .ds-ticket dt { color: var(--ink-2); } .ds-ticket dd { margin: 0 0 0 auto; color: var(--blue); font-weight: 800; text-align: right; }"
+    },
+    {
+      "name": "Finished Keepsake Row",
+      "kind": "card",
+      "refersTo": "keepsake-made",
+      "description": "A flat pale yellow row once a keepsake is made.",
+      "html": "<div class=\"ds-made\"><div><h2>Photo Book</h2><p>24 pages, with a PDF proof and a JPEG of every page.</p></div><button class=\"ds-made-btn\">Show in folder</button></div>",
+      "css": ".ds-made { font-family: var(--display); display: flex; gap: 24px; align-items: center; justify-content: space-between; padding: 16px; background: var(--yellow-soft); color: var(--ink); font-size: 15px; } .ds-made h2 { margin: 0; font-size: 17px; font-weight: 700; } .ds-made p { margin: 0; color: var(--ink-2); } .ds-made-btn { font-family: var(--display); flex: none; min-height: 36px; padding: 7px 14px; border: 1px solid #aab2c5; border-radius: var(--radius); background: var(--paper); color: var(--ink); font-size: 15px; font-weight: 500; cursor: pointer; transition: background-color 120ms, border-color 120ms; } .ds-made-btn:hover { background: var(--wash); border-color: var(--ink-3); } .ds-made-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }"
+    },
+    {
+      "name": "Notice, Error and Progress",
+      "kind": "custom",
+      "refersTo": "notice",
+      "description": "Plain status surfaces and the blue progress bar.",
+      "html": "<p class=\"ds-notice\">Export cancelled. Nothing else was made.</p><p class=\"ds-error\">The export stopped before it finished. Try again.</p><div class=\"ds-progress\"><div></div></div>",
+      "css": ".ds-notice, .ds-error { font-family: var(--display); margin: 0 0 8px; padding: 10px 14px; border-radius: var(--radius); font-size: 15px; } .ds-notice { background: var(--yellow-soft); color: var(--ink); } .ds-error { background: var(--red-soft); color: var(--red); } .ds-progress { height: 8px; overflow: hidden; border-radius: 1px; background: var(--line); } .ds-progress > div { width: 70%; height: 100%; background: var(--blue); transition: width 240ms var(--ease-out); }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Back From the Lab",
+    "overview": "TripTape takes the color of a one-hour photo counter and none of its objects. A processing-blue sidebar holds the app steady, signal orange names the next step, yellow marks where you are, and the work area stays white so the photos carry the only other color on screen. The feeling is a pile of pictures handed back already sorted: confident, loud in a few places, and quiet everywhere the parent actually works.\n\nDensity is moderate and made for a laptop at home. One wide, heavy headline announces each screen, and everything below it drops to normal-width Archivo at 15px. Structure comes from solid color blocks and hairlines rather than cards or shadows. The world refuses both the gray admin dashboard and the dark pro editor.\n\nTwo moves make it recognizable: every photo keeps a frame number in deep orange, and the sidebar's trip ticket always reports real status. Photos also develop from overexposed to true the first time they arrive, once per session.",
+    "keyCharacteristics": [
+      "Saturated color blocks on a white work area, light theme only.",
+      "One typeface in two widths: wide and heavy to announce, normal to work.",
+      "Frame numbers on photos wherever a photo is identified.",
+      "Flat surfaces, square content, gently curved controls.",
+      "Status shown as plain words and numbers, never as decoration."
+    ],
+    "rules": [
+      {
+        "name": "The Yellow Means Here Rule",
+        "body": "Counter Yellow marks where you are: the current screen, the current day, the day you are scrolling through. Pale Yellow marks what came back or needs a glance. Neither is ever decoration.",
+        "section": "colors"
+      },
+      {
+        "name": "The Next Step Rule",
+        "body": "Signal Orange names the one next step on a screen. If it appears twice, as on Story's header and last-day pager, it is the same action both times.",
+        "section": "colors"
+      },
+      {
+        "name": "The Numbers Own Their Orange Rule",
+        "body": "Frame Orange is reserved for frame numbers, so a number reads as a frame number anywhere in the app.",
+        "section": "colors"
+      },
+      {
+        "name": "The Untinted Photo Rule",
+        "body": "Photos are never tinted, filtered or overlaid at rest. The only filter a photo ever carries is its first-load development, which ends at no filter at all.",
+        "section": "colors"
+      },
+      {
+        "name": "The Wide Is A Voice Rule",
+        "body": "Width 125% belongs to the headline, wordmark, day bands, film title and frame numbers. Controls, captions and running text stay normal width.",
+        "section": "typography"
+      },
+      {
+        "name": "The One Headline Rule",
+        "body": "Each screen has exactly one headline, and it sits in the same place on every screen except Import, where the tagline centers vertically.",
+        "section": "typography"
+      },
+      {
+        "name": "The Tabular Rule",
+        "body": "All numerals are tabular, set globally on the body, so counts and frame numbers stay aligned as they change.",
+        "section": "typography"
+      },
+      {
+        "name": "The Same Frame Rule",
+        "body": "Headers do not move between screens. A new screen inherits the frame and the header row rather than composing its own.",
+        "section": "layout"
+      },
+      {
+        "name": "The Flat Counter Rule",
+        "body": "Nothing floats. A surface earns separation with a color change or a 1px hairline, and a sticky element stays in the plane of the page.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Square Photo Rule",
+        "body": "Photos keep hard corners, always. A rounded photo stops looking like a photo.",
+        "section": "shapes"
+      }
+    ],
+    "dos": [
+      "Do use Signal Orange with ink text for the next step, and keep it at 44px tall.",
+      "Do carry a frame number in Frame Orange beside every photo the parent can identify or act on.",
+      "Do mark the current screen and day in Counter Yellow, and use Ink on Yellow for secondary text on it.",
+      "Do keep the trip ticket's values tied to real state, in plain words such as \"Not made yet\".",
+      "Do inherit the screen frame: 32px, 36px and 56px padding, with the action at the header's right.",
+      "Do separate surfaces with a color change or a 1px hairline.",
+      "Do keep photos square-cornered and untinted, and crop from 30% down wherever a tile crops.",
+      "Do keep every state change behind `prefers-reduced-motion`."
+    ],
+    "donts": [
+      "Don't draw the lab's objects: no envelope, paper, tape, film-strip or cardboard imagery. Frame numbers and the ticket borrow the lab's logic as plain type and color blocks, and that is as literal as the world gets.",
+      "Don't imply a purchase in the interface: never \"order\" or \"prints ready\".",
+      "Don't drift toward a gray admin dashboard or a dark pro editor.",
+      "Don't add a dark theme; the world is light only.",
+      "Don't tint, overlay or filter a photo at rest.",
+      "Don't put white text on Signal Orange; it reaches only 3.06:1, while ink holds 5.95:1.",
+      "Don't use Frame Orange for anything but frame numbers.",
+      "Don't add drop shadows or rounded photos.",
+      "Don't set controls, captions or running text in wide Archivo."
+    ]
+  }
+}

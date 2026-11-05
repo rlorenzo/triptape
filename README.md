@@ -63,9 +63,10 @@ executable; the project license is unaffected.
 
 ## Privacy
 
-Local first, cloud by consent. Faces are detected on-device (count + boxes
-only; naming is opt-in), originals are never uploaded, and face data is
-deletable in Settings. Cloud polish is a per-trip opt-in, never default.
+Local first. TripTape makes no network calls in its media pipeline and never
+uploads your photos. Face detection and cloud polish are planned but have not
+shipped, and exports do not strip EXIF yet. See `PLAN.md` Section 23 for the
+current state of each privacy control.
 
 ## Clean-machine notes
 
@@ -73,8 +74,8 @@ deletable in Settings. Cloud polish is a per-trip opt-in, never default.
   No Xcode license, kernel extensions, or daemons required.
 - Windows: install Rust + the pinned static FFmpeg sidecar (see
   `scripts/fetch-ffmpeg`); PATH fallback is dev-only.
-- Cache lives in the OS cache dir (content-addressed, 5–10 GB LRU);
-  temp work is job-scoped under the temp dir and deleted on completion.
+- Thumbnails cache in the OS cache dir with no size cap yet. Export
+  intermediates stay in `.work` inside the export folder.
 
 ## Known blockers (Sprint 0)
 

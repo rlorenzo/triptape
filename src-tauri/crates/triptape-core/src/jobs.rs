@@ -112,8 +112,8 @@ pub fn required_free_bytes(estimate_bytes: u64) -> u64 {
 
 /// Free bytes available on the filesystem containing `path`.
 ///
-/// Uses `df -P -k` on unix; falls back to `None` where unknowable so the
-/// caller can warn instead of block.
+/// Uses `df -P -k` on unix and `GetDiskFreeSpaceExW` on Windows. `None` when
+/// unknowable, so the caller can warn instead of block.
 pub fn free_bytes(path: &Path) -> Option<u64> {
     #[cfg(unix)]
     {
@@ -129,7 +129,33 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
         let avail_kb: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
         Some(avail_kb * 1024)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetDiskFreeSpaceExW(
+                directory: *const u16,
+                free_to_caller: *mut u64,
+                total: *mut u64,
+                total_free: *mut u64,
+            ) -> i32;
+        }
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut free = 0u64;
+        // SAFETY: `wide` is NUL-terminated and outlives the call, `free` is a
+        // valid out pointer, and the API accepts null for the other two.
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(free)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         None

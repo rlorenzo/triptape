@@ -1,7 +1,10 @@
 <script lang="ts">
   import { project, assets, screen, consentGiven, giveConsent, simulateDemoIngestBackground } from "./lib/store";
   import { scanFolder, loadAllAssets, isTauri, onProgress } from "./lib/tauri";
-  import { onMount, onDestroy } from "svelte";
+  import { friendlyStep } from "./lib/trip";
+  import ErrorNote from "./lib/ErrorNote.svelte";
+  import ProgressBar from "./lib/ProgressBar.svelte";
+  import { onMount, onDestroy, tick } from "svelte";
 
   let folder = "";
   let busy = false;
@@ -13,12 +16,9 @@
   // Determinate once an event (or the demo simulation) reports progress > 0;
   // the walk phase stays at 0 and renders the indeterminate bar instead.
   $: determinate = seenAny && progress > 0;
-  $: percent = Math.round(progress * 100);
   // Sub-percent movement matters during hashing (1 file of 2119 is 0.02%):
-  // one decimal under 10%, integer at/above. `percent` stays the integer
-  // for aria-valuenow and the bar reads the raw value.
+  // one decimal under 10%, integer at/above.
   $: percentLabel = progress * 100 < 10 ? (progress * 100).toFixed(1) : String(Math.round(progress * 100));
-  $: barWidth = (progress * 100).toFixed(2);
 
   // Stray export jobs must not drive the scan bar: only `ingest` events
   // arriving while a scan is in flight count. Svelte runs the returned
@@ -63,6 +63,52 @@
   }
   onDestroy(stopDemoProgress);
 
+  // Tauri delivers dropped folders as paths; the browser preview has no drop.
+  let dropping = false;
+  onMount(() => {
+    if (!isTauri()) return;
+    let stop: (() => void) | undefined;
+    let gone = false;
+    (async () => {
+      const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+      const off = await getCurrentWebview().onDragDropEvent((e) => {
+        if (e.payload.type === "enter" || e.payload.type === "over") dropping = true;
+        else if (e.payload.type === "leave") dropping = false;
+        else {
+          dropping = false;
+          const path = e.payload.paths[0];
+          if (path && !busy) {
+            folder = path;
+            startWithConsent();
+          }
+        }
+      });
+      if (gone) off();
+      else stop = off;
+    })().catch(() => {
+      // Choosing a folder still works if drop can't be set up.
+    });
+    return () => {
+      gone = true;
+      stop?.();
+    };
+  });
+
+  async function startWithConsent() {
+    error = "";
+    try {
+      if (!$consentGiven) {
+        showConsent = true;
+        await tick();
+        consentHeading?.focus();
+        return;
+      }
+      await runScan();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   async function pickAndScan() {
     error = "";
     try {
@@ -75,11 +121,7 @@
         error = "Browser preview: type any folder name to load the demo trip.";
         return;
       }
-      if (!$consentGiven) {
-        showConsent = true;
-        return;
-      }
-      await runScan();
+      await startWithConsent();
     } catch (e) {
       error = String(e);
     }
@@ -109,6 +151,15 @@
     }
   }
 
+  let consentHeading: HTMLElement;
+  let addButton: HTMLButtonElement;
+
+  async function declineConsent() {
+    showConsent = false;
+    await tick();
+    addButton?.focus();
+  }
+
   function acceptConsent() {
     giveConsent();
     showConsent = false;
@@ -117,76 +168,146 @@
 </script>
 
 <style>
-  @keyframes scan-slide {
-    from {
-      transform: translateX(-100%);
-    }
-    to {
-      transform: translateX(300%);
-    }
+  .import {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-height: 100%;
   }
-  .scan-indeterminate {
-    animation: scan-slide 1.2s linear infinite;
+
+  .headline {
+    font-size: clamp(2.4rem, 5vw, 4.25rem);
   }
-  @media (prefers-reduced-motion: reduce) {
-    .scan-indeterminate {
-      animation: none;
-      width: 100%;
-    }
+
+  .headline span {
+    display: block;
+  }
+
+  .lede {
+    margin: 16px 0 28px;
+    font-size: 18px;
+  }
+
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+  }
+
+  .demo-input {
+    max-width: 280px;
+  }
+
+  .notice,
+  .error {
+    margin-bottom: 16px;
+  }
+
+  .error {
+    margin-top: 16px;
+    margin-bottom: 0;
+  }
+
+  .panel {
+    max-width: 560px;
+    margin-top: 24px;
+    padding: 18px;
+    border: 1px solid var(--line);
+  }
+
+  .panel h2 {
+    margin-bottom: 6px;
+    font-size: 17px;
+    font-weight: 700;
+  }
+
+  .panel h2:focus {
+    outline: none;
+  }
+
+  .panel p {
+    margin-bottom: 14px;
+  }
+
+  .scan-step {
+    display: flex;
+    gap: 6px;
+    margin: 6px 0 0;
+    color: var(--ink-2);
+  }
+
+  .import-error {
+    max-width: 560px;
+    margin-top: 16px;
+  }
+
+  .dropping {
+    box-shadow: inset 0 0 0 6px var(--yellow);
+    background: var(--yellow-soft);
+  }
+
+  .again {
+    max-width: 60ch;
+    margin-top: 14px;
+    color: var(--ink-2);
   }
 </style>
 
-<div class="p-8 max-w-2xl mx-auto">
-  <h1 class="text-3xl font-bold mb-2">Drop in the trip. Get the story back.</h1>
-  <p class="text-gray-600 mb-6">Add a folder of vacation photos and videos. Everything runs on this computer.</p>
+<div class="screen import" class:dropping>
+  <h1 class="headline" tabindex="-1"><span>Drop in the trip.</span> <span>Get the story back.</span></h1>
+  <p class="lede">Drag in a folder of vacation photos and videos, or choose one. TripTape sorts it into days and places, then makes a film, reels and a photo book. Everything runs on this computer.</p>
 
   {#if !isTauri()}
-    <div class="mb-4 p-3 rounded bg-amber-100 text-amber-900 text-sm">
-      Browser preview — demo state. Run inside the Tauri app for the real pipeline.
-    </div>
+    <div class="notice">Browser preview with a demo trip. The real pipeline runs in the desktop app.</div>
   {/if}
 
-  <div class="flex gap-2 mb-4">
+  <div class="actions">
     {#if !isTauri()}
-      <input class="border rounded px-3 py-2 flex-1" placeholder="Demo folder name" bind:value={folder} />
+      <input class="input demo-input" placeholder="Demo folder name" aria-label="Demo folder name" bind:value={folder} />
     {/if}
-    <button class="bg-blue-600 text-white rounded px-4 py-2 disabled:opacity-50" disabled={busy} on:click={pickAndScan}>
-      {busy ? "Scanning…" : "Add folder"}
+    <button bind:this={addButton} class="btn btn-primary" disabled={busy} on:click={pickAndScan}>
+      {busy ? "Scanning…" : "Choose trip folder"}
     </button>
+    {#if $project && !busy}
+      <button class="btn" on:click={() => screen.set("library")}>Back to this trip</button>
+    {/if}
   </div>
-  {#if error}<p class="text-red-600 text-sm">{error}</p>{/if}
+  {#if $project && !busy}
+    <p class="again">Choosing a folder again starts a new trip, without the edits you made to this one.</p>
+  {/if}
+  {#if error}
+    {#if error.startsWith("Browser preview")}
+      <p class="error" role="alert">{error}</p>
+    {:else}
+      <div class="import-error"><ErrorNote message="Couldn't scan that folder. Check that it's a folder and that it's still there, then try again." detail={error} /></div>
+    {/if}
+  {/if}
 
   {#if busy}
-    <div class="mt-2 p-4 border rounded bg-white">
-      <p class="text-sm font-medium mb-2">Scanning {folder || "Demo Trip"}…</p>
-      <div
-        class="h-2 rounded bg-gray-200 overflow-hidden"
-        role="progressbar"
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={determinate ? percent : undefined}
-        aria-label="Scan progress"
-      >
-        {#if determinate}
-          <div class="h-full bg-blue-600" style="width: {barWidth}%"></div>
-        {:else}
-          <div class="h-full w-1/3 bg-blue-600 scan-indeterminate"></div>
-        {/if}
-      </div>
-      <p class="text-sm text-gray-600 mt-1 flex gap-x-1.5" aria-live="polite">
+    <div class="panel">
+      <h2>Scanning {folder || "Demo Trip"}</h2>
+      <ProgressBar value={determinate ? progress : null} label="Scan progress" />
+      <p class="scan-step" aria-live="polite">
         {#if determinate}<span>{percentLabel}%</span>{/if}
-        <span>{step || "Starting…"}</span>
+        <span>{friendlyStep(step) || "Starting…"}</span>
       </p>
     </div>
   {/if}
 
   {#if showConsent}
-    <div class="mt-6 p-4 border rounded bg-white shadow" role="dialog" aria-label="Consent">
-      <h2 class="font-semibold mb-2">One-time note</h2>
-      <p class="text-sm mb-4">TripTape finds faces and places on this computer. Nothing is uploaded unless you turn on Cloud Polish for a trip.</p>
-      <div class="flex gap-2">
-        <button class="bg-blue-600 text-white rounded px-4 py-2" on:click={acceptConsent}>Got it</button>
-        <button class="border rounded px-4 py-2" on:click={() => (showConsent = false)}>Not now</button>
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <div
+      class="panel"
+      role="group"
+      aria-labelledby="consent-title"
+      on:keydown={(e) => e.key === "Escape" && declineConsent()}
+    >
+      <h2 id="consent-title" tabindex="-1" bind:this={consentHeading}>Before we start</h2>
+      <p>TripTape sorts your photos by date and place on this computer. Nothing is uploaded.</p>
+      <div class="actions">
+        <button class="btn btn-primary" on:click={acceptConsent}>Got it</button>
+        <button class="btn" on:click={declineConsent}>Not now</button>
       </div>
     </div>
   {/if}

@@ -1,3 +1,8 @@
+<script module lang="ts">
+  // A photo develops once per session; revisits show it true at once.
+  const developed = new Set<string>();
+</script>
+
 <script lang="ts">
   import { onMount } from "svelte";
   import { getThumbnail } from "./tauri";
@@ -5,10 +10,20 @@
   export let projectId: string | undefined;
   export let assetId: string;
   export let kind: string;
+  export let alt = "";
   export let small = false;
+  /** "cover" crops to the frame, "contain" fits inside it, "full" keeps the photo's own shape. */
+  export let fit: "cover" | "contain" | "full" = "cover";
 
   let box: HTMLElement;
   let visible = false;
+  let loaded = false;
+  const instant = developed.has(assetId);
+
+  function onLoad() {
+    loaded = true;
+    developed.add(assetId);
+  }
 
   // Only request thumbnails near the viewport: a cold one spawns a decoder.
   onMount(() => {
@@ -28,15 +43,10 @@
   $: request = visible && projectId ? getThumbnail(projectId, assetId) : undefined;
 </script>
 
-<div
-  bind:this={box}
-  class="rounded overflow-hidden bg-gray-200 text-gray-500 flex items-center justify-center {small
-    ? 'h-14 w-20 shrink-0 text-[10px]'
-    : 'w-full aspect-video text-xs'}"
->
+<div bind:this={box} class="thumb {fit}" class:small>
   {#await request}
     <svg
-      class="h-5 w-5 animate-spin text-gray-500"
+      class="h-5 w-5 animate-spin"
       viewBox="0 0 24 24"
       fill="none"
       role="status"
@@ -51,9 +61,73 @@
     </svg>
   {:then url}
     {#if url}
-      <img src={url} alt="Thumbnail for {assetId}" class="w-full h-full object-cover" />
+      <img src={url} {alt} class:loaded class:instant on:load={onLoad} />
     {:else}
-      {request ? "no preview" : kind}
+      <span>{request ? "No preview" : kind}</span>
     {/if}
   {/await}
 </div>
+
+<style>
+  .thumb {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    aspect-ratio: 3 / 2;
+    overflow: hidden;
+    background: var(--wash);
+    color: var(--ink-2);
+    font-size: 13px;
+  }
+
+  .thumb.small {
+    flex: none;
+    width: 72px;
+    font-size: 12px;
+  }
+
+  img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    /* Faces sit high in most photos, so crop from below. */
+    object-position: 50% 30%;
+    /* Develops from overexposed to true the first time it arrives. */
+    filter: brightness(1.7) contrast(0.6) saturate(0.4);
+    opacity: 0;
+    transition:
+      filter 700ms var(--ease-out),
+      opacity 200ms linear;
+  }
+
+  img.loaded {
+    filter: none;
+    opacity: 1;
+  }
+
+  img.instant {
+    transition: none;
+  }
+
+  .contain {
+    aspect-ratio: 4 / 3;
+  }
+
+  .contain img {
+    object-fit: contain;
+    object-position: center;
+  }
+
+  .full {
+    aspect-ratio: auto;
+    min-height: 120px;
+  }
+
+  .full img {
+    height: auto;
+    max-height: 46vh;
+    object-fit: contain;
+  }
+</style>

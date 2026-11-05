@@ -1,7 +1,6 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # Node / frontend
 node_modules/
@@ -14,6 +13,13 @@ src-tauri/binaries/
 src-tauri/gen/
 
 .boost/
+
+# Impeccable critique reports are point-in-time and carry local paths
+.impeccable/critique/
+
+# Linter output
+report/
+.fallow/
 
 # App data / outputs (never commit user media or exports)
 *.sqlite

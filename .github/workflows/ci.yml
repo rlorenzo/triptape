@@ -5,6 +5,9 @@ on:
     branches: ["main", "sprint/**"]
   pull_request:
 
+permissions:
+  contents: read
+
 # A PR push from a sprint branch triggers both events; keep only the latest run.
 concurrency:
   group: ci-${{ github.ref }}
@@ -19,10 +22,10 @@ jobs:
         os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Check formatting
         run: cargo fmt --all -- --check
       - uses: actions/setup-node@v4
@@ -53,6 +56,37 @@ jobs:
         run: |
           ./scripts/make-fixture.sh "$RUNNER_TEMP/fixture"
           ./scripts/spike-render.sh
+
+  linters:
+    name: linters
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Unused code and duplication (fallow, jscpd)
+        run: npm run lint
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
+        with:
+          tool: cargo-deny,cargo-audit
+      - name: Install deadwood
+        run: cargo install --locked --git https://github.com/rlorenzo/deadwood --rev 1fd13d0c8e5222bb48788451ce5a32e6770129dd deadwood-rs
+      - name: Dead Rust code and dependencies (deadwood)
+        # deadwood resolves lib names with `cargo metadata --frozen`; without a
+        # populated registry it falls back to package names and misflags
+        # kamadak-exif (imported as `exif`) as unused.
+        run: |
+          cargo fetch --locked
+          deadwood check .
+      - name: Dependency policy (cargo-deny)
+        run: cargo deny check
+      - name: Security advisories (cargo-audit)
+        run: cargo audit
 
   frontend:
     name: npm build

@@ -271,6 +271,53 @@ fn closing_secs(has_route: bool, has_places: bool, map_secs: f64) -> f64 {
     map + if has_places { CREDITS_SECS } else { 0.0 }
 }
 
+/// Choose at most `slots` entries for a short film so every chapter is seen,
+/// instead of spending the whole budget on the first day. Slots are dealt to
+/// chapters in turn, each chapter's picks are spaced evenly through it, and
+/// the result keeps the plan's order.
+fn spread_across_chapters<'a>(
+    entries: &[&'a ResolvedEntry],
+    slots: usize,
+    chapter_of: impl Fn(&str) -> usize,
+) -> Vec<&'a ResolvedEntry> {
+    if entries.len() <= slots {
+        return entries.to_vec();
+    }
+    let mut chapters: Vec<(usize, Vec<usize>)> = vec![];
+    for (i, e) in entries.iter().enumerate() {
+        let ch = chapter_of(&e.entry.asset_id);
+        match chapters.iter_mut().find(|(c, _)| *c == ch) {
+            Some((_, members)) => members.push(i),
+            None => chapters.push((ch, vec![i])),
+        }
+    }
+    let mut counts = vec![0usize; chapters.len()];
+    let mut left = slots;
+    while left > 0 {
+        for (count, (_, members)) in counts.iter_mut().zip(&chapters) {
+            if left > 0 && *count < members.len() {
+                *count += 1;
+                left -= 1;
+            }
+        }
+    }
+    let mut picked: Vec<usize> = chapters
+        .iter()
+        .zip(&counts)
+        .flat_map(|((_, members), &k)| {
+            (0..k).map(move |i| members[(2 * i + 1) * members.len() / (2 * k)])
+        })
+        .collect();
+    picked.sort_unstable();
+    picked.into_iter().map(|i| entries[i]).collect()
+}
+
+/// The most one segment may take of the remaining budget, so a long clip early
+/// in a short film can't use up the time later chapters need.
+fn fair_share(budget: f64, segments_left: usize) -> f64 {
+    budget / segments_left.max(1) as f64
+}
+
 /// Sidecar text for a collage: each member's caption on its own line.
 fn collage_caption(members: &[&ResolvedEntry]) -> Option<String> {
     let lines: Vec<&str> = members
@@ -456,7 +503,32 @@ pub fn render_hero_video(
     // Clips and Live Photo motion always stay solo.
     let mut groups: Vec<Vec<&ResolvedEntry>> = vec![];
     let mut collage_members: HashMap<String, Vec<String>> = HashMap::new();
-    for r in resolved {
+    let selected: Vec<&ResolvedEntry> = if opts.short_mode {
+        let slots = (budget / still_secs).floor().max(1.0) as usize;
+        let on_disk: Vec<&ResolvedEntry> = resolved
+            .iter()
+            .filter(|r| {
+                let ok =
+                    r.still_path.exists() || r.motion_path.as_ref().is_some_and(|p| p.exists());
+                if !ok {
+                    fallbacks.push(format!("{} missing on disk; skipped", r.entry.asset_id));
+                }
+                ok
+            })
+            .collect();
+        let chosen = spread_across_chapters(&on_disk, slots, chapter_of);
+        if chosen.len() < on_disk.len() {
+            fallbacks.push(format!(
+                "short variant: {} of {} picks spread across the trip to fit ~30 s",
+                chosen.len(),
+                on_disk.len()
+            ));
+        }
+        chosen
+    } else {
+        resolved.iter().collect()
+    };
+    for r in selected {
         let is_still = |e: &ResolvedEntry| matches!(e.entry.rendition, Rendition::Still);
         match groups.last_mut() {
             Some(g)
@@ -494,7 +566,8 @@ pub fn render_hero_video(
             break;
         }
         let rendered = if present.len() == 1 {
-            render_entry_segment(caps, r, idx, still_secs, budget, work_dir, &mut fallbacks)
+            let cap = fair_share(budget, groups.len() - idx);
+            render_entry_segment(caps, r, idx, still_secs, cap, work_dir, &mut fallbacks)
         } else {
             render_collage_segment(caps, &present, idx, still_secs, work_dir)
         };
@@ -1525,7 +1598,7 @@ mod tests {
         // The caption on the collage's second photo survives grouping, and
         // the EDL names both photos on screen.
         let srt = std::fs::read_to_string(v.srt_path.as_ref().expect("sidecar")).unwrap();
-        assert!(srt.contains("Golden Gate at sunset"), "{srt}");
+        assert!(srt.contains("Golden Gate at sunset"));
         assert_eq!(
             edl["segments"][1]["collage_asset_ids"],
             serde_json::json!(["a0", "a1"])
@@ -1550,6 +1623,71 @@ mod tests {
         assert_eq!(closing_secs(true, false, 3.0), 4.5);
         assert_eq!(closing_secs(false, true, 3.0), CREDITS_SECS);
         assert_eq!(closing_secs(false, false, 3.0), 0.0);
+    }
+
+    #[test]
+    fn long_clips_leave_time_for_later_segments() {
+        const CLIP_SECS: f64 = 8.0;
+        let segments = 6;
+        let mut budget = 24.0;
+        for done in 0..segments {
+            assert!(budget >= 0.5, "segment {done} would be dropped");
+            budget -= CLIP_SECS.min(fair_share(budget, segments - done));
+        }
+        assert!(budget.abs() < 1e-9, "the film uses its budget: {budget}");
+        // Full-length films have no budget to share.
+        assert!(fair_share(f64::INFINITY, 3).is_infinite());
+    }
+
+    #[test]
+    fn short_film_picks_reach_every_chapter_in_order() {
+        let entries: Vec<ResolvedEntry> = (0..39)
+            .map(|i| ResolvedEntry {
+                entry: PlanEntry {
+                    asset_id: format!("a{i}"),
+                    content_hash: None,
+                    size_bytes: 0,
+                    mtime: 0,
+                    rendition: Rendition::Still,
+                },
+                still_path: PathBuf::new(),
+                motion_path: None,
+                caption: None,
+                taken_at: None,
+                tz_offset_secs: None,
+            })
+            .collect();
+        let refs: Vec<&ResolvedEntry> = entries.iter().collect();
+        let index = |id: &str| id[1..].parse::<usize>().unwrap();
+        // Days of 12, 13 and 14 photos.
+        let chapter = |id: &str| match index(id) {
+            0..=11 => 0,
+            12..=24 => 1,
+            _ => 2,
+        };
+
+        let picks: Vec<usize> = spread_across_chapters(&refs, 7, chapter)
+            .iter()
+            .map(|r| index(&r.entry.asset_id))
+            .collect();
+        assert_eq!(picks.len(), 7);
+        assert!(
+            picks.windows(2).all(|w| w[0] < w[1]),
+            "keeps order: {picks:?}"
+        );
+        let per_day = |day| {
+            picks
+                .iter()
+                .filter(|&&p| chapter(&format!("a{p}")) == day)
+                .count()
+        };
+        assert_eq!((per_day(0), per_day(1), per_day(2)), (3, 2, 2));
+
+        // Everything fits: nothing is dropped.
+        assert_eq!(spread_across_chapters(&refs, 39, chapter).len(), 39);
+        // A chapter smaller than its share gives its slots to the others.
+        let two = |id: &str| usize::from(index(id) > 0);
+        assert_eq!(spread_across_chapters(&refs[..4], 3, two).len(), 3);
     }
 
     /// Regression: GPS + named places in short mode. The closing cards used

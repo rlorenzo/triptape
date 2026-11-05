@@ -51,41 +51,16 @@ pub fn blake3_files_parallel(
     workers: usize,
     mut on_file: impl FnMut(usize, Option<String>, usize, usize),
 ) -> Vec<Option<String>> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let total = paths.len();
-    let mut results: Vec<Option<String>> = vec![None; total];
-    if total == 0 {
-        return results;
-    }
-    let live = workers.max(1).min(total);
-    let next = AtomicUsize::new(0);
-    let (tx, rx) = std::sync::mpsc::channel::<(usize, Option<String>)>();
-    std::thread::scope(|s| {
-        // Shared borrows stay borrows under the `move` closures below, so
-        // every worker sees the same index counter and input slice.
-        let next_ref = &next;
-        let paths_ref = paths;
-        for _ in 0..live {
-            let worker_tx = tx.clone();
-            s.spawn(move || loop {
-                let idx = next_ref.fetch_add(1, Ordering::SeqCst);
-                if idx >= total {
-                    break;
-                }
-                let digest = blake3_file_chunked(&paths_ref[idx], |_| {}).ok();
-                if worker_tx.send((idx, digest)).is_err() {
-                    break;
-                }
-            });
-        }
-        drop(tx);
-        let mut done = 0usize;
-        for (idx, digest) in rx {
-            done += 1;
+    let mut results: Vec<Option<String>> = vec![None; paths.len()];
+    crate::parallel::for_each_parallel(
+        paths,
+        workers,
+        |path| blake3_file_chunked(path, |_| {}).ok(),
+        |idx, digest, done, total| {
             on_file(idx, digest.clone(), done, total);
             results[idx] = digest;
-        }
-    });
+        },
+    );
     results
 }
 

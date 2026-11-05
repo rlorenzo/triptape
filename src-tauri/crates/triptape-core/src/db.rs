@@ -126,7 +126,7 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-const JOB_COLS: &str = "id,kind,state,progress,error,current_step,temp_dir";
+const JOB_COLS: &str = "id,kind,state,progress,error,current_step,temp_dir,project_id";
 
 fn project_from_row(r: &Row) -> rusqlite::Result<Project> {
     Ok(Project {
@@ -150,6 +150,7 @@ fn job_from_row(r: &Row) -> rusqlite::Result<Job> {
         error: r.get(4)?,
         current_step: r.get(5)?,
         temp_dir: r.get(6)?,
+        project_id: r.get(7)?,
     })
 }
 
@@ -663,6 +664,7 @@ impl Db {
         let t = now();
         let job = Job {
             id: new_id("job"),
+            project_id: project_id.to_string(),
             kind: kind.to_string(),
             state: JobState::Queued,
             progress: 0.0,
@@ -999,6 +1001,8 @@ mod tests {
         let db = mem();
         let p = db.create_project("t", "/x").unwrap();
         let j = db.insert_job(&p.id, "render-video", None).unwrap();
+        assert_eq!(j.project_id, p.id);
+        assert_eq!(db.get_job(&j.id).unwrap().unwrap().project_id, p.id);
         assert_eq!(j.state, JobState::Queued);
         db.update_job(&j.id, JobState::Running, 0.5, Some("xfade"), None)
             .unwrap();
@@ -1077,21 +1081,15 @@ mod tests {
             Some("deadbeef")
         );
         assert!(
-            cache
-                .get(&("/f/photo.jpg".to_string(), 101, 1000))
-                .is_none(),
+            !cache.contains_key(&("/f/photo.jpg".to_string(), 101, 1000)),
             "changed size misses"
         );
         assert!(
-            cache
-                .get(&("/f/photo.jpg".to_string(), 100, 1001))
-                .is_none(),
+            !cache.contains_key(&("/f/photo.jpg".to_string(), 100, 1001)),
             "changed mtime misses"
         );
         assert!(
-            cache
-                .get(&("/f/other.jpg".to_string(), 100, 1000))
-                .is_none(),
+            !cache.contains_key(&("/f/other.jpg".to_string(), 100, 1000)),
             "changed path misses"
         );
     }

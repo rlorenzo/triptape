@@ -181,7 +181,7 @@ impl Plan {
 }
 
 /// Per-signal quality score with human-readable reasons.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Score {
     /// 0..1 sharpness estimate.
     pub sharpness: f32,
@@ -215,6 +215,7 @@ pub enum JobState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: String,
+    pub project_id: String,
     pub kind: String,
     pub state: JobState,
     pub progress: f32,

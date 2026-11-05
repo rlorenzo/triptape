@@ -1,15 +1,24 @@
 <script lang="ts">
-  import { screen, project, assets, ingestJob } from "./lib/store";
-  import { onProgress, restoreLatestProject, loadAllAssets, isTauri } from "./lib/tauri";
+  import { screen, project, assets, ingestJob, exportJob, storyPicks, IDLE_EXPORT, type ExportJobState } from "./lib/store";
+  import { applyExportProgress, exportStateFor } from "./lib/exporter";
+  import { countOf, friendlyStep } from "./lib/trip";
+  import ProgressBar from "./lib/ProgressBar.svelte";
+  import { getStory, onProgress, restoreLatestProject, loadAllAssets, isTauri } from "./lib/tauri";
   import Import from "./Import.svelte";
   import Library from "./Library.svelte";
   import Story from "./Story.svelte";
   import Export from "./Export.svelte";
   import Settings from "./Settings.svelte";
-  import { onMount, onDestroy } from "svelte";
+  import { onMount, onDestroy, tick } from "svelte";
   import { get } from "svelte/store";
 
-  const tabs = ["import", "library", "story", "export", "settings"] as const;
+  const tabs = [
+    { id: "import", label: "Import" },
+    { id: "library", label: "Library" },
+    { id: "story", label: "Story" },
+    { id: "export", label: "Export" },
+    { id: "settings", label: "About" }
+  ] as const;
 
   // Global ingest indicator: App is always mounted, so one subscription
   // covers Library/Story/Export too. A new scan (running) overwrites any
@@ -19,7 +28,10 @@
   // ingest job the indicator above picks up automatically.
   onMount(() => {
     const unsub = onProgress((e) => {
-      if (e.kind !== "ingest") return;
+      if (e.kind !== "ingest") {
+        applyExportProgress(e);
+        return;
+      }
       ingestJob.set({
         id: e.id,
         progress: e.progress,
@@ -36,6 +48,7 @@
         const current = get(project);
         if (current) {
           const pid = current.projectId;
+          loadPicks(pid);
           loadAllAssets(pid)
             .then((a) => {
               if (get(project)?.projectId === pid) assets.set(a);
@@ -83,47 +96,235 @@
   $: ingestDone = $ingestJob?.state === "done";
   $: ingestFailed = $ingestJob?.state === "failed";
   $: ingestPercent = Math.round(($ingestJob?.progress ?? 0) * 100);
+
+  // Per-trip status follows the trip; an export still rendering keeps its own state.
+  let ticketTrip: string | undefined;
+  $: if ($project?.projectId !== ticketTrip) {
+    ticketTrip = $project?.projectId;
+    storyPicks.set(null);
+    exportJob.set(ticketTrip ? exportStateFor(ticketTrip) : IDLE_EXPORT);
+    if (ticketTrip) loadPicks(ticketTrip);
+  }
+
+  // The ticket reports real picks from the moment a trip opens.
+  function loadPicks(pid: string) {
+    getStory(pid)
+      .then((s) => {
+        if (get(project)?.projectId === pid) {
+          storyPicks.set(s.chapters.reduce((sum, c) => sum + c.entries.length, 0));
+        }
+      })
+      .catch(() => {
+        // Not ready yet: the ticket says so, and the ingest "done" event retries.
+      });
+  }
+
+  // Move focus to the new screen's heading so keyboard and screen-reader users
+  // land there. Skips first paint, which keeps default focus on launch.
+  let mainEl: HTMLElement;
+  let shownScreen = $screen;
+  $: if ($screen !== shownScreen) {
+    shownScreen = $screen;
+    tick().then(() => {
+      mainEl?.scrollTo(0, 0);
+      mainEl?.querySelector<HTMLElement>("h1")?.focus();
+    });
+  }
+
+  function storyStatusText(picks: number | null, running: boolean): string {
+    if (picks) return countOf(picks, "pick");
+    if (running) return "Still sorting";
+    return picks === 0 ? "No picks yet" : "Not ready";
+  }
+
+  function keepsakeStatusText(job: ExportJobState): string {
+    if (job.label) return job.progress > 0 ? `Making, ${Math.round(job.progress * 100)}%` : "Making";
+    if (job.error) return "Stopped";
+    const made = [
+      job.summary?.video && "Film",
+      job.summary?.reels.length && "reels",
+      job.summary?.bookPages && "book"
+    ].filter(Boolean);
+    if (made.length === 0) return "Not made yet";
+    return made.length === 3 ? "All three" : made.join(", ");
+  }
+
+  $: storyStatus = storyStatusText($storyPicks, ingestRunning);
+  $: keepsakeStatus = keepsakeStatusText($exportJob);
 </script>
 
-<nav class="flex gap-1 p-2 border-b bg-white" aria-label="Main">
-  {#each tabs as t}
-    <button
-      class="px-4 py-2 rounded capitalize {$screen === t ? 'bg-gray-900 text-white' : 'hover:bg-gray-100'}"
-      aria-current={$screen === t ? "page" : undefined}
-      on:click={() => screen.set(t)}>{t}</button>
-  {/each}
-  {#if ingestRunning || ingestDone || ingestFailed}
-    <div class="ml-auto flex items-center gap-2 text-xs text-gray-600 self-center" role="status" aria-live="polite">
-      {#if ingestRunning}
-        <div
-          class="h-1.5 w-24 rounded bg-gray-200 overflow-hidden"
-          role="progressbar"
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-valuenow={ingestPercent}
-          aria-label="Background ingest progress"
-        >
-          <div class="h-full bg-blue-600" style="width: {ingestPercent}%"></div>
-        </div>
-        <span>{ingestPercent}%</span>
-        <span class="max-w-56 truncate">{$ingestJob?.step}</span>
-      {:else if ingestDone}
-        <span>Library up to date</span>
-      {:else}
-        <span class="text-red-600 max-w-56 truncate">Background update failed{$ingestJob?.error ? `: ${$ingestJob.error}` : ""}</span>
-      {/if}
-    </div>
-  {/if}
-  {#if $project}
-    <span class="{ingestRunning || ingestDone || ingestFailed ? '' : 'ml-auto '}text-sm text-gray-500 self-center">{$project.projectName}</span>
-  {/if}
-</nav>
+<div class="shell">
+  <aside class="side">
+    <div class="brand">TripTape</div>
+    <nav aria-label="Main">
+      {#each tabs as t}
+        <button
+          class="nav-item"
+          class:on={$screen === t.id}
+          aria-current={$screen === t.id ? "page" : undefined}
+          on:click={() => screen.set(t.id)}>{t.label}</button>
+      {/each}
+    </nav>
 
-<main>
-  {#if $screen === "import"}<Import />
-  {:else if $screen === "library"}<Library />
-  {:else if $screen === "story"}<Story />
-  {:else if $screen === "export"}<Export />
-  {:else}<Settings />
-  {/if}
-</main>
+    <section class="ticket" aria-label="Trip status">
+      {#if $project}
+        <h2 title={$project.projectName}>{$project.projectName}</h2>
+        <dl>
+          <div><dt>Files found</dt><dd>{($assets.length || $project.filesSeen).toLocaleString()}</dd></div>
+          <div><dt>Story</dt><dd>{storyStatus}</dd></div>
+          <div><dt>Keepsakes</dt><dd>{keepsakeStatus}</dd></div>
+        </dl>
+      {:else}
+        <h2>No trip yet</h2>
+        <p>Add a folder to start.</p>
+      {/if}
+      {#if ingestRunning || ingestDone || ingestFailed}
+        <div class="ingest" role="status" aria-live="polite">
+          {#if ingestRunning}
+            <ProgressBar value={$ingestJob?.progress ?? 0} label="Checking files" />
+            <p>{ingestPercent}% · {friendlyStep($ingestJob?.step)}</p>
+          {:else if ingestDone}
+            <p>Library up to date</p>
+          {:else}
+            <p class="failed" title={$ingestJob?.error}>Couldn't finish checking your files. Rescan the folder from the Library to try again.</p>
+          {/if}
+        </div>
+      {/if}
+    </section>
+  </aside>
+
+  <main bind:this={mainEl}>
+    {#if $screen === "import"}<Import />
+    {:else if $screen === "library"}<Library />
+    {:else if $screen === "story"}<Story />
+    {:else if $screen === "export"}<Export />
+    {:else}<Settings />
+    {/if}
+  </main>
+</div>
+
+<style>
+  .shell {
+    display: grid;
+    grid-template-columns: 220px minmax(0, 1fr);
+    height: 100%;
+  }
+
+  .side {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 18px 12px 12px;
+    background: var(--blue);
+    color: #fff;
+  }
+
+  .brand {
+    padding: 0 10px 18px;
+    font-size: 22px;
+    font-weight: 800;
+    font-stretch: 125%;
+    letter-spacing: -0.01em;
+  }
+
+  nav {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .nav-item {
+    min-height: 38px;
+    padding: 7px 10px;
+    border-radius: var(--radius);
+    color: #fff;
+    font-weight: 500;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color 120ms;
+  }
+
+  .nav-item:hover:not(.on) {
+    background: var(--blue-deep);
+  }
+
+  .nav-item.on {
+    background: var(--yellow);
+    color: var(--ink);
+    font-weight: 700;
+  }
+
+  .nav-item:focus-visible {
+    outline-color: var(--yellow);
+  }
+
+  .ticket {
+    margin-top: auto;
+    padding: 12px;
+    border-top: 6px solid var(--orange);
+    background: var(--paper);
+    color: var(--ink);
+    font-size: 13px;
+  }
+
+  .ticket h2 {
+    overflow: hidden;
+    font-size: 14px;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .ticket > p {
+    color: var(--ink-2);
+  }
+
+  dl {
+    margin-top: 6px;
+  }
+
+  dl > div {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 4px 0;
+    border-top: 1px solid var(--line);
+  }
+
+  dt {
+    color: var(--ink-2);
+  }
+
+  dd {
+    margin-left: auto;
+    color: var(--blue);
+    font-weight: 800;
+    text-align: right;
+  }
+
+  .ingest {
+    margin-top: 8px;
+  }
+
+  .ingest p {
+    display: -webkit-box;
+    margin-top: 4px;
+    overflow: hidden;
+    color: var(--ink-2);
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+  }
+
+  .ingest .failed {
+    color: var(--red);
+  }
+
+  main {
+    min-width: 0;
+    overflow-y: auto;
+    background: var(--paper);
+  }
+</style>

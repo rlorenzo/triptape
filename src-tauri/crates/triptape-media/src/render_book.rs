@@ -2012,7 +2012,7 @@ mod tests {
         let at: Vec<usize> = titles
             .iter()
             .map(|t| {
-                assert_eq!(typ.matches(t.as_str()).count(), 1, "{t} once:\n{typ}");
+                assert_eq!(typ.matches(t.as_str()).count(), 1, "{t} once");
                 typ.find(t.as_str()).unwrap()
             })
             .collect();
