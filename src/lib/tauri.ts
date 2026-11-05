@@ -1,5 +1,6 @@
 import { convertFileSrc, invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { simulateDemoIngestBackground } from "./store";
 
 // Tauri IPC layer with a graceful browser-preview fallback.
 //
@@ -18,6 +19,9 @@ export interface AssetView {
   timeGuessed: boolean;
   hasGps: boolean;
   isLivePhoto: boolean;
+  place?: string | null;
+  score?: number | null;
+  highlight: boolean;
 }
 
 export interface ScanSummary {
@@ -45,6 +49,10 @@ export { isTauri };
 
 // --- Demo state (browser fallback) -----------------------------------------
 
+const demoPlaces = ["Kyoto, Japan", "Osaka, Japan", undefined];
+
+// Deterministic demo scores so the browser preview demonstrates the Best
+// filter: a fixed subset is marked highlight, mirroring stored scores.
 const demoAssets: AssetView[] = Array.from({ length: 12 }, (_, i) => ({
   id: `demo_a${i.toString().padStart(6, "0")}`,
   kind: i % 4 === 3 ? "video" : "photo",
@@ -53,8 +61,20 @@ const demoAssets: AssetView[] = Array.from({ length: 12 }, (_, i) => ({
   takenAt: 1720000000 + i * 3600,
   timeGuessed: false,
   hasGps: i % 3 !== 0,
-  isLivePhoto: false
+  isLivePhoto: false,
+  place: i % 3 === 0 ? undefined : demoPlaces[Math.floor(i / 4) % 3],
+  score: 0.45 + (i % 5) * 0.1,
+  highlight: i % 3 === 0
 }));
+
+// One demo Live Photo so the browser preview shows the paired treatment
+// (kind string matches the backend `AssetKind::LivePhoto` serialization).
+demoAssets[0] = {
+  ...demoAssets[0],
+  kind: "live-photo",
+  durationSecs: 2.5,
+  isLivePhoto: true
+};
 
 export async function scanFolder(folder: string): Promise<ScanSummary> {
   if (isTauri()) return invoke("scan_folder", { folder });
@@ -62,9 +82,43 @@ export async function scanFolder(folder: string): Promise<ScanSummary> {
   return { projectId: "demo_prj", projectName: "Demo Trip", filesSeen: demoAssets.length, jobId: "demo_job" };
 }
 
+/**
+ * Re-run the scan for the current trip's folder in place (same project,
+ * no folder picker). The backend reuses the stored folder; the raw path
+ * never crosses IPC. Demo mode returns the same demo project and drives
+ * the nav indicator through the shared background simulation.
+ */
+export async function rescanProject(projectId: string): Promise<ScanSummary> {
+  if (isTauri()) return invoke("rescan_project", { projectId });
+  await new Promise((r) => setTimeout(r, 400));
+  simulateDemoIngestBackground();
+  return { projectId, projectName: "Demo Trip", filesSeen: demoAssets.length, jobId: "demo_job" };
+}
+
 export async function getAssets(projectId: string, page = 0, perPage = 100): Promise<AssetView[]> {
   if (isTauri()) return invoke("get_assets", { projectId, page, perPage });
   return demoAssets.slice(page * perPage, page * perPage + perPage);
+}
+
+/**
+ * Reopen the last trip after a relaunch: the latest project's summary, or
+ * null when the store is empty. When unfinished hashing remains, the backend
+ * resumes it as a fresh ingest job and returns its id in the summary.
+ */
+export async function restoreLatestProject(): Promise<ScanSummary | null> {
+  if (isTauri()) return invoke("restore_latest_project");
+  return null;
+}
+
+/** Fetch every page; a short page marks the end. Shared by scan + restore. */
+export async function loadAllAssets(projectId: string): Promise<AssetView[]> {
+  const PER_PAGE = 500;
+  const all: AssetView[] = [];
+  for (let page = 0; ; page++) {
+    const batch = await getAssets(projectId, page, PER_PAGE);
+    all.push(...batch);
+    if (batch.length < PER_PAGE) return all;
+  }
 }
 
 export async function cancelJob(jobId: string): Promise<void> {

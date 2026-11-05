@@ -26,6 +26,9 @@
   // `onProgress` returns its unsubscribe, which Svelte runs on destroy.
   onMount(() =>
     onProgress((e) => {
+      // Ingest background events must not drive the export bar: the hash
+      // phase now runs for minutes after the scan command returns.
+      if (e.kind === "ingest") return;
       // The backend emits the job (state `running`) before rendering starts,
       // so Cancel can target it while the export command is still pending.
       if (busy && e.state === "running") currentJob = e.id;
