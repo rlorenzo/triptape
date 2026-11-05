@@ -5,7 +5,7 @@ import { exportKeepsake, type ExportCmd, type ExportSummary, type ProgressEvent 
 const key = (projectId: string) => `triptape-export-${projectId}`;
 
 /** The finished keepsakes last recorded for this trip, surviving a relaunch. */
-export function savedExport(projectId: string): ExportSummary | null {
+function savedExport(projectId: string): ExportSummary | null {
   try {
     const raw = localStorage.getItem(key(projectId));
     return raw ? (JSON.parse(raw) as ExportSummary) : null;

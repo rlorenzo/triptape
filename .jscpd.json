@@ -1,0 +1,19 @@
+{
+  "threshold": 2,
+  "minTokens": 50,
+  "minLines": 5,
+  "format": [
+    "rust",
+    "svelte",
+    "typescript"
+  ],
+  "pattern": "{src,src-tauri/src,src-tauri/crates}/**",
+  "ignore": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/target/**"
+  ],
+  "reporters": [
+    "console"
+  ]
+}

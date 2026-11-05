@@ -12,9 +12,6 @@ pub fn exif_strip_args() -> Vec<String> {
     vec!["-map_metadata".into(), "-1".into()]
 }
 
-/// Suffix appended to an export filename to mark the pairing as stripped.
-pub const PAIRING_STRIPPED_MARKER: &str = "pairing-stripped";
-
 /// Radius (m) around home inside which route points are fuzzed.
 pub const HOME_FUZZ_METERS: f64 = 500.0;
 

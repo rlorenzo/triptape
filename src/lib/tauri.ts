@@ -97,7 +97,7 @@ export async function rescanProject(projectId: string): Promise<ScanSummary> {
   return { projectId, projectName: "Demo Trip", filesSeen: demoAssets.length, jobId: "demo_job" };
 }
 
-export async function getAssets(projectId: string, page = 0, perPage = 100): Promise<AssetView[]> {
+async function getAssets(projectId: string, page = 0, perPage = 100): Promise<AssetView[]> {
   if (isTauri()) return invoke("get_assets", { projectId, page, perPage });
   return demoAssets.slice(page * perPage, page * perPage + perPage);
 }

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 /// Thumbnail long-edge target (px).
 pub const THUMB_LONG_EDGE: u32 = 320;
 /// Proxy height target (720p).
-pub const PROXY_HEIGHT: u32 = 720;
+const PROXY_HEIGHT: u32 = 720;
 
 /// Content-addressed cache path: `<cache>/<kind>/<hash><suffix>`.
 pub fn cache_path(cache_dir: &Path, kind: &str, content_hash: &str, suffix: &str) -> PathBuf {

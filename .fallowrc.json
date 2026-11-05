@@ -1,0 +1,14 @@
+{
+  // Loaded by the Svelte tooling, not imported by any module.
+  "entry": ["svelte.config.js"],
+  // Command-line tools, run from npm scripts and CI.
+  "ignoreDependencies": ["@tauri-apps/cli", "fallow", "jscpd"],
+  // Read only through Svelte's $store syntax, which fallow 3.37 doesn't count.
+  "ignoreExports": [{ "file": "src/lib/store.ts", "exports": ["assetsByTime", "consentGiven"] }],
+  "rules": {
+    // A Svelte prop can share a name with a store on purpose.
+    "duplicate-exports": "off",
+    // Svelte compiles away, so it belongs in devDependencies.
+    "dev-dependencies-in-production": "off"
+  }
+}

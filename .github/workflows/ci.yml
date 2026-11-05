@@ -54,6 +54,37 @@ jobs:
           ./scripts/make-fixture.sh "$RUNNER_TEMP/fixture"
           ./scripts/spike-render.sh
 
+  linters:
+    name: linters
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Unused code and duplication (fallow, jscpd)
+        run: npm run lint
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+      - name: Install deadwood
+        run: cargo install --locked --git https://github.com/rlorenzo/deadwood --rev 1fd13d0c8e5222bb48788451ce5a32e6770129dd deadwood-rs
+      - name: Dead Rust code and dependencies (deadwood)
+        # deadwood resolves lib names with `cargo metadata --frozen`; without a
+        # populated registry it falls back to package names and misflags
+        # kamadak-exif (imported as `exif`) as unused.
+        run: |
+          cargo fetch --locked
+          deadwood check .
+      - name: Dependency policy (cargo-deny)
+        run: cargo deny check
+      - name: Security advisories (cargo-audit)
+        run: cargo audit
+
   frontend:
     name: npm build
     runs-on: ubuntu-latest

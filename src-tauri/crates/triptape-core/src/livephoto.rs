@@ -13,8 +13,6 @@ use std::path::{Path, PathBuf};
 
 /// Upper bound for the Tier-2 basename fallback (seconds).
 pub const TIER2_MAX_SECS: f64 = 3.5;
-/// Above this, a same-stem MOV is always a real video — never merge.
-pub const NEVER_MERGE_SECS: f64 = 5.0;
 
 /// A still candidate for pairing.
 #[derive(Debug, Clone)]
