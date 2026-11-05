@@ -1,5 +1,8 @@
 # Submission Checklist (PLAN.md Section 18)
 
+The project was submitted to the hackathon in November 2026. This file is a
+historical record; open release work is tracked in `PLAN.md` Section 23.
+
 ## Product
 
 - [ ] TripTape desktop app (macOS universal + Windows x64) with all three keepsakes.
@@ -16,7 +19,7 @@
 ## Hackathon
 
 - [ ] Project description naming the "Build for Your World" track + family problem.
-- [ ] Demo video (live flow + fallback capture) under the track time limit.
+- [x] Demo video (live flow + fallback capture) under the track time limit. Submitted to the hackathon.
 - [ ] Privacy + licensing statement: local-first faces, Meta OSS usage, third-party model licenses.
 
 ## Known blockers (honest gaps)

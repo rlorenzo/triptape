@@ -1,9 +1,9 @@
 # TripTape — Plan
 
-- Version: v0.4 — Hackathon MVP plan (adds Live Photos + modern transition pack; codex review cycle 1: FFmpeg licensing, vendor/privacy gates, degraded-input rules, job recovery; cycle 2: blur-by-default share gate, kid marks force blur; cycle 3: face decisions cover reel cover frames and book proof PDF; v0.4 owner decisions: kid-protection blur/gate removed in favor of a share disclosure on Reels, FFmpeg switched to a full GPL build with `libx264` + `vidstab` for best out-of-box quality)
+- Version: v0.5 — Production plan (hackathon submitted; Section 23 tracks the road to a public release). Earlier: v0.4 Hackathon MVP plan (adds Live Photos + modern transition pack; codex review cycle 1: FFmpeg licensing, vendor/privacy gates, degraded-input rules, job recovery; cycle 2: blur-by-default share gate, kid marks force blur; cycle 3: face decisions cover reel cover frames and book proof PDF; v0.4 owner decisions: kid-protection blur/gate removed in favor of a share disclosure on Reels, FFmpeg switched to a full GPL build with `libx264` + `vidstab` for best out-of-box quality)
 - Context: Free, open-source project for the Meta Global AI Developer Hackathon, "Build for Your World" track
 - Orchestration: Planning by muse-wonder-1.0, research/implementation slices by muse-spark-1.3-contributor subagents
-- Status: Pre-code. This file is the source of truth until code exists.
+- Status: MVP merged and submitted to the hackathon. Sections 1-22 are the target design; they are not a description of what ships today. Section 23 records the actual state and the remaining work, audited against the code on 2026-11-04.
 
 ## 1. Vision
 
@@ -624,13 +624,13 @@
 
 ## 21. Open Decisions (TBD, Owner Needed)
 
-- TBD: Frontend stack final pin (Svelte 5 vs React 19). Decide in Sprint 0 by contributor experience. Do not build both.
-- TBD: Project license (permissive recommended). Decide in Sprint 0 before third-party code lands.
+- Decided: Frontend stack is Svelte 5 + Vite + Tailwind (`docs/decisions.md`).
+- Decided: Project license is MIT (`docs/decisions.md`).
 - TBD: Cloud polish host/provider, cost ceiling, and upload-consent plumbing. Needed only when cloud work starts; local MVP must not depend on it.
 - TBD: Exact bundled music track list (20–30 CC0-class tracks, self-hosted, ledgered).
 - TBD: Typst press-verdict: confirm sRGB proof quality and whether CMYK/PDF-X is achievable or stays out of scope.
 - TBD: Bundled PMTiles build source and style (Section 12), and whether the opt-in regional detail pack ships at all.
-- TBD: Whether face naming ships in the hackathon cut or stays detection-only. Default: detection-only unless Sprint 2 finishes early.
+- TBD: Whether face naming ships in 1.0. The hackathon cut shipped neither detection nor naming (Section 23).
 
 ## 22. Success Metrics
 
@@ -641,3 +641,43 @@
 - Privacy metric: full MVP flow verified offline; face data deletable; no network calls in local mode (verified by firewall/log check).
 - Reliability metric: cancel, sleep/wake, and disk-full during render all end in a recoverable state, never a corrupt library.
 
+## 23. Production Roadmap (Audited 2026-11-04)
+
+The hackathon submission is done, including the demo video. The goal is now a release that ordinary families can install and trust. Work is sequenced by user impact, and each phase is tracked as a card on the Obsidian board.
+
+### 23.1 What works today
+
+- Ingest in the app and CLI: folder walk, hashing, EXIF and video metadata, Live Photo pairing, clustering, heuristic scoring, and a saved plan. First-run consent sheet.
+- Three keepsakes: Trip Video, Reels Pack, and Photo Book, all from one plan, with offline place names and a route card.
+- Story editing: rename a place, edit a caption, leave a photo out and put it back, swap a photo. Edits persist.
+- Export screen with progress and reveal-in-folder, and a Reels share disclosure.
+
+### 23.2 Where the code falls short of this plan
+
+- Install: FFmpeg, ffprobe, and Typst are called by bare name from PATH. Nothing is bundled, so the app fails without developer tools. `sips` also makes HEIC decoding best on macOS only.
+- Jobs (Section 7): `cancel_job` only changes the database row. FFmpeg keeps running and temp files stay. Outputs are written straight to the destination, the app never runs the free-space precheck (only the CLI does), and interrupted jobs get no Resume or Discard.
+- Distribution: no signing, no release workflow, updater off. CI is not confirmed green on Windows.
+- Privacy (Section 14): `exif_strip_args` has no caller, so EXIF stripping is not applied to exports. Home fuzz exists only as a CLI flag. There is no rolling log or diagnostic report, and no crash reporting.
+- Settings: an About page only. No cache cap or clear, and no controls. The FFmpeg GPL text and source link are absent.
+- Export UX: the book preset is fixed to P1, the destination is fixed, eligibility and preflight appear only after a run, and there is no integrity sheet or Relink (Section 8).
+- Light tweaks: no reorder, music picker, caption toggle, map toggle, or single-reel re-export. One bundled music track.
+- Intelligence: no ML models. Face detection returns nothing, so there is no face scoring or smart crop. Reels crop to center or blurred fill. Audio scoring and stabilization are not implemented.
+- Library: thumbnails load lazily, but the grid is not virtualized. No "time guessed" badge or unpair control.
+- Gates G1-G5 remain open. Renderers shipped ahead of G1 and G2 for the hackathon, which is now a release risk rather than a schedule rule.
+
+### 23.3 Phases
+
+| Phase | Outcome | Depends on |
+| --- | --- | --- |
+| R1 Reliable exports | Cancel stops the work, outputs appear only when verified, disk-full fails early, interrupted exports recover | Nothing |
+| R2 Self-contained app | Bundled, pinned FFmpeg, ffprobe, and Typst; HEIC works on both OSes; Windows CI green (G1) | Nothing |
+| R3 Signed releases | Release workflow, notarized and Authenticode-signed builds, working updater (G5) | R2; owner's signing certificates |
+| R4 Privacy and Settings | EXIF strip applied by default, hide home, cache cap and clear, redacted logs and diagnostic report, licenses | Nothing |
+| R5 Export choices | Destination picker, eligibility before a run, book preset and preflight in the UI, integrity sheet and Relink | R1 |
+| R6 Light tweaks | Music picker and bundled library, reorder, caption and map toggles, single-reel re-export | Music list decision |
+| R7 Local intelligence | Pinned models, face detection, smart crop, audio scoring, stabilization (G4) | Budgets measured on baseline hardware |
+| R8 Book and map proof | Vendor designer checks and one ordered proof (G2); bundled basemap or the plain-background fallback (G3) | Owner's vendor test order |
+
+Tooling runs alongside these: add fallow, jscpd, and deadwood, plus `cargo-deny` and `cargo-audit`, to CI.
+
+A 1.0 release needs R1 through R5. R6 and R7 improve the product but do not block it, except that docs must not claim features that have not shipped.

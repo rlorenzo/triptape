@@ -1,5 +1,8 @@
 # Go/No-Go Gates (PLAN.md Section 17, Sprint 0)
 
+All five gates are still open. They now gate the public release (`PLAN.md`
+Section 23) rather than the renderer sprints, which shipped for the hackathon.
+
 No keepsake renderer sprint (3–5) starts until G1 passes. Sprint 5 does not
 start until G2 has a recorded outcome.
 
