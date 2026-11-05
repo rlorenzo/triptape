@@ -312,6 +312,12 @@ fn spread_across_chapters<'a>(
     picked.into_iter().map(|i| entries[i]).collect()
 }
 
+/// The most one segment may take of the remaining budget, so a long clip early
+/// in a short film can't use up the time later chapters need.
+fn fair_share(budget: f64, segments_left: usize) -> f64 {
+    budget / segments_left.max(1) as f64
+}
+
 /// Sidecar text for a collage: each member's caption on its own line.
 fn collage_caption(members: &[&ResolvedEntry]) -> Option<String> {
     let lines: Vec<&str> = members
@@ -560,7 +566,8 @@ pub fn render_hero_video(
             break;
         }
         let rendered = if present.len() == 1 {
-            render_entry_segment(caps, r, idx, still_secs, budget, work_dir, &mut fallbacks)
+            let cap = fair_share(budget, groups.len() - idx);
+            render_entry_segment(caps, r, idx, still_secs, cap, work_dir, &mut fallbacks)
         } else {
             render_collage_segment(caps, &present, idx, still_secs, work_dir)
         };
@@ -1616,6 +1623,20 @@ mod tests {
         assert_eq!(closing_secs(true, false, 3.0), 4.5);
         assert_eq!(closing_secs(false, true, 3.0), CREDITS_SECS);
         assert_eq!(closing_secs(false, false, 3.0), 0.0);
+    }
+
+    #[test]
+    fn long_clips_leave_time_for_later_segments() {
+        const CLIP_SECS: f64 = 8.0;
+        let segments = 6;
+        let mut budget = 24.0;
+        for done in 0..segments {
+            assert!(budget >= 0.5, "segment {done} would be dropped");
+            budget -= CLIP_SECS.min(fair_share(budget, segments - done));
+        }
+        assert!(budget.abs() < 1e-9, "the film uses its budget: {budget}");
+        // Full-length films have no budget to share.
+        assert!(fair_share(f64::INFINITY, 3).is_infinite());
     }
 
     #[test]
