@@ -4,8 +4,9 @@
 //! Single-writer model: one [`Db`] handle, WAL mode, idempotent
 //! `CREATE ... IF NOT EXISTS` schema. One row per Live Photo pair in `assets`.
 
-use crate::types::{Asset, AssetKind, Cluster, Job, JobState, PairingConfidence, Plan};
+use crate::types::{Asset, AssetKind, Cluster, Job, JobState, PairingConfidence, Plan, Score};
 use rusqlite::{params, Connection, OptionalExtension, Row};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 fn asset_kind_from_db(kind: &str) -> AssetKind {
@@ -127,6 +128,19 @@ fn now() -> i64 {
 
 const JOB_COLS: &str = "id,kind,state,progress,error,current_step,temp_dir";
 
+fn project_from_row(r: &Row) -> rusqlite::Result<Project> {
+    Ok(Project {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        folder: r.get(2)?,
+        created_at: r.get(3)?,
+        updated_at: r.get(4)?,
+        cloud_consent: r.get::<_, i64>(5)? != 0,
+        book_preset: r.get(6)?,
+        music_pick: r.get(7)?,
+    })
+}
+
 fn job_from_row(r: &Row) -> rusqlite::Result<Job> {
     Ok(Job {
         id: r.get(0)?,
@@ -242,18 +256,20 @@ impl Db {
             .query_row(
                 "SELECT id,name,folder,created_at,updated_at,cloud_consent,book_preset,music_pick FROM projects WHERE id=?1",
                 params![id],
-                |r| {
-                    Ok(Project {
-                        id: r.get(0)?,
-                        name: r.get(1)?,
-                        folder: r.get(2)?,
-                        created_at: r.get(3)?,
-                        updated_at: r.get(4)?,
-                        cloud_consent: r.get::<_, i64>(5)? != 0,
-                        book_preset: r.get(6)?,
-                        music_pick: r.get(7)?,
-                    })
-                },
+                project_from_row,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Most recently updated project (creation order, then row order, break
+    /// ties deterministically). Used to reopen the last trip on launch.
+    pub fn latest_project(&self) -> Result<Option<Project>, String> {
+        self.conn
+            .query_row(
+                "SELECT id,name,folder,created_at,updated_at,cloud_consent,book_preset,music_pick FROM projects ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT 1",
+                [],
+                project_from_row,
             )
             .optional()
             .map_err(|e| e.to_string())
@@ -271,10 +287,14 @@ impl Db {
             Some(PairingConfidence::BasenameOnly) => Some("basename-only"),
             None => None,
         };
+        let score_json = a
+            .score
+            .as_ref()
+            .and_then(|s| serde_json::to_string(s).ok());
         self.conn.prepare_cached(
-            "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,path=excluded.path,companion_path=excluded.companion_path,kind=excluded.kind,size_bytes=excluded.size_bytes,mtime=excluded.mtime,content_hash=excluded.content_hash,phash=excluded.phash,width=excluded.width,height=excluded.height,duration_secs=excluded.duration_secs,taken_at=excluded.taken_at,tz_offset=excluded.tz_offset,time_guessed=excluded.time_guessed,lat=excluded.lat,lon=excluded.lon,rotation_deg=excluded.rotation_deg,pair_confidence=excluded.pair_confidence,user_caption=excluded.user_caption",
+            "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,score_json)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,path=excluded.path,companion_path=excluded.companion_path,kind=excluded.kind,size_bytes=excluded.size_bytes,mtime=excluded.mtime,content_hash=excluded.content_hash,phash=excluded.phash,width=excluded.width,height=excluded.height,duration_secs=excluded.duration_secs,taken_at=excluded.taken_at,tz_offset=excluded.tz_offset,time_guessed=excluded.time_guessed,lat=excluded.lat,lon=excluded.lon,rotation_deg=excluded.rotation_deg,pair_confidence=excluded.pair_confidence,user_caption=excluded.user_caption,score_json=excluded.score_json",
         ).and_then(|mut st| st.execute(params![
                 a.id, project_id,
                 a.path.to_string_lossy().to_string(),
@@ -284,9 +304,32 @@ impl Db {
                 a.width.map(|w| w as i64), a.height.map(|h| h as i64),
                 a.duration_secs, a.taken_at, a.tz_offset_secs, i64::from(a.time_guessed),
                 a.gps.map(|g| g.0), a.gps.map(|g| g.1),
-                a.rotation_deg as i64, conf, a.user_caption,
+                a.rotation_deg as i64, conf, a.user_caption, score_json,
             ]),
         ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Record one file's content hash without touching the rest of the row.
+    /// The ingest background task flushes these in batches; a per-file
+    /// failure surfaces as `None` (hash unknown), never as a job failure.
+    pub fn update_asset_hash(&self, asset_id: &str, hash: Option<&str>) -> Result<(), String> {
+        self.conn
+            .prepare_cached("UPDATE assets SET content_hash=?1 WHERE id=?2")
+            .and_then(|mut st| st.execute(params![hash, asset_id]))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Record one asset's score without touching the rest of the row.
+    /// The ingest background task flushes these in batches after decoding
+    /// and thumbnail work that must never hold the Db lock.
+    pub fn update_asset_score(&self, asset_id: &str, score: &Score) -> Result<(), String> {
+        let json = serde_json::to_string(score).map_err(|e| e.to_string())?;
+        self.conn
+            .prepare_cached("UPDATE assets SET score_json=?1 WHERE id=?2")
+            .and_then(|mut st| st.execute(params![json, asset_id]))
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -315,13 +358,19 @@ impl Db {
         let mut st = self
             .conn
             .prepare(
-                "SELECT id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption FROM assets WHERE project_id=?1 ORDER BY taken_at NULLS LAST, id",
+                "SELECT id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,score_json FROM assets WHERE project_id=?1 ORDER BY taken_at NULLS LAST, id",
             )
             .map_err(|e| e.to_string())?;
         let rows = st
             .query_map(params![project_id], |r| {
                 let conf: Option<String> = r.get(17)?;
                 let (lat, lon): (Option<f64>, Option<f64>) = (r.get(14)?, r.get(15)?);
+                // A corrupt score row never fails the listing: it reads back
+                // as unscored and background scoring recomputes it.
+                let score_json: Option<String> = r.get(19)?;
+                let score = score_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok());
                 Ok(Asset {
                     id: r.get(0)?,
                     path: PathBuf::from(r.get::<_, String>(1)?),
@@ -348,11 +397,62 @@ impl Db {
                         _ => None,
                     },
                     user_caption: r.get(18)?,
+                    score,
                 })
             })
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
+    }
+
+    /// Assets of one project that still lack a content hash (interrupted or
+    /// still-unfinished ingest). Resume passes hash only these.
+    pub fn assets_missing_hash(&self, project_id: &str) -> Result<Vec<Asset>, String> {
+        Ok(self
+            .list_assets(project_id)?
+            .into_iter()
+            .filter(|a| a.content_hash.is_none())
+            .collect())
+    }
+
+    /// Asset ids of one project that still lack a score (unscored restores,
+    /// older stores, or corrupt score rows). Scoring passes only these and
+    /// keeps already-persisted scores untouched.
+    pub fn assets_missing_score(&self, project_id: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .list_assets(project_id)?
+            .into_iter()
+            .filter(|a| a.score.is_none())
+            .map(|a| a.id)
+            .collect())
+    }
+
+    /// Every saved `(path, size_bytes, mtime)` -> content hash, across all
+    /// projects. A rescan reuses a digest only when path AND size AND mtime
+    /// all match, so an edited file (new size/mtime) always re-hashes.
+    pub fn hash_reuse_cache(&self) -> Result<HashMap<(String, u64, i64), String>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT path,size_bytes,mtime,content_hash FROM assets WHERE content_hash IS NOT NULL",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (path, size, mtime, digest) = row.map_err(|e| e.to_string())?;
+            map.insert((path, size, mtime), digest);
+        }
+        Ok(map)
     }
 
     // -- clusters ---------------------------------------------------------
@@ -385,6 +485,64 @@ impl Db {
             .and_then(|mut st| st.execute(params![asset_id, cluster_id, i64::from(is_hero)]))
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Delete one project's cluster graph: its links, then its clusters.
+    /// Plans and Story-editor edits are untouched. Refresh support: the
+    /// ingest persist re-inserts the rebuilt clusters afterwards, so stale
+    /// groupings never linger next to the new ones.
+    pub fn clear_project_clusters(&self, project_id: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM asset_clusters WHERE cluster_id IN (SELECT id FROM clusters WHERE project_id=?1)",
+                params![project_id],
+            )
+            .map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "DELETE FROM clusters WHERE project_id=?1",
+                params![project_id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Delete asset rows of one project whose ids are not in `keep_ids`
+    /// (files removed from the folder since the last scan). Returns the
+    /// number of rows deleted. Other projects are untouched.
+    pub fn delete_stale_assets(
+        &self,
+        project_id: &str,
+        keep_ids: &[String],
+    ) -> Result<usize, String> {
+        let keep: std::collections::HashSet<&str> =
+            keep_ids.iter().map(String::as_str).collect();
+        let mut st = self
+            .conn
+            .prepare("SELECT id FROM assets WHERE project_id=?1")
+            .map_err(|e| e.to_string())?;
+        let existing: Vec<String> = st
+            .query_map(params![project_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        drop(st);
+        let stale: Vec<String> = existing
+            .into_iter()
+            .filter(|id| !keep.contains(id.as_str()))
+            .collect();
+        // Chunked `IN` deletes: a library can hold more ids than one
+        // statement's variable limit.
+        let mut deleted = 0usize;
+        for chunk in stale.chunks(500) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("DELETE FROM assets WHERE id IN ({placeholders})");
+            let mut st = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+            deleted += st
+                .execute(rusqlite::params_from_iter(chunk.iter()))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(deleted)
     }
 
     pub fn hero_ids(&self, cluster_id: &str) -> Result<Vec<String>, String> {
@@ -692,6 +850,73 @@ mod tests {
     }
 
     #[test]
+    fn score_survives_upsert_and_list_round_trip() {
+        let db = mem();
+        let p = db.create_project("trip", "/tmp/trip").unwrap();
+        let mut a = asset("a1");
+        a.score = Some(Score {
+            sharpness: 0.8,
+            exposure: 0.9,
+            blur: 0.2,
+            total: 0.85,
+            highlight: true,
+            reasons: vec!["clean exposure, good detail".into()],
+        });
+        db.upsert_asset(&p.id, &a).unwrap();
+        let got = db.list_assets(&p.id).unwrap();
+        assert_eq!(got.len(), 1);
+        let s = got[0].score.as_ref().expect("score round trip");
+        assert!((s.total - 0.85).abs() < 1e-6);
+        assert!((s.sharpness - 0.8).abs() < 1e-6);
+        assert!(s.highlight);
+        assert_eq!(s.reasons, vec!["clean exposure, good detail".to_string()]);
+        // Unscored assets stay None.
+        db.upsert_asset(&p.id, &asset("a2")).unwrap();
+        let got = db.list_assets(&p.id).unwrap();
+        assert!(got.iter().find(|x| x.id == "a2").unwrap().score.is_none());
+        assert!(db.assets_missing_score(&p.id).unwrap() == vec!["a2".to_string()]);
+        // A corrupt score row reads back as unscored, not as an error.
+        db.conn
+            .execute(
+                "UPDATE assets SET score_json='not json' WHERE id='a1'",
+                [],
+            )
+            .unwrap();
+        let got = db.list_assets(&p.id).unwrap();
+        assert!(got.iter().find(|x| x.id == "a1").unwrap().score.is_none());
+    }
+
+    #[test]
+    fn update_asset_score_changes_only_the_score() {
+        let db = mem();
+        let p = db.create_project("trip", "/tmp/trip").unwrap();
+        db.upsert_asset(&p.id, &asset("a1")).unwrap();
+        let first = Score {
+            total: 0.4,
+            ..Default::default()
+        };
+        db.update_asset_score("a1", &first).unwrap();
+        let after_first = db.list_assets(&p.id).unwrap();
+        assert!((after_first[0].score.as_ref().unwrap().total - 0.4).abs() < 1e-6);
+        // Every other column survives the column-only write.
+        assert_eq!(after_first[0].size_bytes, 42);
+        assert_eq!(after_first[0].content_hash.as_deref(), Some("abc"));
+        assert_eq!(after_first[0].kind, AssetKind::LivePhoto);
+        let second = Score {
+            total: 0.9,
+            highlight: true,
+            ..Default::default()
+        };
+        db.update_asset_score("a1", &second).unwrap();
+        let after_second = db.list_assets(&p.id).unwrap();
+        assert_eq!(after_second.len(), 1);
+        assert!((after_second[0].score.as_ref().unwrap().total - 0.9).abs() < 1e-6);
+        assert!(after_second[0].score.as_ref().unwrap().highlight);
+        assert_eq!(after_second[0].size_bytes, 42);
+        assert!(db.assets_missing_score(&p.id).unwrap().is_empty());
+    }
+
+    #[test]
     fn asset_source_is_scoped_to_project() {
         let db = mem();
         let p = db.create_project("trip", "/tmp/trip").unwrap();
@@ -788,6 +1013,158 @@ mod tests {
         assert_eq!(back.state, JobState::Running);
         assert_eq!(back.current_step.as_deref(), Some("xfade"));
         assert!(db.get_job("job_missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn latest_project_returns_none_on_empty_store() {
+        let db = mem();
+        assert!(db.latest_project().unwrap().is_none());
+    }
+
+    #[test]
+    fn latest_project_prefers_recent_updates_with_deterministic_ties() {
+        let db = mem();
+        let first = db.create_project("first", "/a").unwrap();
+        let second = db.create_project("second", "/b").unwrap();
+        // Same-second creation timestamps tie: the later row wins.
+        assert_eq!(db.latest_project().unwrap().unwrap().id, second.id);
+        // Touching the older project makes it latest again.
+        db.conn
+            .execute(
+                "UPDATE projects SET updated_at = updated_at + 100 WHERE id=?1",
+                params![first.id],
+            )
+            .unwrap();
+        assert_eq!(db.latest_project().unwrap().unwrap().id, first.id);
+    }
+
+    #[test]
+    fn missing_hash_set_lists_only_unhashed_assets() {
+        let db = mem();
+        let p = db.create_project("t", "/x").unwrap();
+        let mut unhashed = asset("a1");
+        unhashed.content_hash = None;
+        db.upsert_asset(&p.id, &unhashed).unwrap();
+        db.upsert_asset(&p.id, &asset("b1")).unwrap(); // hashed ("abc")
+        let missing = db.assets_missing_hash(&p.id).unwrap();
+        assert_eq!(
+            missing.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["a1"]
+        );
+        db.update_asset_hash("a1", Some("fff")).unwrap();
+        assert!(db.assets_missing_hash(&p.id).unwrap().is_empty());
+        // Another project's unhashed assets never leak in.
+        let other = db.create_project("o", "/y").unwrap();
+        let mut stray = asset("a1");
+        stray.content_hash = None;
+        db.upsert_asset(&other.id, &stray).unwrap();
+        assert!(db.assets_missing_hash(&p.id).unwrap().is_empty());
+        assert_eq!(db.assets_missing_hash(&other.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hash_reuse_cache_hits_exact_match_only() {
+        let db = mem();
+        let p = db.create_project("t", "/x").unwrap();
+        let mut a = asset("a1");
+        a.path = PathBuf::from("/f/photo.jpg");
+        a.size_bytes = 100;
+        a.mtime = 1000;
+        a.content_hash = Some("deadbeef".into());
+        db.upsert_asset(&p.id, &a).unwrap();
+        let mut unhashed = asset("a2");
+        unhashed.content_hash = None;
+        db.upsert_asset(&p.id, &unhashed).unwrap();
+        let cache = db.hash_reuse_cache().unwrap();
+        assert_eq!(cache.len(), 1, "unhashed rows stay out of the cache");
+        assert_eq!(
+            cache
+                .get(&("/f/photo.jpg".to_string(), 100, 1000))
+                .map(String::as_str),
+            Some("deadbeef")
+        );
+        assert!(cache
+            .get(&("/f/photo.jpg".to_string(), 101, 1000))
+            .is_none(), "changed size misses");
+        assert!(cache
+            .get(&("/f/photo.jpg".to_string(), 100, 1001))
+            .is_none(), "changed mtime misses");
+        assert!(cache
+            .get(&("/f/other.jpg".to_string(), 100, 1000))
+            .is_none(), "changed path misses");
+    }
+
+    #[test]
+    fn refresh_clear_clusters_allows_reinsert_and_keeps_other_project() {
+        let db = mem();
+        let p = db.create_project("trip", "/tmp/trip").unwrap();
+        let other = db.create_project("other", "/tmp/other").unwrap();
+        for (pid, id) in [(&p.id, "a1"), (&other.id, "b1")] {
+            db.upsert_asset(pid, &asset(id)).unwrap();
+        }
+        let cluster = |id: &str, member: &str| Cluster {
+            id: id.into(),
+            asset_ids: vec![member.into()],
+            start_time: Some(1),
+            end_time: Some(2),
+            centroid_gps: None,
+            label: "day".into(),
+        };
+        db.insert_cluster(&p.id, "day", &cluster("c1", "a1")).unwrap();
+        db.link_asset_cluster("a1", "c1", true).unwrap();
+        db.insert_cluster(&other.id, "day", &cluster("c9", "b1"))
+            .unwrap();
+        db.link_asset_cluster("b1", "c9", true).unwrap();
+
+        db.clear_project_clusters(&p.id).unwrap();
+        // The same cluster id inserts cleanly again (no PK collision) and
+        // the other project's graph is untouched.
+        db.insert_cluster(&p.id, "day", &cluster("c1", "a1")).unwrap();
+        db.link_asset_cluster("a1", "c1", false).unwrap();
+        assert_eq!(db.hero_ids("c1").unwrap(), Vec::<String>::new());
+        assert_eq!(db.hero_ids("c9").unwrap(), vec!["b1".to_string()]);
+        // Assets and other tables are not cleared.
+        assert_eq!(db.list_assets(&p.id).unwrap().len(), 1);
+        assert_eq!(db.list_assets(&other.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn refresh_delete_stale_assets_prunes_only_the_project() {
+        let db = mem();
+        let p = db.create_project("trip", "/tmp/trip").unwrap();
+        let other = db.create_project("other", "/tmp/other").unwrap();
+        db.upsert_asset(&p.id, &asset("kept")).unwrap();
+        db.upsert_asset(&p.id, &asset("stale")).unwrap();
+        db.upsert_asset(&other.id, &asset("o1")).unwrap();
+        let edits = crate::plan::PlanEdits {
+            excluded: vec!["kept".into()],
+            ..Default::default()
+        };
+        db.save_plan_edits(&p.id, &edits).unwrap();
+
+        // A re-upserted kept row still updates in place.
+        let mut kept = asset("kept");
+        kept.size_bytes = 43;
+        db.upsert_asset(&p.id, &kept).unwrap();
+        let deleted = db
+            .delete_stale_assets(&p.id, &["kept".to_string()])
+            .unwrap();
+        assert_eq!(deleted, 1);
+        let ids: Vec<String> = db
+            .list_assets(&p.id)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, ["kept"]);
+        assert_eq!(db.list_assets(&p.id).unwrap()[0].size_bytes, 43);
+        // The other project's assets survive; edits survive.
+        assert_eq!(db.list_assets(&other.id).unwrap().len(), 1);
+        assert_eq!(db.get_plan_edits(&p.id).unwrap(), edits);
+        // Empty keep set clears the project's assets and nothing else.
+        assert_eq!(db.delete_stale_assets(&p.id, &[]).unwrap(), 1);
+        assert!(db.list_assets(&p.id).unwrap().is_empty());
+        assert_eq!(db.list_assets(&other.id).unwrap().len(), 1);
     }
 
     #[test]

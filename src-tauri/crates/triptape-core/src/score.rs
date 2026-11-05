@@ -145,6 +145,47 @@ pub fn highlight_score(base: &Score, signals: &StorySignals, for_print: bool) ->
     out
 }
 
+/// CLI fallback for assets nothing could be scored from: a neutral total
+/// that never highlights on its own.
+pub fn fallback_score() -> Score {
+    Score {
+        total: 0.5,
+        ..Default::default()
+    }
+}
+
+/// Fixed CLI proxy score for videos: a neutral base plus a GPS-novelty
+/// bonus, passed through [`highlight_score`] exactly like the CLI scan.
+pub fn video_proxy_score(has_gps: bool) -> Score {
+    let sig = StorySignals {
+        gps_novelty: if has_gps { 0.6 } else { 0.0 },
+        ..Default::default()
+    };
+    let base = Score {
+        total: 0.55,
+        sharpness: 0.5,
+        exposure: 0.6,
+        ..Default::default()
+    };
+    highlight_score(&base, &sig, false)
+}
+
+/// Score an already-decoded still: luma stats → [`score_still`] → default
+/// story signals. Returns `None` when the pixels carry no frame stats.
+pub fn score_still_image(img: &image::DynamicImage) -> Option<Score> {
+    let gray = img.to_luma8();
+    let stats = frame_stats(gray.as_raw(), gray.width(), gray.height())?;
+    let base = score_still(&stats);
+    Some(highlight_score(&base, &StorySignals::default(), false))
+}
+
+/// Score a still from a file on disk (a photo, or a cached thumbnail of
+/// one). Returns `None` when the file cannot be decoded or carries no
+/// frame stats; callers apply [`fallback_score`].
+pub fn score_still_file(path: &std::path::Path) -> Option<Score> {
+    score_still_image(&image::open(path).ok()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +269,66 @@ mod tests {
         assert_eq!(sp.mean, st.mean);
         assert_eq!(sp.variance, st.variance);
         assert!(frame_stats(&gray, u32::MAX, u32::MAX).is_none());
+    }
+
+    fn checkerboard(size: u32) -> image::DynamicImage {
+        let mut img = image::RgbImage::new(size, size);
+        for y in 0..size {
+            for x in 0..size {
+                let v = if (x + y) % 2 == 0 { 200 } else { 80 };
+                img.put_pixel(x, y, image::Rgb([v, v, v]));
+            }
+        }
+        image::DynamicImage::ImageRgb8(img)
+    }
+
+    fn flat_dark(size: u32) -> image::DynamicImage {
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            size,
+            size,
+            image::Rgb([8, 8, 8]),
+        ))
+    }
+
+    #[test]
+    fn sharp_clean_still_beats_flat_dark_still() {
+        let sharp = score_still_image(&checkerboard(32)).unwrap();
+        let dark = score_still_image(&flat_dark(32)).unwrap();
+        assert!(sharp.total > dark.total, "{sharp:?} vs {dark:?}");
+        assert!(sharp.highlight, "{sharp:?}");
+        assert!(!dark.highlight, "{dark:?}");
+    }
+
+    #[test]
+    fn still_file_scores_saved_image_and_rejects_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let sharp_path = dir.path().join("sharp.png");
+        checkerboard(32).save(&sharp_path).unwrap();
+        let sharp = score_still_file(&sharp_path).unwrap();
+        assert!(sharp.total > 0.65, "{sharp:?}");
+
+        let dark_path = dir.path().join("dark.png");
+        flat_dark(32).save(&dark_path).unwrap();
+        let dark = score_still_file(&dark_path).unwrap();
+        assert!(dark.total < sharp.total, "{dark:?} vs {sharp:?}");
+
+        assert!(score_still_file(&dir.path().join("missing.png")).is_none());
+        let junk = dir.path().join("junk.png");
+        std::fs::write(&junk, b"not an image").unwrap();
+        assert!(score_still_file(&junk).is_none());
+    }
+
+    #[test]
+    fn video_proxy_matches_cli_constants() {
+        // CLI: base total 0.55, GPS novelty 0.6 bonus 0.10, highlight >= 0.65.
+        let plain = video_proxy_score(false);
+        assert_eq!(plain.total, 0.55);
+        assert!(!plain.highlight);
+        let gps = video_proxy_score(true);
+        assert!((gps.total - 0.65).abs() < 1e-6, "{gps:?}");
+        assert!(gps.highlight);
+        assert!(gps.reasons.iter().any(|r| r.contains("unique place")));
+        assert_eq!(fallback_score().total, 0.5);
+        assert!(!fallback_score().highlight);
     }
 }

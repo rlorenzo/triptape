@@ -67,6 +67,9 @@ pub struct Asset {
     /// Caption embedded in the file by the user (EXIF/XMP), if any.
     /// Wins over auto-generated place captions in plans.
     pub user_caption: Option<String>,
+    /// Local quality/story score, filled by background scoring after ingest.
+    /// `None` until scored (or when scoring was skipped).
+    pub score: Option<Score>,
 }
 
 impl Asset {
@@ -90,6 +93,7 @@ impl Asset {
             rotation_deg: 0,
             pairing_confidence: None,
             user_caption: None,
+            score: None,
         }
     }
 }
