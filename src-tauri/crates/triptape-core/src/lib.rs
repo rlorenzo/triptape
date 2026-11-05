@@ -8,6 +8,7 @@ pub mod hash;
 pub mod jobs;
 pub mod livephoto;
 pub mod metadata;
+pub mod parallel;
 pub mod plan;
 pub mod privacy;
 pub mod proxies;

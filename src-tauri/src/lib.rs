@@ -131,6 +131,7 @@ pub struct ScanSummary {
 #[serde(rename_all = "camelCase")]
 pub struct JobView {
     pub id: String,
+    pub project_id: String,
     pub kind: String,
     pub state: String,
     pub progress: f32,
