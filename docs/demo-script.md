@@ -6,14 +6,14 @@ separately. Reels disclosure adds no click.
 
 ## Setup (before the clock)
 
-1. `./scripts/make-fixture.sh /tmp/demo-trip` (tiny synthetic trip).
+1. `./scripts/make-demo-trip.sh` (39 Pexels photos of one family in `/tmp/demo-family-trip`; dates and GPS are staged, never commit them). Offline or for CI: `./scripts/make-fixture.sh /tmp/demo-trip`.
 2. Open TripTape; confirm the Library is empty.
 
 ## The run
 
 | Time | Click | What the judge sees |
 | --- | --- | --- |
-| 0:00 | **Click 1 — Add folder** | Pick `/tmp/demo-trip`, confirm the OS dialog. Grid fills in live with counts; ingest progress bar. |
+| 0:00 | **Click 1 — Add folder** | Pick `/tmp/demo-family-trip`, confirm the OS dialog. Grid fills in live with counts; ingest progress bar. |
 | 0:20 | (consent, one-time) | "Got it" on the consent sheet — faces on-device, nothing uploaded. |
 | 0:30 | — | Library: day/place groups, filters (day, place, people, best/all). |
 | 1:00 | **Click 2 — Story** | Chapters by day with hero picks + "why this moment", editable captions, music pick. Change one caption live. |
