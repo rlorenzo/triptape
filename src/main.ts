@@ -1,3 +1,4 @@
+import "@fontsource-variable/archivo/wdth.css";
 import "./app.css";
 import App from "./App.svelte";
 import { mount } from "svelte";

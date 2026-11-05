@@ -1,5 +1,6 @@
-import { writable } from "svelte/store";
-import type { AssetView, ScanSummary } from "./tauri";
+import { derived, writable } from "svelte/store";
+import { byTime, dayKey } from "./trip";
+import type { AssetView, ExportCmd, ExportSummary, ScanSummary } from "./tauri";
 
 export type Screen = "import" | "library" | "story" | "export" | "settings";
 
@@ -16,6 +17,23 @@ function readConsent(): boolean {
 export const screen = writable<Screen>("import");
 export const project = writable<ScanSummary | null>(null);
 export const assets = writable<AssetView[]>([]);
+
+/** Frame numbers follow the whole trip, so filters and cuts never renumber a photo. */
+export const frameNumbers = derived(
+  assets,
+  ($assets) => new Map([...$assets].sort(byTime).map((a, i) => [a.id, i + 1]))
+);
+
+/** Day numbers follow the whole trip too. */
+export const dayNumbers = derived(assets, ($assets) => {
+  const numbers = new Map<string, number>();
+  for (const a of [...$assets].sort(byTime)) {
+    const key = dayKey(a.takenAt);
+    if (key !== "undated" && !numbers.has(key)) numbers.set(key, numbers.size + 1);
+  }
+  return numbers;
+});
+
 export const consentGiven = writable<boolean>(readConsent());
 
 /** Background ingest job (public surface of `job://progress` for kind `ingest`). */
@@ -28,6 +46,37 @@ export interface IngestJobState {
 }
 
 export const ingestJob = writable<IngestJobState | null>(null);
+
+/** Number of story picks, known once the Story screen has loaded them. */
+export const storyPicks = writable<number | null>(null);
+
+/**
+ * The export in flight or last finished. Lives here, not in the Export screen,
+ * so it survives navigating away during a long render.
+ */
+export interface ExportJobState {
+  cmd: ExportCmd | null;
+  label: string | null;
+  jobId: string;
+  progress: number;
+  step: string;
+  error: string;
+  cancelled: boolean;
+  summary: ExportSummary | null;
+}
+
+export const IDLE_EXPORT: ExportJobState = {
+  cmd: null,
+  label: null,
+  jobId: "",
+  progress: 0,
+  step: "",
+  error: "",
+  cancelled: false,
+  summary: null
+};
+
+export const exportJob = writable<ExportJobState>(IDLE_EXPORT);
 
 // Browser-preview background simulation. Owned at module level (not by the
 // Import component) because the app navigates to Library when the demo scan

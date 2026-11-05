@@ -58,7 +58,8 @@ const demoAssets: AssetView[] = Array.from({ length: 12 }, (_, i) => ({
   kind: i % 4 === 3 ? "video" : "photo",
   width: 4000,
   height: 3000,
-  takenAt: 1720000000 + i * 3600,
+  // Four files a day across three days, matching the demo story's chapters.
+  takenAt: 1720000000 + Math.floor(i / 4) * 86400 + (i % 4) * 3600,
   timeGuessed: false,
   hasGps: i % 3 !== 0,
   isLivePhoto: false,
@@ -121,6 +122,20 @@ export async function loadAllAssets(projectId: string): Promise<AssetView[]> {
   }
 }
 
+/** Open a finished export in the default app. Tauri scopes this to the export folder. */
+export async function openExport(path: string): Promise<void> {
+  if (!isTauri()) throw new Error("Opening files works in the desktop app, not this browser preview.");
+  const { openPath } = await import("@tauri-apps/plugin-opener");
+  await openPath(path);
+}
+
+/** Show a finished export in Finder or Explorer. */
+export async function revealExport(path: string): Promise<void> {
+  if (!isTauri()) throw new Error("Showing files works in the desktop app, not this browser preview.");
+  const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+  await revealItemInDir(path);
+}
+
 export async function cancelJob(jobId: string): Promise<void> {
   if (isTauri()) await invoke("cancel_job", { jobId });
 }
@@ -177,7 +192,11 @@ function buildDemoStory(): StoryView {
       title: place ?? "At sea",
       place,
       dayIndex: c + 1,
-      dateLabel: ["Mon, Oct 5", "Tue, Oct 6", "Wed, Oct 7"][c],
+      dateLabel: new Date((items[0]?.takenAt ?? 0) * 1000).toLocaleDateString(undefined, {
+        weekday: "short",
+        month: "short",
+        day: "numeric"
+      }),
       entries: items.map((a, i) => ({ ...a, caption: place, inHero: i < 3, inReels: i === 0 }))
     };
   }).filter((c) => c.entries.length > 0);
@@ -254,6 +273,22 @@ export async function swapAsset(projectId: string, fromAssetId: string, toAssetI
   });
 }
 
+// Browser preview only: flat synthetic scenes stand in for real thumbnails.
+function demoThumbnail(assetId: string): string {
+  const scenes = [
+    ["#f7b267", "#f4845f", "#22577a"],
+    ["#9bd1e5", "#3a86a8", "#e9d8a6"],
+    ["#264d36", "#5f9e5a", "#d7c98a"],
+    ["#ef476f", "#ffd166", "#118ab2"],
+    ["#1b3a5c", "#5c7fa3", "#2c2c34"],
+    ["#ffe8c7", "#e07a5f", "#3d405b"]
+  ];
+  const n = [...assetId].reduce((sum, c) => sum + c.charCodeAt(0), 0);
+  const [a, b, c] = scenes[n % scenes.length];
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240"><rect width="320" height="240" fill="${a}"/><rect y="110" width="320" height="70" fill="${b}"/><rect y="180" width="320" height="60" fill="${c}"/></svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
 const MAX_THUMB_JOBS = 4;
 let activeThumbJobs = 0;
 const thumbQueue: (() => void)[] = [];
@@ -283,7 +318,7 @@ const thumbsInFlight = new Map<string, Promise<string | null>>();
  * are shared: the backend re-checks the source each time, so edits show up.
  */
 export function getThumbnail(projectId: string, assetId: string): Promise<string | null> {
-  if (!isTauri()) return Promise.resolve(null);
+  if (!isTauri()) return Promise.resolve(demoThumbnail(assetId));
   const key = `${projectId}/${assetId}`;
   let hit = thumbsInFlight.get(key);
   if (!hit) {

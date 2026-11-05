@@ -1,6 +1,8 @@
 <script lang="ts">
-  import Thumb from "./lib/Thumb.svelte";
-  import { assets, ingestJob, project } from "./lib/store";
+  import DayGroup from "./lib/DayGroup.svelte";
+  import ErrorNote from "./lib/ErrorNote.svelte";
+  import { assets, dayNumbers, frameNumbers, ingestJob, project, screen } from "./lib/store";
+  import { byTime, dayKey } from "./lib/trip";
 
   import { loadAllAssets, rescanProject } from "./lib/tauri";
   import type { AssetView } from "./lib/tauri";
@@ -15,11 +17,13 @@
     gps: (a) => a.hasGps
   };
 
-  // Backend kind strings are raw (`live-photo`); display the friendly name.
-  function kindLabel(a: AssetView): string {
-    if (a.isLivePhoto || a.kind === "live-photo" || a.kind === "livephoto") return "Live Photo";
-    return a.kind;
-  }
+  const FILTER_LABELS: Record<string, string> = {
+    all: "All",
+    best: "Best",
+    photo: "Photos",
+    video: "Videos",
+    gps: "Has place"
+  };
 
   let filter = "all";
   let dayFilter = "";
@@ -27,18 +31,60 @@
   $: query = dayFilter.trim().toLowerCase();
   $: filtered = $assets.filter(FILTERS[filter]).filter((a) => {
     if (!query) return true;
+    const day = $dayNumbers.get(dayKey(a.takenAt));
+    // "Day 1" means that day exactly, not Days 10–19.
+    const asked = query.match(/^day\s+(\d+)$/);
+    if (asked) return day === Number(asked[1]);
     const hay = [a.place ?? "", fmtWhen(a.takenAt), a.kind].join(" ").toLowerCase();
     return hay.includes(query);
   });
   // Oldest-first display guarantee: takenAt ascending, missing last,
   // id tie-break. Sorts a copy so the store array is never mutated.
-  $: visible = [...filtered].sort((a, b) => {
-    if (a.takenAt == null && b.takenAt == null) return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-    if (a.takenAt == null) return 1;
-    if (b.takenAt == null) return -1;
-    return a.takenAt - b.takenAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
-  });
+  $: visible = [...filtered].sort(byTime);
   $: pid = $project?.projectId;
+
+  function commonPlaces(items: AssetView[]): string[] {
+    const counts = new Map<string, number>();
+    for (const a of items) if (a.place) counts.set(a.place, (counts.get(a.place) ?? 0) + 1);
+    return [...counts.entries()]
+      .sort((x, y) => y[1] - x[1])
+      .slice(0, 2)
+      .map(([place]) => place);
+  }
+
+  function groupByDay(items: AssetView[]) {
+    const groups = new Map<string, AssetView[]>();
+    for (const a of items) {
+      const key = dayKey(a.takenAt);
+      const group = groups.get(key);
+      if (group) group.push(a);
+      else groups.set(key, [a]);
+    }
+    return [...groups.entries()].map(([key, group]) => ({
+      key,
+      number: $dayNumbers.get(key),
+      date: key === "undated"
+        ? ""
+        : new Date(group[0].takenAt! * 1000).toLocaleDateString(undefined, {
+            weekday: "short",
+            month: "short",
+            day: "numeric"
+          }),
+      places: commonPlaces(group),
+      items: group
+    }));
+  }
+
+  $: days = groupByDay(visible);
+
+  function jumpTo(key: string) {
+    document.getElementById(`day-${key}`)?.scrollIntoView();
+  }
+
+  function clearFilters() {
+    filter = "all";
+    dayFilter = "";
+  }
 
   function fmtWhen(takenAt?: number): string {
     if (!takenAt) return "";
@@ -53,19 +99,6 @@
       minute: "2-digit"
     });
     return `${date}, ${time}`;
-  }
-
-  function caption(a: AssetView): string {
-    const when = fmtWhen(a.takenAt);
-    const parts = [when, a.place].filter((s): s is string => !!s);
-    return parts.join(" · ");
-  }
-
-  function meta(a: AssetView): string {
-    const bits = [kindLabel(a)];
-    if (a.width && a.height) bits.push(`${a.width}×${a.height}`);
-    if (a.durationSecs) bits.push(`${a.durationSecs.toFixed(1)}s`);
-    return bits.join(" · ");
   }
 
   // In-place refresh of the current trip's folder (no folder picker).
@@ -92,50 +125,148 @@
   }
 </script>
 
-<div class="p-6">
-  <h1 class="text-2xl font-bold mb-1">Library</h1>
-  <div class="flex items-center gap-3 mb-4">
-    <p class="text-sm text-gray-600">{$project?.projectName} — {$assets.length} assets</p>
-    <button
-      class="px-3 py-1 rounded border text-sm bg-white disabled:opacity-50"
-      disabled={rescanDisabled}
-      on:click={rescan}>{rescanning ? "Rescanning…" : "Rescan folder"}</button>
-  </div>
-  {#if rescanError}<p class="text-red-600 text-sm mb-4" role="alert">{rescanError}</p>{/if}
-
-  <div class="flex gap-2 mb-4 text-sm" role="toolbar" aria-label="Filters">
-    {#each Object.keys(FILTERS) as f}
-      <button
-        class="px-3 py-1 rounded border {filter === f ? 'bg-gray-900 text-white' : 'bg-white'}"
-        on:click={() => (filter = f)}
-        aria-pressed={filter === f}>{f === "gps" ? "has place" : f}</button>
-    {/each}
-    <input class="border rounded px-2 py-1 ml-2" placeholder="day / place" bind:value={dayFilter} aria-label="Filter by day or place" />
+<div class="screen">
+  <div class="screen-head">
+    <div>
+      <h1 class="headline" tabindex="-1">The whole trip</h1>
+      {#if $project}
+        <p class="lede">{$project.projectName}: {$assets.length.toLocaleString()} {$assets.length === 1 ? "file" : "files"} across {$dayNumbers.size} {$dayNumbers.size === 1 ? "day" : "days"}.</p>
+      {/if}
+    </div>
+    {#if $assets.length > 0}
+      <div class="head-actions">
+        <button class="btn" disabled={rescanDisabled} on:click={rescan}>{rescanning ? "Rescanning…" : "Rescan folder"}</button>
+        <button class="btn btn-primary" on:click={() => screen.set("story")}>See the story</button>
+      </div>
+    {/if}
   </div>
 
   {#if $assets.length === 0}
-    <p class="text-gray-500">Nothing here yet — add a folder first.</p>
-  {:else if visible.length === 0}
-    <p class="text-gray-500">No assets match this filter.</p>
-  {:else}
-    <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-2">
-      {#each visible as a (a.id)}
-        {@const line = caption(a)}
-        <figure class="rounded border bg-white overflow-hidden" title={a.id}>
-          <div class="relative">
-            <Thumb projectId={pid} assetId={a.id} kind={kindLabel(a)} />
-            {#if a.isLivePhoto}
-              <span class="absolute top-1 left-1 rounded bg-gray-700 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white">Live</span>
-            {/if}
-          </div>
-          <figcaption class="px-1.5 py-1 text-xs leading-tight">
-            {#if line}
-              <div class="text-gray-700 truncate">{line}</div>
-            {/if}
-            <div class="text-gray-500 truncate">{meta(a)}{#if a.timeGuessed} · date approx.{/if}</div>
-          </figcaption>
-        </figure>
-      {/each}
+    <div class="empty">
+      <h2>Nothing here yet</h2>
+      <p>Choose a trip folder and everything TripTape finds appears here.</p>
+      <button class="btn btn-primary" on:click={() => screen.set("import")}>Choose trip folder</button>
     </div>
+  {:else}
+    <div class="tools">
+      <div class="filters" role="group" aria-label="Show">
+        {#each Object.keys(FILTERS) as f}
+          <button class="filter" class:on={filter === f} on:click={() => (filter = f)} aria-pressed={filter === f}>{FILTER_LABELS[f]}</button>
+        {/each}
+      </div>
+      <input class="input search" placeholder="Find a day or place" bind:value={dayFilter} aria-label="Find a day or place" />
+    </div>
+    {#if rescanError}<ErrorNote message="Couldn't rescan the folder. Check that it's still there and the drive is connected, then try again." detail={rescanError} />{/if}
+
+    {#if visible.length === 0}
+      <div class="empty">
+        {#if filter === "best" && !query && ingestRunning}
+          <h2>Still finding the best ones</h2>
+          <p>Best picks appear here once TripTape finishes checking your files.</p>
+        {:else}
+          <h2>Nothing matches</h2>
+          <p>Try another day or place, or show everything again.</p>
+          <button class="btn" on:click={clearFilters}>Show all files</button>
+        {/if}
+      </div>
+    {:else}
+      {#if days.length > 1}
+        <nav class="day-index" aria-label="Jump to a day">
+          {#each days as day (day.key)}
+            <button on:click={() => jumpTo(day.key)}>
+              <b>{day.number ? `Day ${day.number}` : "No date"}</b>
+              <span>{day.places[0] ?? day.date}</span>
+              <span>{day.items.length.toLocaleString()} {day.items.length === 1 ? "file" : "files"}</span>
+            </button>
+          {/each}
+        </nav>
+      {/if}
+      {#each days as day (day.key)}
+        <DayGroup {day} projectId={pid} frameNumbers={$frameNumbers} />
+      {/each}
+    {/if}
   {/if}
 </div>
+
+<style>
+  .screen {
+    padding-top: 32px;
+  }
+
+  .tools {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 20px;
+  }
+
+  .filters {
+    display: flex;
+    gap: 2px;
+  }
+
+  .filter {
+    min-height: 36px;
+    padding: 6px 12px;
+    border-radius: var(--radius);
+    color: var(--ink-2);
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .filter:hover:not(.on) {
+    background: var(--wash);
+    color: var(--ink);
+  }
+
+  .filter.on {
+    background: var(--blue);
+    color: #fff;
+  }
+
+  .search {
+    width: 220px;
+  }
+
+  .head-actions {
+    display: flex;
+    flex: none;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .day-index {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 20px;
+    overflow-x: auto;
+  }
+
+  .day-index button {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    max-width: 180px;
+    padding: 6px 12px;
+    background: var(--wash);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .day-index button:hover {
+    background: var(--yellow-soft);
+  }
+
+  .day-index button:focus-visible {
+    outline-offset: -2px;
+  }
+
+  .day-index span {
+    overflow: hidden;
+    color: var(--ink-2);
+    font-size: 13px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+</style>
