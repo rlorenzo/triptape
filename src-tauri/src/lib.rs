@@ -698,20 +698,10 @@ mod tests {
         assert_eq!(paginate(&v, 3, 0), [3]);
     }
 
-    /// Scratch dir for foreground-fill tests (`tempfile` is not a
-    /// dependency of this crate, so plain `std::fs` + the process id keeps
-    /// the names unique without a new dependency).
-    fn fill_scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("triptape-fill-test-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn foreground_fill_without_exif_falls_back_to_mtime() {
-        let dir = fill_scratch("noexif");
-        let path = dir.join("nometa.jpg");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nometa.jpg");
         std::fs::write(&path, b"not an image at all").unwrap();
         let mut a = Asset::new("a1", path.clone(), AssetKind::Photo);
         a.size_bytes = 19;
@@ -720,22 +710,20 @@ mod tests {
         assert_eq!(a.taken_at, Some(1_700_000_000));
         assert!(a.time_guessed);
         assert_eq!(a.gps, None);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn foreground_fill_unprobeable_video_falls_back_to_mtime() {
         // Missing file: ffprobe (present or not) cannot probe it, exactly
         // like the CLI's unprobeable-video path.
-        let dir = fill_scratch("novideo");
-        let mut a = Asset::new("v1", dir.join("gone.mp4"), AssetKind::Video);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = Asset::new("v1", dir.path().join("gone.mp4"), AssetKind::Video);
         a.size_bytes = 10;
         a.mtime = 1_700_000_001;
         fill_foreground_metadata(&mut a);
         assert_eq!(a.taken_at, Some(1_700_000_001));
         assert!(a.time_guessed);
         assert_eq!(a.duration_secs, None);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

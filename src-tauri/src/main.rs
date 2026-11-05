@@ -1056,9 +1056,10 @@ async fn export_all(app: tauri::AppHandle, project_id: String) -> Result<ExportS
     run_export(app, project_id, "export-all").await
 }
 
-/// The store lives in the per-user app data dir; `TRIPTAPE_DB` remains an
-/// explicit development override.
+/// The store lives in the per-user app data dir. `TRIPTAPE_DB` overrides it in
+/// development builds only, so a release never takes this path from outside.
 fn db_path(app: &tauri::App) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(debug_assertions)]
     if let Some(p) = std::env::var_os("TRIPTAPE_DB") {
         return Ok(PathBuf::from(p));
     }

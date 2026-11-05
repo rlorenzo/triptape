@@ -169,9 +169,8 @@ mod tests {
 
     #[test]
     fn source_cache_key_tracks_source_changes() {
-        let dir = std::env::temp_dir().join(format!("triptape-key-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("a.jpg");
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.jpg");
         std::fs::write(&src, b"one").unwrap();
         let file = std::fs::File::options().write(true).open(&src).unwrap();
         let t0 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
@@ -192,7 +191,7 @@ mod tests {
             .unwrap();
         assert_ne!(touched, source_cache_key("a1", &src).unwrap());
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_file(&src).unwrap();
         assert!(source_cache_key("a1", &src).is_err());
     }
 

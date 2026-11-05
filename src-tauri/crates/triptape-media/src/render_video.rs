@@ -1598,7 +1598,7 @@ mod tests {
         // The caption on the collage's second photo survives grouping, and
         // the EDL names both photos on screen.
         let srt = std::fs::read_to_string(v.srt_path.as_ref().expect("sidecar")).unwrap();
-        assert!(srt.contains("Golden Gate at sunset"), "{srt}");
+        assert!(srt.contains("Golden Gate at sunset"));
         assert_eq!(
             edl["segments"][1]["collage_asset_ids"],
             serde_json::json!(["a0", "a1"])
