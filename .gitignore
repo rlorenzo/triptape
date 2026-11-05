@@ -13,6 +13,8 @@ src-tauri/target/
 src-tauri/binaries/
 src-tauri/gen/
 
+.boost/
+
 # App data / outputs (never commit user media or exports)
 *.sqlite
 *.sqlite-*
