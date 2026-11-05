@@ -240,6 +240,26 @@ pub(crate) fn orient_image(
     }
 }
 
+/// Shrink to thumbnail size and apply an EXIF orientation transform (if any),
+/// all in memory. The thumbnail path uses this instead of the
+/// [`apply_exif_orientation`] file round-trip: re-encoding a 24 MP PNG to
+/// disk just to downscale it to 320 px dominated scoring profiles. Shrinking
+/// first means the transform never copies the full-size buffer; the long
+/// edge is the same either way because `thumbnail` fits a square box.
+fn orient_and_downscale(
+    img: image::DynamicImage,
+    transform: Option<triptape_core::metadata::OrientationTransform>,
+    edge: u32,
+) -> image::RgbImage {
+    let small = img.thumbnail(edge, edge);
+    let oriented = match transform {
+        Some(t) if t.mirror_h || t.rotate_cw_deg != 0 => orient_image(small, t),
+        _ => small,
+    };
+    // JPEG has no alpha channel; decoded PNGs may carry one.
+    oriented.to_rgb8()
+}
+
 fn is_heif(src: &Path) -> bool {
     src.extension()
         .map(|e| matches!(e.to_ascii_lowercase().to_str(), Some("heic" | "heif")))
@@ -251,6 +271,11 @@ fn is_heif(src: &Path) -> bool {
 pub struct DecodedStill {
     _dir: tempfile::TempDir,
     pub path: PathBuf,
+    /// True when the decoder left EXIF orientation unapplied (sips output);
+    /// FFmpeg output arrives already rotated. Renders don't care (they use
+    /// [`decode_still_to_png`], which orients the file); the thumbnail path
+    /// orients in memory instead so it never re-encodes full-size pixels.
+    pub needs_orientation: bool,
 }
 
 /// Decode a still to PNG in a private temp dir. Tries FFmpeg first; some
@@ -262,6 +287,18 @@ pub fn decode_still_to_png(
     ffmpeg_bin: &str,
     src: &Path,
 ) -> Result<DecodedStill, super::MediaError> {
+    let mut decoded = decode_still_raw(ffmpeg_bin, src)?;
+    if decoded.needs_orientation {
+        apply_exif_orientation(&decoded.path, src);
+        decoded.needs_orientation = false;
+    }
+    Ok(decoded)
+}
+
+/// [`decode_still_to_png`] without the orientation file round-trip: the
+/// sips/FFmpeg decode selection is shared, but orientation (if any) is left
+/// for the caller to apply in memory.
+fn decode_still_raw(ffmpeg_bin: &str, src: &Path) -> Result<DecodedStill, super::MediaError> {
     let dir = tempfile::Builder::new()
         .prefix("triptape-still-")
         .tempdir()
@@ -314,14 +351,11 @@ pub fn decode_still_to_png(
     let (decoded, via_sips) = (try_ffmpeg(), false);
     if decoded {
         // sips writes stored pixels without applying EXIF orientation
-        // (FFmpeg auto-rotates); portrait HEICs would render sideways
-        // everywhere this decoder feeds (book, hero stills, reels).
-        if via_sips {
-            apply_exif_orientation(&out, src);
-        }
+        // (FFmpeg auto-rotates); the caller orients from here.
         return Ok(DecodedStill {
             _dir: dir,
             path: out,
+            needs_orientation: via_sips,
         });
     }
     Err(super::MediaError::Ffmpeg(format!(
@@ -363,17 +397,23 @@ pub fn render_thumb(
         return Ok(());
     }
     let io_err = |e: String| super::MediaError::Io(e);
-    let decoded = decode_still_to_png(ffmpeg_bin, src)?;
-    let img = image::open(&decoded.path).map_err(|e| io_err(e.to_string()))?;
+    let decoded = decode_still_raw(ffmpeg_bin, src)?;
+    let mut transform = None;
+    if decoded.needs_orientation {
+        transform = triptape_core::metadata::read_image_exif(src)
+            .orientation
+            .map(triptape_core::metadata::orientation_transform);
+    }
+    let img = orient_and_downscale(
+        image::open(&decoded.path).map_err(|e| io_err(e.to_string()))?,
+        transform,
+        proxies::THUMB_LONG_EDGE,
+    );
     if let Some(p) = dst.parent() {
         std::fs::create_dir_all(p).map_err(|e| io_err(e.to_string()))?;
     }
     let tmp = proxies::temp_sibling(dst);
-    let edge = proxies::THUMB_LONG_EDGE;
-    // JPEG has no alpha channel; decoded PNGs may carry one.
     let written = img
-        .thumbnail(edge, edge)
-        .to_rgb8()
         .save(&tmp)
         .map_err(|e| io_err(e.to_string()))
         .and_then(|()| std::fs::rename(&tmp, dst).map_err(|e| io_err(e.to_string())));
@@ -668,6 +708,50 @@ mod tests {
         )
         .to_rgb8();
         assert_eq!(same.dimensions(), (2, 1));
+    }
+
+    #[test]
+    fn orient_and_downscale_applies_the_transform_to_the_thumb() {
+        // 640x480, red left / blue right; EXIF 6 (rotate 90 CW) gives a
+        // portrait 320-edge thumb of 240x320 with red on top.
+        let mut img = image::RgbImage::new(640, 480);
+        for x in 0..640 {
+            for y in 0..480 {
+                img.put_pixel(
+                    x,
+                    y,
+                    if x < 320 {
+                        image::Rgb([255, 0, 0])
+                    } else {
+                        image::Rgb([0, 0, 255])
+                    },
+                );
+            }
+        }
+        let t = triptape_core::metadata::orientation_transform(6);
+        let thumb = orient_and_downscale(image::DynamicImage::ImageRgb8(img), Some(t), 320);
+        assert_eq!(thumb.dimensions(), (240, 320));
+        assert_eq!(thumb.get_pixel(120, 10).0, [255, 0, 0]);
+        assert_eq!(thumb.get_pixel(120, 310).0, [0, 0, 255]);
+        // No transform: plain landscape downscale, colors unmoved.
+        let mut flat = image::RgbImage::new(640, 480);
+        for x in 0..640 {
+            for y in 0..480 {
+                flat.put_pixel(
+                    x,
+                    y,
+                    if x < 320 {
+                        image::Rgb([255, 0, 0])
+                    } else {
+                        image::Rgb([0, 0, 255])
+                    },
+                );
+            }
+        }
+        let plain = orient_and_downscale(image::DynamicImage::ImageRgb8(flat), None, 320);
+        assert_eq!(plain.dimensions(), (320, 240));
+        assert_eq!(plain.get_pixel(10, 120).0, [255, 0, 0]);
+        assert_eq!(plain.get_pixel(310, 120).0, [0, 0, 255]);
     }
 
     #[test]
