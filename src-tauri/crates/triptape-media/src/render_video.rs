@@ -372,8 +372,8 @@ fn render_card_png(
     Ok(false)
 }
 
-/// Render the hero film. `work_dir` holds intermediates (deleted by the
-/// caller on cancel); outputs land directly in their final paths.
+/// Render the hero film. `work_dir` holds intermediates. Outputs land at
+/// `out_mp4` and beside it; `export_all` points that at a staging folder.
 pub fn render_hero_video(
     caps: &Capabilities,
     plan: &Plan,
@@ -544,6 +544,7 @@ pub fn render_hero_video(
         }
     }
     for (idx, group) in groups.iter().enumerate() {
+        crate::check_cancelled()?;
         let present: Vec<&ResolvedEntry> = group
             .iter()
             .copied()
@@ -851,7 +852,10 @@ pub fn render_hero_video(
     let srt_path = out_mp4.with_extension("srt");
     let srt_count = write_captions_srt(&segs, &starts, &srt_path)?;
     let srt_opt = if srt_count > 0 {
-        Some(srt_path.to_string_lossy().into_owned())
+        // A file name: the film may be moved after rendering.
+        srt_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
     } else {
         let _ = std::fs::remove_file(&srt_path);
         None
@@ -895,7 +899,7 @@ pub fn render_hero_video(
     Ok(VideoOutput {
         path: out_mp4.to_path_buf(),
         edl_path,
-        srt_path: srt_opt.map(PathBuf::from),
+        srt_path: (srt_count > 0).then_some(srt_path),
         duration_secs: probed.duration_secs,
         fallbacks,
     })
@@ -1191,13 +1195,17 @@ fn compose_collage(
     const H: u32 = 1620;
     const GAP: u32 = 18;
     let cells = collage_cells(members.len(), W, H);
+    let cancel = triptape_core::process::current().unwrap_or_default();
     let tiles = std::thread::scope(|scope| {
+        let cancel = &cancel;
         let workers: Vec<_> = members
             .iter()
             .zip(&cells)
             .map(|(m, &(_, _, cw, ch))| {
                 scope.spawn(move || -> Result<image::RgbImage, crate::MediaError> {
-                    let png = ffmpeg::decode_still_to_png(ffmpeg_bin, &m.still_path)?;
+                    let png = triptape_core::process::with_cancel(cancel, || {
+                        ffmpeg::decode_still_to_png(ffmpeg_bin, &m.still_path)
+                    })?;
                     let img = image::open(&png.path)
                         .map_err(|e| crate::MediaError::Io(format!("collage open: {e}")))?;
                     Ok(crate::render_book::cover_fit(

@@ -5,7 +5,7 @@
   import ProgressBar from "./lib/ProgressBar.svelte";
   import { countOf, friendlyStep } from "./lib/trip";
   import { runExport, wasAttempted } from "./lib/exporter";
-  import { cancelJob, openExport, revealExport, REELS_DISCLOSURE, type ExportCmd } from "./lib/tauri";
+  import { cancelJob, dismissInterruptedExport, getInterruptedExport, openExport, revealExport, REELS_DISCLOSURE, type ExportCmd } from "./lib/tauri";
 
   const KEEPSAKES: { cmd: Exclude<ExportCmd, "export_all">; label: string; blurb: string; button: string; note?: string }[] = [
     { cmd: "export_video", label: "Trip Video", blurb: "A 1080p film of the trip, up to about 5 minutes.", button: "Make only the film" },
@@ -26,6 +26,26 @@
 
   let openError = "";
 
+  // An export that stopped when the app closed, waiting on the user's call.
+  let interrupted: ExportCmd | null = null;
+  function checkInterrupted(projectId: string | undefined) {
+    interrupted = null;
+    if (!projectId) return;
+    getInterruptedExport(projectId)
+      .then((cmd) => {
+        if ($project?.projectId === projectId) interrupted = cmd;
+      })
+      .catch(() => {
+        // Only a convenience: the keepsakes can still be made from the cards.
+      });
+  }
+  $: checkInterrupted($project?.projectId);
+
+  function dismissInterrupted() {
+    interrupted = null;
+    if ($project) dismissInterruptedExport($project.projectId).catch(() => {});
+  }
+
   $: job = $exportJob;
   $: busy = job.label !== null;
   $: percent = Math.round(job.progress * 100);
@@ -40,6 +60,7 @@
   function start(cmd: ExportCmd) {
     if (!$project) return;
     openError = "";
+    interrupted = null;
     runExport(cmd, labelFor(cmd), $project.projectId);
   }
 
@@ -102,6 +123,14 @@
           <button class="btn" disabled={!job.jobId} on:click={() => cancelJob(job.jobId)}>Cancel</button>
         </div>
       </section>
+    {/if}
+
+    {#if interrupted && !busy}
+      <div class="notice stop" role="status">
+        <p>{labelFor(interrupted)} stopped when TripTape closed, so it wasn't finished. Your earlier keepsakes are untouched.</p>
+        <button class="btn" on:click={() => interrupted && start(interrupted)}>Make it again</button>
+        <button class="btn" on:click={dismissInterrupted}>Dismiss</button>
+      </div>
     {/if}
 
     {#if job.error}

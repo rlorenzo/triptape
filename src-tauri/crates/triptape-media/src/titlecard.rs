@@ -34,12 +34,13 @@ pub fn render_text_png(
 ) -> Result<(), crate::MediaError> {
     let typ = out_png.with_extension("typ");
     std::fs::write(&typ, doc).map_err(|e| crate::MediaError::Io(e.to_string()))?;
-    let out = Command::new(typst_bin)
-        .args(["compile", "--format", "png", "--ppi", &ppi.to_string()])
-        .arg(&typ)
-        .arg(out_png)
-        .output()
-        .map_err(|e| crate::MediaError::Io(format!("spawn {typst_bin}: {e}")))?;
+    let out = triptape_core::process::output(
+        Command::new(typst_bin)
+            .args(["compile", "--format", "png", "--ppi", &ppi.to_string()])
+            .arg(&typ)
+            .arg(out_png),
+    )
+    .map_err(|e| crate::MediaError::Io(format!("spawn {typst_bin}: {e}")))?;
     if !out.status.success() {
         let _ = std::fs::remove_file(out_png);
         return Err(crate::MediaError::Ffmpeg(format!(

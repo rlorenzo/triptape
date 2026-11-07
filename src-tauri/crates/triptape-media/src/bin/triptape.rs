@@ -531,6 +531,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             music_path: music,
             keep_ambience,
             only: flag_or(flags, "only", "all"),
+            cancel: Default::default(),
         },
     )
     .unwrap_or_else(|e| die("export", e));

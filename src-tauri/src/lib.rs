@@ -28,18 +28,22 @@ use triptape_media::export::Skipped;
 /// every command and background worker, so it sits behind a `Mutex`.
 pub struct AppState {
     pub db: Mutex<Db>,
+    /// Cancel flags of the exports running now, by job id.
+    pub running_exports: Mutex<std::collections::HashMap<String, triptape_core::jobs::CancelFlag>>,
 }
 
 impl AppState {
     pub fn open(db_path: &std::path::Path) -> Result<Self, String> {
         Ok(Self {
             db: Mutex::new(Db::open(db_path)?),
+            running_exports: Mutex::default(),
         })
     }
 
     pub fn open_in_memory() -> Result<Self, String> {
         Ok(Self {
             db: Mutex::new(Db::open_in_memory()?),
+            running_exports: Mutex::default(),
         })
     }
 

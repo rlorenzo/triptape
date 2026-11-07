@@ -11,6 +11,7 @@ pub mod metadata;
 pub mod parallel;
 pub mod plan;
 pub mod privacy;
+pub mod process;
 pub mod proxies;
 pub mod scan;
 pub mod score;

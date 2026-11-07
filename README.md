@@ -74,8 +74,8 @@ current state of each privacy control.
   No Xcode license, kernel extensions, or daemons required.
 - Windows: install Rust + the pinned static FFmpeg sidecar (see
   `scripts/fetch-ffmpeg`); PATH fallback is dev-only.
-- Thumbnails cache in the OS cache dir with no size cap yet. Export
-  intermediates stay in `.work` inside the export folder.
+- Thumbnails cache in the OS cache dir with no size cap yet. Exports render
+  in `.work` inside the export folder, which is removed when the export ends.
 
 ## Known blockers (Sprint 0)
 

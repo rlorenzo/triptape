@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, PoisonError};
+use triptape_core::process;
 use triptape_core::proxies;
 use triptape_core::types::AssetKind;
 
@@ -313,25 +314,27 @@ fn decode_still_raw(ffmpeg_bin: &str, src: &Path) -> Result<DecodedStill, super:
         }
     };
     let try_ffmpeg = || {
-        ok(Command::new(ffmpeg_bin)
-            .args(["-nostdin", "-i"])
-            .arg(src)
-            .args(["-frames:v", "1"])
-            .arg(&out)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status())
+        ok(process::status(
+            Command::new(ffmpeg_bin)
+                .args(["-nostdin", "-i"])
+                .arg(src)
+                .args(["-frames:v", "1"])
+                .arg(&out)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        ))
     };
     #[cfg(target_os = "macos")]
     let try_sips = || {
-        ok(Command::new("sips")
-            .args(["-s", "format", "png"])
-            .arg(src)
-            .arg("--out")
-            .arg(&out)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status())
+        ok(process::status(
+            Command::new("sips")
+                .args(["-s", "format", "png"])
+                .arg(src)
+                .arg("--out")
+                .arg(&out)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        ))
     };
     #[cfg(target_os = "macos")]
     let (decoded, via_sips) = {
@@ -446,9 +449,7 @@ pub fn run_ffmpeg(
     let partial = partial_sibling(final_out);
     let mut fixed: Vec<String> = args[..args.len() - 1].to_vec();
     fixed.push(partial.to_string_lossy().into_owned());
-    let out = Command::new(ffmpeg_bin)
-        .args(&fixed)
-        .output()
+    let out = process::output(Command::new(ffmpeg_bin).args(&fixed))
         .map_err(|e| super::MediaError::Ffmpeg(format!("spawn {ffmpeg_bin}: {e}")))?;
     if !out.status.success() {
         let _ = std::fs::remove_file(&partial);
@@ -504,18 +505,16 @@ pub struct ProbeInfo {
 
 /// Probe one media file; errors when ffprobe fails or finds no streams.
 pub fn ffprobe_file(ffprobe_bin: &str, path: &Path) -> Result<ProbeInfo, super::MediaError> {
-    let out = Command::new(ffprobe_bin)
-        .args([
-            "-v",
-            "error",
-            "-show_streams",
-            "-show_format",
-            "-of",
-            "json",
-            &path.to_string_lossy(),
-        ])
-        .output()
-        .map_err(|e| super::MediaError::Ffmpeg(format!("spawn {ffprobe_bin}: {e}")))?;
+    let out = process::output(Command::new(ffprobe_bin).args([
+        "-v",
+        "error",
+        "-show_streams",
+        "-show_format",
+        "-of",
+        "json",
+        &path.to_string_lossy(),
+    ]))
+    .map_err(|e| super::MediaError::Ffmpeg(format!("spawn {ffprobe_bin}: {e}")))?;
     if !out.status.success() {
         return Err(super::MediaError::Ffmpeg(format!(
             "ffprobe failed: {}",
