@@ -32,6 +32,16 @@ CREATE TABLE IF NOT EXISTS plan_edits (
     project_id TEXT PRIMARY KEY REFERENCES projects(id),
     edits_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS preference_events (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    kind TEXT NOT NULL,
+    chosen_id TEXT NOT NULL,
+    rejected_id TEXT NOT NULL,
+    chosen_features TEXT NOT NULL,
+    rejected_features TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (project_id, kind, chosen_id, rejected_id)
+);
 CREATE TABLE IF NOT EXISTS assets (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
@@ -584,6 +594,7 @@ impl Db {
         edits: &crate::plan::PlanEdits,
     ) -> Result<(), String> {
         let json = serde_json::to_string(edits).map_err(|e| e.to_string())?;
+        let before = self.get_plan_edits(project_id)?;
         self.conn
             .execute(
                 "INSERT INTO plan_edits (project_id, edits_json) VALUES (?1, ?2)
@@ -591,7 +602,110 @@ impl Db {
                 params![project_id, json],
             )
             .map_err(|e| e.to_string())?;
+        // Learning is a side channel: a failure there never loses the edit.
+        if let Err(e) = crate::learn::record_edit(self, project_id, &before, edits) {
+            eprintln!("learn: could not record preference events: {e}");
+        }
         Ok(())
+    }
+
+    // -- learned preferences ----------------------------------------------
+    /// Record (or refresh) one preference event of a project.
+    pub fn put_preference_event(
+        &self,
+        project_id: &str,
+        e: &crate::learn::PrefEvent,
+    ) -> Result<(), String> {
+        let feats =
+            |f: &crate::learn::Features| serde_json::to_string(f).map_err(|e| e.to_string());
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO preference_events
+                 (project_id,kind,chosen_id,rejected_id,chosen_features,rejected_features,created_at)
+                 VALUES (?,?,?,?,?,?,?)",
+                params![
+                    project_id,
+                    e.kind.as_str(),
+                    e.chosen_id,
+                    e.rejected_id,
+                    feats(&e.chosen)?,
+                    feats(&e.rejected)?,
+                    now()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Forget one event (its edit was undone).
+    pub fn delete_preference_event(
+        &self,
+        project_id: &str,
+        kind: crate::learn::EventKind,
+        chosen_id: &str,
+        rejected_id: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM preference_events
+                 WHERE project_id=?1 AND kind=?2 AND chosen_id=?3 AND rejected_id=?4",
+                params![project_id, kind.as_str(), chosen_id, rejected_id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// A project's events in a fixed order (kind, chosen, rejected), so a
+    /// fit over them is deterministic.
+    pub fn list_preference_events(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<crate::learn::PrefEvent>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT kind,chosen_id,rejected_id,chosen_features,rejected_features
+                 FROM preference_events WHERE project_id=?1
+                 ORDER BY kind, chosen_id, rejected_id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map(params![project_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = vec![];
+        for row in rows {
+            let (kind, chosen_id, rejected_id, c, r) = row.map_err(|e| e.to_string())?;
+            let Some(kind) = crate::learn::EventKind::parse(&kind) else {
+                continue;
+            };
+            out.push(crate::learn::PrefEvent {
+                kind,
+                chosen_id,
+                rejected_id,
+                chosen: serde_json::from_str(&c).map_err(|e| e.to_string())?,
+                rejected: serde_json::from_str(&r).map_err(|e| e.to_string())?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Delete all of a project's events (reset to the default weights).
+    /// Returns how many were removed.
+    pub fn clear_preference_events(&self, project_id: &str) -> Result<usize, String> {
+        self.conn
+            .execute(
+                "DELETE FROM preference_events WHERE project_id=?1",
+                params![project_id],
+            )
+            .map_err(|e| e.to_string())
     }
 
     pub fn insert_plan(

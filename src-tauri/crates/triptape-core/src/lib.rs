@@ -8,6 +8,7 @@ pub mod db;
 pub mod geo;
 pub mod hash;
 pub mod jobs;
+pub mod learn;
 pub mod livephoto;
 pub mod metadata;
 pub mod parallel;

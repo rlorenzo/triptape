@@ -5,6 +5,7 @@
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...] [--list]
+//! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F] [--keep-ambience] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //! ```
 
@@ -15,7 +16,7 @@ use triptape_core::plan::PlanEdits;
 use triptape_core::{
     asset_ref, cluster,
     db::{Db, EditedPlan},
-    hash, jobs, livephoto, metadata, plan as planmod, privacy, proxies, scan, score,
+    hash, jobs, learn, livephoto, metadata, plan as planmod, privacy, proxies, scan, score,
     types::*,
 };
 use triptape_media::{
@@ -799,15 +800,128 @@ fn edit_cmd(args: &[String]) {
     println!("film now has {} shots", hero.len());
 }
 
+/// `learn`: show, reset or apply the story-score weights learned from the
+/// owner's Story-editor edits. Never changes a plan unless `--apply`.
+fn learn_cmd(flags: &HashMap<String, String>) {
+    let db_path = need(flags, "db");
+    let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
+    let project_id = match flags.get("project") {
+        Some(id) => id.clone(),
+        None => {
+            db.latest_project()
+                .unwrap_or_else(|e| die("project", e))
+                .unwrap_or_else(|| die("learn", "no project in db"))
+                .id
+        }
+    };
+    let on = |k: &str| flags.get(k).is_some_and(|v| v == "true");
+    if on("reset") {
+        let n = db
+            .clear_preference_events(&project_id)
+            .unwrap_or_else(|e| die("reset", e));
+        println!("project: {project_id}");
+        println!("reset: forgot {n} preference events; weights are back to the defaults");
+        println!("a plan built earlier keeps its weights until you rebuild it with --apply");
+        return;
+    }
+    if on("backfill") {
+        learn::backfill(&db, &project_id).unwrap_or_else(|e| die("backfill", e));
+    }
+    let summary = learn::project_summary(&db, &project_id).unwrap_or_else(|e| die("learn", e));
+    let fit = &summary.fit;
+    println!("project: {project_id}");
+    println!(
+        "events: {} ({} informative; weights adapt from {})",
+        fit.events,
+        fit.usable,
+        learn::MIN_USABLE_EVENTS
+    );
+    if fit.weights.is_identity() {
+        if fit.usable < learn::MIN_USABLE_EVENTS {
+            println!(
+                "weights: defaults ({} more informative edits needed before anything adapts)",
+                learn::MIN_USABLE_EVENTS - fit.usable
+            );
+        } else {
+            println!("weights: defaults (your edits agree with them)");
+        }
+    } else {
+        println!("weights:");
+        for def in learn::FEATURES
+            .iter()
+            .filter(|d| fit.weights.multipliers.contains_key(d.name))
+        {
+            println!("  {:<16} x{:.2}", def.label, fit.weights.get(def.name));
+        }
+        for line in &summary.explanations {
+            println!("  - {line}");
+        }
+    }
+    if !on("apply") {
+        return;
+    }
+    if fit.weights.is_identity() {
+        println!("apply: nothing to apply, the weights are at their defaults");
+        return;
+    }
+    let overrides = match flags.get("place-override") {
+        Some(spec) => {
+            planmod::parse_place_overrides(spec).unwrap_or_else(|e| die("place-override", e))
+        }
+        None => vec![],
+    };
+    let length = match flags.get("length") {
+        Some(spec) => planmod::parse_film_length(spec).unwrap_or_else(|e| die("length", e)),
+        None => planmod::FilmLength::Auto,
+    };
+    let hero_of = |db: &Db| -> Vec<String> {
+        db.edited_plan(Some(&project_id))
+            .unwrap_or_else(|e| die("plan", e))
+            .map(|ep| ep.edited.hero.into_iter().map(|e| e.asset_id).collect())
+            .unwrap_or_default()
+    };
+    let before = hero_of(&db);
+    let assets = db
+        .list_assets(&project_id)
+        .unwrap_or_else(|e| die("assets", e));
+    let plan = learn::replan(&assets, &fit.weights, &overrides, length);
+    let plan_id = db
+        .insert_plan(&project_id, &plan, "learned")
+        .unwrap_or_else(|e| die("insert plan", e));
+    let after = hero_of(&db);
+    let by_id: HashMap<&str, &Asset> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
+    let name = |id: &String| {
+        by_id
+            .get(id.as_str())
+            .map_or_else(|| id.clone(), |a| asset_label(a))
+    };
+    println!("apply: new plan {plan_id} (your edits carry over)");
+    println!("film: {} shots before, {} now", before.len(), after.len());
+    if !flags.contains_key("length") {
+        println!("note: film length was rebuilt as auto; pass --length to match your scan");
+    }
+    for (verb, from, to) in [
+        ("now in", &before, &after),
+        ("dropped from", &after, &before),
+    ] {
+        let ids: Vec<&String> = to.iter().filter(|id| !from.contains(id)).collect();
+        println!("{verb} the film: {}", ids.len());
+        for id in ids.iter().take(10) {
+            println!("  {}", name(id));
+        }
+    }
+}
+
 fn main() {
     let (cmd, flags) = parse_args();
     match cmd.as_str() {
         "scan" => scan_cmd(&flags),
         "plan" => plan_cmd(&flags),
         "export" => export_cmd(&flags),
+        "learn" => learn_cmd(&flags),
         "edit" => edit_cmd(&std::env::args().skip(2).collect::<Vec<_>>()),
         _ => {
-            eprintln!("unknown command {cmd}; want scan|plan|edit|export");
+            eprintln!("unknown command {cmd}; want scan|plan|edit|learn|export");
             std::process::exit(2);
         }
     }
