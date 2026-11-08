@@ -1234,7 +1234,7 @@ fn hold_graph(caps: &Capabilities, idx: usize, frames: u32, res: Resolution) -> 
     // blur radius is in canvas pixels, so it scales with the resolution.
     let (sw, sh) = res.supersample();
     let (w, h) = res.dims();
-    let composite = ffmpeg::fit_over_blur_sigma(caps, "[0:v]", sw, sh, "", 40 * res.scale());
+    let composite = ffmpeg::fit_over_blur(caps, "[0:v]", sw, sh, "", 40 * res.scale());
     let hold = ffmpeg::hold_still(frames);
     let glide = ffmpeg::glide(caps, frames, w, h, idx);
     format!("{composite},{hold},{glide},format=yuv420p[v]")
@@ -2684,21 +2684,7 @@ mod tests {
             image::ImageBuffer::from_pixel(160, 90, image::Rgb([20, 120, 90]));
         let still = dir.join("still.png");
         img.save(&still).unwrap();
-        let entry = ResolvedEntry {
-            entry: PlanEntry {
-                asset_id: "a0".into(),
-                content_hash: None,
-                size_bytes: 0,
-                mtime: 0,
-                rendition: Rendition::Still,
-            },
-            still_path: still,
-            motion_path: None,
-            caption: None,
-            taken_at: None,
-            tz_offset_secs: None,
-            aspect: None,
-        };
+        let entry = card_entry("a0", &still);
         let plan = Plan {
             plan_version: 1,
             schema_version: 1,
@@ -2738,6 +2724,22 @@ mod tests {
         assert!(info.has_audio);
     }
 
+    /// Bench capabilities and resolution: `TRIPTAPE_FFMPEG` (ffprobe beside
+    /// it) and `TRIPTAPE_BENCH_RES` (default 4k).
+    fn bench_setup() -> (Capabilities, Resolution) {
+        let ffmpeg_bin = std::env::var("TRIPTAPE_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+        let ffprobe_bin = Path::new(&ffmpeg_bin)
+            .with_file_name("ffprobe")
+            .to_string_lossy()
+            .into_owned();
+        let caps = crate::ffmpeg::probe_capabilities(&ffmpeg_bin, &ffprobe_bin);
+        let res = Resolution::from_flag(
+            &std::env::var("TRIPTAPE_BENCH_RES").unwrap_or_else(|_| "4k".into()),
+        )
+        .unwrap();
+        (caps, res)
+    }
+
     /// Visual check: full hero render of real copies (`TRIPTAPE_BENCH_DIR`,
     /// `TRIPTAPE_BENCH_RES`, optional `TRIPTAPE_FFMPEG` for a libass build).
     #[test]
@@ -2748,16 +2750,7 @@ mod tests {
             return;
         };
         let dir = PathBuf::from(dir);
-        let ffmpeg_bin = std::env::var("TRIPTAPE_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
-        let ffprobe_bin = std::path::Path::new(&ffmpeg_bin)
-            .with_file_name("ffprobe")
-            .to_string_lossy()
-            .into_owned();
-        let caps = crate::ffmpeg::probe_capabilities(&ffmpeg_bin, &ffprobe_bin);
-        let res = Resolution::from_flag(
-            &std::env::var("TRIPTAPE_BENCH_RES").unwrap_or_else(|_| "4k".into()),
-        )
-        .unwrap();
+        let (caps, res) = bench_setup();
         let out_dir = dir.join(format!("hero_{}", res.label()));
         let _ = std::fs::remove_dir_all(&out_dir);
         std::fs::create_dir_all(&out_dir).unwrap();
@@ -2857,7 +2850,8 @@ mod tests {
         );
     }
 
-    /// Timing bench: `TRIPTAPE_BENCH_DIR=<dir with s1..s4.HEIC pano.HEIC clip4k.mov ...>`.
+    /// Timing bench: `TRIPTAPE_BENCH_DIR=<dir with s1..s4.HEIC pano.HEIC clip4k.mov ...>`
+    /// (plus the [`bench_setup`] variables).
     #[test]
     #[ignore = "needs real media via TRIPTAPE_BENCH_DIR"]
     fn bench_segments() {
@@ -2865,29 +2859,11 @@ mod tests {
             return;
         };
         let dir = PathBuf::from(dir);
-        let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
-        let res = Resolution::from_flag(
-            &std::env::var("TRIPTAPE_BENCH_RES").unwrap_or_else(|_| "4k".into()),
-        )
-        .unwrap();
+        let (caps, res) = bench_setup();
         let work = dir.join(format!("work_{}", res.label()));
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work).unwrap();
-        let still = |n: &str| ResolvedEntry {
-            entry: PlanEntry {
-                asset_id: n.into(),
-                content_hash: None,
-                size_bytes: 0,
-                mtime: 0,
-                rendition: Rendition::Still,
-            },
-            still_path: dir.join(n),
-            motion_path: None,
-            caption: None,
-            taken_at: None,
-            tz_offset_secs: None,
-            aspect: None,
-        };
+        let still = |n: &str| card_entry(n, &dir.join(n));
         let only = std::env::var("TRIPTAPE_BENCH_ONLY").unwrap_or_default();
         let time = |label: &str, f: &mut dyn FnMut()| {
             if !only.is_empty() && !only.split(',').any(|o| o == label) {

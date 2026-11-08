@@ -19,13 +19,9 @@ pub const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
 /// blurred fill at `w`x`h` (no crop of the subject, no aspect distortion).
 /// `tag` suffixes the internal labels so several copies can share one graph.
 /// Ends unlabeled after `setsar=1`, ready for [`hold_still`] + [`glide`].
-pub fn fit_over_blur(caps: &Capabilities, input: &str, w: u32, h: u32, tag: &str) -> String {
-    fit_over_blur_sigma(caps, input, w, h, tag, 40)
-}
-
-/// [`fit_over_blur`] with an explicit fill blur radius; the radius is in
-/// canvas pixels, so larger canvases scale it to keep the same look.
-pub fn fit_over_blur_sigma(
+/// `sigma` is the fill blur radius in canvas pixels, so larger canvases
+/// scale it to keep the same look.
+pub fn fit_over_blur(
     caps: &Capabilities,
     input: &str,
     w: u32,
@@ -911,7 +907,7 @@ mod tests {
             gblur: true,
             ..Default::default()
         };
-        let g = fit_over_blur(&caps, "[2:v]", 1080, 1920, "2");
+        let g = fit_over_blur(&caps, "[2:v]", 1080, 1920, "2", 40);
         assert!(g.starts_with("[2:v]split[a2][b2]"), "{g}");
         assert!(g.contains("gblur=sigma=40[bg2]"), "{g}");
         assert!(
@@ -919,7 +915,7 @@ mod tests {
             "{g}"
         );
         caps.gblur = false;
-        assert!(!fit_over_blur(&caps, "[0:v]", 1920, 1080, "").contains("gblur"));
+        assert!(!fit_over_blur(&caps, "[0:v]", 1920, 1080, "", 40).contains("gblur"));
         // Motion runs per frame, with progress clamped at the end.
         caps.perspective = true;
         let g = glide(&caps, 90, 1920, 1080, 0);

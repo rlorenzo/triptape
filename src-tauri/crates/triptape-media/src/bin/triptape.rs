@@ -544,9 +544,22 @@ fn export_cmd(flags: &HashMap<String, String>) {
     // Hero film frame size: 4K unless asked otherwise (reels stay 1080x1920).
     let resolution = Resolution::from_flag(&flag_or(flags, "resolution", "4k"))
         .unwrap_or_else(|e| die("resolution", e));
-    // Free-space precheck: estimate for the three keepsakes, larger at 4K
-    // (the precheck applies its own 1.5x headroom).
-    if let Err(e) = jobs::free_space_precheck(&out, resolution.export_disk_estimate()) {
+    let only = flag_or(flags, "only", "all");
+    if !matches!(only.as_str(), "all" | "video" | "reels" | "book") {
+        die(
+            "only",
+            format!("unknown keepsake {only:?} (want all|video|reels|book)"),
+        );
+    }
+    // Free-space precheck (the precheck applies its own 1.5x headroom). Only
+    // the hero film scales with --resolution; reels and the book keep the
+    // 1080p-era estimate.
+    let estimate = if matches!(only.as_str(), "all" | "video") {
+        resolution.export_disk_estimate()
+    } else {
+        Resolution::Hd1080.export_disk_estimate()
+    };
+    if let Err(e) = jobs::free_space_precheck(&out, estimate) {
         die("free space", e);
     }
 
@@ -562,7 +575,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             typst_bin,
             music_path: music,
             keep_ambience,
-            only: flag_or(flags, "only", "all"),
+            only,
             resolution,
         },
     )

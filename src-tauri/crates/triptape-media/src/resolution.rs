@@ -113,7 +113,18 @@ mod tests {
         assert_eq!(Resolution::Hd1080.ppi(), 72);
         assert_eq!(Resolution::Uhd4k.dims(), (3840, 2160));
         assert_eq!(Resolution::Uhd4k.supersample(), (5760, 3240));
+        assert_eq!(Resolution::Uhd4k.clip_prescale(), (3840, 2160));
         assert_eq!(Resolution::Uhd4k.ppi(), 144);
+    }
+
+    #[test]
+    fn only_4k_states_an_h264_level() {
+        assert!(Resolution::Hd1080.x264_level_args().is_empty());
+        let uhd = Resolution::Uhd4k.x264_level_args();
+        assert!(uhd.windows(2).any(|p| p == ["-level:v", "5.1"]), "{uhd:?}");
+        assert!(
+            Resolution::Uhd4k.export_disk_estimate() > Resolution::Hd1080.export_disk_estimate()
+        );
     }
 
     #[test]

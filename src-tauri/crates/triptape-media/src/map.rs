@@ -367,6 +367,27 @@ mod tests {
     }
 
     #[test]
+    fn card_strokes_scale_with_4k_canvas() {
+        // A near-vertical route keeps the line clear of the pin's sides.
+        let route = vec![(35.0, 139.0), (36.0, 139.05)];
+        let white = Rgb([255, 255, 255]);
+        for (w, h, k) in [(1920, 1080, 1), (3840, 2160, 2)] {
+            let img = draw_route_card(&route, &[], w, h);
+            let fit = RouteFit::new(
+                &unwrap_longitudes(&route),
+                w,
+                h - (h as f32 * 0.045).ceil() as u32,
+            );
+            let (x, y) = fit.project(route[0]);
+            // Start pin: white ring from 8k to 11k px, so 10 px out is
+            // ring at 1080p and colored core at 4K.
+            let at = |d: i32| *img.get_pixel((x + d * k) as u32, y as u32);
+            assert_eq!(at(10), white, "{w}x{h}: ring at 10k px");
+            assert_ne!(at(13), white, "{w}x{h}: pin ends before 13k px");
+        }
+    }
+
+    #[test]
     fn card_geometry_and_bar() {
         let route = vec![(35.0, 139.0), (36.0, 140.0)];
         let img = draw_route_card(&route, &[0], 320, 200);
