@@ -53,7 +53,8 @@ pub const PANO_MIN_SECS: f64 = 6.0;
 pub const PANO_MAX_SECS: f64 = 8.0;
 const PANO_BASE_SECS: f64 = 4.5;
 const PANO_SECS_PER_ASPECT: f64 = 0.8;
-/// Fastest allowed pan, in frame-widths per second. Very wide images
+/// Fastest allowed average pan, in frame-widths per second (the eased
+/// pan peaks at 1.5x this mid-travel). Very wide images
 /// first hold longer (up to [`PANO_LONG_SECS`]), then pan less of their
 /// width rather than whip across it.
 pub const PANO_MAX_SPEED: f64 = 0.3;
@@ -94,24 +95,41 @@ pub struct PanoMotion {
     pub coverage: f64,
 }
 
+/// Frame-widths (wide) or frame-heights (tall) of a panorama beyond the
+/// landscape output frame, along the pan axis. A wide image is scaled to
+/// the frame height, a tall one to the frame width.
+fn pano_overflow(aspect: f64) -> f64 {
+    let along = if aspect >= 1.0 {
+        aspect / FRAME_ASPECT
+    } else {
+        FRAME_ASPECT / aspect
+    };
+    (along - 1.0).max(0.0)
+}
+
+/// Fraction of the overflow a pan of `secs` may travel while keeping its
+/// average speed within [`PANO_MAX_SPEED`].
+pub fn pano_coverage(aspect: f64, secs: f64) -> f64 {
+    let overflow = pano_overflow(aspect);
+    if overflow > 0.0 {
+        (PANO_MAX_SPEED * secs / overflow).min(1.0)
+    } else {
+        1.0
+    }
+}
+
 /// Hold length and travel for a panorama of this display aspect.
 pub fn pano_motion(aspect: f64) -> PanoMotion {
     let elongation = if aspect >= 1.0 { aspect } else { 1.0 / aspect };
-    // Frame-widths (or heights) of image beyond the frame.
-    let overflow = (elongation / FRAME_ASPECT - 1.0).max(0.0);
+    let overflow = pano_overflow(aspect);
     let mut hold =
         (PANO_BASE_SECS + PANO_SECS_PER_ASPECT * elongation).clamp(PANO_MIN_SECS, PANO_MAX_SECS);
     if overflow / hold > PANO_MAX_SPEED {
         hold = (overflow / PANO_MAX_SPEED).min(PANO_LONG_SECS);
     }
-    let coverage = if overflow > 0.0 {
-        (PANO_MAX_SPEED * hold / overflow).min(1.0)
-    } else {
-        1.0
-    };
     PanoMotion {
         hold_secs: hold,
-        coverage,
+        coverage: pano_coverage(aspect, hold),
     }
 }
 
@@ -180,10 +198,11 @@ fn estimate_hero_secs<'e, 'c>(
     let mut run: Option<(&str, usize)> = None; // (chapter, stills in collage)
     for e in entries {
         let chapter = chapter_of(&e.asset_id);
+        let pano_secs = pano_secs_of(&e.asset_id);
         match e.rendition {
             // A panorama is always solo, with its own pan hold.
-            Rendition::Still if pano_secs_of(&e.asset_id).is_some() => {
-                total += pano_secs_of(&e.asset_id).unwrap_or(EST_STILL_SECS);
+            Rendition::Still if pano_secs.is_some() => {
+                total += pano_secs.unwrap_or(EST_STILL_SECS);
                 segments += 1;
                 run = None;
             }
@@ -1741,14 +1760,22 @@ mod tests {
         let wide = pano_motion(4.4);
         assert!(wide.hold_secs >= mid.hold_secs && wide.hold_secs <= PANO_MAX_SECS);
         assert_eq!(wide.coverage, 1.0);
-        // Tall mirrors wide.
-        assert_eq!(pano_motion(0.25), pano_motion(4.0));
+        // Tall pans along the frame height: a 1:4 strip is ~7.1 frame
+        // heights tall, so it holds long and travels part of the way.
+        let tall = pano_motion(0.25);
+        let tall_overflow = (16.0 / 9.0) / 0.25 - 1.0;
+        assert!(tall.hold_secs > PANO_MAX_SECS && tall.coverage < 1.0);
+        assert!(tall_overflow * tall.coverage / tall.hold_secs <= PANO_MAX_SPEED + 1e-9);
         // Extreme: longer hold, bounded speed, partial coverage.
         let huge = pano_motion(12.0);
         assert!(huge.hold_secs > PANO_MAX_SECS && huge.hold_secs <= PANO_LONG_SECS);
         assert!(huge.coverage < 1.0);
         let overflow = 12.0 / (16.0 / 9.0) - 1.0;
         assert!(overflow * huge.coverage / huge.hold_secs <= PANO_MAX_SPEED + 1e-9);
+        // A shortened pan travels less, at the same speed bound.
+        let short = pano_coverage(12.0, MIN_SEGMENT_SECS);
+        assert!(short < huge.coverage);
+        assert!(overflow * short / MIN_SEGMENT_SECS <= PANO_MAX_SPEED + 1e-9);
     }
 
     #[test]

@@ -11,7 +11,8 @@ use crate::ffmpeg::{self, path_arg as s, Capabilities};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{
-    collage_hold_secs, is_panorama, pano_motion, MAX_CLIP_SECS, MAX_COLLAGE, MIN_SEGMENT_SECS,
+    collage_hold_secs, is_panorama, pano_coverage, pano_motion, MAX_CLIP_SECS, MAX_COLLAGE,
+    MIN_SEGMENT_SECS,
 };
 use triptape_core::types::{Plan, PlanEntry, Rendition};
 
@@ -533,16 +534,12 @@ pub fn render_hero_video(
         resolved.iter().collect()
     };
     for r in selected {
-        // Panoramas pan solo and never join a collage.
-        let is_still = |e: &ResolvedEntry| {
-            matches!(e.entry.rendition, Rendition::Still) && !e.aspect.is_some_and(is_panorama)
-        };
         match groups.last_mut() {
             Some(g)
                 if !opts.short_mode
                     && g.len() < MAX_COLLAGE
-                    && is_still(r)
-                    && is_still(g[0])
+                    && collage_eligible(r)
+                    && collage_eligible(g[0])
                     && chapter_of(&g[0].entry.asset_id) == chapter_of(&r.entry.asset_id) =>
             {
                 g.push(r);
@@ -1052,7 +1049,9 @@ fn render_entry_segment(
                 let motion = pano_motion(aspect);
                 // A short-mode budget can shorten the pan, never below a still.
                 let dur = motion.hold_secs.min(max_secs.max(still_secs));
-                render_pano_segment(caps, &png.path, dur, aspect, motion.coverage, idx, &out)?;
+                // Travel less when shortened so the pan keeps its speed bound.
+                let coverage = pano_coverage(aspect, dur);
+                render_pano_segment(caps, &png.path, dur, aspect, coverage, idx, &out)?;
                 return Ok((out, dur, "still".into()));
             }
             render_hold_segment(caps, &png.path, still_secs, idx, &out)?;
@@ -1178,6 +1177,12 @@ fn render_collage_segment(
     let dur = collage_hold_secs(members.len(), still_secs);
     render_hold_segment(caps, &canvas, dur, idx, &out)?;
     Ok((out, dur, "still".into()))
+}
+
+/// Whether an entry may join a collage: a still that is not a panorama
+/// (panoramas pan solo).
+fn collage_eligible(e: &ResolvedEntry) -> bool {
+    matches!(e.entry.rendition, Rendition::Still) && !e.aspect.is_some_and(is_panorama)
 }
 
 /// Under this width / height a photo counts as a portrait for layout.
@@ -1405,7 +1410,7 @@ fn render_pano_segment(
         "[0:v]{},format=yuv420p[v]",
         ffmpeg::pano_pan(caps, frames, 1920, 1080, aspect, coverage, idx % 2 == 1)
     );
-    render_graph_segment(caps, img, dur, &graph, out)
+    render_graph_segment(caps, img, dur, graph, out)
 }
 
 /// Still Ken Burns hold.
@@ -1418,7 +1423,7 @@ fn render_hold_segment(
 ) -> Result<(), crate::MediaError> {
     let frames = (dur * 30.0).round() as u32;
     let graph = hold_graph(caps, idx, frames);
-    render_graph_segment(caps, img, dur, &graph, out)
+    render_graph_segment(caps, img, dur, graph, out)
 }
 
 /// Encode a one-image segment of `dur` seconds through `graph` (a
@@ -1427,11 +1432,10 @@ fn render_graph_segment(
     caps: &Capabilities,
     img: &Path,
     dur: f64,
-    graph: &str,
+    graph: String,
     out: &Path,
 ) -> Result<(), crate::MediaError> {
     let frames = (dur * 30.0).round() as u32;
-    let graph = graph.to_string();
     let args: Vec<String> = [
         vec![
             "-y".into(),
@@ -1611,9 +1615,9 @@ mod tests {
             aspect: Some(1.5),
             ..card_entry("s", Path::new("s.jpg"))
         };
-        // Mirror of the grouping predicate.
-        let eligible = |e: &ResolvedEntry| !e.aspect.is_some_and(is_panorama);
-        assert!(!eligible(&pano) && eligible(&plain));
+        let unknown = card_entry("u", Path::new("u.jpg"));
+        assert!(!collage_eligible(&pano));
+        assert!(collage_eligible(&plain) && collage_eligible(&unknown));
     }
 
     #[test]
