@@ -219,6 +219,9 @@ pub struct UseStats {
     pub stored: usize,
     /// Fresh segments not cached because the volume was low on space.
     pub skipped_low_disk: usize,
+    /// Lower-third overlays taken from / re-rendered past the cache.
+    pub overlay_hits: usize,
+    pub overlay_misses: usize,
 }
 
 /// A live export, as recorded in its lease file.
@@ -265,6 +268,9 @@ pub struct SegmentCache {
     work_dir: PathBuf,
     lease_path: Mutex<Option<PathBuf>>,
     stats: Mutex<UseStats>,
+    /// Key of the entry each work-dir path was filled from or stored as, so a
+    /// later stage (the overlay) can key itself on the base segment.
+    keys_by_path: Mutex<std::collections::HashMap<PathBuf, String>>,
 }
 
 impl std::fmt::Debug for SegmentCache {
@@ -292,6 +298,7 @@ impl SegmentCache {
             work_dir: work_dir.to_path_buf(),
             lease_path: Mutex::new(None),
             stats: Mutex::new(UseStats::default()),
+            keys_by_path: Mutex::new(Default::default()),
         };
         let lease = Lease {
             pid: std::process::id(),
@@ -338,11 +345,22 @@ impl SegmentCache {
     /// return its sidecar. A miss, a torn entry, or an entry that vanished
     /// mid-way all return `None`.
     pub fn fetch(&self, key: &str, dest: &Path) -> Option<SegmentMeta> {
-        let meta = read_valid(&self.dir, key);
-        let Some(meta) = meta else {
-            self.bump(|s| s.misses += 1);
-            return None;
-        };
+        let meta = self.fetch_entry(key, dest);
+        self.bump(|s| {
+            if meta.is_some() {
+                s.hits += 1
+            } else {
+                s.misses += 1
+            }
+        });
+        if meta.is_some() {
+            self.note_key(dest, key);
+        }
+        meta
+    }
+
+    fn fetch_entry(&self, key: &str, dest: &Path) -> Option<SegmentMeta> {
+        let meta = read_valid(&self.dir, key)?;
         // Touch first: the lease rule protects entries used since a lease
         // began, and LRU reads the same timestamp.
         let mp4 = entry_path(&self.dir, key, "mp4");
@@ -350,37 +368,77 @@ impl SegmentCache {
         if place(&mp4, dest).is_err() {
             // Deleted between the check and the link: a miss, not an error.
             let _ = std::fs::remove_file(dest);
-            self.bump(|s| s.misses += 1);
             return None;
         }
-        self.bump(|s| s.hits += 1);
         Some(meta)
     }
 
     /// Cache the finished segment at `produced`. Best effort: a full disk or
     /// an I/O error is swallowed because the export itself already has its
-    /// segment. Returns whether the entry was stored.
+    /// segment. Returns whether the entry is in the cache.
     pub fn store(&self, key: &str, produced: &Path, secs: f64) -> bool {
+        self.note_key(produced, key);
+        let (ok, fresh) = self.store_entry(key, produced, secs);
+        if fresh {
+            self.bump(|s| s.stored += 1);
+        }
+        ok
+    }
+
+    /// [`fetch`](Self::fetch) for a lower-third overlay: counted apart from
+    /// the segments so "reused N/M" stays about segments.
+    pub fn fetch_overlay(&self, key: &str, dest: &Path) -> bool {
+        let hit = self.fetch_entry(key, dest).is_some();
+        self.bump(|s| {
+            if hit {
+                s.overlay_hits += 1
+            } else {
+                s.overlay_misses += 1
+            }
+        });
+        hit
+    }
+
+    /// [`store`](Self::store) for a lower-third overlay.
+    pub fn store_overlay(&self, key: &str, produced: &Path, secs: f64) -> bool {
+        self.store_entry(key, produced, secs).0
+    }
+
+    /// Key the segment at `path` came from (or was stored as), if cached.
+    pub fn key_of(&self, path: &Path) -> Option<String> {
+        self.keys_by_path
+            .lock()
+            .expect("keys lock")
+            .get(path)
+            .cloned()
+    }
+
+    fn note_key(&self, path: &Path, key: &str) {
+        self.keys_by_path
+            .lock()
+            .expect("keys lock")
+            .insert(path.to_path_buf(), key.to_string());
+    }
+
+    /// `(entry is in the cache, this call wrote it)`.
+    fn store_entry(&self, key: &str, produced: &Path, secs: f64) -> (bool, bool) {
         if read_valid(&self.dir, key).is_some() {
-            return true;
+            return (true, false);
         }
         if free_bytes(&self.dir).is_some_and(|f| f < LOW_DISK_BYTES) {
             self.bump(|s| s.skipped_low_disk += 1);
-            return false;
+            return (false, false);
         }
         let Ok(size) = std::fs::metadata(produced).map(|m| m.len()) else {
-            return false;
+            return (false, false);
         };
         if size == 0 {
-            return false;
+            return (false, false);
         }
         let ok = self
             .try_store(key, produced, &SegmentMeta { secs, size })
             .is_ok();
-        if ok {
-            self.bump(|s| s.stored += 1);
-        }
-        ok
+        (ok, ok)
     }
 
     fn try_store(&self, key: &str, produced: &Path, meta: &SegmentMeta) -> std::io::Result<()> {
