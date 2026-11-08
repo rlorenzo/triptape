@@ -90,9 +90,9 @@ fn score_asset_with_cache(cache_dir: &Path, a: &Asset) -> Score {
         let mut s = score::video_proxy_score(a.gps.is_some());
         // Best playback window for the hero film; any failure keeps the
         // start-of-clip trim.
-        s.clip_window = a
-            .duration_secs
-            .and_then(|d| triptape_media::clip_analysis::best_clip_window("ffmpeg", &a.path, d));
+        s.clip_window = a.duration_secs.and_then(|d| {
+            triptape_media::clip_analysis::best_clip_window("ffmpeg", "ffprobe", &a.path, d)
+        });
         return s;
     }
     if let Ok(key) = proxies::source_cache_key(&a.id, &a.path) {

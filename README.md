@@ -51,7 +51,7 @@ packs, disabled book card) and the Reels share disclosure (no blur gate,
 no extra click).
 
 Gaps: FFmpeg sidecar SHA-256 pins unfilled (system ffmpeg in dev only,
-`zscale`/`drawtext`/`vidstab`/`libass` missing — captions burn and
+`zscale`/`vidstab`/libass (`subtitles`) missing on plain Homebrew ffmpeg — hero captions burn (needs libass) and
 stabilization wait on the sidecar); no signing keys or update channel
 (G5 — updater wired off with a pubkey placeholder); G2/G3/G4 gates open;
 CI not yet green on Windows.
@@ -80,6 +80,6 @@ current state of each privacy control.
 ## Known blockers (Sprint 0)
 
 - Sidecar SHA-256 pins unfilled (`scripts/fetch-ffmpeg` refuses to install).
-- System ffmpeg lacks `zscale`/`drawtext`/`vidstab`/`libass` (recorded G1 gaps).
+- System ffmpeg lacks `zscale`/`drawtext`/`vidstab`/libass `subtitles` (recorded G1 gaps).
 - G2 vendor workflow, G3 offline maps, G4 model budgets, G5 signed update:
   all open — see evidence in [docs/gates.md](docs/gates.md).

@@ -14,8 +14,10 @@ No `--enable-nonfree` build may ever ship (not redistributable).
 - `scripts/check-ffmpeg.sh` result today: PASS on all required items
   (`libx264`, native `aac`, `xfade`, `perspective`, `loudnorm`).
 - Reported gaps (warn-only, see Gates G1): `zscale`, `drawtext`,
-  `vidstabdetect`/`vidstabtransform`, `libass` all missing from this
-  Homebrew build.
+  `vidstabdetect`/`vidstabtransform`, `subtitles`/`ass` (libass) all
+  missing from this plain Homebrew build. The `ffmpeg-full` formula
+  (`/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg`) has `subtitles`, `ass` and
+  `drawtext`.
 
 ## Download attempt (2026-11-03, Sprint 6, macOS arm64 dev machine)
 
@@ -47,7 +49,7 @@ No `--enable-nonfree` build may ever ship (not redistributable).
    `<FILL…>` placeholder) and into the table above.
 4. Run `scripts/fetch-ffmpeg`, then `scripts/check-ffmpeg.sh <sidecar>`.
    Required encoders/filters must PASS; missing `zscale`/`drawtext`/
-   `vidstab`/`libass` are recorded as G1 gaps (see `docs/gates.md`).
+   `vidstab`/`subtitles` are recorded as G1 gaps (see `docs/gates.md`).
 5. Record the sidecar's `-buildconf` output in this file.
 6. CI runs `check-ffmpeg.sh` per bundled binary per target and fails the
    build on `--enable-nonfree` or a missing required encoder/filter.
@@ -58,7 +60,9 @@ No `--enable-nonfree` build may ever ship (not redistributable).
   Section 7 (`zscale` + `tonemap`) cannot run as specified. Short-term:
   `tonemap` alone (present) or format-convert fallback; revisit when the
   pinned sidecar restores `zscale`.
-- No `drawtext`/`libass`: burned-in captions need `libass` (ASS subtitles)
-  in the pinned sidecar; the system build cannot do them.
+- No libass (`subtitles`/`ass` filters; ffmpeg has no filter named
+  `libass`): the hero film writes captions as a sidecar SRT only. With a
+  libass build the SRT is also burned in. The app never uses `drawtext`;
+  title and lower-third text are Typst PNG overlays.
 - No `vidstab`: two-pass stabilization is unavailable until the sidecar
   lands; stabilization stays off by default per plan.
