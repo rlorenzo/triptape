@@ -330,7 +330,7 @@ pub fn probe_capabilities(ffmpeg_bin: &str, ffprobe_bin: &str) -> Capabilities {
     }
 }
 
-fn run_capture(bin: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn run_capture(bin: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(bin).args(args).output().ok()?;
     if out.status.success() {
         Some(String::from_utf8_lossy(&out.stdout).into_owned())

@@ -10,6 +10,7 @@
 
 use crate::ffmpeg::{self, path_arg as s, Capabilities};
 use crate::resolution::Resolution;
+use crate::segment_cache::SegmentCache;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{
@@ -1339,39 +1340,30 @@ fn render_entry_segment(
     match &r.entry.rendition {
         Rendition::Still => {
             let out = work_dir.join(format!("seg_{idx:03}.mp4"));
-            let cached = caps
-                .segment_cache
-                .as_deref()
-                .map(|c| (c, still_key(c, caps, r, idx, still_secs, max_secs, res)));
-            if let Some((c, key)) = &cached {
-                if let Some(m) = c.fetch(key, &out) {
-                    return Ok((out, m.secs, m.kind));
-                }
-            }
-            // Decode first: looping a raw HEIC fails on tmap/Dolby Vision items.
-            let png = ffmpeg::decode_still_to_png(&caps.ffmpeg_bin, &r.still_path)?;
-            // The decoded (oriented) pixels are the truth about aspect.
-            let aspect = image::image_dimensions(&png.path)
-                .ok()
-                .filter(|&(w, h)| w > 0 && h > 0)
-                .map(|(w, h)| f64::from(w) / f64::from(h))
-                .or(r.aspect);
-            let dur = if let Some(aspect) = aspect.filter(|&a| is_panorama(a)) {
-                let motion = pano_motion(aspect);
-                // A short-mode budget can shorten the pan, never below a still.
-                let dur = motion.hold_secs.min(max_secs.max(still_secs));
-                // Travel less when shortened so the pan keeps its speed bound.
-                let coverage = pano_coverage(aspect, dur);
-                render_pano_segment(caps, &png.path, dur, aspect, coverage, idx, res, &out)?;
-                dur
-            } else {
-                render_hold_segment(caps, &png.path, still_secs, idx, res, &out)?;
-                still_secs
-            };
-            if let Some((c, key)) = &cached {
-                c.store(key, &out, dur, "still");
-            }
-            Ok((out, dur, "still".into()))
+            let key = |c: &SegmentCache| still_key(c, caps, r, idx, still_secs, max_secs, res);
+            cached_segment(caps, key, out, "still", |out| {
+                // Decode first: looping a raw HEIC fails on tmap/Dolby Vision items.
+                let png = ffmpeg::decode_still_to_png(&caps.ffmpeg_bin, &r.still_path)?;
+                // The decoded (oriented) pixels are the truth about aspect.
+                let aspect = image::image_dimensions(&png.path)
+                    .ok()
+                    .filter(|&(w, h)| w > 0 && h > 0)
+                    .map(|(w, h)| f64::from(w) / f64::from(h))
+                    .or(r.aspect);
+                let dur = if let Some(aspect) = aspect.filter(|&a| is_panorama(a)) {
+                    let motion = pano_motion(aspect);
+                    // A short-mode budget can shorten the pan, never below a still.
+                    let dur = motion.hold_secs.min(max_secs.max(still_secs));
+                    // Travel less when shortened so the pan keeps its speed bound.
+                    let coverage = pano_coverage(aspect, dur);
+                    render_pano_segment(caps, &png.path, dur, aspect, coverage, idx, res, out)?;
+                    dur
+                } else {
+                    render_hold_segment(caps, &png.path, still_secs, idx, res, out)?;
+                    still_secs
+                };
+                Ok(dur)
+            })
         }
         Rendition::Motion {
             trim_start,
@@ -1484,28 +1476,18 @@ fn render_entry_segment(
             ]);
             args.extend(ffmpeg::x264_aac("veryfast", 16));
             args.extend(["-shortest".into(), s(&out)]);
-            // The finished argument list (trim, filters, audio choice, output
-            // name with the work dir normalized away) is the whole recipe.
-            let cached = caps.segment_cache.as_deref().map(|c| {
-                // The output name carries the position; it is not a recipe input.
-                let mut recipe = args.clone();
-                if let Some(last) = recipe.last_mut() {
-                    *last = "<OUT>".into();
-                }
+            // The finished argument list (trim, filters, audio choice) is the
+            // whole recipe; the output name, last, only carries the position.
+            let recipe = &args[..args.len() - 1];
+            let key = |c: &SegmentCache| {
                 let mut k = c.key("clip");
-                k.file("src", src).args(&recipe);
-                (c, k.finish())
-            });
-            if let Some((c, key)) = &cached {
-                if let Some(m) = c.fetch(key, &out) {
-                    return Ok((out, m.secs, m.kind));
-                }
-            }
-            caps.run(&args, &out)?;
-            if let Some((c, key)) = &cached {
-                c.store(key, &out, len, "clip");
-            }
-            Ok((out, len, "clip".into()))
+                k.file("src", src).args(recipe);
+                k.finish()
+            };
+            cached_segment(caps, key, out, "clip", |out| {
+                caps.run(&args, out)?;
+                Ok(len)
+            })
         }
     }
 }
@@ -1589,7 +1571,7 @@ fn render_collage_segment(
     let dur = collage_hold_secs(members.len(), still_secs);
     // Members in order, plus the hold recipe; the layout and crop code is
     // pixel logic outside ffmpeg's arguments, covered by the cache version.
-    let cached = caps.segment_cache.as_deref().map(|c| {
+    let key = |c: &SegmentCache| {
         let mut k = c.key("collage");
         for (i, m) in members.iter().enumerate() {
             k.file(&format!("member{i}"), &m.still_path);
@@ -1603,20 +1585,37 @@ fn render_collage_segment(
             res,
             Path::new("<OUT>"),
         ));
-        (c, k.finish())
-    });
+        k.finish()
+    };
+    cached_segment(caps, key, out, "still", |out| {
+        let canvas = work_dir.join(format!("collage_{idx:03}.png"));
+        compose_collage(&caps.ffmpeg_bin, members, res, &canvas)?;
+        render_hold_segment(caps, &canvas, dur, idx, res, out)?;
+        Ok(dur)
+    })
+}
+
+/// Serve the segment at `out` from the export's segment cache when it holds
+/// `key`; otherwise `render` it (returning its seconds) and store the result.
+/// The key is only built when a cache is in use.
+fn cached_segment(
+    caps: &Capabilities,
+    key: impl FnOnce(&SegmentCache) -> String,
+    out: PathBuf,
+    kind: &str,
+    render: impl FnOnce(&Path) -> Result<f64, crate::MediaError>,
+) -> Result<(PathBuf, f64, String), crate::MediaError> {
+    let cached = caps.segment_cache.as_deref().map(|c| (c, key(c)));
     if let Some((c, key)) = &cached {
         if let Some(m) = c.fetch(key, &out) {
             return Ok((out, m.secs, m.kind));
         }
     }
-    let canvas = work_dir.join(format!("collage_{idx:03}.png"));
-    compose_collage(&caps.ffmpeg_bin, members, res, &canvas)?;
-    render_hold_segment(caps, &canvas, dur, idx, res, &out)?;
+    let secs = render(&out)?;
     if let Some((c, key)) = &cached {
-        c.store(key, &out, dur, "still");
+        c.store(key, &out, secs, kind);
     }
-    Ok((out, dur, "still".into()))
+    Ok((out, secs, kind.into()))
 }
 
 /// Whether an entry may join a collage: a still that is not a panorama
@@ -1985,7 +1984,7 @@ fn hold_args(
 /// or pan); the generated hold arguments, and the pan arguments for a
 /// reference panorama, stand in for the renderer code.
 fn still_key(
-    cache: &crate::segment_cache::SegmentCache,
+    cache: &SegmentCache,
     caps: &Capabilities,
     r: &ResolvedEntry,
     idx: usize,

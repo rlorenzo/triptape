@@ -47,7 +47,6 @@
 //! [`store`]: SegmentCache::store
 //! [`Capabilities::run`]: crate::ffmpeg::Capabilities::run
 
-use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -181,13 +180,13 @@ impl KeyBuilder {
     /// The full generated ffmpeg argument list, with the work directory
     /// normalized out.
     pub fn args(&mut self, args: &[String]) -> &mut Self {
-        let norm: Vec<String> = args
+        let norm: Vec<std::borrow::Cow<str>> = args
             .iter()
             .map(|a| {
-                if self.work_dir.is_empty() {
-                    a.clone()
+                if !self.work_dir.is_empty() && a.contains(&self.work_dir) {
+                    a.replace(&self.work_dir, "<WORK>").into()
                 } else {
-                    a.replace(&self.work_dir, "<WORK>")
+                    a.as_str().into()
                 }
             })
             .collect();
@@ -268,7 +267,6 @@ pub struct SegmentCache {
     work_dir: PathBuf,
     lease_path: Mutex<Option<PathBuf>>,
     stats: Mutex<UseStats>,
-    used: Mutex<HashSet<String>>,
 }
 
 impl std::fmt::Debug for SegmentCache {
@@ -296,7 +294,6 @@ impl SegmentCache {
             work_dir: work_dir.to_path_buf(),
             lease_path: Mutex::new(None),
             stats: Mutex::new(UseStats::default()),
-            used: Mutex::new(HashSet::new()),
         };
         let pid = std::process::id();
         let path = cache.dir.join("leases").join(format!(
@@ -308,9 +305,22 @@ impl SegmentCache {
             pid,
             started_ms: now_ms(),
         };
-        std::fs::write(&path, serde_json::to_vec(&lease)?).map_err(io_err)?;
+        // Written aside and renamed in: a half-written lease would read as
+        // stale to another process and be swept.
+        let tmp = cache.tmp_name();
+        std::fs::write(&tmp, serde_json::to_vec(&lease)?)
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                io_err(e)
+            })?;
         *cache.lease_path.lock().expect("lease lock") = Some(path);
         Ok(Arc::new(cache))
+    }
+
+    /// The cache directory.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// Start a key for a segment of the given kind.
@@ -337,14 +347,14 @@ impl SegmentCache {
         };
         // Touch first: the lease rule protects entries used since a lease
         // began, and LRU reads the same timestamp.
-        touch(&entry_mp4(&self.dir, key));
-        if place(&entry_mp4(&self.dir, key), dest).is_err() {
+        let mp4 = entry_path(&self.dir, key, "mp4");
+        touch(&mp4);
+        if place(&mp4, dest).is_err() {
             // Deleted between the check and the link: a miss, not an error.
             let _ = std::fs::remove_file(dest);
             self.bump(|s| s.misses += 1);
             return None;
         }
-        self.used.lock().expect("used lock").insert(key.to_string());
         self.bump(|s| s.hits += 1);
         Some(meta)
     }
@@ -368,7 +378,6 @@ impl SegmentCache {
         }
         let ok = self.try_store(key, produced, secs, kind, size).is_ok();
         if ok {
-            self.used.lock().expect("used lock").insert(key.to_string());
             self.bump(|s| s.stored += 1);
         }
         ok
@@ -382,8 +391,8 @@ impl SegmentCache {
         kind: &str,
         size: u64,
     ) -> std::io::Result<()> {
-        let mp4 = entry_mp4(&self.dir, key);
-        let json = entry_json(&self.dir, key);
+        let mp4 = entry_path(&self.dir, key, "mp4");
+        let json = entry_path(&self.dir, key, "json");
         std::fs::create_dir_all(mp4.parent().expect("entry has a parent"))?;
         let tmp_mp4 = self.tmp_name();
         let tmp_json = self.tmp_name();
@@ -458,17 +467,8 @@ pub fn resolve_cap(max_bytes: Option<u64>, dir: &Path) -> u64 {
 
 /// `ffmpeg -version`'s first line, or the binary name when it will not run.
 pub fn ffmpeg_version(ffmpeg_bin: &str) -> String {
-    std::process::Command::new(ffmpeg_bin)
-        .arg("-version")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .next()
-                .map(str::to_string)
-        })
+    crate::ffmpeg::run_capture(ffmpeg_bin, &["-version"])
+        .and_then(|out| out.lines().next().map(str::to_string))
         .unwrap_or_else(|| format!("unknown:{ffmpeg_bin}"))
 }
 
@@ -476,22 +476,23 @@ pub fn ffmpeg_version(ffmpeg_bin: &str) -> String {
 // Disk operations shared with the CLI
 // ---------------------------------------------------------------------------
 
-fn entry_mp4(dir: &Path, key: &str) -> PathBuf {
+/// `<dir>/<kk>/<key>.<ext>` (`ext`: "mp4" or "json").
+fn entry_path(dir: &Path, key: &str, ext: &str) -> PathBuf {
     dir.join(&key[..2.min(key.len())])
-        .join(format!("{key}.mp4"))
+        .join(format!("{key}.{ext}"))
 }
 
-fn entry_json(dir: &Path, key: &str) -> PathBuf {
-    dir.join(&key[..2.min(key.len())])
-        .join(format!("{key}.json"))
+/// The sidecar at `json` when it describes a complete `.mp4` of `mp4_len`
+/// bytes: parseable, nonzero, size matches.
+fn complete_meta(json: &Path, mp4_len: u64) -> Option<SegmentMeta> {
+    let meta: SegmentMeta = serde_json::from_slice(&std::fs::read(json).ok()?).ok()?;
+    (mp4_len > 0 && mp4_len == meta.size && meta.secs.is_finite()).then_some(meta)
 }
 
-/// The sidecar when the entry is complete: exists, nonzero, size matches.
+/// The sidecar when the entry is complete (see [`complete_meta`]).
 fn read_valid(dir: &Path, key: &str) -> Option<SegmentMeta> {
-    let meta: SegmentMeta =
-        serde_json::from_slice(&std::fs::read(entry_json(dir, key)).ok()?).ok()?;
-    let len = std::fs::metadata(entry_mp4(dir, key)).ok()?.len();
-    (len > 0 && len == meta.size && meta.secs.is_finite()).then_some(meta)
+    let len = std::fs::metadata(entry_path(dir, key, "mp4")).ok()?.len();
+    complete_meta(&entry_path(dir, key, "json"), len)
 }
 
 /// Set mtime to now (the LRU and lease timestamp). Opening for write does not
@@ -571,13 +572,32 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Leases of exports still running; stale lease files are deleted.
-fn live_leases(dir: &Path, now: u64) -> Vec<Lease> {
+/// `<pid>-<timestamp>-<seq>.lease`, the only lease names [`SegmentCache::open`]
+/// makes.
+fn is_lease_name(name: &str) -> bool {
+    name.strip_suffix(".lease").is_some_and(|stem| {
+        let parts: Vec<&str> = stem.split('-').collect();
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+    })
+}
+
+/// Leases of exports still running. With `sweep`, stale lease files are
+/// deleted. Only regular files named like the cache's own leases are read;
+/// anything else under `leases/` is left alone.
+fn live_leases(dir: &Path, now: u64, sweep: bool) -> Vec<Lease> {
     let mut live = vec![];
     let Ok(rd) = std::fs::read_dir(dir.join("leases")) else {
         return live;
     };
     for e in rd.flatten() {
+        if !is_lease_name(&e.file_name().to_string_lossy())
+            || !e.file_type().is_ok_and(|t| t.is_file())
+        {
+            continue;
+        }
         let path = e.path();
         let lease: Option<Lease> = std::fs::read(&path)
             .ok()
@@ -589,9 +609,10 @@ fn live_leases(dir: &Path, now: u64) -> Vec<Lease> {
             {
                 live.push(l)
             }
-            _ => {
+            _ if sweep => {
                 let _ = std::fs::remove_file(&path);
             }
+            _ => {}
         }
     }
     live
@@ -604,8 +625,29 @@ struct DiskEntry {
     last_used_ms: u64,
 }
 
-/// Complete entries, plus a sweep of old temp files and orphans.
-fn scan(dir: &Path, now: u64) -> Vec<DiskEntry> {
+/// `s` is exactly `n` lowercase hex digits (the form [`KeyBuilder::finish`]
+/// produces).
+fn is_hex(s: &str, n: usize) -> bool {
+    s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `.tmp-<pid>-<seq>`, the only temp names [`SegmentCache::tmp_name`] makes.
+fn is_cache_tmp(name: &str) -> bool {
+    name.strip_prefix(".tmp-")
+        .and_then(|r| r.split_once('-'))
+        .is_some_and(|(a, b)| {
+            [a, b]
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+        })
+}
+
+/// Complete entries. With `sweep`, also delete old temp files and orphans.
+/// Only names the cache itself creates are ever considered (`<kk>/` shard
+/// dirs holding `<key>.mp4` with a 64-hex key starting with `kk`, and
+/// `.tmp-<pid>-<seq>`), so pointing the cache at a directory with other
+/// files never touches them.
+fn scan(dir: &Path, now: u64, sweep: bool) -> Vec<DiskEntry> {
     let mut out = vec![];
     let Ok(rd) = std::fs::read_dir(dir) else {
         return out;
@@ -620,13 +662,13 @@ fn scan(dir: &Path, now: u64) -> Vec<DiskEntry> {
         let path = e.path();
         let name = e.file_name().to_string_lossy().into_owned();
         let Ok(md) = e.metadata() else { continue };
-        if md.is_file() && name.starts_with(".tmp-") {
-            if old(&md) {
+        if md.is_file() && is_cache_tmp(&name) {
+            if sweep && old(&md) {
                 let _ = std::fs::remove_file(&path);
             }
             continue;
         }
-        if !md.is_dir() || name == "leases" {
+        if !md.is_dir() || !is_hex(&name, 2) {
             continue;
         }
         let Ok(sub) = std::fs::read_dir(&path) else {
@@ -637,14 +679,17 @@ fn scan(dir: &Path, now: u64) -> Vec<DiskEntry> {
             if fp.extension().and_then(|x| x.to_str()) != Some("mp4") {
                 continue;
             }
+            let owned = fp
+                .file_stem()
+                .and_then(|x| x.to_str())
+                .is_some_and(|k| is_hex(k, 64) && k.starts_with(name.as_str()));
+            if !owned {
+                continue;
+            }
             let Ok(fmd) = f.metadata() else { continue };
             let json = fp.with_extension("json");
-            let complete = std::fs::read(&json)
-                .ok()
-                .and_then(|b| serde_json::from_slice::<SegmentMeta>(&b).ok())
-                .is_some_and(|m| m.size == fmd.len() && fmd.len() > 0);
-            if !complete {
-                if old(&fmd) {
+            if complete_meta(&json, fmd.len()).is_none() {
+                if sweep && old(&fmd) {
                     let _ = std::fs::remove_file(&fp);
                     let _ = std::fs::remove_file(&json);
                 }
@@ -669,8 +714,8 @@ fn scan(dir: &Path, now: u64) -> Vec<DiskEntry> {
 /// Remove oldest-used unprotected entries until the total is at most `cap`
 /// (`None`: remove all unprotected entries).
 fn evict_to(dir: &Path, cap: Option<u64>, now: u64) -> EvictReport {
-    let mut entries = scan(dir, now);
-    let leases = live_leases(dir, now);
+    let mut entries = scan(dir, now, true);
+    let leases = live_leases(dir, now, true);
     let floor = leases.iter().map(|l| l.started_ms).min();
     let mut total: u64 = entries.iter().map(|e| e.size).sum();
     entries.sort_by_key(|e| e.last_used_ms);
@@ -699,14 +744,14 @@ pub fn clear(dir: &Path) -> EvictReport {
     evict_to(dir, None, now_ms())
 }
 
-/// `triptape cache stats`.
+/// `triptape cache stats`. Read-only: no orphan or temp-file sweep.
 pub fn disk_stats(dir: &Path) -> DiskStats {
     let now = now_ms();
-    let entries = scan(dir, now);
+    let entries = scan(dir, now, false);
     DiskStats {
         entries: entries.len(),
         bytes: entries.iter().map(|e| e.size).sum(),
-        live_leases: live_leases(dir, now).len(),
+        live_leases: live_leases(dir, now, false).len(),
     }
 }
 
@@ -848,7 +893,7 @@ mod tests {
         let made = produce(&work, "made.mp4", 500);
         assert!(c.store(&key, &made, 4.0, "still"));
         // mp4 without sidecar (crash between renames).
-        std::fs::remove_file(entry_json(&cdir, &key)).unwrap();
+        std::fs::remove_file(entry_path(&cdir, &key, "json")).unwrap();
         assert!(c.fetch(&key, &dest).is_none());
         // Sidecar present but file torn (size mismatch).
         let meta = SegmentMeta {
@@ -856,18 +901,26 @@ mod tests {
             kind: "still".into(),
             size: 999,
         };
-        std::fs::write(entry_json(&cdir, &key), serde_json::to_vec(&meta).unwrap()).unwrap();
+        std::fs::write(
+            entry_path(&cdir, &key, "json"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
         assert!(c.fetch(&key, &dest).is_none());
         // Empty file.
-        std::fs::write(entry_mp4(&cdir, &key), b"").unwrap();
+        std::fs::write(entry_path(&cdir, &key, "mp4"), b"").unwrap();
         let meta = SegmentMeta { size: 0, ..meta };
-        std::fs::write(entry_json(&cdir, &key), serde_json::to_vec(&meta).unwrap()).unwrap();
+        std::fs::write(
+            entry_path(&cdir, &key, "json"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
         assert!(c.fetch(&key, &dest).is_none());
         // A store with a missing or empty source writes nothing.
         let key2 = c.key("other").finish();
         assert!(!c.store(&key2, &work.join("nope.mp4"), 1.0, "still"));
         assert!(!c.store(&key2, &produce(&work, "empty.mp4", 0), 1.0, "still"));
-        assert!(!entry_mp4(&cdir, &key2).exists());
+        assert!(!entry_path(&cdir, &key2, "mp4").exists());
         // No temp debris from the failures.
         let debris = std::fs::read_dir(&cdir)
             .unwrap()
@@ -914,10 +967,10 @@ mod tests {
         for (i, k) in keys.iter().enumerate() {
             assert!(c.store(k, &produce(&work, &format!("m{i}.mp4"), 1000), 1.0, "still"));
             // Oldest first: k0 oldest, k3 newest.
-            set_age(&entry_mp4(&cdir, k), 1000 - 100 * i as u64);
+            set_age(&entry_path(&cdir, k, "mp4"), 1000 - 100 * i as u64);
         }
         // k0 was used most recently of all.
-        touch(&entry_mp4(&cdir, &keys[0]));
+        touch(&entry_path(&cdir, &keys[0], "mp4"));
         let r = c.finish();
         assert_eq!(r.removed, 2, "{r:?}");
         let alive: Vec<bool> = keys
@@ -938,8 +991,8 @@ mod tests {
         assert!(setup.store(&old, &produce(&work, "a.mp4", 1000), 1.0, "still"));
         assert!(setup.store(&used, &produce(&work, "b.mp4", 1000), 1.0, "still"));
         setup.release_lease();
-        set_age(&entry_mp4(&cdir, &old), 5000);
-        set_age(&entry_mp4(&cdir, &used), 5000);
+        set_age(&entry_path(&cdir, &old, "mp4"), 5000);
+        set_age(&entry_path(&cdir, &used, "mp4"), 5000);
         // A live export starts, then hits `used`.
         let live = open(&cdir, &work, None);
         assert!(live.fetch(&used, &work.join("seg.mp4")).is_some());
@@ -976,9 +1029,12 @@ mod tests {
             pid: u32::MAX - 1,
             started_ms: now_ms() - 1000,
         };
-        let lp = cdir.join("leases").join("dead.lease");
+        let lp = cdir
+            .join("leases")
+            .join(format!("{}-1-0.lease", u32::MAX - 1));
         std::fs::write(&lp, serde_json::to_vec(&stale).unwrap()).unwrap();
         assert_eq!(disk_stats(&cdir).live_leases, 0);
+        assert!(lp.exists(), "stats must not sweep leases");
         let r = clear(&cdir);
         assert_eq!((r.removed, r.protected), (1, 0));
         assert!(!lp.exists(), "stale lease swept");
@@ -992,15 +1048,50 @@ mod tests {
         let tmp = cdir.join(".tmp-1-1");
         std::fs::write(&tmp, b"partial").unwrap();
         let k = c.key("o").finish();
-        std::fs::create_dir_all(entry_mp4(&cdir, &k).parent().unwrap()).unwrap();
-        std::fs::write(entry_mp4(&cdir, &k), b"orphan").unwrap();
+        std::fs::create_dir_all(entry_path(&cdir, &k, "mp4").parent().unwrap()).unwrap();
+        std::fs::write(entry_path(&cdir, &k, "mp4"), b"orphan").unwrap();
         // Fresh ones may belong to a live write: kept.
         c.finish();
-        assert!(tmp.exists() && entry_mp4(&cdir, &k).exists());
+        assert!(tmp.exists() && entry_path(&cdir, &k, "mp4").exists());
         set_age(&tmp, 7200);
-        set_age(&entry_mp4(&cdir, &k), 7200);
+        set_age(&entry_path(&cdir, &k, "mp4"), 7200);
         evict_to(&cdir, None, now_ms());
-        assert!(!tmp.exists() && !entry_mp4(&cdir, &k).exists());
+        assert!(!tmp.exists() && !entry_path(&cdir, &k, "mp4").exists());
+    }
+
+    #[test]
+    fn foreign_files_in_the_cache_dir_are_never_touched() {
+        let t = tempfile::tempdir().unwrap();
+        let (cdir, work) = (t.path().join("c"), t.path().join("w"));
+        let c = open(&cdir, &work, None);
+        let k = c.key("o").finish();
+        let foreign = [
+            cdir.join("holiday").join("original.mp4"),
+            cdir.join(&k[..2]).join("original.mp4"),
+            cdir.join("zz").join(format!("{}.mp4", "z".repeat(64))),
+            cdir.join(if &k[..2] == "00" { "01" } else { "00" })
+                .join(format!("{k}.mp4")),
+            cdir.join(".tmp-notes.mp4"),
+            cdir.join("leases").join("notes.txt"),
+            cdir.join("leases").join("dead.lease"),
+        ];
+        for f in &foreign {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, b"precious").unwrap();
+            set_age(f, 7200);
+        }
+        // Stats never sweeps, even owned orphans.
+        let orphan = entry_path(&cdir, &k, "mp4");
+        std::fs::write(&orphan, b"orphan").unwrap();
+        set_age(&orphan, 7200);
+        assert_eq!(disk_stats(&cdir).entries, 0);
+        assert!(orphan.exists());
+        c.finish();
+        clear(&cdir);
+        assert!(!orphan.exists());
+        for f in &foreign {
+            assert!(f.exists(), "{} was deleted", f.display());
+        }
     }
 
     #[test]

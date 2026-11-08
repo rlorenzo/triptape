@@ -214,10 +214,10 @@ pub fn export_all(
         // this export used is protected any longer than it is needed.
         let stats = cache.stats();
         let evicted = cache.finish();
-        if let (Ok(report), Some(cfg)) = (out.as_mut(), &opts.segment_cache) {
+        if let Ok(report) = out.as_mut() {
             if stats.hits + stats.misses > 0 {
                 report.segment_cache = Some(SegmentCacheReport {
-                    dir: cfg.dir.to_string_lossy().into_owned(),
+                    dir: cache.dir().to_string_lossy().into_owned(),
                     reused: stats.hits,
                     total: stats.hits + stats.misses,
                     stored: stats.stored,
@@ -227,14 +227,23 @@ pub fn export_all(
             }
             if stats.skipped_low_disk > 0 {
                 report.fallbacks.push(format!(
-                    "segment cache: {} segments not cached (under 5 GB free)",
-                    stats.skipped_low_disk
+                    "segment cache: {} segments not cached (under {} free)",
+                    stats.skipped_low_disk,
+                    crate::segment_cache::fmt_bytes(crate::segment_cache::LOW_DISK_BYTES)
                 ));
             }
         }
     }
     if let (Ok(report), Some(note)) = (out.as_mut(), cache_note) {
         report.fallbacks.push(note);
+    }
+    // Written last so the durable record includes the cache diagnostics.
+    if let Ok(report) = &out {
+        std::fs::write(
+            out_dir.join("export.json"),
+            serde_json::to_string_pretty(report)?,
+        )
+        .map_err(|e| crate::MediaError::Io(e.to_string()))?;
     }
     out
 }
@@ -511,9 +520,6 @@ fn export_inner(
         }
     }
 
-    let report_path = out_dir.join("export.json");
-    std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)
-        .map_err(|e| crate::MediaError::Io(e.to_string()))?;
     Ok(report)
 }
 

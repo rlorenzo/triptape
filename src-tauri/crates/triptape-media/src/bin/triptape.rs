@@ -652,38 +652,40 @@ fn segment_cache_config(flags: &HashMap<String, String>) -> Option<SegmentCacheC
             "--segment-cache and --no-segment-cache conflict",
         );
     }
-    let max_bytes = flags
-        .get("segment-cache-max")
-        .map(|v| segment_cache::parse_size(v).unwrap_or_else(|e| die("segment-cache-max", e)));
+    let max_bytes = cache_max_flag(flags);
     if off {
         return None;
     }
-    let dir = flags
-        .get("segment-cache")
-        .map(PathBuf::from)
-        .or_else(segment_cache::default_dir);
+    let dir = cache_dir_flag(flags);
     if dir.is_none() {
         eprintln!("segment cache off: no cache directory on this platform");
     }
     dir.map(|dir| SegmentCacheConfig { dir, max_bytes })
 }
 
-/// `cache stats` / `cache clear`.
-fn cache_cmd(sub: &str, flags: &HashMap<String, String>) {
-    let dir = flags
+/// `--segment-cache DIR`, else the platform default.
+fn cache_dir_flag(flags: &HashMap<String, String>) -> Option<PathBuf> {
+    flags
         .get("segment-cache")
         .map(PathBuf::from)
         .or_else(segment_cache::default_dir)
+}
+
+/// `--segment-cache-max SIZE`, when given.
+fn cache_max_flag(flags: &HashMap<String, String>) -> Option<u64> {
+    flags
+        .get("segment-cache-max")
+        .map(|v| segment_cache::parse_size(v).unwrap_or_else(|e| die("segment-cache-max", e)))
+}
+
+/// `cache stats` / `cache clear`.
+fn cache_cmd(sub: &str, flags: &HashMap<String, String>) {
+    let dir = cache_dir_flag(flags)
         .unwrap_or_else(|| die("cache", "no cache directory on this platform"));
     match sub {
         "stats" => {
             let st = segment_cache::disk_stats(&dir);
-            let cap = segment_cache::resolve_cap(
-                flags.get("segment-cache-max").map(|v| {
-                    segment_cache::parse_size(v).unwrap_or_else(|e| die("segment-cache-max", e))
-                }),
-                &dir,
-            );
+            let cap = segment_cache::resolve_cap(cache_max_flag(flags), &dir);
             println!("segment cache: {}", dir.display());
             println!(
                 "entries: {}  size: {}  cap: {}  exports running: {}",

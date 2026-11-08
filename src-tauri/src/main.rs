@@ -991,10 +991,11 @@ fn export_blocking(
         only: "all".to_string(),
         resolution: triptape_media::resolution::Resolution::default(),
         jobs: None,
-        // The app's own cache dir: macOS ~/Library/Caches/app.triptape.desktop.
-        segment_cache: app.path().app_cache_dir().ok().map(|d| {
+        // The same dir the CLI uses, so `triptape cache` sees the app's
+        // segments: macOS ~/Library/Caches/app.triptape.desktop/segments.
+        segment_cache: triptape_media::segment_cache::default_dir().map(|dir| {
             triptape_media::segment_cache::SegmentCacheConfig {
-                dir: d.join("segments"),
+                dir,
                 max_bytes: None,
             }
         }),
