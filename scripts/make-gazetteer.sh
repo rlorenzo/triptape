@@ -47,6 +47,19 @@ PY
 # which must keep their `City, Country` label: a row reached only through
 # that class is dropped when it is also typed as a city, town, village,
 # municipality, or spa town, unless it is an archaeological site (Persepolis).
+# Places that no longer exist are left out (Ryōunkaku, the Asakusa tower
+# demolished in 1923, still has Wikidata coordinates): any item typed
+# "destroyed building or structure" (Q19860854) or with a state of use of
+# "demolished or destroyed" (P5817 = Q56556915). The dissolved date (P576) and
+# closure date (P3999) are NOT used: they also sit on Hagia Sophia, Persepolis,
+# Osaka Castle, Stonehenge and Kumamoto Castle (a trial run dropped 157 rows,
+# most of them places that stand and get visited). "Decommissioned" and
+# "cancelled" states are not used either: a deconsecrated church can stand.
+# Religious sites (Buddhist temples, Shinto shrines, churches, mosques, Hindu
+# temples, synagogues) are classes of their own: Sensō-ji and the Kamakura
+# temples are where a day is spent. Monuments and gates were left out:
+# monuments add ~1,270 mostly memorials and statues for little naming value,
+# and a gate (Kaminarimon) sits inside the temple that names the day anyway.
 # Umbrella resort parents of two or more amusement parks are likewise
 # dropped for the specific park (Tokyo DisneySea over Tokyo Disney
 # Resort, via P361 within 3 km). Only parks need their parents, so those come
@@ -54,15 +67,17 @@ PY
 UA='TripTape-gazetteer-build/1.0'
 MIN_LINKS=12
 # class:floor. Each floor is about 90% of that class's row count from the
-# recorded full run on 2026-11-03 (QLever). This catches a response cut off
+# recorded full run on 2026-11-07 (QLever, with the STILL_STANDS filter
+# and the religious classes). This catches a response cut off
 # at a row boundary, which still parses cleanly. Reset these from a recorded
 # run whenever the class list or endpoint changes; never lower them to make
 # a partial run pass.
-CLASS_FLOORS='Q570116:1400 Q194195:107 Q22746:108 Q22698:2355 Q33506:3306 Q167346:94 Q43501:144 Q23413:821 Q11315:45'
+CLASS_FLOORS='Q570116:1398 Q194195:107 Q22746:108 Q22698:2357 Q33506:3303 Q167346:94 Q43501:144 Q23413:811 Q11315:45 Q5393308:151 Q845945:144 Q16970:2720 Q32815:680 Q842402:114 Q34627:136'
 # Same floor rule. These filter rows out, so a cut-off response here would
 # silently let towns back in.
 TOWN_FLOORS='Q515:12900 Q3957:16004 Q532:34452 Q15284:120942 Q4946461:311'
 SITE_FLOORS='Q839954:2390'
+STILL_STANDS='FILTER NOT EXISTS { ?item wdt:P31 wd:Q19860854 } FILTER NOT EXISTS { ?item wdt:P5817 wd:Q56556915 }'
 PREFIXES='PREFIX wd: <http://www.wikidata.org/entity/> PREFIX wdt: <http://www.wikidata.org/prop/direct/> PREFIX wikibase: <http://wikiba.se/ontology#> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>'
 wikidata_query() {
   curl -fsS --retry 3 --max-time 600 -H "User-Agent: $UA" -H 'Accept: text/csv' \
@@ -70,7 +85,7 @@ wikidata_query() {
 }
 for entry in $CLASS_FLOORS; do
   cls=${entry%:*}
-  wikidata_query "SELECT ?item ?itemLabel ?coord ?links WHERE { ?item wdt:P31/wdt:P279* wd:$cls; wdt:P625 ?coord; wikibase:sitelinks ?links. FILTER(?links >= $MIN_LINKS) ?item rdfs:label ?itemLabel. FILTER(LANG(?itemLabel) = 'en') }" "wd-$cls"
+  wikidata_query "SELECT ?item ?itemLabel ?coord ?links WHERE { ?item wdt:P31/wdt:P279* wd:$cls; wdt:P625 ?coord; wikibase:sitelinks ?links. FILTER(?links >= $MIN_LINKS) $STILL_STANDS ?item rdfs:label ?itemLabel. FILTER(LANG(?itemLabel) = 'en') }" "wd-$cls"
 done
 for entry in $TOWN_FLOORS $SITE_FLOORS; do
   cls=${entry%:*}
@@ -82,7 +97,7 @@ python3 - "$tmp" "$MIN_LINKS" "$TOWN_FLOORS" "$SITE_FLOORS" $CLASS_FLOORS <<'PY'
 import csv, math, re, sys
 tmp, min_links = sys.argv[1], int(sys.argv[2])
 class_floors = [arg.split(':') for arg in sys.argv[5:]]
-MIN_TOTAL_ROWS = 5195
+MIN_TOTAL_ROWS = 7952
 # About 90% of the recorded run, like the floors above.
 MIN_PARK_PARENT_ROWS = 17
 MAX_PARK_TO_PARENT_M = 3000

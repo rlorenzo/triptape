@@ -46,6 +46,16 @@ pub struct ExportReport {
     pub attribution: Vec<String>,
 }
 
+/// The place of the chapter holding `asset_id`, for keepsakes that print or
+/// overlay it (reels, book). The hero film never uses it: its lower third
+/// already names the place.
+fn chapter_place<'a>(plan: &'a Plan, asset_id: &str) -> Option<&'a str> {
+    plan.chapters
+        .iter()
+        .find(|c| c.asset_ids.iter().any(|id| id == asset_id))
+        .and_then(|c| c.place.as_deref())
+}
+
 /// Resolve a plan entry to files from the asset map.
 fn resolve_entry(
     plan: &Plan,
@@ -260,6 +270,13 @@ pub fn export_all(
             .filter(|e| seen.insert(e.asset_id.clone()))
             .take(elig.reels)
             .filter_map(|e| resolve_verified(plan, &by_id, e, "reels", &mut report.fallbacks))
+            .map(|mut r| {
+                // A reel names where it is; the user's caption wins.
+                if r.caption.is_none() {
+                    r.caption = chapter_place(plan, &r.entry.asset_id).map(String::from);
+                }
+                r
+            })
             .collect();
         // Still highlights become slideshows of their chapter neighbors,
         // never reusing a photo across reels.
@@ -347,13 +364,19 @@ pub fn export_all(
                     }
                 },
             };
+            let chapter = chapter_of.get(a.id.as_str()).copied();
             book_photos.push(BookPhoto {
                 asset_id: a.id.clone(),
                 path: a.path.clone(),
                 width: w,
                 height: h,
-                caption: plan.captions.get(&a.id).cloned(),
-                chapter: chapter_of.get(a.id.as_str()).copied(),
+                // The user's caption, else the chapter place.
+                caption: plan
+                    .captions
+                    .get(&a.id)
+                    .or_else(|| chapter.and_then(|i| plan.chapters[i].place.as_ref()))
+                    .cloned(),
+                chapter,
             });
         }
         // Story order: keep db order (taken_at, id).
@@ -560,5 +583,19 @@ mod tests {
         let r = resolve_entry(&plan, &assets, "a0").expect("resolves");
         assert_eq!(r.taken_at, Some(1791288000));
         assert_eq!(r.caption.as_deref(), Some("Overlook"));
+    }
+
+    #[test]
+    fn chapter_place_names_the_chapter_not_the_hero_caption() {
+        let mut plan = empty_plan();
+        plan.chapters.push(triptape_core::types::Chapter {
+            title: "Sensō-ji".into(),
+            asset_ids: vec!["a0".into()],
+            place: Some("Sensō-ji".into()),
+            day_index: None,
+            date_label: None,
+        });
+        assert_eq!(chapter_place(&plan, "a0"), Some("Sensō-ji"));
+        assert_eq!(chapter_place(&plan, "other"), None);
     }
 }

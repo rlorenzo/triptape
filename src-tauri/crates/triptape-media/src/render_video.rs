@@ -327,14 +327,20 @@ fn fair_share(budget: f64, segments_left: usize) -> f64 {
     budget / segments_left.max(1) as f64
 }
 
-/// Sidecar text for a collage: each member's caption on its own line.
+/// Sidecar text for a collage: each member's caption on its own line,
+/// identical lines once.
 fn collage_caption(members: &[&ResolvedEntry]) -> Option<String> {
-    let lines: Vec<&str> = members
+    let mut lines: Vec<&str> = vec![];
+    for c in members
         .iter()
         .filter_map(|m| m.caption.as_deref())
         .map(str::trim)
         .filter(|c| !c.is_empty())
-        .collect();
+    {
+        if !lines.contains(&c) {
+            lines.push(c);
+        }
+    }
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
@@ -2351,6 +2357,13 @@ mod tests {
         assert_eq!(collage_caption(&[&a, &b, &c]).as_deref(), Some("One\nTwo"));
         let blank = member(Some("  "));
         assert_eq!(collage_caption(&[&b, &blank]), None);
+        // The same words on every member show once.
+        let (x, y, z) = (
+            member(Some("Tower")),
+            member(Some(" Tower ")),
+            member(Some("Tower")),
+        );
+        assert_eq!(collage_caption(&[&x, &y, &z]).as_deref(), Some("Tower"));
     }
 
     #[test]
