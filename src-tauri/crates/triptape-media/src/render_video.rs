@@ -358,6 +358,7 @@ fn card_entry(id: &str, path: &Path) -> ResolvedEntry {
     ResolvedEntry {
         entry: PlanEntry {
             asset_id: id.into(),
+            window: 0,
             content_hash: None,
             size_bytes: 0,
             mtime: 0,
@@ -2041,6 +2042,7 @@ mod tests {
                     let secs = 1.0 + next(8) as f64;
                     entries.push(PlanEntry {
                         asset_id: id,
+                        window: 0,
                         content_hash: None,
                         size_bytes: 0,
                         mtime: 0,
@@ -2601,6 +2603,7 @@ mod tests {
         ResolvedEntry {
             entry: PlanEntry {
                 asset_id: id.into(),
+                window: 0,
                 content_hash: None,
                 size_bytes: 0,
                 mtime: 0,
@@ -2808,6 +2811,7 @@ mod tests {
             entries.push(ResolvedEntry {
                 entry: PlanEntry {
                     asset_id: format!("a{i}"),
+                    window: 0,
                     content_hash: None,
                     size_bytes: 0,
                     mtime: 0,
@@ -2958,6 +2962,7 @@ mod tests {
             .map(|i| ResolvedEntry {
                 entry: PlanEntry {
                     asset_id: format!("a{i}"),
+                    window: 0,
                     content_hash: None,
                     size_bytes: 0,
                     mtime: 0,
@@ -3026,6 +3031,7 @@ mod tests {
             .map(|id| ResolvedEntry {
                 entry: PlanEntry {
                     asset_id: id.clone(),
+                    window: 0,
                     content_hash: None,
                     size_bytes: 0,
                     mtime: 0,
@@ -3139,6 +3145,7 @@ mod tests {
             ResolvedEntry {
                 entry: PlanEntry {
                     asset_id: "clip0".into(),
+                    window: 0,
                     content_hash: None,
                     size_bytes: 0,
                     mtime: 0,
@@ -3157,6 +3164,7 @@ mod tests {
             ResolvedEntry {
                 entry: PlanEntry {
                     asset_id: "still1".into(),
+                    window: 0,
                     content_hash: None,
                     size_bytes: 0,
                     mtime: 0,
@@ -3506,6 +3514,7 @@ mod tests {
             entries.push(ResolvedEntry {
                 entry: PlanEntry {
                     asset_id: id,
+                    window: 0,
                     content_hash: None,
                     size_bytes: 0,
                     mtime: 0,

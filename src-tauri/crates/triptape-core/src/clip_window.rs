@@ -2,6 +2,13 @@
 //! grayscale samples and per-sample audio energy. No decoding happens here
 //! (the media crate feeds samples in), so everything is deterministic and
 //! unit-testable. No ML and no face detection, per PLAN.md privacy rules.
+//!
+//! Short clips get one window. Clips over [`MULTI_WINDOW_MIN_SECS`] are split
+//! at scene cuts (frame-difference spikes in the samples the media crate
+//! already decodes, so no extra decode) and each scene that holds up against
+//! the clip's best earns its own window, up to [`MAX_CLIP_WINDOWS`].
+
+use crate::types::ClipSpan;
 
 /// Seconds between analysis samples. Matches the ~1 s keyframe spacing of
 /// phone video, so the media crate can decode keyframes only (~10x faster
@@ -16,6 +23,22 @@ const _: () = assert!(TARGET_WINDOW_SECS <= MAX_WINDOW_SECS);
 pub const MIN_ANALYZED_SECS: f64 = 2.0;
 /// Opening and closing margin a window never touches (camera raise/lower).
 pub const EDGE_SKIP_SECS: f64 = 0.7;
+
+/// Clips longer than this are split at scene cuts into several windows.
+pub const MULTI_WINDOW_MIN_SECS: f64 = 20.0;
+/// Most windows one clip can contribute to the film.
+pub const MAX_CLIP_WINDOWS: usize = 3;
+/// Shortest window worth showing from a short scene.
+pub const MIN_SCENE_WINDOW_SECS: f64 = 3.0;
+/// A scene's window must score at least this fraction of the clip's best
+/// window (mean per-sample score) to be kept.
+pub const WINDOW_QUALITY_BAR: f32 = 0.85;
+/// Mean abs difference (0..1) between consecutive samples that can be a cut.
+/// Sampling is ~1 s apart, so this sits well above steady handheld footage.
+pub const SCENE_CUT_DIFF: f32 = 0.22;
+/// A cut must also exceed its neighbours' differences by this factor, so a
+/// sustained pan or busy scene (many high differences in a row) is not cut.
+pub const SCENE_CUT_SPIKE: f32 = 1.5;
 
 /// Weight of sharpness (Laplacian variance, normalised per clip).
 const W_SHARP: f32 = 0.30;
@@ -205,6 +228,106 @@ pub fn pick_window(scores: &[f32], duration: f64) -> Option<(f64, f64)> {
     Some((start, start + len))
 }
 
+/// Samples that open a new scene (never 0), given each sample's difference
+/// from its predecessor (`diffs[0]` is `None`). A cut is a spike: at least
+/// [`SCENE_CUT_DIFF`] and [`SCENE_CUT_SPIKE`] times both neighbours.
+pub fn scene_cuts(diffs: &[Option<f32>]) -> Vec<usize> {
+    let d = |i: usize| diffs.get(i).copied().flatten().unwrap_or(0.0);
+    (1..diffs.len())
+        .filter(|&i| {
+            let here = d(i);
+            here >= SCENE_CUT_DIFF && here >= SCENE_CUT_SPIKE * d(i - 1).max(d(i + 1))
+        })
+        .collect()
+}
+
+fn span(scores: &[f32], start: f64, end: f64) -> ClipSpan {
+    ClipSpan {
+        start,
+        end,
+        quality: window_quality(scores, Some((start, end))).unwrap_or(0.0),
+    }
+}
+
+/// Best window of `n` samples starting within `[first, last]` (sample
+/// indices), earliest on ties, with its mean score.
+fn best_run(scores: &[f32], n: usize, first: usize, last: usize) -> Option<(usize, f32)> {
+    let last = last.min(scores.len().checked_sub(n)?);
+    let mut best: Option<(usize, f32)> = None;
+    for s in first..=last {
+        let mean = scores[s..s + n].iter().sum::<f32>() / n as f32;
+        if best.is_none_or(|(_, m)| mean > m) {
+            best = Some((s, mean));
+        }
+    }
+    best
+}
+
+/// Pick the playback windows of a clip, in time order: one per scene at
+/// most, never overlapping, at most [`MAX_CLIP_WINDOWS`], each scoring
+/// within [`WINDOW_QUALITY_BAR`] of the clip's best. `cuts` are scene-start
+/// sample indices from [`scene_cuts`]. Clips of [`MULTI_WINDOW_MIN_SECS`] or
+/// less, and clips without cuts, get exactly [`pick_window`]'s single
+/// window. Empty when the clip should play whole.
+pub fn pick_windows(scores: &[f32], cuts: &[usize], duration: f64) -> Vec<ClipSpan> {
+    let single = || {
+        pick_window(scores, duration)
+            .map(|(a, b)| span(scores, a, b))
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    if !wants_window(duration) {
+        return vec![];
+    }
+    let mut starts: Vec<usize> = cuts
+        .iter()
+        .copied()
+        .filter(|&c| c > 0 && c < scores.len())
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    if duration <= MULTI_WINDOW_MIN_SECS || starts.is_empty() {
+        return single();
+    }
+    starts.insert(0, 0);
+    let mut found: Vec<(f32, ClipSpan)> = vec![];
+    for (i, &a) in starts.iter().enumerate() {
+        // Stay inside the scene: it starts at the first post-cut sample and
+        // ends at the last pre-cut one (the cut falls somewhere after it).
+        let lo = if a == 0 {
+            EDGE_SKIP_SECS
+        } else {
+            a as f64 * SAMPLE_SECS
+        };
+        let hi = match starts.get(i + 1) {
+            Some(&b) => (b - 1) as f64 * SAMPLE_SECS,
+            None => duration - EDGE_SKIP_SECS,
+        };
+        let n = (((hi - lo).min(TARGET_WINDOW_SECS)) / SAMPLE_SECS).floor() as usize;
+        if (n as f64) * SAMPLE_SECS < MIN_SCENE_WINDOW_SECS {
+            continue;
+        }
+        let first = (lo / SAMPLE_SECS).ceil() as usize;
+        let last = ((hi - n as f64 * SAMPLE_SECS) / SAMPLE_SECS).floor() as usize;
+        if last < first {
+            continue;
+        }
+        if let Some((s, mean)) = best_run(scores, n, first, last) {
+            let start = s as f64 * SAMPLE_SECS;
+            found.push((mean, span(scores, start, start + n as f64 * SAMPLE_SECS)));
+        }
+    }
+    let Some(top) = found.iter().map(|f| f.0).max_by(f32::total_cmp) else {
+        return single();
+    };
+    found.retain(|f| f.0 >= WINDOW_QUALITY_BAR * top);
+    // Best first (earliest on ties), keep the cap, then back to time order.
+    found.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.start.total_cmp(&b.1.start)));
+    found.truncate(MAX_CLIP_WINDOWS);
+    found.sort_by(|a, b| a.1.start.total_cmp(&b.1.start));
+    found.into_iter().map(|f| f.1).collect()
+}
+
 /// Mean per-sample score over the part of the clip that will play: the
 /// samples overlapping `window`, or every sample when the clip plays whole.
 /// This is the clip's quality for story scoring. `None` without samples.
@@ -365,5 +488,126 @@ mod tests {
         assert!(window_quality(&scores, Some((8.0, 14.0))).is_some());
         assert_eq!(window_quality(&scores, Some((20.0, 26.0))), None);
         assert_eq!(window_quality(&[], None), None);
+    }
+
+    fn diffs(n: usize, spikes: &[(usize, f32)]) -> Vec<Option<f32>> {
+        (0..n)
+            .map(|i| (i > 0).then(|| spikes.iter().find(|s| s.0 == i).map_or(0.03, |s| s.1)))
+            .collect()
+    }
+
+    #[test]
+    fn cuts_are_isolated_difference_spikes() {
+        assert_eq!(
+            scene_cuts(&diffs(40, &[(15, 0.5), (30, 0.4)])),
+            vec![15, 30]
+        );
+        assert!(scene_cuts(&diffs(40, &[])).is_empty());
+        // Below the absolute bar.
+        assert!(scene_cuts(&diffs(40, &[(15, 0.15)])).is_empty());
+        assert!(scene_cuts(&[]).is_empty());
+        assert!(scene_cuts(&[None]).is_empty());
+    }
+
+    #[test]
+    fn a_sustained_pan_is_not_a_cut() {
+        // Several large differences in a row: busy, not a cut.
+        let pan = diffs(40, &[(14, 0.3), (15, 0.32), (16, 0.3)]);
+        assert!(scene_cuts(&pan).is_empty());
+    }
+
+    /// A 60 s clip: three 20 s scenes, each with a good 6 s stretch.
+    fn three_scenes(peaks: [f32; 3]) -> (Vec<f32>, Vec<usize>) {
+        let mut s = vec![0.2; 60];
+        for (k, p) in peaks.iter().enumerate() {
+            for v in &mut s[k * 20 + 8..k * 20 + 14] {
+                *v = *p;
+            }
+        }
+        (s, vec![20, 40])
+    }
+
+    #[test]
+    fn long_clip_gets_one_window_per_scene() {
+        let (s, cuts) = three_scenes([0.9, 0.85, 0.8]);
+        let w = pick_windows(&s, &cuts, 60.0);
+        let spans: Vec<(f64, f64)> = w.iter().map(|w| (w.start, w.end)).collect();
+        assert_eq!(spans, vec![(8.0, 14.0), (28.0, 34.0), (48.0, 54.0)]);
+        assert!(w[0].quality > w[2].quality);
+    }
+
+    #[test]
+    fn windows_never_overlap_or_cross_a_cut() {
+        let (s, cuts) = three_scenes([0.9, 0.9, 0.9]);
+        let w = pick_windows(&s, &cuts, 60.0);
+        for pair in w.windows(2) {
+            assert!(pair[0].end <= pair[1].start);
+        }
+        for w in &w {
+            assert!(!cuts
+                .iter()
+                .any(|&c| w.start < c as f64 - 1.0 && w.end > c as f64));
+        }
+        // A good stretch straddling a cut stays on one side of it.
+        let mut s = vec![0.2; 60];
+        for v in &mut s[17..24] {
+            *v = 0.9;
+        }
+        for w in pick_windows(&s, &[20], 60.0) {
+            assert!(w.end <= 19.0 || w.start >= 20.0, "{w:?}");
+        }
+    }
+
+    #[test]
+    fn weak_scenes_miss_the_quality_bar() {
+        let (s, cuts) = three_scenes([0.9, 0.3, 0.88]);
+        let w = pick_windows(&s, &cuts, 60.0);
+        let starts: Vec<f64> = w.iter().map(|w| w.start).collect();
+        assert_eq!(starts, vec![8.0, 48.0]);
+    }
+
+    #[test]
+    fn at_most_the_cap_and_best_scenes_win() {
+        let mut s = vec![0.2; 100];
+        let cuts = vec![20, 40, 60, 80];
+        for (k, p) in [0.80f32, 0.95, 0.90, 0.85, 0.99].iter().enumerate() {
+            for v in &mut s[k * 20 + 8..k * 20 + 14] {
+                *v = *p;
+            }
+        }
+        let w = pick_windows(&s, &cuts, 100.0);
+        assert_eq!(w.len(), MAX_CLIP_WINDOWS);
+        let starts: Vec<f64> = w.iter().map(|w| w.start).collect();
+        // Scenes 5, 2 and 3 are best; time order.
+        assert_eq!(starts, vec![28.0, 48.0, 88.0]);
+    }
+
+    #[test]
+    fn short_scenes_are_skipped_and_cutless_clips_match_the_single_pick() {
+        // Scene 2 is 2 s: no room for a window.
+        let s = vec![0.5; 60];
+        let w = pick_windows(&s, &[30, 32], 60.0);
+        assert!(w.iter().all(|w| w.end - w.start >= MIN_SCENE_WINDOW_SECS));
+        assert!(w.iter().all(|w| !(w.start >= 30.0 && w.end <= 32.0)));
+        let one = pick_windows(&s, &[], 60.0);
+        let old = pick_window(&s, 60.0).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!((one[0].start, one[0].end), old);
+    }
+
+    #[test]
+    fn clips_up_to_the_threshold_keep_the_single_window_even_with_cuts() {
+        let mut s = vec![0.2; 20];
+        for v in &mut s[10..16] {
+            *v = 0.9;
+        }
+        let w = pick_windows(&s, &[8, 14], MULTI_WINDOW_MIN_SECS);
+        assert_eq!(w.len(), 1);
+        assert_eq!(
+            (w[0].start, w[0].end),
+            pick_window(&s, MULTI_WINDOW_MIN_SECS).unwrap()
+        );
+        assert!(pick_windows(&[1.0; 2], &[], 2.0).is_empty());
+        assert!(pick_windows(&[], &[], 30.0).is_empty());
     }
 }

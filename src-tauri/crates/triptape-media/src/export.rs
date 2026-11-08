@@ -65,15 +65,13 @@ fn chapter_place<'a>(plan: &'a Plan, asset_id: &str) -> Option<&'a str> {
 fn resolve_entry(
     plan: &Plan,
     assets: &HashMap<String, triptape_core::types::Asset>,
-    asset_id: &str,
+    entry: &PlanEntry,
 ) -> Option<ResolvedEntry> {
+    let asset_id = entry.asset_id.as_str();
     let a = assets.get(asset_id)?;
-    let entry = plan
-        .hero
-        .iter()
-        .chain(plan.reel_selects.iter())
-        .find(|e| e.asset_id == asset_id)?
-        .clone();
+    // The caller's entry, not a lookup by asset id: sibling windows of one
+    // clip share the id but not the trim.
+    let entry = entry.clone();
     let (still_path, motion_path) = match a.kind {
         AssetKind::Photo => (a.path.clone(), None),
         AssetKind::Video => (a.path.clone(), Some(a.path.clone())),
@@ -123,6 +121,7 @@ fn verify_source(entry: &PlanEntry, path: &Path) -> Result<(), String> {
 fn asset_snapshot(a: &triptape_core::types::Asset) -> PlanEntry {
     PlanEntry {
         asset_id: a.id.clone(),
+        window: 0,
         content_hash: a.content_hash.clone(),
         size_bytes: a.size_bytes,
         mtime: a.mtime,
@@ -139,7 +138,7 @@ fn resolve_verified(
     label: &str,
     fallbacks: &mut Vec<String>,
 ) -> Option<ResolvedEntry> {
-    let r = resolve_entry(plan, assets, &entry.asset_id)?;
+    let r = resolve_entry(plan, assets, entry)?;
     match verify_source(entry, &r.still_path) {
         Ok(()) => Some(r),
         Err(reason) => {
@@ -549,6 +548,7 @@ mod tests {
         let still = |id: &str| ResolvedEntry {
             entry: PlanEntry {
                 asset_id: id.into(),
+                window: 0,
                 content_hash: None,
                 size_bytes: 1,
                 mtime: 0,
@@ -600,6 +600,7 @@ mod tests {
         let mut plan = empty_plan();
         plan.hero.push(PlanEntry {
             asset_id: "a0".into(),
+            window: 0,
             content_hash: None,
             size_bytes: 1,
             mtime: 0,
@@ -611,7 +612,7 @@ mod tests {
         asset.taken_at = Some(1791288000);
         let assets: HashMap<String, triptape_core::types::Asset> =
             [("a0".to_string(), asset)].into_iter().collect();
-        let r = resolve_entry(&plan, &assets, "a0").expect("resolves");
+        let r = resolve_entry(&plan, &assets, &plan.hero[0]).expect("resolves");
         assert_eq!(r.taken_at, Some(1791288000));
         assert_eq!(r.caption.as_deref(), Some("Overlook"));
     }
