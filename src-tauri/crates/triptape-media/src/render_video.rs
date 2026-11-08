@@ -10,7 +10,10 @@
 use crate::ffmpeg::{self, path_arg as s, Capabilities};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use triptape_core::plan::{MAX_CLIP_SECS, MAX_COLLAGE, MIN_SEGMENT_SECS};
+use triptape_core::plan::{
+    collage_hold_secs, is_panorama, pano_coverage, pano_motion, MAX_CLIP_SECS, MAX_COLLAGE,
+    MIN_SEGMENT_SECS,
+};
 use triptape_core::types::{Plan, PlanEntry, Rendition};
 
 /// Crossfade applied at the cut *into* a segment (PLAN.md Sec 9, 6-pack).
@@ -183,6 +186,9 @@ pub struct ResolvedEntry {
     pub taken_at: Option<i64>,
     /// UTC offset at capture (seconds) for local-time display.
     pub tz_offset_secs: Option<i32>,
+    /// Display width / height (EXIF rotation applied) when known; lets
+    /// panoramas be kept out of collages before anything is decoded.
+    pub aspect: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -347,6 +353,7 @@ fn card_entry(id: &str, path: &Path) -> ResolvedEntry {
         caption: None,
         taken_at: None,
         tz_offset_secs: None,
+        aspect: None,
     }
 }
 
@@ -527,13 +534,12 @@ pub fn render_hero_video(
         resolved.iter().collect()
     };
     for r in selected {
-        let is_still = |e: &ResolvedEntry| matches!(e.entry.rendition, Rendition::Still);
         match groups.last_mut() {
             Some(g)
                 if !opts.short_mode
                     && g.len() < MAX_COLLAGE
-                    && is_still(r)
-                    && is_still(g[0])
+                    && collage_eligible(r)
+                    && collage_eligible(g[0])
                     && chapter_of(&g[0].entry.asset_id) == chapter_of(&r.entry.asset_id) =>
             {
                 g.push(r);
@@ -1044,6 +1050,21 @@ fn render_entry_segment(
             let out = work_dir.join(format!("seg_{idx:03}.mp4"));
             // Decode first: looping a raw HEIC fails on tmap/Dolby Vision items.
             let png = ffmpeg::decode_still_to_png(&caps.ffmpeg_bin, &r.still_path)?;
+            // The decoded (oriented) pixels are the truth about aspect.
+            let aspect = image::image_dimensions(&png.path)
+                .ok()
+                .filter(|&(w, h)| w > 0 && h > 0)
+                .map(|(w, h)| f64::from(w) / f64::from(h))
+                .or(r.aspect);
+            if let Some(aspect) = aspect.filter(|&a| is_panorama(a)) {
+                let motion = pano_motion(aspect);
+                // A short-mode budget can shorten the pan, never below a still.
+                let dur = motion.hold_secs.min(max_secs.max(still_secs));
+                // Travel less when shortened so the pan keeps its speed bound.
+                let coverage = pano_coverage(aspect, dur);
+                render_pano_segment(caps, &png.path, dur, aspect, coverage, idx, &out)?;
+                return Ok((out, dur, "still".into()));
+            }
             render_hold_segment(caps, &png.path, still_secs, idx, &out)?;
             Ok((out, still_secs, "still".into()))
         }
@@ -1166,30 +1187,169 @@ fn render_collage_segment(
     let canvas = work_dir.join(format!("collage_{idx:03}.png"));
     compose_collage(&caps.ffmpeg_bin, members, &canvas)?;
     let out = work_dir.join(format!("seg_{idx:03}.mp4"));
-    let dur = still_secs * 1.5;
+    let dur = collage_hold_secs(members.len(), still_secs);
     render_hold_segment(caps, &canvas, dur, idx, &out)?;
     Ok((out, dur, "still".into()))
 }
 
-/// Cells (x, y, w, h) of a 2-4 photo collage: 2 side by side, 3 as one
-/// tall + two stacked, 4 as a 2x2 grid.
-fn collage_cells(n: usize, w: u32, h: u32) -> Vec<(u32, u32, u32, u32)> {
+/// Whether an entry may join a collage: a still that is not a panorama
+/// (panoramas pan solo).
+fn collage_eligible(e: &ResolvedEntry) -> bool {
+    matches!(e.entry.rendition, Rendition::Still) && !e.aspect.is_some_and(is_panorama)
+}
+
+/// Under this width / height a photo counts as a portrait for layout.
+const PORTRAIT_BELOW: f64 = 0.95;
+/// Most of a photo a collage cell may crop away before the photo is
+/// shown whole over its own blurred fill instead.
+const MAX_CELL_CROP: f64 = 0.30;
+/// Focal height for cover crops that must cut height: people sit in the
+/// upper part of a portrait, so keep the top (0 = top, 0.5 = centre).
+const CROP_FOCUS_Y: f64 = 0.35;
+
+/// One collage cell: which member it holds and its rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollageCell {
+    member: usize,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+/// Lay out a collage by photo orientation (`aspects` are width / height in
+/// member order). 2: side by side, widths following the photos' aspects.
+/// 3: three portrait columns, else one big cell (the lone portrait, or the
+/// widest photo) beside two stacked. 4: 2x2, or four columns when mostly
+/// portraits. Cells tile the canvas exactly.
+fn collage_layout(aspects: &[f64], w: u32, h: u32) -> Vec<CollageCell> {
+    let n = aspects.len().min(MAX_COLLAGE);
+    let portraits: Vec<usize> = (0..n).filter(|&i| aspects[i] < PORTRAIT_BELOW).collect();
+    let cell = |member, x, y, w, h| CollageCell { member, x, y, w, h };
+    // Full-height columns in `order`, widths by weight.
+    let columns = |order: &[usize], weights: &[f64]| {
+        let total: f64 = weights.iter().sum();
+        let (mut x, mut acc) = (0u32, 0.0);
+        order
+            .iter()
+            .zip(weights)
+            .enumerate()
+            .map(|(k, (&m, wt))| {
+                acc += wt;
+                let right = if k + 1 == order.len() {
+                    w
+                } else {
+                    (f64::from(w) * acc / total).round() as u32
+                };
+                let c = cell(m, x, 0, right - x, h);
+                x = right;
+                c
+            })
+            .collect::<Vec<_>>()
+    };
     let (hw, hh) = (w / 2, h / 2);
     match n {
-        2 => vec![(0, 0, hw, h), (hw, 0, hw, h)],
-        3 => vec![(0, 0, hw, h), (hw, 0, hw, hh), (hw, hh, hw, hh)],
+        0 => vec![],
+        1 => vec![cell(0, 0, 0, w, h)],
+        2 => {
+            let share = (aspects[0] / (aspects[0] + aspects[1])).clamp(0.35, 0.65);
+            columns(&[0, 1], &[share, 1.0 - share])
+        }
+        3 if portraits.len() == 3 => columns(&[0, 1, 2], &[1.0; 3]),
+        3 => {
+            let big = match portraits.as_slice() {
+                [only] => *only,
+                _ => (0..3)
+                    .max_by(|&a, &b| aspects[a].total_cmp(&aspects[b]))
+                    .unwrap_or(0),
+            };
+            let bw = if aspects[big] < PORTRAIT_BELOW {
+                hw
+            } else {
+                (f64::from(w) * 0.58).round() as u32
+            };
+            let rest: Vec<usize> = (0..3).filter(|&i| i != big).collect();
+            vec![
+                cell(big, 0, 0, bw, h),
+                cell(rest[0], bw, 0, w - bw, hh),
+                cell(rest[1], bw, hh, w - bw, h - hh),
+            ]
+        }
+        _ if portraits.len() >= 3 => columns(&[0, 1, 2, 3], &[1.0; 4]),
         _ => vec![
-            (0, 0, hw, hh),
-            (hw, 0, hw, hh),
-            (0, hh, hw, hh),
-            (hw, hh, hw, hh),
+            cell(0, 0, 0, hw, hh),
+            cell(1, hw, 0, w - hw, hh),
+            cell(2, 0, hh, hw, h - hh),
+            cell(3, hw, hh, w - hw, h - hh),
         ],
     }
 }
 
-/// Compose 2-4 photos into a 2880x1620 collage canvas. Each cell cover-fits
-/// its photo like the book grids, with dark gaps between. Photos decode in
-/// parallel: each is an independent ffmpeg spawn plus a resize.
+/// Fraction of a `sa`-aspect photo cut away to cover a `ca`-aspect cell.
+fn crop_loss(sa: f64, ca: f64) -> f64 {
+    1.0 - (sa / ca).min(ca / sa)
+}
+
+/// Cover-fit `src` into `tw`x`th`, cutting height around `focus_y`
+/// (0 top .. 1 bottom) and width around the centre.
+fn cover_fit_focus(src: &image::RgbImage, tw: u32, th: u32, focus_y: f64) -> image::RgbImage {
+    let (sw, sh) = (
+        f64::from(src.width().max(1)),
+        f64::from(src.height().max(1)),
+    );
+    let scale = (f64::from(tw) / sw).max(f64::from(th) / sh);
+    let (nw, nh) = (
+        ((sw * scale).round() as u32).max(tw),
+        ((sh * scale).round() as u32).max(th),
+    );
+    let big = image::imageops::resize(src, nw, nh, image::imageops::FilterType::Triangle);
+    let x = (nw - tw) / 2;
+    let y = (f64::from(nh - th) * focus_y).round() as u32;
+    image::imageops::crop_imm(&big, x, y.min(nh - th), tw, th).to_image()
+}
+
+/// The whole photo centred over a blurred, cover-fitted copy of itself
+/// (the film's usual fit-over-blur, per cell).
+fn contain_over_blur(src: &image::RgbImage, tw: u32, th: u32) -> image::RgbImage {
+    // Blur a small copy and scale it up: same look, a fraction of the cost.
+    let small = cover_fit_focus(src, (tw / 8).max(1), (th / 8).max(1), 0.5);
+    let blurred = image::imageops::blur(&small, 3.0);
+    let mut cell = image::imageops::resize(&blurred, tw, th, image::imageops::FilterType::Triangle);
+    let (sw, sh) = (
+        f64::from(src.width().max(1)),
+        f64::from(src.height().max(1)),
+    );
+    let scale = (f64::from(tw) / sw).min(f64::from(th) / sh);
+    let (fw, fh) = (
+        ((sw * scale).round() as u32).clamp(1, tw),
+        ((sh * scale).round() as u32).clamp(1, th),
+    );
+    let fg = image::imageops::resize(src, fw, fh, image::imageops::FilterType::Triangle);
+    image::imageops::replace(
+        &mut cell,
+        &fg,
+        i64::from((tw - fw) / 2),
+        i64::from((th - fh) / 2),
+    );
+    cell
+}
+
+/// Fill a cell: cover-crop (top-biased) when little is lost, else the
+/// whole photo over its own blur so faces and subjects are never cut off.
+fn fill_cell(img: &image::RgbImage, cw: u32, ch: u32) -> image::RgbImage {
+    let sa = f64::from(img.width().max(1)) / f64::from(img.height().max(1));
+    let ca = f64::from(cw) / f64::from(ch.max(1));
+    if crop_loss(sa, ca) <= MAX_CELL_CROP {
+        cover_fit_focus(img, cw, ch, CROP_FOCUS_Y)
+    } else {
+        contain_over_blur(img, cw, ch)
+    }
+}
+
+/// Compose 2-4 photos into a 2880x1620 collage canvas with an
+/// orientation-aware layout ([`collage_layout`]) and thin dark gaps.
+/// Photos decode, then fill their cells, in parallel: each is an
+/// independent ffmpeg spawn plus a resize.
 fn compose_collage(
     ffmpeg_bin: &str,
     members: &[&ResolvedEntry],
@@ -1198,21 +1358,15 @@ fn compose_collage(
     const W: u32 = 2880;
     const H: u32 = 1620;
     const GAP: u32 = 18;
-    let cells = collage_cells(members.len(), W, H);
-    let tiles = std::thread::scope(|scope| {
+    let images = std::thread::scope(|scope| {
         let workers: Vec<_> = members
             .iter()
-            .zip(&cells)
-            .map(|(m, &(_, _, cw, ch))| {
+            .map(|m| {
                 scope.spawn(move || -> Result<image::RgbImage, crate::MediaError> {
                     let png = ffmpeg::decode_still_to_png(ffmpeg_bin, &m.still_path)?;
                     let img = image::open(&png.path)
                         .map_err(|e| crate::MediaError::Io(format!("collage open: {e}")))?;
-                    Ok(crate::render_book::cover_fit(
-                        &img.to_rgb8(),
-                        cw - GAP,
-                        ch - GAP,
-                    ))
+                    Ok(img.to_rgb8())
                 })
             })
             .collect();
@@ -1221,18 +1375,55 @@ fn compose_collage(
             .map(|w| w.join().expect("collage worker panicked"))
             .collect::<Result<Vec<_>, _>>()
     })?;
+    let aspects: Vec<f64> = images
+        .iter()
+        .map(|i| f64::from(i.width().max(1)) / f64::from(i.height().max(1)))
+        .collect();
+    let cells = collage_layout(&aspects, W, H);
+    let tiles: Vec<image::RgbImage> = std::thread::scope(|scope| {
+        let workers: Vec<_> = cells
+            .iter()
+            .map(|c| {
+                let img = &images[c.member];
+                scope.spawn(move || fill_cell(img, c.w - GAP, c.h - GAP))
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|w| w.join().expect("collage worker panicked"))
+            .collect()
+    });
     let mut canvas = image::RgbImage::from_pixel(W, H, image::Rgb([13, 20, 32]));
-    for (tile, &(x, y, _, _)) in tiles.iter().zip(&cells) {
+    for (tile, c) in tiles.iter().zip(&cells) {
         image::imageops::replace(
             &mut canvas,
             tile,
-            i64::from(x + GAP / 2),
-            i64::from(y + GAP / 2),
+            i64::from(c.x + GAP / 2),
+            i64::from(c.y + GAP / 2),
         );
     }
     canvas
         .save(out)
         .map_err(|e| crate::MediaError::Io(format!("collage save: {e}")))
+}
+
+/// Panorama segment: pans across the whole image ([`ffmpeg::pano_pan`]);
+/// direction alternates with the segment index.
+fn render_pano_segment(
+    caps: &Capabilities,
+    img: &Path,
+    dur: f64,
+    aspect: f64,
+    coverage: f64,
+    idx: usize,
+    out: &Path,
+) -> Result<(), crate::MediaError> {
+    let frames = (dur * 30.0).round() as u32;
+    let graph = format!(
+        "[0:v]{},format=yuv420p[v]",
+        ffmpeg::pano_pan(caps, frames, 1920, 1080, aspect, coverage, idx % 2 == 1)
+    );
+    render_graph_segment(caps, img, dur, graph, out)
 }
 
 /// Still Ken Burns hold.
@@ -1245,6 +1436,19 @@ fn render_hold_segment(
 ) -> Result<(), crate::MediaError> {
     let frames = (dur * 30.0).round() as u32;
     let graph = hold_graph(caps, idx, frames);
+    render_graph_segment(caps, img, dur, graph, out)
+}
+
+/// Encode a one-image segment of `dur` seconds through `graph` (a
+/// `[0:v]` ... `[v]` filter chain) with silent stereo audio.
+fn render_graph_segment(
+    caps: &Capabilities,
+    img: &Path,
+    dur: f64,
+    graph: String,
+    out: &Path,
+) -> Result<(), crate::MediaError> {
+    let frames = (dur * 30.0).round() as u32;
     let args: Vec<String> = [
         vec![
             "-y".into(),
@@ -1319,14 +1523,141 @@ mod tests {
         }
     }
 
-    #[test]
-    fn collage_cells_tile_the_canvas() {
-        for n in 2..=MAX_COLLAGE {
-            let cells = collage_cells(n, 2880, 1620);
-            assert_eq!(cells.len(), n);
-            let area: u32 = cells.iter().map(|c| c.2 * c.3).sum();
-            assert_eq!(area, 2880 * 1620, "{n} cells cover the canvas");
+    /// Cells tile the canvas exactly, never overlap, use each member once.
+    fn assert_tiles(cells: &[CollageCell], n: usize) {
+        assert_eq!(cells.len(), n);
+        let area: u64 = cells.iter().map(|c| u64::from(c.w) * u64::from(c.h)).sum();
+        assert_eq!(area, 2880 * 1620, "{cells:?}");
+        let mut members: Vec<usize> = cells.iter().map(|c| c.member).collect();
+        members.sort_unstable();
+        assert_eq!(members, (0..n).collect::<Vec<_>>());
+        for (i, a) in cells.iter().enumerate() {
+            assert!(a.x + a.w <= 2880 && a.y + a.h <= 1620, "{a:?}");
+            for b in &cells[i + 1..] {
+                let apart =
+                    a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y;
+                assert!(apart, "overlap {a:?} {b:?}");
+            }
         }
+    }
+
+    #[test]
+    fn collage_layouts_tile_the_canvas() {
+        const L: f64 = 1.5;
+        const P: f64 = 0.75;
+        for aspects in [
+            vec![L, L],
+            vec![P, P],
+            vec![P, L],
+            vec![L, L, L],
+            vec![P, P, P],
+            vec![L, P, L],
+            vec![P, L, P],
+            vec![L, L, L, L],
+            vec![P, P, P, L],
+            vec![P, P, L, L],
+            vec![P, P, P, P],
+        ] {
+            assert_tiles(&collage_layout(&aspects, 2880, 1620), aspects.len());
+        }
+    }
+
+    #[test]
+    fn two_portraits_sit_side_by_side_at_full_height() {
+        let cells = collage_layout(&[0.75, 0.75], 2880, 1620);
+        assert!(cells.iter().all(|c| c.h == 1620 && c.y == 0));
+        assert_eq!((cells[0].w, cells[1].w), (1440, 1440));
+        // A portrait + landscape pair splits by aspect, never past 65/35.
+        let mixed = collage_layout(&[1.5, 0.75], 2880, 1620);
+        assert!(mixed[0].w > mixed[1].w && mixed[0].w <= 1872);
+    }
+
+    #[test]
+    fn three_photos_get_one_big_cell_for_the_odd_one_out() {
+        // Lone portrait leads, landscapes stack beside it.
+        let cells = collage_layout(&[1.5, 0.75, 1.5], 2880, 1620);
+        let big = cells[0];
+        assert_eq!((big.member, big.h, big.x), (1, 1620, 0));
+        assert!(cells[1..].iter().all(|c| c.x == big.w && c.h == 810));
+        // All landscape: the widest photo gets the big (wider) cell.
+        let cells = collage_layout(&[1.5, 1.78, 1.33], 2880, 1620);
+        assert_eq!(cells[0].member, 1);
+        assert!(cells[0].w > 1440);
+        // Three portraits: three columns.
+        let cols = collage_layout(&[0.7, 0.75, 0.8], 2880, 1620);
+        assert!(cols.iter().all(|c| c.h == 1620 && c.w == 960));
+    }
+
+    #[test]
+    fn four_photos_grid_unless_mostly_portrait() {
+        let grid = collage_layout(&[1.5, 1.5, 0.75, 1.5], 2880, 1620);
+        assert!(grid.iter().all(|c| c.w == 1440 && c.h == 810));
+        let cols = collage_layout(&[0.75; 4], 2880, 1620);
+        assert!(cols.iter().all(|c| c.h == 1620 && c.w == 720));
+    }
+
+    #[test]
+    fn cells_cover_when_close_and_contain_when_far() {
+        // 3:2 landscape into a 144x162 cell would lose ~40%: shown whole,
+        // so even the photo's top-left corner marker (green) survives.
+        let mut land = image::RgbImage::from_pixel(300, 200, image::Rgb([200, 30, 30]));
+        for y in 0..20 {
+            for x in 0..20 {
+                land.put_pixel(x, y, image::Rgb([30, 200, 30]));
+            }
+        }
+        let cell = fill_cell(&land, 144, 162);
+        assert_eq!((cell.width(), cell.height()), (144, 162));
+        // Whole photo is 144x96 at y 33..129.
+        assert_eq!(cell.get_pixel(2, 35), &image::Rgb([30, 200, 30]));
+        assert_eq!(cell.get_pixel(100, 81), &image::Rgb([200, 30, 30]));
+        // Near-matching portrait covers the cell edge to edge.
+        let port = image::RgbImage::from_pixel(300, 400, image::Rgb([30, 30, 200]));
+        let cell = fill_cell(&port, 144, 162);
+        assert_eq!(cell.get_pixel(0, 0), &image::Rgb([30, 30, 200]));
+        assert_eq!(cell.get_pixel(143, 161), &image::Rgb([30, 30, 200]));
+    }
+
+    #[test]
+    fn panoramas_never_join_collages() {
+        let pano = ResolvedEntry {
+            aspect: Some(4.4),
+            ..card_entry("p", Path::new("p.jpg"))
+        };
+        let plain = ResolvedEntry {
+            aspect: Some(1.5),
+            ..card_entry("s", Path::new("s.jpg"))
+        };
+        let unknown = card_entry("u", Path::new("u.jpg"));
+        assert!(!collage_eligible(&pano));
+        assert!(collage_eligible(&plain) && collage_eligible(&unknown));
+    }
+
+    #[test]
+    fn pano_graph_pans_with_perspective_not_zoompan() {
+        let caps = Capabilities {
+            perspective: true,
+            ..Default::default()
+        };
+        let g = ffmpeg::pano_pan(&caps, 240, 1920, 1080, 4.4, 1.0, false);
+        assert!(g.starts_with("scale=-2:1296"), "fills height: {g}");
+        assert!(!g.contains("zoompan") && !g.contains("blur"), "{g}");
+        assert!(g.contains("perspective=") && g.contains("lanczos"), "{g}");
+        assert!(
+            g.find("loop=loop=239").unwrap() < g.find("perspective=").unwrap(),
+            "{g}"
+        );
+        // Direction flips with `reverse`; tall images scan vertically.
+        assert_ne!(g, ffmpeg::pano_pan(&caps, 240, 1920, 1080, 4.4, 1.0, true));
+        let tall = ffmpeg::pano_pan(&caps, 240, 1920, 1080, 0.25, 1.0, false);
+        assert!(tall.starts_with("scale=2304:-2"), "{tall}");
+        assert!(tall.contains("x0='0'") && tall.contains("x1='W'"), "{tall}");
+        // No perspective: a centred crop, still the right size.
+        let still = ffmpeg::pano_pan(&Capabilities::default(), 240, 1920, 1080, 4.4, 1.0, false);
+        assert!(
+            still.contains("crop=") && still.ends_with("scale=1920:1080:flags=lanczos,setsar=1"),
+            "{still}"
+        );
     }
 
     #[test]
@@ -1627,6 +1958,7 @@ mod tests {
                 // Oct 6/7/8 2026 12:00 UTC.
                 taken_at: Some(1791288000 + i as i64 * 86400),
                 tz_offset_secs: None,
+                aspect: None,
             });
         }
         let mut captions = HashMap::new();
@@ -1763,6 +2095,7 @@ mod tests {
                 caption: None,
                 taken_at: None,
                 tz_offset_secs: None,
+                aspect: None,
             })
             .collect();
         let refs: Vec<&ResolvedEntry> = entries.iter().collect();
@@ -1830,6 +2163,7 @@ mod tests {
                 caption: None,
                 taken_at: Some(1791288000),
                 tz_offset_secs: None,
+                aspect: None,
             })
             .collect();
         let plan = Plan {
@@ -1944,6 +2278,7 @@ mod tests {
                 caption: None,
                 taken_at: Some(1791288000),
                 tz_offset_secs: None,
+                aspect: None,
             },
             ResolvedEntry {
                 entry: PlanEntry {
@@ -1958,6 +2293,7 @@ mod tests {
                 caption: None,
                 taken_at: Some(1791374400),
                 tz_offset_secs: None,
+                aspect: None,
             },
         ];
         let plan = Plan {
