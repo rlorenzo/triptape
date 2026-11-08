@@ -986,7 +986,7 @@ fn export_blocking(
         preset: triptape_media::render_book::BookPreset::P1,
         trip_name,
         typst_bin: "typst".to_string(),
-        music_path: None,
+        music_paths: Vec::new(),
         keep_ambience: false,
         only: "all".to_string(),
         resolution: triptape_media::resolution::Resolution::default(),

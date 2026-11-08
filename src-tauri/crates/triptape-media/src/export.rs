@@ -21,7 +21,8 @@ pub struct ExportOptions {
     pub preset: render_book::BookPreset,
     pub trip_name: String,
     pub typst_bin: String,
-    pub music_path: Option<PathBuf>,
+    /// Music playlist in order (crossfaded); empty uses the bundled theme.
+    pub music_paths: Vec<PathBuf>,
     /// Keep the original film audio at 0.12 under the music bed (default
     /// mutes it; the music is the primary audio).
     pub keep_ambience: bool,
@@ -349,7 +350,7 @@ fn export_inner(
             &VideoOptions {
                 trip_name: opts.trip_name.clone(),
                 short_mode: elig.video == "short",
-                music_path: opts.music_path.clone(),
+                music_paths: opts.music_paths.clone(),
                 keep_ambience: opts.keep_ambience,
                 typst_bin: opts.typst_bin.clone(),
                 resolution: opts.resolution,
@@ -428,7 +429,9 @@ fn export_inner(
                 &resolved,
                 &reels_dir,
                 &ReelOptions {
-                    music_path: opts.music_path.clone(),
+                    // Reels are short: they loop the first playlist track
+                    // rather than building the crossfaded bed.
+                    music_path: opts.music_paths.first().cloned(),
                     slideshows,
                     typst_bin: opts.typst_bin.clone(),
                     ..Default::default()
@@ -616,7 +619,7 @@ mod tests {
             preset: render_book::BookPreset::P1,
             trip_name: "t".into(),
             typst_bin: "typst".into(),
-            music_path: None,
+            music_paths: Vec::new(),
             keep_ambience: false,
             only: "reels".into(),
             resolution: Default::default(),

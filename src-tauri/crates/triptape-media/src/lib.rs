@@ -4,6 +4,7 @@ pub mod clip_analysis;
 pub mod export;
 pub mod ffmpeg;
 pub mod map;
+pub mod music;
 pub mod progress;
 pub mod render_book;
 pub mod render_reels;

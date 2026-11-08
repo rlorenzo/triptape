@@ -6,7 +6,7 @@
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
-//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F] [--keep-ambience] [--resolution 4k|1080p] [--jobs N] [--quiet]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE]
 //! triptape cache stats|clear [--segment-cache DIR]
 //! ```
@@ -32,6 +32,32 @@ use triptape_media::{
     segment_cache::{self, SegmentCacheConfig},
 };
 
+/// Repeatable flags accumulate `;`-joined (`--music A --music B` is
+/// `--music "A;B"`); every other flag keeps its last value.
+fn insert_flag(flags: &mut HashMap<String, String>, k: String, v: String) {
+    if k == "music" {
+        if let Some(prev) = flags.get_mut(&k) {
+            prev.push(';');
+            prev.push_str(&v);
+            return;
+        }
+    }
+    flags.insert(k, v);
+}
+
+/// Split a `--music` value into playlist paths. A value that is itself an
+/// existing file is taken whole (so a `;` in a filename still works).
+fn music_list(v: &str) -> Vec<PathBuf> {
+    if Path::new(v).exists() {
+        return vec![PathBuf::from(v)];
+    }
+    v.split(';')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
 fn parse_args() -> (String, HashMap<String, String>) {
     let mut it = std::env::args().skip(1);
     let cmd = it.next().unwrap_or_else(|| {
@@ -45,11 +71,11 @@ fn parse_args() -> (String, HashMap<String, String>) {
             // A flag directly after a valueless boolean flag must not
             // swallow it as its value: `--keep-ambience --out x`.
             if let Some(p) = pending.take() {
-                flags.insert(p, "true".to_string());
+                insert_flag(&mut flags, p, "true".to_string());
             }
             pending = Some(k.to_string());
         } else if let Some(p) = pending.take() {
-            flags.insert(p, a);
+            insert_flag(&mut flags, p, a);
         }
     }
     // Trailing valueless flag: `--export --keep-ambience`.
@@ -515,8 +541,8 @@ fn export_cmd(flags: &HashMap<String, String>) {
     let ffmpeg_bin = flag_or(flags, "ffmpeg", "ffmpeg");
     let ffprobe_bin = flag_or(flags, "ffprobe", "ffprobe");
     let typst_bin = flag_or(flags, "typst", "typst");
-    let music = flags.get("music").map(PathBuf::from);
-    if let Some(m) = &music {
+    let music = flags.get("music").map_or_else(Vec::new, |v| music_list(v));
+    for m in &music {
         if !m.exists() {
             die("music", format!("not found: {}", m.display()));
         }
@@ -602,7 +628,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             preset,
             trip_name,
             typst_bin,
-            music_path: music,
+            music_paths: music,
             keep_ambience,
             only,
             resolution,
@@ -1028,6 +1054,22 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn music_flag_repeats_and_semicolons() {
+        let mut f = HashMap::new();
+        insert_flag(&mut f, "music".into(), "A.wav".into());
+        insert_flag(&mut f, "music".into(), "B.wav;C.wav".into());
+        insert_flag(&mut f, "out".into(), "x".into());
+        insert_flag(&mut f, "out".into(), "y".into());
+        assert_eq!(f["music"], "A.wav;B.wav;C.wav");
+        assert_eq!(f["out"], "y", "other flags keep the last value");
+        let list = music_list(&f["music"]);
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[2], PathBuf::from("C.wav"));
+        assert_eq!(music_list("single.wav"), vec![PathBuf::from("single.wav")]);
+        assert!(music_list("").is_empty());
+    }
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
