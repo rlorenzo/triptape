@@ -10,6 +10,7 @@ use crate::render_book::{self, BookOptions, BookPhoto};
 use crate::render_reels::{self, ReelOptions};
 use crate::render_video::{self, ResolvedEntry, VideoOptions};
 use crate::resolution::Resolution;
+use crate::segment_cache::{SegmentCache, SegmentCacheConfig};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{check_source_integrity, plan_eligibility, Integrity};
@@ -32,6 +33,30 @@ pub struct ExportOptions {
     pub jobs: Option<usize>,
     /// Progress sink and cancel flag (default: silent, never cancelled).
     pub progress: Progress,
+    /// Reuse rendered hero segments across exports; `None` renders all.
+    pub segment_cache: Option<SegmentCacheConfig>,
+}
+
+/// How the segment cache served one export.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SegmentCacheReport {
+    pub dir: String,
+    /// Segments taken from the cache / segments the cache was asked for.
+    pub reused: usize,
+    pub total: usize,
+    /// Fresh segments written to the cache.
+    pub stored: usize,
+    /// Fresh segments left out because the volume was low on space.
+    pub skipped_low_disk: usize,
+    /// Old entries removed to stay within the size cap.
+    pub evicted: usize,
+}
+
+impl SegmentCacheReport {
+    /// `segments reused 158/160 from cache`.
+    pub fn summary(&self) -> String {
+        format!("segments reused {}/{} from cache", self.reused, self.total)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -49,6 +74,8 @@ pub struct ExportReport {
     pub skipped: Vec<Skipped>,
     pub fallbacks: Vec<String>,
     pub attribution: Vec<String>,
+    /// Present when a segment cache was in use.
+    pub segment_cache: Option<SegmentCacheReport>,
 }
 
 /// The place of the chapter holding `asset_id`, for keepsakes that print or
@@ -157,15 +184,57 @@ pub fn export_all(
     opts: &ExportOptions,
 ) -> Result<ExportReport, crate::MediaError> {
     // Every renderer polls the one cancel flag through its capabilities.
-    let caps = &crate::ffmpeg::Capabilities {
+    let mut caps = crate::ffmpeg::Capabilities {
         progress: opts.progress.clone(),
         ..caps.clone()
     };
-    let out = export_inner(caps, plan, assets, out_dir, opts);
+    // The cache takes its lease before any segment is used and gives it back
+    // however the export ends (the handle also releases on drop).
+    let work = out_dir.join(".work");
+    let mut cache_note = None;
+    let cache: Option<std::sync::Arc<SegmentCache>> = opts.segment_cache.as_ref().and_then(|cfg| {
+        let version = crate::segment_cache::ffmpeg_version(&caps.ffmpeg_bin);
+        match SegmentCache::open(cfg, version, &work) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                cache_note = Some(format!("segment cache off ({}): {e}", cfg.dir.display()));
+                None
+            }
+        }
+    });
+    caps.segment_cache = cache.clone();
+    let mut out = export_inner(&caps, plan, assets, out_dir, opts);
     if matches!(out, Err(crate::MediaError::Cancelled)) {
         // Leave no intermediates behind; finished outputs and `.partial`
         // siblings are already gone (a killed encode removes its own).
-        let _ = std::fs::remove_dir_all(out_dir.join(".work"));
+        let _ = std::fs::remove_dir_all(&work);
+    }
+    if let Some(cache) = cache {
+        // Eviction runs only now: the lease is released first, so nothing
+        // this export used is protected any longer than it is needed.
+        let stats = cache.stats();
+        let evicted = cache.finish();
+        if let (Ok(report), Some(cfg)) = (out.as_mut(), &opts.segment_cache) {
+            if stats.hits + stats.misses > 0 {
+                report.segment_cache = Some(SegmentCacheReport {
+                    dir: cfg.dir.to_string_lossy().into_owned(),
+                    reused: stats.hits,
+                    total: stats.hits + stats.misses,
+                    stored: stats.stored,
+                    skipped_low_disk: stats.skipped_low_disk,
+                    evicted: evicted.removed,
+                });
+            }
+            if stats.skipped_low_disk > 0 {
+                report.fallbacks.push(format!(
+                    "segment cache: {} segments not cached (under 5 GB free)",
+                    stats.skipped_low_disk
+                ));
+            }
+        }
+    }
+    if let (Ok(report), Some(note)) = (out.as_mut(), cache_note) {
+        report.fallbacks.push(note);
     }
     out
 }
@@ -205,6 +274,7 @@ fn export_inner(
         skipped: vec![],
         fallbacks: vec![],
         attribution: vec![crate::map::MAP_ATTRIBUTION.to_string()],
+        segment_cache: None,
     };
 
     // Map card once, shared by the hero film and the book map page.

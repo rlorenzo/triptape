@@ -228,6 +228,8 @@ pub struct Capabilities {
     pub threads: Option<usize>,
     /// Cancel flag and progress sink; every [`Capabilities::run`] polls it.
     pub progress: crate::progress::Progress,
+    /// Hero-segment render cache for the running export (`None`: off).
+    pub segment_cache: Option<std::sync::Arc<crate::segment_cache::SegmentCache>>,
 }
 
 impl Capabilities {

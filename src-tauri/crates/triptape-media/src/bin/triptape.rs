@@ -7,6 +7,8 @@
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F] [--keep-ambience] [--resolution 4k|1080p] [--jobs N] [--quiet]
+//!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE]
+//! triptape cache stats|clear [--segment-cache DIR]
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -27,6 +29,7 @@ use triptape_media::{
     progress::{ConsoleProgress, Progress},
     render_book::BookPreset,
     resolution::Resolution,
+    segment_cache::{self, SegmentCacheConfig},
 };
 
 fn parse_args() -> (String, HashMap<String, String>) {
@@ -589,6 +592,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
     } else {
         Progress::new(console.clone())
     };
+    let segment_cache = segment_cache_config(flags);
     let exported = export_all(
         &caps,
         &plan,
@@ -604,6 +608,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             resolution,
             jobs,
             progress,
+            segment_cache,
         },
     );
     console.finish();
@@ -611,6 +616,15 @@ fn export_cmd(flags: &HashMap<String, String>) {
 
     if let Some(v) = &report.video {
         println!("video: {v}");
+    }
+    if let Some(c) = &report.segment_cache {
+        println!("video: {}", c.summary());
+        if c.stored > 0 || c.evicted > 0 {
+            println!(
+                "segment cache: {} new, {} evicted ({})",
+                c.stored, c.evicted, c.dir
+            );
+        }
     }
     for r in &report.reels {
         println!("reel: {r}");
@@ -625,6 +639,79 @@ fn export_cmd(flags: &HashMap<String, String>) {
         println!("fallback: {f}");
     }
     println!("wrote {}", out.join("export.json").display());
+}
+
+/// Segment cache for `export`: on by default in the platform cache dir,
+/// moved by `--segment-cache DIR`, bounded by `--segment-cache-max SIZE`,
+/// off with `--no-segment-cache`.
+fn segment_cache_config(flags: &HashMap<String, String>) -> Option<SegmentCacheConfig> {
+    let off = flags.get("no-segment-cache").is_some_and(|v| v != "false");
+    if off && flags.contains_key("segment-cache") {
+        die(
+            "segment-cache",
+            "--segment-cache and --no-segment-cache conflict",
+        );
+    }
+    let max_bytes = flags
+        .get("segment-cache-max")
+        .map(|v| segment_cache::parse_size(v).unwrap_or_else(|e| die("segment-cache-max", e)));
+    if off {
+        return None;
+    }
+    let dir = flags
+        .get("segment-cache")
+        .map(PathBuf::from)
+        .or_else(segment_cache::default_dir);
+    if dir.is_none() {
+        eprintln!("segment cache off: no cache directory on this platform");
+    }
+    dir.map(|dir| SegmentCacheConfig { dir, max_bytes })
+}
+
+/// `cache stats` / `cache clear`.
+fn cache_cmd(sub: &str, flags: &HashMap<String, String>) {
+    let dir = flags
+        .get("segment-cache")
+        .map(PathBuf::from)
+        .or_else(segment_cache::default_dir)
+        .unwrap_or_else(|| die("cache", "no cache directory on this platform"));
+    match sub {
+        "stats" => {
+            let st = segment_cache::disk_stats(&dir);
+            let cap = segment_cache::resolve_cap(
+                flags.get("segment-cache-max").map(|v| {
+                    segment_cache::parse_size(v).unwrap_or_else(|e| die("segment-cache-max", e))
+                }),
+                &dir,
+            );
+            println!("segment cache: {}", dir.display());
+            println!(
+                "entries: {}  size: {}  cap: {}  exports running: {}",
+                st.entries,
+                segment_cache::fmt_bytes(st.bytes),
+                segment_cache::fmt_bytes(cap),
+                st.live_leases
+            );
+        }
+        "clear" => {
+            let r = segment_cache::clear(&dir);
+            println!(
+                "removed {} entries ({})",
+                r.removed,
+                segment_cache::fmt_bytes(r.freed)
+            );
+            if r.protected > 0 {
+                println!(
+                    "kept {} entries in use by a running export; clear again when it finishes",
+                    r.protected
+                );
+            }
+        }
+        other => {
+            eprintln!("unknown cache command {other:?}; want stats|clear");
+            std::process::exit(2);
+        }
+    }
 }
 
 /// Parsed `edit` arguments. `--include`, `--exclude`, `--uninclude` and
@@ -930,9 +1017,10 @@ fn main() {
         "plan" => plan_cmd(&flags),
         "export" => export_cmd(&flags),
         "learn" => learn_cmd(&flags),
+        "cache" => cache_cmd(std::env::args().nth(2).as_deref().unwrap_or(""), &flags),
         "edit" => edit_cmd(&std::env::args().skip(2).collect::<Vec<_>>()),
         _ => {
-            eprintln!("unknown command {cmd}; want scan|plan|edit|learn|export");
+            eprintln!("unknown command {cmd}; want scan|plan|edit|learn|export|cache");
             std::process::exit(2);
         }
     }
