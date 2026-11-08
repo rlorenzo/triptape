@@ -9,7 +9,7 @@
 
 use crate::geo::haversine_m;
 use crate::hash::is_near_dupe;
-use crate::types::{Asset, Cluster, Score};
+use crate::types::{Asset, AssetKind, Cluster, Score};
 use std::collections::{HashMap, HashSet};
 
 /// A time gap this large always starts a new cluster (4 h).
@@ -23,6 +23,14 @@ pub const OUTLIER_SPEED_MPS: f64 = 1_000_000.0 / 3600.0;
 pub const DUPE_WINDOW_SECS: i64 = 10 * 60;
 /// Max GPS distance between two near-dupe shots when both have a fix (200 m).
 pub const DUPE_RADIUS_METERS: f64 = 200.0;
+
+/// Clusters with at most this many assets are merged into a neighbour on
+/// the same local day: a one-photo chapter (a hotel lobby, a bus window)
+/// would otherwise get its own guaranteed shot and a title card of its own.
+pub const MERGE_MAX_ASSETS: usize = 3;
+/// Walking pace used to weigh GPS distance against time when picking which
+/// neighbour a small cluster joins (m/s): 50 m counts as ~36 s apart.
+const MERGE_WALK_MPS: f64 = 1.4;
 
 /// Calendar day (`YYYY-MM-DD`) in the photo's own timezone, or
 /// `"unknown-date"`. An 8 AM Japan photo is 11 PM UTC the day before —
@@ -103,8 +111,38 @@ impl Acc {
         }
     }
 
-    /// Emit the accumulated cluster (if any) and reset for `next_day`.
-    fn flush(&mut self, out: &mut Vec<Cluster>, next_day: String) {
+    /// Fold the next cluster in story order into this one.
+    fn absorb(&mut self, next: Acc) {
+        self.ids.extend(next.ids);
+        self.start = match (self.start, next.start) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.end = match (self.end, next.end) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        self.gps_n += next.gps_n;
+        self.gps_sum.0 += next.gps_sum.0;
+        self.gps_sum.1 += next.gps_sum.1;
+    }
+
+    /// How far apart two clusters are: time gap plus GPS distance at
+    /// walking pace. A missing time or fix contributes nothing.
+    fn distance_secs(&self, other: &Acc) -> f64 {
+        let gap = match (self.start, self.end, other.start, other.end) {
+            (Some(s1), Some(e1), Some(s2), Some(e2)) => (s2 - e1).max(s1 - e2).max(0) as f64,
+            _ => 0.0,
+        };
+        let walk = match (self.centroid(), other.centroid()) {
+            (Some(a), Some(b)) => haversine_m(a, b) / MERGE_WALK_MPS,
+            _ => 0.0,
+        };
+        gap + walk
+    }
+
+    /// Push the accumulated cluster (if any) and reset for `next_day`.
+    fn flush(&mut self, out: &mut Vec<Acc>, next_day: String) {
         let acc = std::mem::replace(
             self,
             Acc {
@@ -112,33 +150,73 @@ impl Acc {
                 ..Default::default()
             },
         );
-        if acc.ids.is_empty() {
-            return;
+        if !acc.ids.is_empty() {
+            out.push(acc);
         }
-        let seq = out.len() + 1;
-        let center = acc.centroid();
-        let place = if center.is_some() {
-            format!(" · place {seq}")
-        } else {
-            String::new()
-        };
-        out.push(Cluster {
-            id: format!("c{seq:03}"),
-            asset_ids: acc.ids,
-            start_time: acc.start,
-            end_time: acc.end,
-            centroid_gps: center,
-            label: format!("{}{place}", acc.day),
-        });
     }
 }
 
-/// Group assets into day/place clusters in story order.
+/// Merge every cluster of at most [`MERGE_MAX_ASSETS`] assets into the
+/// adjacent cluster on the same local day that is closer in time and place.
+/// Smallest clusters go first (earliest on ties), and a merge that is still
+/// small keeps merging, so a run of tiny clusters collapses into a
+/// neighbour. Clusters never merge across days. The merged cluster keeps the
+/// larger side's centroid, since the GPS sums are dominated by it.
+fn merge_small(mut v: Vec<Acc>) -> Vec<Acc> {
+    let neighbour = |v: &[Acc], i: usize| -> Option<usize> {
+        [i.checked_sub(1), Some(i + 1)]
+            .into_iter()
+            .flatten()
+            .filter(|&j| j < v.len() && v[j].day == v[i].day)
+            .min_by(|&a, &b| {
+                v[i].distance_secs(&v[a])
+                    .total_cmp(&v[i].distance_secs(&v[b]))
+                    .then(a.cmp(&b))
+            })
+    };
+    loop {
+        let pick = (0..v.len())
+            .filter(|&i| v[i].ids.len() <= MERGE_MAX_ASSETS)
+            .filter_map(|i| neighbour(&v, i).map(|n| (i, n)))
+            .min_by_key(|&(i, _)| (v[i].ids.len(), i));
+        let Some((i, n)) = pick else { return v };
+        let (lo, hi) = (i.min(n), i.max(n));
+        let later = v.remove(hi);
+        v[lo].absorb(later);
+    }
+}
+
+/// Finish clusters: sequential ids and `day · place N` labels.
+fn finish(accs: Vec<Acc>) -> Vec<Cluster> {
+    accs.into_iter()
+        .enumerate()
+        .map(|(i, acc)| {
+            let seq = i + 1;
+            let center = acc.centroid();
+            let place = if center.is_some() {
+                format!(" · place {seq}")
+            } else {
+                String::new()
+            };
+            Cluster {
+                id: format!("c{seq:03}"),
+                asset_ids: acc.ids,
+                start_time: acc.start,
+                end_time: acc.end,
+                centroid_gps: center,
+                label: format!("{}{place}", acc.day),
+            }
+        })
+        .collect()
+}
+
+/// Group assets into day/place clusters in story order, then merge tiny
+/// clusters into a same-day neighbour ([`MERGE_MAX_ASSETS`]).
 pub fn cluster_assets(assets: &[Asset]) -> Vec<Cluster> {
     let ordered = story_order(assets);
     let outliers = gps_outliers_ordered(&ordered);
 
-    let mut clusters: Vec<Cluster> = vec![];
+    let mut clusters: Vec<Acc> = vec![];
     let mut acc = Acc::default();
     for a in ordered {
         let day = day_key(a.taken_at, a.tz_offset_secs);
@@ -159,7 +237,7 @@ pub fn cluster_assets(assets: &[Asset]) -> Vec<Cluster> {
         acc.push(&a.id, a.taken_at, gps);
     }
     acc.flush(&mut clusters, String::new());
-    clusters
+    finish(merge_small(clusters))
 }
 
 /// One near-dupe stack: members plus the best-shot pick.
@@ -189,6 +267,9 @@ fn same_moment(a: &Asset, b: &Asset) -> bool {
 /// with union-find; groups merge only when every cross pair is the same
 /// moment, so a whole group stays within the window and radius. The best
 /// shot is the highest `total` score (ties → first in story order).
+/// Videos never collapse: their pHash is only the poster frame, so two
+/// clips (or a clip and a photo) opening on the same view can still hold
+/// different footage.
 pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) -> Vec<DupeGroup> {
     let n = assets.len();
     let mut parent: Vec<usize> = (0..n).collect();
@@ -199,7 +280,10 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
         }
         x
     }
-    let phashes: Vec<Option<u64>> = assets.iter().map(|a| a.phash).collect();
+    let phashes: Vec<Option<u64>> = assets
+        .iter()
+        .map(|a| a.phash.filter(|_| a.kind != AssetKind::Video))
+        .collect();
     let mut members: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
     for i in 0..n {
         for j in (i + 1)..n {
@@ -252,10 +336,19 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
     out
 }
 
+/// Ids of every near-dupe group member except the group's best shot: the
+/// assets to keep out of plans (they stay in the library).
+pub fn suppressed_ids(groups: &[DupeGroup]) -> HashSet<String> {
+    groups
+        .iter()
+        .flat_map(|g| g.members.iter().filter(|m| **m != g.best_id))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::AssetKind;
 
     fn asset(id: &str, taken: Option<i64>, gps: Option<(f64, f64)>, phash: Option<u64>) -> Asset {
         let mut a = Asset::new(id, format!("/tmp/{id}.jpg").into(), AssetKind::Photo);
@@ -279,11 +372,17 @@ mod tests {
 
     #[test]
     fn place_split_on_drift() {
-        // ~11 km apart on the same day.
-        let a = vec![
-            asset("a", Some(1_714_557_600), Some((37.77, -122.41)), None),
-            asset("b", Some(1_714_558_000), Some((37.87, -122.41)), None),
-        ];
+        // ~11 km apart on the same day, four shots at each place.
+        let at = |lat: f64, offset: i64, n: usize| -> Vec<Asset> {
+            (0..n)
+                .map(|i| {
+                    let id = format!("{lat}-{i}");
+                    let t = 1_714_557_600 + offset + i as i64 * 60;
+                    asset(&id, Some(t), Some((lat, -122.41)), None)
+                })
+                .collect()
+        };
+        let a: Vec<Asset> = [at(37.77, 0, 4), at(37.87, 3600, 4)].concat();
         let c = cluster_assets(&a);
         assert_eq!(c.len(), 2, "far drift starts a new place: {c:?}");
     }
@@ -330,6 +429,23 @@ mod tests {
             .find(|x| x.members.contains(&"a".to_string()))
             .unwrap();
         assert_eq!(ab.best_id, "b");
+    }
+
+    #[test]
+    fn videos_never_collapse_as_near_dupes() {
+        // Same poster frame, same moment: distinct clips (and a clip vs. a
+        // photo) all stay, since the pHash only covers the first frame.
+        let video = |id: &str, t: i64| {
+            let mut a = asset(id, Some(t), None, Some(0b101));
+            a.kind = AssetKind::Video;
+            a
+        };
+        let a = vec![
+            video("v1", 1),
+            video("v2", 2),
+            asset("p", Some(3), None, Some(0b101)),
+        ];
+        assert_eq!(collapse_near_dupes(&a, &HashMap::new()).len(), 3);
     }
 
     #[test]
@@ -413,17 +529,114 @@ mod tests {
     #[test]
     fn time_gap_split_and_bounds() {
         let t0 = 1_714_550_400; // 2024-05-01 08:00 UTC
-        let a = vec![
+        let mut a = vec![
             asset("b", Some(t0 + 600), None, None),
             asset("a", Some(t0), None, None),
-            asset("c", Some(t0 + 600 + TIME_GAP_SECS + 1), None, None),
+            asset("a2", Some(t0 + 1200), None, None),
+            asset("a3", Some(t0 + 1800), None, None),
         ];
+        let later = t0 + 1800 + TIME_GAP_SECS + 1;
+        a.extend((0..4).map(|i| asset(&format!("c{i}"), Some(later + i * 60), None, None)));
         let c = cluster_assets(&a);
         assert_eq!(c.len(), 2, "same day, >4 h gap splits: {c:?}");
-        assert_eq!(c[0].asset_ids, vec!["a", "b"], "story order");
-        assert_eq!((c[0].start_time, c[0].end_time), (Some(t0), Some(t0 + 600)));
+        assert_eq!(c[0].asset_ids, vec!["a", "b", "a2", "a3"], "story order");
+        assert_eq!(
+            (c[0].start_time, c[0].end_time),
+            (Some(t0), Some(t0 + 1800))
+        );
         assert_eq!(c[0].label, "2024-05-01");
         assert_eq!(c[1].id, "c002");
+    }
+
+    /// `n` shots a minute apart from `t0`, ids `<prefix><i>`.
+    fn run(prefix: &str, t0: i64, n: usize, gps: Option<(f64, f64)>) -> Vec<Asset> {
+        (0..n)
+            .map(|i| asset(&format!("{prefix}{i}"), Some(t0 + i as i64 * 60), gps, None))
+            .collect()
+    }
+
+    #[test]
+    fn small_clusters_merge_into_the_closer_same_day_neighbour() {
+        let t0 = 1_714_550_400; // 2024-05-01 08:00 UTC
+        let h = 3600;
+        // Big morning walk, a lone hotel shot 5 h later, big evening walk
+        // 6 h after that: the loner is nearer the morning in time and place.
+        let morning = (37.7700, -122.4100);
+        let evening = (37.7710, -122.4100);
+        let mut a = run("m", t0, 6, Some(morning));
+        a.extend(run("h", t0 + 5 * h, 1, Some((37.7701, -122.4100))));
+        a.extend(run("e", t0 + 11 * h, 5, Some(evening)));
+        let c = cluster_assets(&a);
+        assert_eq!(c.len(), 2, "{c:?}");
+        assert_eq!(c[0].asset_ids.len(), 7);
+        assert!(c[0].asset_ids.contains(&"h0".to_string()));
+        assert_eq!(c[1].asset_ids.len(), 5);
+        assert_eq!(c[0].id, "c001");
+        assert_eq!(c[1].id, "c002", "ids stay sequential after merging");
+        assert_eq!(
+            c[0].end_time,
+            Some(t0 + 5 * h),
+            "bounds cover the merged shot"
+        );
+        // The merged centroid is still the big cluster's place (the loner
+        // adds one fix to six).
+        let g = c[0].centroid_gps.unwrap();
+        assert!((g.0 - morning.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn small_clusters_prefer_the_neighbour_closer_in_place_when_time_ties() {
+        let t0 = 1_714_550_400;
+        let h = 3600;
+        // Loner exactly 5 h after one cluster ends and 5 h before the next
+        // begins, but 11 km from the first and right next to the second.
+        let mut a = run("a", t0, 4, Some((37.77, -122.41)));
+        let lone = a.last().unwrap().taken_at.unwrap() + 5 * h;
+        a.extend(run("x", lone, 1, Some((37.87, -122.41))));
+        a.extend(run("b", lone + 5 * h, 4, Some((37.87, -122.41))));
+        let c = cluster_assets(&a);
+        let with_x = c
+            .iter()
+            .find(|c| c.asset_ids.contains(&"x0".into()))
+            .unwrap();
+        assert!(with_x.asset_ids.contains(&"b0".into()), "{c:?}");
+    }
+
+    #[test]
+    fn small_clusters_never_merge_across_days_and_runs_collapse() {
+        let t0 = 1_714_550_400; // 08:00 UTC
+        let day = 86_400;
+        // A lone shot on its own day stays alone, even next to a big day.
+        let mut a = run("d1", t0, 5, None);
+        a.extend(run("d2", t0 + day, 1, None));
+        a.extend(run("d3", t0 + 2 * day, 5, None));
+        assert_eq!(cluster_assets(&a).len(), 3);
+        // Singletons strung through one day (each >4 h apart) collapse
+        // into one cluster rather than staying a string of one-shot chapters.
+        let h = 3600;
+        let strung: Vec<Asset> = (0..4)
+            .map(|i| asset(&format!("s{i}"), Some(t0 + i * 5 * h), None, None))
+            .collect();
+        let c = cluster_assets(&strung);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].asset_ids, vec!["s0", "s1", "s2", "s3"]);
+    }
+
+    #[test]
+    fn suppressed_ids_drop_everything_but_the_best_shot() {
+        let g = [
+            DupeGroup {
+                members: vec!["a".into(), "b".into(), "c".into()],
+                best_id: "b".into(),
+            },
+            DupeGroup {
+                members: vec!["d".into()],
+                best_id: "d".into(),
+            },
+        ];
+        let mut s: Vec<String> = suppressed_ids(&g).into_iter().collect();
+        s.sort();
+        assert_eq!(s, vec!["a", "c"]);
     }
 
     #[test]

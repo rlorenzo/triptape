@@ -71,13 +71,48 @@ pub const MAX_CLIP_SECS: f64 = 30.0;
 // Hero timing model. The renderer (`triptape-media` render_video) uses the
 // three constants above directly; the rest mirror its `VideoOptions`
 // defaults, collage hold, transition overlaps and closing cards so the plan
-// can fill a time budget. Keep in sync.
+// can fill a time budget. A test in render_video checks this model against
+// the renderer's own transition assignment. Keep in sync.
 /// Solo still hold.
 const EST_STILL_SECS: f64 = 4.0;
-/// Average transition overlap per cut.
-const EST_CUT_OVERLAP_SECS: f64 = 0.55;
-/// Title, opening map, closing map and places card.
-const EST_FIXED_SECS: f64 = 2.5 + 3.0 + 4.5 + 4.5;
+/// Title card hold.
+const EST_TITLE_SECS: f64 = 2.5;
+/// Opening route map hold (only with a GPS route).
+const EST_MAP_SECS: f64 = 3.0;
+/// Closing route map hold: the opening map plus 1.5 s (GPS route only).
+const EST_CLOSING_MAP_SECS: f64 = 4.5;
+/// Closing places card hold (only when a chapter has a named place).
+const EST_PLACES_SECS: f64 = 4.5;
+/// Overlap of the first cut (circleopen) and the last (circleclose).
+const EST_BOOKEND_OVERLAP_SECS: f64 = 0.7;
+/// Overlaps at chapter breaks and other cuts into or out of a card: the
+/// renderer cycles fadeblack (0.8 s), smoothleft, smoothleft (0.5 s each).
+const EST_BREAK_OVERLAPS_SECS: [f64; 3] = [0.8, 0.5, 0.5];
+/// Overlap of an ordinary cut: 0.5 s, plus an occasional 0.7 s circleopen
+/// in the transition rotation.
+const EST_PLAIN_OVERLAP_SECS: f64 = 0.54;
+/// Hero time is dealt to chapters in proportion to `size^0.75`: a chapter
+/// with twice the photos gets ~1.7x the time (the old square root gave
+/// 1.4x, which starved big days like a theme-park day to a few shots).
+const CHAPTER_TIME_EXPONENT: f64 = 0.75;
+/// A requested film length is a minimum: the plan fills to this fraction
+/// over it, absorbing small errors in the timing model.
+pub const LENGTH_OVERSHOOT: f64 = 0.03;
+/// Two shots this close in time are one moment when they also look alike.
+const SAME_MOMENT_SECS: i64 = 120;
+/// Shots this close in time are one moment (a burst), looks aside.
+const SAME_MOMENT_BURST_SECS: i64 = 5;
+/// Looks-alike bound (pHash Hamming distance) for [`SAME_MOMENT_SECS`].
+/// Looser than the dupe-collapse bound: these are different frames of the
+/// same moment, not retakes.
+const SAME_MOMENT_PHASH_DISTANCE: u32 = 14;
+/// Weight of an asset's percentile within its chapter in its technical
+/// quality (the rest is the absolute quality). Kept small so story signals
+/// (people, captions) still outrank a few percentiles of sharpness.
+const REL_QUALITY_WEIGHT: f32 = 0.2;
+/// Live Photos per chapter that keep their motion in the hero film; the
+/// rest play as stills so they can form collages.
+pub const MOTION_PER_CHAPTER: usize = 1;
 
 /// Whether a display aspect (width / height) is a panorama: >= 2:1, or
 /// a tall one <= 1:2.
@@ -187,15 +222,56 @@ pub fn parse_film_length(spec: &str) -> Result<FilmLength, String> {
     Ok(FilmLength::Secs(secs))
 }
 
-/// Estimated rendered seconds for hero entries in story order, grouping
-/// consecutive same-chapter stills into collages the way the renderer does.
-fn estimate_hero_secs<'e, 'c>(
+/// Which fixed cards the renderer will add around the hero entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeroCards {
+    /// Opening and closing route maps (the plan has a GPS route).
+    pub route: bool,
+    /// Closing places card (some chapter has a named place).
+    pub places: bool,
+}
+
+/// Screen seconds one entry takes on its own (a still joining a collage
+/// costs less than this; see [`estimate_hero_secs`]).
+fn solo_secs(e: &PlanEntry, pano_secs_of: impl Fn(&str) -> Option<f64>) -> f64 {
+    match e.rendition {
+        Rendition::Still => pano_secs_of(&e.asset_id).unwrap_or(EST_STILL_SECS),
+        Rendition::Motion {
+            trim_start,
+            trim_end,
+        }
+        | Rendition::Clip {
+            trim_start,
+            trim_end,
+        } => (trim_end - trim_start).clamp(MIN_SEGMENT_SECS, MAX_CLIP_SECS),
+    }
+}
+
+/// What one rendered segment is, for transition overlaps.
+#[derive(Clone, Copy, PartialEq)]
+enum Seg<'c> {
+    Title,
+    Card,
+    Chapter(&'c str),
+}
+
+/// Estimated rendered seconds for hero entries in story order, as the
+/// renderer builds them: the fixed cards around the entries, consecutive
+/// same-chapter stills grouped into collages, clips padded to
+/// [`MIN_SEGMENT_SECS`], and every cut overlapped by the transition the
+/// renderer assigns it (opening and closing cut 0.7 s, chapter breaks and
+/// card cuts cycling 0.8/0.5/0.5 s, others ~0.54 s).
+pub fn estimate_hero_secs<'e, 'c>(
     entries: impl IntoIterator<Item = &'e PlanEntry>,
     chapter_of: impl Fn(&str) -> &'c str,
     pano_secs_of: impl Fn(&str) -> Option<f64>,
+    cards: HeroCards,
 ) -> f64 {
-    let mut total = EST_FIXED_SECS;
-    let mut segments = 4usize; // the fixed cards
+    let mut segs: Vec<(Seg<'c>, f64)> = vec![(Seg::Title, EST_TITLE_SECS)];
+    if cards.route {
+        segs.push((Seg::Card, EST_MAP_SECS));
+    }
+    let first_hero = segs.len();
     let mut run: Option<(&str, usize)> = None; // (chapter, stills in collage)
     for e in entries {
         let chapter = chapter_of(&e.asset_id);
@@ -203,55 +279,88 @@ fn estimate_hero_secs<'e, 'c>(
         match e.rendition {
             // A panorama is always solo, with its own pan hold.
             Rendition::Still if pano_secs.is_some() => {
-                total += pano_secs.unwrap_or(EST_STILL_SECS);
-                segments += 1;
+                segs.push((Seg::Chapter(chapter), pano_secs.unwrap_or(EST_STILL_SECS)));
                 run = None;
             }
             Rendition::Still => match &mut run {
                 Some((c, n)) if *c == chapter && *n < MAX_COLLAGE => {
                     // Growing a solo still into a collage, or a collage by one.
-                    total += collage_hold_secs(*n + 1, EST_STILL_SECS)
-                        - collage_hold_secs(*n, EST_STILL_SECS);
+                    if let Some(last) = segs.last_mut() {
+                        last.1 = collage_hold_secs(*n + 1, EST_STILL_SECS);
+                    }
                     *n += 1;
                 }
                 _ => {
-                    total += EST_STILL_SECS;
-                    segments += 1;
+                    segs.push((Seg::Chapter(chapter), EST_STILL_SECS));
                     run = Some((chapter, 1));
                 }
             },
-            Rendition::Motion {
-                trim_start,
-                trim_end,
-            }
-            | Rendition::Clip {
-                trim_start,
-                trim_end,
-            } => {
-                total += (trim_end - trim_start).clamp(MIN_SEGMENT_SECS, MAX_CLIP_SECS);
-                segments += 1;
+            Rendition::Motion { .. } | Rendition::Clip { .. } => {
+                segs.push((Seg::Chapter(chapter), solo_secs(e, &pano_secs_of)));
                 run = None;
             }
         }
     }
-    total - EST_CUT_OVERLAP_SECS * segments.saturating_sub(1) as f64
+    if segs.len() == first_hero {
+        // No entries: the renderer refuses to build a film from cards alone.
+        return segs.iter().map(|s| s.1).sum();
+    }
+    if cards.route {
+        segs.push((Seg::Card, EST_CLOSING_MAP_SECS));
+    }
+    if cards.places {
+        segs.push((Seg::Card, EST_PLACES_SECS));
+    }
+    let n = segs.len();
+    let mut overlap = 0.0;
+    let mut breaks = 0usize;
+    // A cut into or out of a card, or between chapters, is a chapter break.
+    let is_break = |a: Seg, b: Seg| a == Seg::Card || b == Seg::Card || (a != Seg::Title && a != b);
+    for i in 1..n {
+        // The opening cut and (when there is a middle) the closing cut.
+        let bookend = i == 1 || (i == n - 1 && n > 2);
+        overlap += if bookend {
+            EST_BOOKEND_OVERLAP_SECS
+        } else if is_break(segs[i - 1].0, segs[i].0) {
+            breaks += 1;
+            EST_BREAK_OVERLAPS_SECS[(breaks - 1) % EST_BREAK_OVERLAPS_SECS.len()]
+        } else {
+            EST_PLAIN_OVERLAP_SECS
+        };
+    }
+    segs.iter().map(|s| s.1).sum::<f64>() - overlap
 }
 
-/// Pick hero entries (given in story order) to fill `budget_secs`.
+/// How much hero film to plan: picks keep coming until none fits under
+/// `ceiling_secs`, so the film lands as close under it as the shots allow.
+#[derive(Debug, Clone, Copy)]
+struct HeroBudget {
+    ceiling_secs: f64,
+    cards: HeroCards,
+}
+
+/// Pick hero entries (given in story order) to fill `budget`.
 ///
 /// Every chapter first gets its best entry (dropping the weakest chapters'
-/// picks only if even those overrun the budget). Remaining time is dealt
+/// picks only if even those overrun the ceiling). Remaining time is dealt
 /// out one entry at a time to the chapter with the least estimated screen
-/// time relative to `sqrt(chapter size)`, taking that chapter's best
-/// remaining entry, so
-/// big days get more screen time without crowding out small ones. Stops at
-/// the first pick that would overrun the budget. Keeps story order.
+/// time relative to `size^CHAPTER_TIME_EXPONENT`, taking that chapter's
+/// best remaining entry, so big days get more screen time without crowding
+/// out small ones.
+///
+/// An entry that would overrun the ceiling is skipped and the chapter's
+/// next-best, cheaper entry tried, so the film fills the budget instead of
+/// stopping at the first clip that does not fit. While better options
+/// remain, an entry that `similar` calls the same moment as one the chapter
+/// already has is passed over; when every chapter has run dry the budget
+/// is plentiful, and a second pass allows them. Keeps story order.
 fn select_hero_by_budget<'a>(
     cands: Vec<PlanEntry>,
     chapter_of: impl Fn(&str) -> &'a str + Copy,
     score_of: impl Fn(&str) -> f32,
+    similar: impl Fn(&str, &str) -> bool,
     pano_secs_of: impl Fn(&str) -> Option<f64> + Copy,
-    budget_secs: f64,
+    budget: HeroBudget,
 ) -> Vec<PlanEntry> {
     // Chapters in story order, each with its candidates best-first.
     let mut chapters: Vec<(&str, Vec<usize>)> = vec![];
@@ -279,6 +388,7 @@ fn select_hero_by_budget<'a>(
                 .map(|(e, _)| e),
             chapter_of,
             pano_secs_of,
+            budget.cards,
         )
     };
     // Every chapter's best entry, weakest dropped first if over budget
@@ -294,7 +404,7 @@ fn select_hero_by_budget<'a>(
     });
     if let Some((_, weaker)) = reps.split_last() {
         for &r in weaker {
-            if estimate(&picked) <= budget_secs {
+            if estimate(&picked) <= budget.ceiling_secs {
                 break;
             }
             picked[r] = false;
@@ -302,45 +412,59 @@ fn select_hero_by_budget<'a>(
     }
     // Deal the rest of the budget across chapters by estimated screen time
     // (a clip costs more than a still joining a collage).
-    let mut taken: Vec<usize> = chapters
+    let mut taken: Vec<Vec<usize>> = chapters
         .iter()
-        .map(|(_, m)| usize::from(picked[m[0]]))
+        .map(|(_, m)| m.iter().copied().filter(|&i| picked[i]).collect())
         .collect();
-    let mut secs: Vec<f64> = chapters
+    let mut secs: Vec<f64> = taken
         .iter()
-        .map(|(_, m)| {
-            if picked[m[0]] {
-                estimate_hero_secs([&cands[m[0]]], chapter_of, pano_secs_of) - EST_FIXED_SECS
-                    + EST_CUT_OVERLAP_SECS
-            } else {
-                0.0
-            }
-        })
+        .map(|t| t.iter().map(|&i| solo_secs(&cands[i], pano_secs_of)).sum())
         .collect();
     let mut total = estimate(&picked);
-    loop {
-        let next = chapters
-            .iter()
-            .enumerate()
-            .filter(|(ci, (_, m))| taken[*ci] < m.len())
-            .min_by(|(a, (_, ma)), (b, (_, mb))| {
-                let share = |ci: usize, n: usize| secs[ci] / (n as f64).sqrt();
-                share(*a, ma.len())
-                    .total_cmp(&share(*b, mb.len()))
-                    .then(a.cmp(b))
-            })
-            .map(|(ci, _)| ci);
-        let Some(ci) = next else { break };
-        let i = chapters[ci].1[taken[ci]];
-        picked[i] = true;
-        let grown = estimate(&picked);
-        if grown > budget_secs {
-            picked[i] = false;
-            break;
+    for allow_similar in [false, true] {
+        let mut closed = vec![false; chapters.len()];
+        loop {
+            let next = chapters
+                .iter()
+                .enumerate()
+                .filter(|(ci, _)| !closed[*ci])
+                .min_by(|(a, (_, ma)), (b, (_, mb))| {
+                    let share =
+                        |ci: usize, n: usize| secs[ci] / (n as f64).powf(CHAPTER_TIME_EXPONENT);
+                    share(*a, ma.len())
+                        .total_cmp(&share(*b, mb.len()))
+                        .then(a.cmp(b))
+                })
+                .map(|(ci, _)| ci);
+            let Some(ci) = next else { break };
+            // First entry (best-first) that is allowed and still fits.
+            let mut fitted = None;
+            for &i in &chapters[ci].1 {
+                if picked[i]
+                    || (!allow_similar
+                        && taken[ci]
+                            .iter()
+                            .any(|&t| similar(&cands[i].asset_id, &cands[t].asset_id)))
+                {
+                    continue;
+                }
+                picked[i] = true;
+                let grown = estimate(&picked);
+                if grown <= budget.ceiling_secs {
+                    fitted = Some((i, grown));
+                    break;
+                }
+                picked[i] = false;
+            }
+            match fitted {
+                Some((i, grown)) => {
+                    secs[ci] += (grown - total).max(0.0);
+                    total = grown;
+                    taken[ci].push(i);
+                }
+                None => closed[ci] = true,
+            }
         }
-        secs[ci] += (grown - total).max(0.0);
-        total = grown;
-        taken[ci] += 1;
     }
     cands
         .into_iter()
@@ -525,11 +649,16 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
         // plan already picks takes over, and the old pick goes. This is how
         // a removed pick is restored as a replacement; `check_swap` rejects
         // replacements that are still picked.
-        for picks in [&mut out.hero, &mut out.reel_selects] {
+        for (is_hero, picks) in [(true, &mut out.hero), (false, &mut out.reel_selects)] {
             if picks.iter().any(|e| e.asset_id == *to) {
                 picks.retain(|e| e.asset_id != *from);
             } else if let Some(entry) = picks.iter_mut().find(|e| e.asset_id == *from) {
                 *entry = plan_entry(asset, asset.score.as_ref());
+                // The film shows Live Photos as stills unless the plan
+                // picked them for motion; a swap-in is a still.
+                if is_hero && matches!(entry.rendition, Rendition::Motion { .. }) {
+                    entry.rendition = Rendition::Still;
+                }
             }
         }
     }
@@ -584,12 +713,75 @@ pub fn build_plan_with_length(
     length: FilmLength,
 ) -> Plan {
     let ordered = story_order(assets);
-    let score_of = |id: &str| scores.get(id).map_or(DEFAULT_SCORE, |s| s.total);
+    let chapter_label = |id: &str| cluster_of.get(id).map_or(UNGROUPED, String::as_str);
+    // Story score per asset: technical quality relative to its chapter plus
+    // the story bonuses (people, caption, clip). Assets without a score keep
+    // the neutral default.
+    let story_scores = relative_scores(&ordered, chapter_label, scores);
+    let score_of = |id: &str| story_scores.get(id).copied().unwrap_or(DEFAULT_SCORE);
     // Fresh scores win; a persisted one still carries the clip window.
     let entry = |a: &Asset| plan_entry(a, scores.get(&a.id).or(a.score.as_ref()));
+    let local_date = |a: &Asset| crate::metadata::local_date(a.taken_at?, a.tz_offset_secs);
+
+    // Group by cluster label in story order (drives chapters and reels).
+    let mut groups: Vec<(&str, Vec<&Asset>)> = vec![];
+    let mut group_idx: HashMap<&str, usize> = HashMap::new();
+    for a in &ordered {
+        let label = chapter_label(&a.id);
+        let i = *group_idx.entry(label).or_insert_with(|| {
+            groups.push((label, vec![]));
+            groups.len() - 1
+        });
+        groups[i].1.push(a);
+    }
+
+    // Chapters: one per cluster label, in story order, named by place
+    // when the chapter's GPS medoid lands near a populated place
+    // (bundled gazetteer, never a network lookup). The day is shown once
+    // per chapter (overlays, book day-marker pages) — photos inside a
+    // chapter need no per-photo timestamp.
+    let trip_start = ordered.iter().filter_map(|a| local_date(a)).min();
+    let chapters: Vec<Chapter> = groups
+        .iter()
+        .map(|(label, members)| {
+            let gps: Vec<(f64, f64)> = members.iter().filter_map(|a| a.gps).collect();
+            let first_date = members.iter().filter_map(|a| local_date(a)).min();
+            // GPS naming first; a user override (e.g. the ship's name for
+            // days at sea) only fills what GPS honestly cannot name.
+            let place = chapter_place(&gps).or_else(|| {
+                let d = first_date?;
+                overrides
+                    .iter()
+                    .find(|o| o.start <= d && d <= o.end)
+                    .map(|o| o.label.clone())
+            });
+            Chapter {
+                title: place.clone().unwrap_or_else(|| human_chapter_title(label)),
+                asset_ids: members.iter().map(|a| a.id.clone()).collect(),
+                place,
+                day_index: match (first_date, trip_start) {
+                    (Some(d), Some(s)) => Some(((d - s).num_days() + 1).max(1) as u32),
+                    _ => None,
+                },
+                date_label: first_date.map(|d| d.format(DAY_FORMAT).to_string()),
+            }
+        })
+        .collect();
+
+    // Map polyline: GPS fixes in story order, minus fixes that imply
+    // impossible speed. Capture times separate those from real flights.
+    let outliers = gps_outliers(assets);
+    let map_polyline: Vec<(f64, f64)> = ordered
+        .iter()
+        .filter(|a| !outliers.contains(&a.id))
+        .filter_map(|a| a.gps)
+        .collect();
 
     // Hero: story order, one entry per identical content hash (pHash
-    // near-dupe stacks are resolved upstream via cluster picks).
+    // near-dupe stacks are resolved upstream via cluster picks). Live
+    // Photos play as stills so they can form collages, except the best one
+    // of each chapter, which keeps its motion.
+    let motion_ok = motion_picks(&ordered, chapter_label, &score_of);
     let mut seen_hash: HashSet<&str> = HashSet::new();
     let mut hero: Vec<PlanEntry> = ordered
         .iter()
@@ -598,13 +790,19 @@ pub fn build_plan_with_length(
                 .as_deref()
                 .is_none_or(|h| seen_hash.insert(h))
         })
-        .map(|a| entry(a))
+        .map(|a| {
+            let mut e = entry(a);
+            if !motion_ok.contains(a.id.as_str()) && matches!(e.rendition, Rendition::Motion { .. })
+            {
+                e.rendition = Rendition::Still;
+            }
+            e
+        })
         .collect();
     if hero.len() > HERO_TRIM_ABOVE {
         hero.retain(|e| score_of(&e.asset_id) >= HERO_MIN_SCORE);
     }
-    let local_date = |a: &Asset| crate::metadata::local_date(a.taken_at?, a.tz_offset_secs);
-    let budget_secs = match length {
+    let target_secs = match length {
         FilmLength::Secs(s) => s,
         FilmLength::Auto => {
             // Inclusive calendar span, so days without captures still count.
@@ -616,7 +814,22 @@ pub fn build_plan_with_length(
             auto_film_secs(span)
         }
     };
-    let chapter_label = |id: &str| cluster_of.get(id).map_or(UNGROUPED, String::as_str);
+    let budget = HeroBudget {
+        // A requested length is a minimum, so aim a little over it.
+        ceiling_secs: match length {
+            FilmLength::Secs(_) => target_secs * (1.0 + LENGTH_OVERSHOOT),
+            FilmLength::Auto => target_secs,
+        },
+        cards: HeroCards {
+            route: !map_polyline.is_empty(),
+            places: chapters.iter().any(|c| c.place.is_some()),
+        },
+    };
+    let by_id: HashMap<&str, &Asset> = ordered.iter().map(|a| (a.id.as_str(), *a)).collect();
+    let similar = |x: &str, y: &str| match (by_id.get(x), by_id.get(y)) {
+        (Some(a), Some(b)) => same_moment(a, b),
+        _ => false,
+    };
     // Panoramas pan solo for longer than a plain still; the estimator
     // needs each one's hold to fill the budget honestly.
     let pano_hold: HashMap<&str, f64> = assets
@@ -627,19 +840,7 @@ pub fn build_plan_with_length(
         })
         .collect();
     let pano_secs_of = |id: &str| pano_hold.get(id).copied();
-    let hero = select_hero_by_budget(hero, chapter_label, score_of, pano_secs_of, budget_secs);
-
-    // Group by cluster label in story order (drives chapters and reels).
-    let mut groups: Vec<(&str, Vec<&Asset>)> = vec![];
-    let mut group_idx: HashMap<&str, usize> = HashMap::new();
-    for a in &ordered {
-        let label = cluster_of.get(&a.id).map_or(UNGROUPED, String::as_str);
-        let i = *group_idx.entry(label).or_insert_with(|| {
-            groups.push((label, vec![]));
-            groups.len() - 1
-        });
-        groups[i].1.push(a);
-    }
+    let hero = select_hero_by_budget(hero, chapter_label, score_of, similar, pano_secs_of, budget);
 
     // Reel selects: trip highlights. Rank every asset trip-wide by score
     // (motion-capable assets get a small ranking bonus — a clip or Live
@@ -689,39 +890,6 @@ pub fn build_plan_with_length(
         .collect();
     reel_selects.sort_by_key(|e| story_pos[e.asset_id.as_str()]);
 
-    // Chapters: one per cluster label, in story order, named by place
-    // when the chapter's GPS medoid lands near a populated place
-    // (bundled gazetteer, never a network lookup). The day is shown once
-    // per chapter (overlays, book day-marker pages) — photos inside a
-    // chapter need no per-photo timestamp.
-    let trip_start = ordered.iter().filter_map(|a| local_date(a)).min();
-    let chapters: Vec<Chapter> = groups
-        .into_iter()
-        .map(|(label, members)| {
-            let gps: Vec<(f64, f64)> = members.iter().filter_map(|a| a.gps).collect();
-            let first_date = members.iter().filter_map(|a| local_date(a)).min();
-            // GPS naming first; a user override (e.g. the ship's name for
-            // days at sea) only fills what GPS honestly cannot name.
-            let place = chapter_place(&gps).or_else(|| {
-                let d = first_date?;
-                overrides
-                    .iter()
-                    .find(|o| o.start <= d && d <= o.end)
-                    .map(|o| o.label.clone())
-            });
-            Chapter {
-                title: place.clone().unwrap_or_else(|| human_chapter_title(label)),
-                asset_ids: members.iter().map(|a| a.id.clone()).collect(),
-                place,
-                day_index: match (first_date, trip_start) {
-                    (Some(d), Some(s)) => Some(((d - s).num_days() + 1).max(1) as u32),
-                    _ => None,
-                },
-                date_label: first_date.map(|d| d.format(DAY_FORMAT).to_string()),
-            }
-        })
-        .collect();
-
     // Auto captions: the photo's chapter place, nothing else. Day/time
     // live on the chapter, not on every photo; without a pinned VLM we
     // never invent what a photo shows. Photos in unnamed places get no
@@ -741,15 +909,6 @@ pub fn build_plan_with_length(
         }))
         .collect();
 
-    // Map polyline: GPS fixes in story order, minus fixes that imply
-    // impossible speed. Capture times separate those from real flights.
-    let outliers = gps_outliers(assets);
-    let map_polyline: Vec<(f64, f64)> = ordered
-        .iter()
-        .filter(|a| !outliers.contains(&a.id))
-        .filter_map(|a| a.gps)
-        .collect();
-
     Plan {
         plan_version: PLAN_VERSION,
         schema_version: Plan::SCHEMA_VERSION,
@@ -764,6 +923,89 @@ pub fn build_plan_with_length(
                 .to_string(),
         },
     }
+}
+
+/// Whether `a` and `b` show the same moment: a burst (within
+/// [`SAME_MOMENT_BURST_SECS`]), or close in time
+/// ([`SAME_MOMENT_SECS`]) with similar pixels.
+fn same_moment(a: &Asset, b: &Asset) -> bool {
+    let (Some(ta), Some(tb)) = (a.taken_at, b.taken_at) else {
+        return false;
+    };
+    let dt = (ta - tb).abs();
+    if dt <= SAME_MOMENT_BURST_SECS {
+        return true;
+    }
+    let (Some(p), Some(q)) = (a.phash, b.phash) else {
+        return false;
+    };
+    dt <= SAME_MOMENT_SECS && crate::hash::phash_distance(p, q) <= SAME_MOMENT_PHASH_DISTANCE
+}
+
+/// Story score per asset: technical quality made relative to the asset's
+/// chapter, plus its story bonuses.
+///
+/// Quality is [`Score::tech_quality`] (already squeezed by the scorer, and
+/// kept apart from the clamped `total` so saturation can't make a bonus
+/// lower an asset's rank). Each asset's
+/// percentile within its chapter (mid-rank, so a lone asset sits at 0.5)
+/// is blended in at [`REL_QUALITY_WEIGHT`], so a chapter's sharpest frames
+/// are favoured over equal frames of a dull chapter without letting
+/// sharpness beat people or captions. Assets without a score are left out.
+fn relative_scores<'a>(
+    ordered: &[&Asset],
+    chapter_of: impl Fn(&str) -> &'a str,
+    scores: &HashMap<String, Score>,
+) -> HashMap<String, f32> {
+    let mut by_chapter: HashMap<&str, Vec<(&str, f32, f32)>> = HashMap::new();
+    for a in ordered {
+        let Some(s) = scores.get(&a.id).or(a.score.as_ref()) else {
+            continue;
+        };
+        by_chapter.entry(chapter_of(&a.id)).or_default().push((
+            a.id.as_str(),
+            s.tech_quality(),
+            s.bonus,
+        ));
+    }
+    let mut out = HashMap::new();
+    for members in by_chapter.values() {
+        let n = members.len() as f32;
+        let mut sorted: Vec<f32> = members.iter().map(|m| m.1).collect();
+        sorted.sort_by(f32::total_cmp);
+        for &(id, quality, bonus) in members {
+            let less = sorted.partition_point(|&q| q < quality);
+            let same = sorted.partition_point(|&q| q <= quality) - less;
+            let pct = (less as f32 + same as f32 / 2.0) / n;
+            let relative = (1.0 - REL_QUALITY_WEIGHT) * quality
+                + REL_QUALITY_WEIGHT * crate::score::squeeze_quality(pct);
+            out.insert(id.to_string(), (relative + bonus).clamp(0.0, 1.0));
+        }
+    }
+    out
+}
+
+/// Live Photos that keep their motion in the hero film: the
+/// [`MOTION_PER_CHAPTER`] best-scoring ones of each chapter (earliest on
+/// ties). Every other Live Photo plays as its still.
+fn motion_picks<'a, 'c>(
+    ordered: &[&'a Asset],
+    chapter_of: impl Fn(&str) -> &'c str,
+    score_of: &impl Fn(&str) -> f32,
+) -> HashSet<&'a str> {
+    let mut by_chapter: HashMap<&'c str, Vec<&'a Asset>> = HashMap::new();
+    for a in ordered {
+        if a.kind == AssetKind::LivePhoto && a.companion_path.is_some() {
+            by_chapter.entry(chapter_of(&a.id)).or_default().push(a);
+        }
+    }
+    let mut out = HashSet::new();
+    for mut live in by_chapter.into_values() {
+        // `ordered` is story order, so a stable sort keeps the earliest first.
+        live.sort_by(|x, y| score_of(&y.id).total_cmp(&score_of(&x.id)));
+        out.extend(live.iter().take(MOTION_PER_CHAPTER).map(|a| a.id.as_str()));
+    }
+    out
 }
 
 /// Place name for a chapter from its GPS fixes: the geographic medoid
@@ -1486,6 +1728,10 @@ mod tests {
             &plan.hero,
             |id| clusters.get(id).map_or(UNGROUPED, String::as_str),
             |_| None,
+            HeroCards {
+                route: !plan.map_polyline.is_empty(),
+                places: plan.chapters.iter().any(|c| c.place.is_some()),
+            },
         )
     }
 
@@ -1506,8 +1752,8 @@ mod tests {
         let plan = build_plan_with_length(&assets, &none, &scores, &[], FilmLength::Secs(120.0));
         let secs = hero_secs(&plan, &none);
         assert!(
-            plan.hero.len() < 130 && secs <= 120.0 && secs > 110.0,
-            "fills ~120 s: {} entries, {secs:.1} s",
+            plan.hero.len() < 130 && (120.0..=120.0 * 1.03).contains(&secs),
+            "fills 120 s, at most 3% over: {} entries, {secs:.1} s",
             plan.hero.len()
         );
         assert!(
@@ -1683,7 +1929,12 @@ mod tests {
                 .len()
         };
         let auto = len(FilmLength::Auto);
-        assert_eq!(auto, len(FilmLength::Secs(auto_film_secs(30))));
+        // An explicit length is a minimum (up to 3% over); auto is not.
+        let explicit = len(FilmLength::Secs(auto_film_secs(30)));
+        assert!(
+            auto <= explicit && explicit as f64 <= auto as f64 * 1.06,
+            "auto={auto} explicit={explicit}"
+        );
         assert!(
             auto > len(FilmLength::Secs(auto_film_secs(4))),
             "auto={auto}"
@@ -1739,11 +1990,23 @@ mod tests {
             clip("y2", 1.0),
             still("y3"),
         ];
-        let segs = 4 + 5;
-        // 4-photo collage 7.0, solo 4.0, clips 6.0 + 2.5, solo 4.0.
-        let want =
-            EST_FIXED_SECS + 7.0 + 4.0 + 6.0 + 2.5 + 4.0 - EST_CUT_OVERLAP_SECS * (segs - 1) as f64;
-        assert!((estimate_hero_secs(&entries, ch, |_| None) - want).abs() < 1e-9);
+        // Segments: title 2.5, map 3, 4-photo collage 7, solo 4, clip 6,
+        // padded clip 2.5, solo 4, closing map 4.5, places 4.5 = 38 s. Cuts:
+        // opening 0.7, map->hero break 0.8, plain 0.54, chapter break 0.5,
+        // plain 0.54 x2, hero->closing break 0.5, closing 0.7 = 4.82 s.
+        let cards = HeroCards {
+            route: true,
+            places: true,
+        };
+        assert!((estimate_hero_secs(&entries, ch, |_| None, cards) - 33.18).abs() < 1e-9);
+        // Without a route or places only the title card remains.
+        let bare = HeroCards {
+            route: false,
+            places: false,
+        };
+        // 2.5 + 7 + 4 + 6 + 2.5 + 4 = 26 s; cuts 0.7 + 0.54 + 0.8 + 0.54 +
+        // 0.7 = 3.28 s.
+        assert!((estimate_hero_secs(&entries, ch, |_| None, bare) - 22.72).abs() < 1e-9);
     }
 
     #[test]
@@ -1797,9 +2060,13 @@ mod tests {
         };
         let entries = [still("x1"), still("p"), still("x2"), still("x3")];
         let pano = |id: &str| (id == "p").then_some(8.0);
-        // x1 solo, pano breaks the run, x2+x3 collage of 2 (5.0).
-        let want = EST_FIXED_SECS + 4.0 + 8.0 + 5.0 - EST_CUT_OVERLAP_SECS * (4 + 3 - 1) as f64;
-        assert!((estimate_hero_secs(&entries, |_| "X", pano) - want).abs() < 1e-9);
+        // x1 solo 4, pano breaks the run 8, x2+x3 collage of 2 (5.0) = 19.5 s
+        // plus title 2.5 = 19.5 + ... cuts 0.7 + 0.54 + 0.7 = 1.94 s.
+        let bare = HeroCards {
+            route: false,
+            places: false,
+        };
+        assert!((estimate_hero_secs(&entries, |_| "X", pano, bare) - 17.56).abs() < 1e-9);
     }
 
     #[test]
@@ -1861,5 +2128,422 @@ mod tests {
         let plan = build_plan(&[a, b], &HashMap::new(), &HashMap::new());
         assert_eq!(plan.hero.len(), 1);
         assert_eq!(plan.hero[0].asset_id, "a");
+    }
+
+    // -- story scoring, selection and timing ------------------------------
+
+    fn still_entry(id: &str) -> PlanEntry {
+        PlanEntry {
+            asset_id: id.into(),
+            content_hash: None,
+            size_bytes: 0,
+            mtime: 0,
+            rendition: Rendition::Still,
+        }
+    }
+
+    fn clip_entry(id: &str, secs: f64) -> PlanEntry {
+        PlanEntry {
+            rendition: Rendition::Clip {
+                trim_start: 0.0,
+                trim_end: secs,
+            },
+            ..still_entry(id)
+        }
+    }
+
+    /// Chapter = the id's first letter.
+    fn letter(id: &str) -> &'static str {
+        ["a", "b", "c", "d"]
+            .into_iter()
+            .find(|l| id.starts_with(l))
+            .unwrap_or("z")
+    }
+
+    const NO_CARDS: HeroCards = HeroCards {
+        route: false,
+        places: false,
+    };
+
+    fn pick(
+        cands: Vec<PlanEntry>,
+        scores: &[(&str, f32)],
+        ceiling_secs: f64,
+        similar: impl Fn(&str, &str) -> bool,
+    ) -> Vec<String> {
+        let score_of = |id: &str| {
+            scores
+                .iter()
+                .find(|(i, _)| *i == id)
+                .map_or(0.5, |(_, s)| *s)
+        };
+        select_hero_by_budget(
+            cands,
+            letter,
+            score_of,
+            similar,
+            |_| None,
+            HeroBudget {
+                ceiling_secs,
+                cards: NO_CARDS,
+            },
+        )
+        .into_iter()
+        .map(|e| e.asset_id)
+        .collect()
+    }
+
+    #[test]
+    fn selection_skips_a_pick_that_does_not_fit_and_tries_cheaper_ones() {
+        let cands = vec![
+            clip_entry("a1", 8.0),
+            clip_entry("a2", 8.0),
+            still_entry("a3"),
+            still_entry("b1"),
+        ];
+        let scores = [("a1", 0.9), ("a2", 0.8), ("a3", 0.7), ("b1", 0.6)];
+        let reps = estimate_hero_secs([&cands[0], &cands[3]], letter, |_| None, NO_CARDS);
+        // Room for a still after the reps, not for a second 8 s clip.
+        let got = pick(cands, &scores, reps + 4.0, |_, _| false);
+        assert_eq!(got, vec!["a1", "a3", "b1"], "{got:?}");
+    }
+
+    #[test]
+    fn near_identical_shots_are_passed_over_until_nothing_else_is_left() {
+        let cands = || {
+            vec![
+                clip_entry("a1", 3.0),
+                clip_entry("a2", 3.0),
+                clip_entry("a3", 3.0),
+                clip_entry("a4", 3.0),
+            ]
+        };
+        let scores = [("a1", 0.9), ("a2", 0.85), ("a3", 0.5), ("a4", 0.4)];
+        // a2 is the same moment as a1.
+        let twin = |x: &str, y: &str| {
+            let pair = |p: &str, q: &str| (x == p && y == q) || (x == q && y == p);
+            pair("a1", "a2")
+        };
+        let reps = estimate_hero_secs([&cands()[0]], letter, |_| None, NO_CARDS);
+        let tight = pick(cands(), &scores, reps + 7.0, twin);
+        assert_eq!(tight, vec!["a1", "a3", "a4"], "twin skipped: {tight:?}");
+        // With budget to spare the twin comes back in the second pass.
+        let plenty = pick(cands(), &scores, 1000.0, twin);
+        assert_eq!(plenty.len(), 4);
+    }
+
+    #[test]
+    fn big_chapters_get_time_by_size_to_the_three_quarters() {
+        // 16-clip day vs 4-clip day, equal clips and scores, ~20 clips of room.
+        let mut cands: Vec<PlanEntry> = (0..16)
+            .map(|i| clip_entry(&format!("a{i:02}"), 3.0))
+            .collect();
+        cands.extend((0..4).map(|i| clip_entry(&format!("b{i:02}"), 3.0)));
+        let ceiling = estimate_hero_secs(&cands[..0], letter, |_| None, NO_CARDS) + 20.0 * 2.5;
+        let got = pick(cands, &[], ceiling, |_, _| false);
+        let big = got.iter().filter(|i| i.starts_with('a')).count() as f64;
+        let small = got.iter().filter(|i| i.starts_with('b')).count() as f64;
+        assert!(small >= 1.0, "every chapter keeps its best shot");
+        // size^0.75 predicts 2.8x the small day's screen time (sqrt: 2x).
+        assert!(big / small > 2.3, "big={big} small={small}");
+    }
+
+    fn live(id: &str, taken: i64) -> Asset {
+        let mut a = asset(id, taken, AssetKind::LivePhoto);
+        a.companion_path = Some(PathBuf::from(format!("/t/{id}.mov")));
+        a.duration_secs = Some(2.6);
+        a
+    }
+
+    #[test]
+    fn live_photos_play_as_stills_except_the_best_of_each_chapter() {
+        let mut assets: Vec<Asset> = (0..6).map(|i| live(&format!("a{i}"), 100 + i)).collect();
+        assets.extend((0..4).map(|i| live(&format!("b{i}"), 1000 + i)));
+        let mut clusters = HashMap::new();
+        let mut scores = HashMap::new();
+        for a in &assets {
+            let idx: f32 = a.id[1..].parse().unwrap();
+            clusters.insert(a.id.clone(), a.id[..1].to_string());
+            scores.insert(
+                a.id.clone(),
+                Score {
+                    total: 0.5 + idx / 20.0,
+                    ..Default::default()
+                },
+            );
+        }
+        let plan =
+            build_plan_with_length(&assets, &clusters, &scores, &[], FilmLength::Secs(3600.0));
+        let motion: Vec<&str> = plan
+            .hero
+            .iter()
+            .filter(|e| matches!(e.rendition, Rendition::Motion { .. }))
+            .map(|e| e.asset_id.as_str())
+            .collect();
+        assert_eq!(motion, vec!["a5", "b3"], "best live photo per chapter");
+        assert_eq!(plan.hero.len(), 10);
+        assert!(plan
+            .hero
+            .iter()
+            .filter(|e| !motion.contains(&e.asset_id.as_str()))
+            .all(|e| e.rendition == Rendition::Still));
+        // Reels still prefer motion.
+        assert!(plan
+            .reel_selects
+            .iter()
+            .all(|e| matches!(e.rendition, Rendition::Motion { .. })));
+    }
+
+    #[test]
+    fn swapped_in_live_photo_is_a_hero_still_but_a_reel_motion() {
+        let assets = vec![asset("a", 100, AssetKind::Photo), live("l", 200)];
+        let plan = build_plan(&assets, &HashMap::new(), &HashMap::new());
+        let mut plan = plan;
+        plan.hero = vec![still_entry("a")];
+        plan.reel_selects = vec![still_entry("a")];
+        let edits = PlanEdits {
+            swaps: vec![("a".into(), "l".into())],
+            ..Default::default()
+        };
+        let out = apply_edits(&plan, &assets, &edits);
+        assert_eq!(out.hero[0].asset_id, "l");
+        assert_eq!(out.hero[0].rendition, Rendition::Still);
+        assert!(matches!(
+            out.reel_selects[0].rendition,
+            Rendition::Motion { .. }
+        ));
+    }
+
+    fn with_bonus(quality: f32, bonus: f32) -> Score {
+        Score {
+            total: quality + bonus,
+            bonus,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn people_and_captions_beat_a_sharper_dull_photo_in_the_hero() {
+        // One chapter, one hero slot beyond nothing: the group photo wins
+        // even though the empty street is technically the best frame.
+        let assets = vec![
+            asset("street", 100, AssetKind::Photo),
+            asset("group", 200, AssetKind::Photo),
+            asset("bus", 300, AssetKind::Photo),
+        ];
+        let scores: HashMap<String, Score> = [
+            ("street", with_bonus(0.74, 0.0)),
+            ("group", with_bonus(0.62, 0.28)),
+            ("bus", with_bonus(0.70, 0.0)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        // Room for exactly one still.
+        let one = estimate_hero_secs([&still_entry("x")], |_| UNGROUPED, |_| None, NO_CARDS);
+        let plan = build_plan_with_length(
+            &assets,
+            &HashMap::new(),
+            &scores,
+            &[],
+            FilmLength::Secs(one - 0.01),
+        );
+        let ids: Vec<&str> = plan.hero.iter().map(|e| e.asset_id.as_str()).collect();
+        assert_eq!(ids, vec!["group"], "{ids:?}");
+    }
+
+    #[test]
+    fn relative_quality_favours_the_best_of_a_dull_chapter() {
+        let assets: Vec<Asset> = ["a1", "a2", "a3", "b1", "b2", "b3"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| asset(id, 100 + i as i64, AssetKind::Photo))
+            .collect();
+        let q = |id: &str| match id {
+            "a1" => 0.60,
+            "a2" => 0.62,
+            "a3" => 0.64, // best of a dull chapter
+            "b1" => 0.64,
+            "b2" => 0.68,
+            _ => 0.72,
+        };
+        let scores: HashMap<String, Score> = assets
+            .iter()
+            .map(|a| (a.id.clone(), with_bonus(q(&a.id), 0.0)))
+            .collect();
+        let ordered: Vec<&Asset> = assets.iter().collect();
+        let rel = relative_scores(&ordered, letter, &scores);
+        // Same absolute quality, but a3 tops its chapter while b1 is last in
+        // its own.
+        assert!(rel["a3"] > rel["b1"], "{rel:?}");
+        // Percentile never overturns a story bonus.
+        let mut with_people = scores.clone();
+        with_people.insert("a1".into(), with_bonus(0.60, 0.10));
+        let rel = relative_scores(&ordered, letter, &with_people);
+        assert!(rel["a1"] > rel["a3"], "{rel:?}");
+        // Tied qualities share one mid-rank.
+        let mut tied = scores.clone();
+        tied.insert("a2".into(), with_bonus(0.60, 0.0));
+        let rel = relative_scores(&ordered, letter, &tied);
+        assert_eq!(rel["a1"], rel["a2"], "{rel:?}");
+        assert!(rel["a3"] > rel["a1"], "{rel:?}");
+        // A lone asset sits mid-chapter and keeps its bonus.
+        let lone = vec![&assets[0]];
+        let rel = relative_scores(&lone, |_| "x", &scores);
+        assert!((rel["a1"] - 0.60).abs() < 0.1 * REL_QUALITY_WEIGHT + 1e-6);
+    }
+
+    #[test]
+    fn saturated_total_does_not_let_a_caption_lower_the_rank() {
+        // Equal technical quality; the caption pushes `total` past 1. Ranking
+        // must read the stored quality, not `total - bonus`.
+        let assets = [
+            asset("plain", 100, AssetKind::Photo),
+            asset("captioned", 101, AssetKind::Photo),
+        ];
+        let score = |total: f32, bonus: f32| Score {
+            total,
+            bonus,
+            quality: Some(0.70),
+            ..Default::default()
+        };
+        let scores = HashMap::from([
+            ("plain".to_string(), score(0.98, 0.28)),
+            ("captioned".to_string(), score(1.0, 0.38)),
+        ]);
+        let ordered: Vec<&Asset> = assets.iter().collect();
+        let rel = relative_scores(&ordered, |_| "x", &scores);
+        assert!(rel["captioned"] > rel["plain"], "{rel:?}");
+        // Older scores without `quality` fall back to `total - bonus`.
+        assert!((with_bonus(0.6, 0.1).tech_quality() - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn same_moment_needs_a_burst_or_close_time_with_similar_pixels() {
+        let shot = |id: &str, taken: i64, phash: Option<u64>| {
+            let mut a = asset(id, taken, AssetKind::Photo);
+            a.phash = phash;
+            a
+        };
+        let base = shot("a", 1_000, Some(0));
+        // A burst counts even without pixels.
+        assert!(same_moment(
+            &base,
+            &shot("b", 1_000 + SAME_MOMENT_BURST_SECS, None)
+        ));
+        let later = 1_000 + SAME_MOMENT_SECS;
+        assert!(same_moment(&base, &shot("c", later, Some(0))));
+        assert!(!same_moment(&base, &shot("d", later, Some(u64::MAX))));
+        assert!(!same_moment(&base, &shot("e", later, None)));
+        assert!(!same_moment(&base, &shot("f", later + 1, Some(0))));
+        let mut undated = shot("g", 1_000, Some(0));
+        undated.taken_at = None;
+        assert!(!same_moment(&base, &undated));
+    }
+
+    #[test]
+    fn near_identical_pair_in_a_chapter_is_not_used_twice_when_budget_is_tight() {
+        // Two takes of one clip's moment 10 s apart, plus an unrelated clip
+        // 40 min later, all in one chapter.
+        let clip = |id: &str, taken: i64, phash: u64| {
+            let mut a = asset(id, taken, AssetKind::Video);
+            a.duration_secs = Some(3.0);
+            a.phash = Some(phash);
+            a
+        };
+        let assets = vec![
+            clip("a1", 1_000, 0xF0F0_F0F0_F0F0_F0F0),
+            clip("a2", 1_010, 0xF0F0_F0F0_F0F0_F0F1),
+            clip("a3", 3_400, 0x0F0F_0F0F_0F0F_0F0F),
+        ];
+        let scores: HashMap<String, Score> = [("a1", 0.9), ("a2", 0.88), ("a3", 0.6)]
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    Score {
+                        total: *v,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let clusters = HashMap::new();
+        let ids = |secs| -> Vec<String> {
+            build_plan_with_length(&assets, &clusters, &scores, &[], FilmLength::Secs(secs))
+                .hero
+                .into_iter()
+                .map(|e| e.asset_id)
+                .collect()
+        };
+        // Title + two 3 s clips fits 7.5 s; three do not.
+        assert_eq!(ids(7.5), vec!["a1", "a3"]);
+        // Plenty of time: the twin is allowed back.
+        assert_eq!(ids(600.0), vec!["a1", "a2", "a3"]);
+    }
+
+    #[test]
+    fn explicit_length_is_a_minimum_and_auto_a_maximum() {
+        // 8 chapters of 30 stills, with a few clips mixed in.
+        let mut assets = vec![];
+        let mut clusters = HashMap::new();
+        for ch in 0..8 {
+            for i in 0..30 {
+                let id = format!("{}{i:02}", (b'a' + ch as u8) as char);
+                let kind = if i % 10 == 0 {
+                    AssetKind::Video
+                } else {
+                    AssetKind::Photo
+                };
+                let mut a = asset(&id, 1_714_557_600 + ch * 1800 + i as i64 * 30, kind);
+                if kind == AssetKind::Video {
+                    a.duration_secs = Some(5.0 + (i % 7) as f64);
+                }
+                clusters.insert(id, format!("day {ch}"));
+                assets.push(a);
+            }
+        }
+        for target in [120.0_f64, 240.0, 400.0] {
+            let plan = build_plan_with_length(
+                &assets,
+                &clusters,
+                &HashMap::new(),
+                &[],
+                FilmLength::Secs(target),
+            );
+            let secs = hero_secs(&plan, &clusters);
+            assert!(
+                (target..=target * (1.0 + LENGTH_OVERSHOOT)).contains(&secs),
+                "target {target}: estimated {secs:.1}"
+            );
+        }
+        let auto =
+            build_plan_with_length(&assets, &clusters, &HashMap::new(), &[], FilmLength::Auto);
+        let secs = hero_secs(&auto, &clusters);
+        let want = auto_film_secs(1);
+        assert!(secs <= want && secs > want * 0.9, "{secs} vs {want}");
+    }
+
+    #[test]
+    fn route_and_places_cards_shift_the_estimate() {
+        let e = [still_entry("a1")];
+        let bare = estimate_hero_secs(&e, letter, |_| None, NO_CARDS);
+        let full = estimate_hero_secs(
+            &e,
+            letter,
+            |_| None,
+            HeroCards {
+                route: true,
+                places: true,
+            },
+        );
+        // title 2.5 + still 4 - 0.7 vs + map 3 + closing map 4.5 + places 4.5.
+        assert!((bare - 5.8).abs() < 1e-9, "{bare}");
+        assert!((full - bare - 10.0).abs() < 1e-9, "{full}");
+        // No entries: nothing but the title, and no overlap to subtract.
+        assert_eq!(
+            estimate_hero_secs([], letter, |_| None, NO_CARDS),
+            EST_TITLE_SECS
+        );
     }
 }

@@ -64,6 +64,13 @@ pub fn blake3_files_parallel(
     results
 }
 
+/// Decode an image file for hashing and scoring; `None` when it cannot be
+/// decoded. Lets crates without their own `image` dependency (the app) read
+/// thumbnails.
+pub fn open_image(path: &Path) -> Option<image::DynamicImage> {
+    image::open(path).ok()
+}
+
 /// 64-bit average hash (aHash) of decoded image pixels.
 ///
 /// Decodes with the `image` crate, shrinks to 8x8 luma, and sets one bit

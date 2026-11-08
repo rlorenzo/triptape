@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS assets (
     rotation_deg INTEGER NOT NULL DEFAULT 0,
     pair_confidence TEXT,
     user_caption TEXT,
+    people_count INTEGER,
     thumb_path TEXT,
     proxy_path TEXT,
     score_json TEXT
@@ -168,6 +169,24 @@ pub struct EditedPlan {
     pub assets: Vec<Asset>,
 }
 
+/// Add `assets.<column>` with type `ddl` unless the table already has it
+/// (forward migration for DBs created before the column existed).
+fn add_column_if_missing(conn: &Connection, column: &str, ddl: &str) -> Result<(), String> {
+    let present = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name=?1",
+            [column],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())?
+        > 0;
+    if !present {
+        conn.execute(&format!("ALTER TABLE assets ADD COLUMN {column} {ddl}"), [])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 impl Db {
     /// Open (creating parent dirs) and apply the schema.
     pub fn open(path: &Path) -> Result<Self, String> {
@@ -186,32 +205,11 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-        // Migration for DBs created before capture timezones were stored.
-        let has_tz_offset = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='tz_offset'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(|e| e.to_string())?
-            > 0;
-        if !has_tz_offset {
-            conn.execute("ALTER TABLE assets ADD COLUMN tz_offset INTEGER", [])
-                .map_err(|e| e.to_string())?;
-        }
-        // Migration for DBs created before embedded user captions were read.
-        let has_caption = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='user_caption'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(|e| e.to_string())?
-            > 0;
-        if !has_caption {
-            conn.execute("ALTER TABLE assets ADD COLUMN user_caption TEXT", [])
-                .map_err(|e| e.to_string())?;
-        }
+        // Migrations for DBs created before capture timezones, embedded
+        // user captions and people counts were stored.
+        add_column_if_missing(&conn, "tz_offset", "INTEGER")?;
+        add_column_if_missing(&conn, "user_caption", "TEXT")?;
+        add_column_if_missing(&conn, "people_count", "INTEGER")?;
         Ok(Self { conn })
     }
 
@@ -290,9 +288,9 @@ impl Db {
         };
         let score_json = a.score.as_ref().and_then(|s| serde_json::to_string(s).ok());
         self.conn.prepare_cached(
-            "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,score_json)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,path=excluded.path,companion_path=excluded.companion_path,kind=excluded.kind,size_bytes=excluded.size_bytes,mtime=excluded.mtime,content_hash=excluded.content_hash,phash=excluded.phash,width=excluded.width,height=excluded.height,duration_secs=excluded.duration_secs,taken_at=excluded.taken_at,tz_offset=excluded.tz_offset,time_guessed=excluded.time_guessed,lat=excluded.lat,lon=excluded.lon,rotation_deg=excluded.rotation_deg,pair_confidence=excluded.pair_confidence,user_caption=excluded.user_caption,score_json=excluded.score_json",
+            "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,people_count,score_json)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,path=excluded.path,companion_path=excluded.companion_path,kind=excluded.kind,size_bytes=excluded.size_bytes,mtime=excluded.mtime,content_hash=excluded.content_hash,phash=excluded.phash,width=excluded.width,height=excluded.height,duration_secs=excluded.duration_secs,taken_at=excluded.taken_at,tz_offset=excluded.tz_offset,time_guessed=excluded.time_guessed,lat=excluded.lat,lon=excluded.lon,rotation_deg=excluded.rotation_deg,pair_confidence=excluded.pair_confidence,user_caption=excluded.user_caption,people_count=excluded.people_count,score_json=excluded.score_json",
         ).and_then(|mut st| st.execute(params![
                 a.id, project_id,
                 a.path.to_string_lossy().to_string(),
@@ -302,7 +300,7 @@ impl Db {
                 a.width.map(|w| w as i64), a.height.map(|h| h as i64),
                 a.duration_secs, a.taken_at, a.tz_offset_secs, i64::from(a.time_guessed),
                 a.gps.map(|g| g.0), a.gps.map(|g| g.1),
-                a.rotation_deg as i64, conf, a.user_caption, score_json,
+                a.rotation_deg as i64, conf, a.user_caption, a.people_count.map(i64::from), score_json,
             ]),
         ).map_err(|e| e.to_string())?;
         Ok(())
@@ -319,14 +317,20 @@ impl Db {
         Ok(())
     }
 
-    /// Record one asset's score without touching the rest of the row.
-    /// The ingest background task flushes these in batches after decoding
-    /// and thumbnail work that must never hold the Db lock.
-    pub fn update_asset_score(&self, asset_id: &str, score: &Score) -> Result<(), String> {
+    /// Record one asset's score and perceptual hash without touching the
+    /// rest of the row. A `None` hash keeps any hash already stored.
+    pub fn update_asset_scoring(
+        &self,
+        asset_id: &str,
+        score: &Score,
+        phash: Option<u64>,
+    ) -> Result<(), String> {
         let json = serde_json::to_string(score).map_err(|e| e.to_string())?;
         self.conn
-            .prepare_cached("UPDATE assets SET score_json=?1 WHERE id=?2")
-            .and_then(|mut st| st.execute(params![json, asset_id]))
+            .prepare_cached(
+                "UPDATE assets SET score_json=?1, phash=COALESCE(?2, phash) WHERE id=?3",
+            )
+            .and_then(|mut st| st.execute(params![json, phash.map(|h| h as i64), asset_id]))
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -356,7 +360,7 @@ impl Db {
         let mut st = self
             .conn
             .prepare(
-                "SELECT id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,score_json FROM assets WHERE project_id=?1 ORDER BY taken_at NULLS LAST, id",
+                "SELECT id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,score_json,people_count FROM assets WHERE project_id=?1 ORDER BY taken_at NULLS LAST, id",
             )
             .map_err(|e| e.to_string())?;
         let rows = st
@@ -395,6 +399,7 @@ impl Db {
                         _ => None,
                     },
                     user_caption: r.get(18)?,
+                    people_count: r.get::<_, Option<i64>>(20)?.map(|n| n as u32),
                     score,
                 })
             })
@@ -811,6 +816,44 @@ mod tests {
     }
 
     #[test]
+    fn init_adds_people_count_to_older_databases_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        let old_schema = SCHEMA.replace("    people_count INTEGER,\n", "");
+        assert_ne!(old_schema, SCHEMA);
+        conn.execute_batch(&old_schema).unwrap();
+        let db = Db::init(conn).unwrap();
+        let db = Db::init(db.conn).unwrap();
+        let p = db.create_project("trip", "/tmp/trip").unwrap();
+        let mut a = asset("a1");
+        a.people_count = Some(4);
+        db.upsert_asset(&p.id, &a).unwrap();
+        db.upsert_asset(&p.id, &asset("a2")).unwrap();
+        let got = db.list_assets(&p.id).unwrap();
+        assert_eq!(got[0].people_count, Some(4));
+        assert_eq!(got[1].people_count, None);
+    }
+
+    #[test]
+    fn update_asset_scoring_sets_phash_and_keeps_it_when_none() {
+        let db = mem();
+        let p = db.create_project("trip", "/tmp/trip").unwrap();
+        let mut a = asset("a1");
+        a.phash = None;
+        db.upsert_asset(&p.id, &a).unwrap();
+        let s = Score {
+            total: 0.7,
+            ..Default::default()
+        };
+        db.update_asset_scoring("a1", &s, Some(u64::MAX - 5))
+            .unwrap();
+        assert_eq!(db.list_assets(&p.id).unwrap()[0].phash, Some(u64::MAX - 5));
+        db.update_asset_scoring("a1", &s, None).unwrap();
+        let got = db.list_assets(&p.id).unwrap();
+        assert_eq!(got[0].phash, Some(u64::MAX - 5));
+        assert!((got[0].score.as_ref().unwrap().total - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
     fn init_adds_tz_offset_to_older_databases_once() {
         let conn = Connection::open_in_memory().unwrap();
         let old_schema = SCHEMA.replace("    tz_offset INTEGER,\n", "");
@@ -860,6 +903,7 @@ mod tests {
             highlight: true,
             reasons: vec!["clean exposure, good detail".into()],
             clip_window: Some((4.5, 10.5)),
+            ..Default::default()
         });
         db.upsert_asset(&p.id, &a).unwrap();
         let got = db.list_assets(&p.id).unwrap();
@@ -884,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn update_asset_score_changes_only_the_score() {
+    fn update_asset_scoring_changes_only_the_score() {
         let db = mem();
         let p = db.create_project("trip", "/tmp/trip").unwrap();
         db.upsert_asset(&p.id, &asset("a1")).unwrap();
@@ -892,7 +936,7 @@ mod tests {
             total: 0.4,
             ..Default::default()
         };
-        db.update_asset_score("a1", &first).unwrap();
+        db.update_asset_scoring("a1", &first, None).unwrap();
         let after_first = db.list_assets(&p.id).unwrap();
         assert!((after_first[0].score.as_ref().unwrap().total - 0.4).abs() < 1e-6);
         // Every other column survives the column-only write.
@@ -904,7 +948,7 @@ mod tests {
             highlight: true,
             ..Default::default()
         };
-        db.update_asset_score("a1", &second).unwrap();
+        db.update_asset_scoring("a1", &second, None).unwrap();
         let after_second = db.list_assets(&p.id).unwrap();
         assert_eq!(after_second.len(), 1);
         assert!((after_second[0].score.as_ref().unwrap().total - 0.9).abs() < 1e-6);

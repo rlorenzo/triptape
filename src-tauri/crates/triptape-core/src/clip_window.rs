@@ -205,6 +205,21 @@ pub fn pick_window(scores: &[f32], duration: f64) -> Option<(f64, f64)> {
     Some((start, start + len))
 }
 
+/// Mean per-sample score over the part of the clip that will play: the
+/// samples overlapping `window`, or every sample when the clip plays whole.
+/// This is the clip's quality for story scoring. `None` without samples.
+pub fn window_quality(scores: &[f32], window: Option<(f64, f64)>) -> Option<f32> {
+    let span = match window {
+        Some((start, end)) => {
+            let from = (start / SAMPLE_SECS).floor().max(0.0) as usize;
+            let to = ((end / SAMPLE_SECS).ceil() as usize).min(scores.len());
+            scores.get(from..to)?
+        }
+        None => scores,
+    };
+    (!span.is_empty()).then(|| span.iter().sum::<f32>() / span.len() as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +351,19 @@ mod tests {
             r.sharpness = 0.5;
         }
         assert_eq!(pick_window(&score_samples(&raw), 20.0), Some((10.0, 16.0)));
+    }
+
+    #[test]
+    fn window_quality_is_the_mean_of_the_played_samples() {
+        let scores = [0.1, 0.1, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.1, 0.1];
+        let q = window_quality(&scores, Some((2.0, 8.0))).unwrap();
+        assert!((q - 0.9).abs() < 1e-6);
+        // Plays whole: every sample counts.
+        let whole = window_quality(&scores, None).unwrap();
+        assert!((whole - 0.58).abs() < 1e-6, "{whole}");
+        // A window running past the samples is clipped, not an error.
+        assert!(window_quality(&scores, Some((8.0, 14.0))).is_some());
+        assert_eq!(window_quality(&scores, Some((20.0, 26.0))), None);
+        assert_eq!(window_quality(&[], None), None);
     }
 }
