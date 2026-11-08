@@ -310,7 +310,11 @@ pub fn score_still_image(img: &image::DynamicImage, signals: &StorySignals) -> O
     let gray = img.to_luma8();
     let stats = frame_stats(gray.as_raw(), gray.width(), gray.height())?;
     let mut base = score_still(&stats);
-    base.colourfulness = colourfulness(img.to_rgb8().as_raw());
+    // Borrow the pixels when already RGB8 rather than copying the frame.
+    base.colourfulness = match img.as_rgb8() {
+        Some(rgb) => colourfulness(rgb.as_raw()),
+        None => colourfulness(img.to_rgb8().as_raw()),
+    };
     Some(highlight_score(&base, signals, false))
 }
 
@@ -364,14 +368,26 @@ mod tests {
 
     #[test]
     fn still_image_records_colourfulness() {
-        let grey = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 8, image::Rgb([90; 3])));
-        let red = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 8, image::Rgb([220, 30, 30])));
+        let grey =
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 8, image::Rgb([90; 3])));
+        let red = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            8,
+            8,
+            image::Rgb([220, 30, 30]),
+        ));
         let sig = StorySignals::default();
         let g = score_still_image(&grey, &sig).unwrap();
         let r = score_still_image(&red, &sig).unwrap();
         assert!(g.colourfulness.unwrap() < 1e-3);
         assert!(r.colourfulness.unwrap() > 50.0);
-        assert!((g.total - r.total).abs() < 1e-6, "colour must not change the absolute total");
+        assert!(
+            (g.total - r.total).abs() < 1e-6,
+            "colour must not change the absolute total"
+        );
+        // Non-RGB8 frames are converted first and score the same.
+        let rgba = image::DynamicImage::ImageRgba8(red.to_rgba8());
+        let a = score_still_image(&rgba, &sig).unwrap();
+        assert_eq!(a.colourfulness, r.colourfulness);
     }
 
     #[test]
