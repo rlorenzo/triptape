@@ -1056,8 +1056,11 @@ fn apply_lower_third(
     res: Resolution,
 ) -> Result<(), crate::MediaError> {
     let graph = lower_third_graph(seg_dur, res);
-    burn_png_overlay(caps, seg, png, &graph, 16)
+    burn_png_overlay(caps, seg, png, &graph, LOWER_THIRD_CRF)
 }
+
+/// Quality of the re-encode that bakes a lower third into its segment.
+const LOWER_THIRD_CRF: u32 = 16;
 
 fn lower_third_graph(seg_dur: f64, res: Resolution) -> String {
     let k = res.scale();
@@ -1121,9 +1124,9 @@ fn overlay_key(
         .part("typst", &opts.typst_bin)
         .args(&overlay_args(
             Path::new(KEY_IN),
-            Path::new("<PNG>"),
+            Path::new(KEY_PNG),
             &lower_third_graph(seg_dur, opts.resolution),
-            16,
+            LOWER_THIRD_CRF,
         ));
     k.finish()
 }
@@ -2093,6 +2096,8 @@ fn hold_args(
 /// arguments are hashed into its key: the recipe, not where it runs.
 const KEY_IN: &str = "<IN>";
 const KEY_OUT: &str = "<OUT>";
+/// Stand-in for the per-segment overlay PNG, whose name carries its index.
+const KEY_PNG: &str = "<PNG>";
 
 /// Cache key of a still entry, before anything is decoded. The source's
 /// identity stands in for its pixels (and so for the aspect that picks hold
