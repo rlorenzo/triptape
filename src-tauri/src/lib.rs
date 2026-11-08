@@ -315,8 +315,8 @@ pub struct ExportSummary {
 // ---------------------------------------------------------------------------
 
 /// Foreground metadata fill for desktop ingest (the Tauri shell's
-/// `scan_folder`): EXIF capture time / TZ / GPS / rotation / dims / caption
-/// for photos, ffprobe duration / dims / rotation / GPS / capture time for
+/// `scan_folder`): EXIF capture time / TZ / GPS / rotation / dims / caption /
+/// people count for photos, ffprobe duration / dims / rotation / GPS / capture time for
 /// videos. Mirrors the CLI mapping in `triptape-media`'s `triptape` binary
 /// minus pixel-decode work (no phash, no decoded-image dimensions): EXIF
 /// reads are header-only and each video costs one ffprobe spawn.
@@ -326,6 +326,7 @@ pub struct ExportSummary {
 pub fn fill_foreground_metadata(a: &mut Asset) {
     if a.kind == AssetKind::Video {
         let probe = metadata::probe_video("ffprobe", &a.path).ok();
+        (a.user_caption, a.people_count) = metadata::story_fields(&a.path, None);
         let Some(p) = probe else {
             a.taken_at = Some(a.mtime);
             a.time_guessed = true;
@@ -347,10 +348,7 @@ pub fn fill_foreground_metadata(a: &mut Asset) {
         a.taken_at = Some(ct.unix_secs);
         a.time_guessed = ct.time_guessed;
         a.tz_offset_secs = exif.tz_offset_secs;
-        a.user_caption = exif
-            .caption
-            .clone()
-            .or_else(|| metadata::read_sidecar_caption(&a.path));
+        (a.user_caption, a.people_count) = metadata::story_fields(&a.path, Some(&exif));
         a.gps = exif.gps;
         a.rotation_deg = exif
             .orientation

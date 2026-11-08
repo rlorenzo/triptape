@@ -191,28 +191,37 @@ fn scan_cmd(flags: &HashMap<String, String>) {
                 a.duration_secs = p.duration_secs();
             }
         }
-        scores.insert(
-            a.id.clone(),
-            score_asset(&a, img.as_ref(), &cache, &ffmpeg, &mut thumbs),
-        );
+        // Every asset gets a perceptual hash from the pixels the scan
+        // already has (decoded photo) or the thumbnail/poster it makes
+        // (HEIC, Live Photos, videos), so near-dupes collapse everywhere.
+        let (score, phash) = score_asset(&a, img.as_ref(), &cache, &ffmpeg, &mut thumbs);
+        a.phash = a.phash.or(phash);
+        scores.insert(a.id.clone(), score);
         final_assets.push(a);
     }
 
     // Best playback window per video, analysed in parallel (ffmpeg-bound).
-    let videos: Vec<(String, PathBuf, f64)> = final_assets
+    // The clip's score follows the quality of the window that will play.
+    let videos: Vec<(String, PathBuf, f64, score::StorySignals)> = final_assets
         .iter()
         .filter(|a| a.kind == AssetKind::Video)
-        .filter_map(|a| Some((a.id.clone(), a.path.clone(), a.duration_secs?)))
+        .filter_map(|a| {
+            Some((
+                a.id.clone(),
+                a.path.clone(),
+                a.duration_secs?,
+                score::StorySignals::for_asset(a),
+            ))
+        })
         .collect();
     let workers = std::thread::available_parallelism().map_or(2, |n| n.get().min(4));
     triptape_core::parallel::for_each_parallel(
         &videos,
         workers,
-        |(_, path, dur)| clip_analysis::best_clip_window(&ffmpeg, &ffprobe, path, *dur),
-        |idx, window, _, _| {
-            if let Some(s) = scores.get_mut(&videos[idx].0) {
-                s.clip_window = window;
-            }
+        |(_, path, dur, _)| clip_analysis::analyze_clip(&ffmpeg, &ffprobe, path, *dur),
+        |idx, analysis, _, _| {
+            let (id, _, _, signals) = &videos[idx];
+            scores.insert(id.clone(), analysis.score(signals));
         },
     );
 
@@ -231,11 +240,7 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     let groups = cluster::collapse_near_dupes(&final_assets, &scores);
     let best: HashSet<String> = groups.iter().map(|g| g.best_id.clone()).collect();
     // Non-best near-dupe members stay in the DB but are kept out of the plan.
-    let suppressed: HashSet<&str> = groups
-        .iter()
-        .flat_map(|g| g.members.iter().filter(|m| **m != g.best_id))
-        .map(String::as_str)
-        .collect();
+    let suppressed = cluster::suppressed_ids(&groups);
 
     // Store scores (including clip windows) on the asset rows so later
     // `Db::edited_plan` reloads see the same windows as this initial plan.
@@ -294,7 +299,7 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         .collect();
     let plan_assets: Vec<Asset> = final_assets
         .iter()
-        .filter(|a| !suppressed.contains(a.id.as_str()))
+        .filter(|a| !suppressed.contains(&a.id))
         .cloned()
         .collect();
     // Optional user place labels for GPS-unnamed days (e.g. a ship name
@@ -375,6 +380,7 @@ fn fill_video(a: &mut Asset, probe: Option<&metadata::FfprobeOutput>) {
     let Some(p) = probe else {
         a.taken_at = Some(a.mtime);
         a.time_guessed = true;
+        (a.user_caption, a.people_count) = metadata::story_fields(&a.path, None);
         return;
     };
     a.duration_secs = p.duration_secs();
@@ -387,6 +393,7 @@ fn fill_video(a: &mut Asset, probe: Option<&metadata::FfprobeOutput>) {
     let ct = metadata::resolve_capture_time(p.creation_time(), a.mtime);
     a.taken_at = Some(ct.unix_secs);
     a.time_guessed = ct.time_guessed;
+    (a.user_caption, a.people_count) = metadata::story_fields(&a.path, None);
 }
 
 /// Fill photo metadata from EXIF; dimensions + pHash from the decoded
@@ -397,10 +404,7 @@ fn fill_photo(a: &mut Asset, img: Option<&image::DynamicImage>) {
     a.taken_at = Some(ct.unix_secs);
     a.time_guessed = ct.time_guessed;
     a.tz_offset_secs = exif.tz_offset_secs;
-    a.user_caption = exif
-        .caption
-        .clone()
-        .or_else(|| metadata::read_sidecar_caption(&a.path));
+    (a.user_caption, a.people_count) = metadata::story_fields(&a.path, Some(&exif));
     a.gps = exif.gps;
     a.rotation_deg = exif
         .orientation
@@ -417,29 +421,20 @@ fn fill_photo(a: &mut Asset, img: Option<&image::DynamicImage>) {
     }
 }
 
-/// Score one asset. Stills score on `img` (already decoded) or, failing
-/// that, a cached FFmpeg thumbnail (counted in `thumbs`); video uses a
-/// duration + GPS-novelty proxy.
+/// Score one asset and fingerprint it. Stills score on `img` (already
+/// decoded) or, failing that, a cached FFmpeg thumbnail (counted in
+/// `thumbs`); videos get a poster-frame thumbnail the same way and a
+/// provisional score (their real one follows clip analysis). The returned
+/// pHash comes from the pixels used for scoring, so HEIC stills, Live
+/// Photos and videos get one too; `None` when nothing could be decoded.
 fn score_asset(
     a: &Asset,
     img: Option<&image::DynamicImage>,
     cache: &Path,
     ffmpeg: &str,
     thumbs: &mut usize,
-) -> Score {
-    if a.kind == AssetKind::Video {
-        let sig = score::StorySignals {
-            gps_novelty: if a.gps.is_some() { 0.6 } else { 0.0 },
-            ..Default::default()
-        };
-        let base = Score {
-            total: 0.55,
-            sharpness: 0.5,
-            exposure: 0.6,
-            ..Default::default()
-        };
-        return score::highlight_score(&base, &sig, false);
-    }
+) -> (Score, Option<u64>) {
+    let signals = score::StorySignals::for_asset(a);
     let mut thumb = || {
         let h = a.content_hash.as_deref()?;
         let dst = proxies::cache_path(cache, "thumb", h, ".jpg");
@@ -447,19 +442,19 @@ fn score_asset(
         *thumbs += 1;
         image::open(&dst).ok()
     };
-    let gray = match img {
-        Some(img) => Some(img.to_luma8()),
-        None => thumb().map(|t| t.to_luma8()),
+    let owned;
+    let pixels = match img {
+        Some(img) => Some(img),
+        None => {
+            owned = thumb();
+            owned.as_ref()
+        }
     };
-    gray.and_then(|g| score::frame_stats(g.as_raw(), g.width(), g.height()))
-        .map(|stats| {
-            let base = score::score_still(&stats);
-            score::highlight_score(&base, &score::StorySignals::default(), false)
-        })
-        .unwrap_or_else(|| Score {
-            total: 0.5,
-            ..Default::default()
-        })
+    let phash = pixels.map(hash::average_hash_from_image);
+    if a.kind == AssetKind::Video {
+        return (score::score_video(None, &signals), phash);
+    }
+    (score::score_still_or_fallback(pixels, &signals), phash)
 }
 
 fn plan_cmd(flags: &HashMap<String, String>) {

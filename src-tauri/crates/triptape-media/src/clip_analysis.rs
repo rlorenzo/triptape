@@ -9,8 +9,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use triptape_core::clip_window::{
     audio_rms_buckets, laplacian_variance, mean_abs_diff, mean_luma, pick_window, score_samples,
-    wants_window, RawSample, SAMPLE_SECS,
+    window_quality, RawSample, MIN_ANALYZED_SECS, SAMPLE_SECS,
 };
+use triptape_core::score;
 
 /// Analysis frame width in pixels.
 const FRAME_W: usize = 160;
@@ -114,20 +115,49 @@ fn measure(ffmpeg_bin: &str, audio_map: Option<&str>, path: &Path) -> Option<Vec
     )
 }
 
-/// Best `(start, end)` playback window of a video clip, in seconds. `None`
-/// when the clip is short enough to play whole or analysis failed.
-pub fn best_clip_window(
+/// What ingest learns about a video clip.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ClipAnalysis {
+    /// Best `(start, end)` playback window in seconds; `None` when the clip
+    /// plays whole.
+    pub window: Option<(f64, f64)>,
+    /// Mean sample score (0..1) over the part that will play; `None` when
+    /// the clip was too short to analyse or analysis failed.
+    pub quality: Option<f32>,
+}
+
+impl ClipAnalysis {
+    /// The clip's score: [`score::score_video`] on the window quality,
+    /// carrying the playback window it was measured over.
+    pub fn score(&self, signals: &score::StorySignals) -> triptape_core::types::Score {
+        let mut s = score::score_video(self.quality, signals);
+        s.clip_window = self.window;
+        s
+    }
+}
+
+/// Analyse a clip once: best playback window plus the quality of what plays.
+/// Clips at or under [`MIN_ANALYZED_SECS`] are not decoded and yield the
+/// default (no window, no quality).
+pub fn analyze_clip(
     ffmpeg_bin: &str,
     ffprobe_bin: &str,
     path: &Path,
     duration_secs: f64,
-) -> Option<(f64, f64)> {
-    if !wants_window(duration_secs) {
-        return None;
+) -> ClipAnalysis {
+    if !duration_secs.is_finite() || duration_secs <= MIN_ANALYZED_SECS {
+        return ClipAnalysis::default();
     }
     let audio = crate::ffmpeg::audio_map(ffprobe_bin, path);
-    let raw = measure(ffmpeg_bin, audio.as_deref(), path)?;
-    pick_window(&score_samples(&raw), duration_secs)
+    let Some(raw) = measure(ffmpeg_bin, audio.as_deref(), path) else {
+        return ClipAnalysis::default();
+    };
+    let scores = score_samples(&raw);
+    let window = pick_window(&scores, duration_secs);
+    ClipAnalysis {
+        window,
+        quality: window_quality(&scores, window),
+    }
 }
 
 #[cfg(test)]
@@ -135,19 +165,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_ffmpeg_or_file_yields_no_window() {
+    fn unanalysable_clips_report_no_window_and_no_quality() {
         let p = Path::new("/nonexistent/clip.mov");
         assert_eq!(
-            best_clip_window("ffmpeg-does-not-exist", "ffprobe", p, 30.0),
-            None
+            analyze_clip("ffmpeg-does-not-exist", "ffprobe", p, 30.0),
+            ClipAnalysis::default()
         );
-        assert_eq!(best_clip_window("ffmpeg", "ffprobe", p, 30.0), None);
+        assert_eq!(
+            analyze_clip("ffmpeg", "ffprobe", p, 30.0),
+            ClipAnalysis::default()
+        );
+        assert_eq!(
+            analyze_clip("ffmpeg", "ffprobe", p, 1.5),
+            ClipAnalysis::default()
+        );
+        assert_eq!(
+            analyze_clip("ffmpeg", "ffprobe", p, f64::NAN),
+            ClipAnalysis::default()
+        );
     }
 
     #[test]
-    fn short_clips_skip_analysis() {
-        let p = Path::new("/nonexistent/clip.mov");
-        assert_eq!(best_clip_window("ffmpeg", "ffprobe", p, 1.5), None);
-        assert_eq!(best_clip_window("ffmpeg", "ffprobe", p, f64::NAN), None);
+    fn score_carries_window_and_quality() {
+        let analysis = ClipAnalysis {
+            window: Some((2.0, 6.0)),
+            quality: Some(0.8),
+        };
+        let signals = score::StorySignals::default();
+        let s = analysis.score(&signals);
+        assert_eq!(s.clip_window, Some((2.0, 6.0)));
+        assert_eq!(s.total, score::score_video(Some(0.8), &signals).total);
     }
 }
