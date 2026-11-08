@@ -1316,6 +1316,160 @@ mod tests {
         }
     }
 
+    /// The plan's film-length estimate must track what the renderer builds:
+    /// replay the renderer's own grouping, card durations and transition
+    /// assignment over synthetic films and compare totals.
+    #[test]
+    fn plan_estimate_tracks_renderer_timeline() {
+        use triptape_core::plan::{estimate_hero_secs, HeroCards};
+
+        let opts = VideoOptions::default();
+        // Deterministic pseudo-random films: (chapter, rendition) per entry.
+        let mut seed = 12_345u64;
+        let mut next = move |n: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) % n
+        };
+        for film in 0..12 {
+            let chapters = 3 + film * 2;
+            let mut entries: Vec<PlanEntry> = vec![];
+            for ch in 0..chapters {
+                for k in 0..(1 + next(6) as usize) {
+                    let still = next(5) < 3;
+                    let id = format!("c{ch:02}e{k}");
+                    let secs = 1.0 + next(8) as f64;
+                    entries.push(PlanEntry {
+                        asset_id: id,
+                        content_hash: None,
+                        size_bytes: 0,
+                        mtime: 0,
+                        rendition: if still {
+                            Rendition::Still
+                        } else {
+                            Rendition::Clip {
+                                trim_start: 0.0,
+                                trim_end: secs,
+                            }
+                        },
+                    });
+                }
+            }
+            let chapter_of = |id: &str| id[..3].to_string();
+            for cards in [
+                HeroCards {
+                    route: true,
+                    places: true,
+                },
+                HeroCards {
+                    route: false,
+                    places: false,
+                },
+                HeroCards {
+                    route: true,
+                    places: false,
+                },
+            ] {
+                // -- renderer replay: groups of consecutive same-chapter stills.
+                let mut groups: Vec<Vec<&PlanEntry>> = vec![];
+                for e in &entries {
+                    let is_still = |e: &PlanEntry| matches!(e.rendition, Rendition::Still);
+                    match groups.last_mut() {
+                        Some(g)
+                            if g.len() < MAX_COLLAGE
+                                && is_still(e)
+                                && is_still(g[0])
+                                && chapter_of(&g[0].asset_id) == chapter_of(&e.asset_id) =>
+                        {
+                            g.push(e)
+                        }
+                        _ => groups.push(vec![e]),
+                    }
+                }
+                // (asset id, duration, kind) as in the renderer's `segs`.
+                let mut segs: Vec<(String, f64, &str)> =
+                    vec![("title".into(), opts.title_secs, "title")];
+                if cards.route {
+                    segs.push(("map".into(), opts.map_secs, "map"));
+                }
+                for g in &groups {
+                    let e = g[0];
+                    let (dur, kind) = match &e.rendition {
+                        Rendition::Still if g.len() > 1 => (opts.still_secs * 1.5, "still"),
+                        Rendition::Still => (opts.still_secs, "still"),
+                        Rendition::Motion {
+                            trim_start,
+                            trim_end,
+                        }
+                        | Rendition::Clip {
+                            trim_start,
+                            trim_end,
+                        } => (
+                            (trim_end - trim_start)
+                                .clamp(0.5, MAX_CLIP_SECS)
+                                .max(MIN_SEGMENT_SECS),
+                            "clip",
+                        ),
+                    };
+                    segs.push((e.asset_id.clone(), dur, kind));
+                }
+                if cards.route {
+                    segs.push((
+                        "closing".into(),
+                        opts.map_secs + CLOSING_MAP_EXTRA_SECS,
+                        "still",
+                    ));
+                }
+                if cards.places {
+                    segs.push(("credits".into(), CREDITS_SECS, "still"));
+                }
+                let mut chapter_break = vec![false; segs.len()];
+                for i in 1..segs.len() {
+                    let (a, b) = (&segs[i - 1].0, &segs[i].0);
+                    let cut_card = |s: &str| is_card(s) && s != "title";
+                    chapter_break[i] = cut_card(a)
+                        || cut_card(b)
+                        || (a != "title" && chapter_of(a) != chapter_of(b));
+                }
+                let kinds: Vec<SegKind> = segs
+                    .iter()
+                    .map(|s| match s.2 {
+                        "title" => SegKind::Title,
+                        "map" => SegKind::Map,
+                        "clip" => SegKind::Clip,
+                        _ => SegKind::Still,
+                    })
+                    .collect();
+                let transitions = assign_transitions(segs.len(), &chapter_break, &kinds);
+                let overlaps: f64 = transitions
+                    .iter()
+                    .skip(1)
+                    .map(|t| transition_overlap(&t.unwrap_or(Transition::Fade)))
+                    .sum();
+                let actual = segs.iter().map(|s| s.1).sum::<f64>() - overlaps;
+
+                let est = estimate_hero_secs(
+                    &entries,
+                    |id| CHAPTER_LABELS[id[1..3].parse::<usize>().unwrap()],
+                    cards,
+                );
+                let err = (est - actual).abs() / actual;
+                assert!(
+                    err < 0.015,
+                    "film {film} {cards:?}: estimate {est:.1} vs renderer {actual:.1} ({:.2}%)",
+                    err * 100.0
+                );
+            }
+        }
+    }
+
+    /// Static chapter names for the estimator test (`c00`..`c40`).
+    const CHAPTER_LABELS: [&str; 41] = [
+        "c00", "c01", "c02", "c03", "c04", "c05", "c06", "c07", "c08", "c09", "c10", "c11", "c12",
+        "c13", "c14", "c15", "c16", "c17", "c18", "c19", "c20", "c21", "c22", "c23", "c24", "c25",
+        "c26", "c27", "c28", "c29", "c30", "c31", "c32", "c33", "c34", "c35", "c36", "c37", "c38",
+        "c39", "c40",
+    ];
+
     #[test]
     fn offsets_account_for_overlap() {
         // 3 x 4 s segments, 0.6 overlap: cuts at 3.4 and 6.8; total 10.8.
