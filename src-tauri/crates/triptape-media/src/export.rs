@@ -68,6 +68,7 @@ fn resolve_entry(
         caption: plan.captions.get(asset_id).cloned(),
         taken_at: a.taken_at,
         tz_offset_secs: a.tz_offset_secs,
+        aspect: a.display_aspect(),
     })
 }
 
@@ -499,6 +500,7 @@ mod tests {
             caption: None,
             taken_at: None,
             tz_offset_secs: None,
+            aspect: None,
         };
         // Both selected stills are reserved up front, as export_all does.
         let mut used: HashSet<PathBuf> = [&by_id["p1"].path, &by_id["p3"].path]

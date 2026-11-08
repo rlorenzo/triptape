@@ -44,6 +44,22 @@ pub const MAX_FILM_SECS: f64 = 3600.0;
 
 /// Most stills shown together in one hero collage segment.
 pub const MAX_COLLAGE: usize = 4;
+/// Photos at least this wide (or this tall, inverted) pan instead of
+/// sitting as a thin strip: width/height >= 2 or <= 1/2.
+pub const PANO_MIN_ASPECT: f64 = 2.0;
+/// Pan hold bounds, seconds. Base hold grows with elongation
+/// (`PANO_BASE_SECS + PANO_SECS_PER_ASPECT * e`) within the first two.
+pub const PANO_MIN_SECS: f64 = 6.0;
+pub const PANO_MAX_SECS: f64 = 8.0;
+const PANO_BASE_SECS: f64 = 4.5;
+const PANO_SECS_PER_ASPECT: f64 = 0.8;
+/// Fastest allowed pan, in frame-widths per second. Very wide images
+/// first hold longer (up to [`PANO_LONG_SECS`]), then pan less of their
+/// width rather than whip across it.
+pub const PANO_MAX_SPEED: f64 = 0.3;
+pub const PANO_LONG_SECS: f64 = 12.0;
+/// Output frame aspect the pan is measured against.
+const FRAME_ASPECT: f64 = 16.0 / 9.0;
 /// Minimum on-screen time for a hero segment; shorter clips are
 /// freeze-padded up to it.
 pub const MIN_SEGMENT_SECS: f64 = 2.5;
@@ -56,12 +72,54 @@ pub const MAX_CLIP_SECS: f64 = 30.0;
 // can fill a time budget. Keep in sync.
 /// Solo still hold.
 const EST_STILL_SECS: f64 = 4.0;
-/// Collage hold (renderer: `still_secs * 1.5`).
-const EST_COLLAGE_SECS: f64 = 6.0;
 /// Average transition overlap per cut.
 const EST_CUT_OVERLAP_SECS: f64 = 0.55;
 /// Title, opening map, closing map and places card.
 const EST_FIXED_SECS: f64 = 2.5 + 3.0 + 4.5 + 4.5;
+
+/// Whether a display aspect (width / height) is a panorama: >= 2:1, or
+/// a tall one <= 1:2.
+pub fn is_panorama(aspect: f64) -> bool {
+    aspect.is_finite()
+        && aspect > 0.0
+        && (aspect >= PANO_MIN_ASPECT || aspect <= 1.0 / PANO_MIN_ASPECT)
+}
+
+/// How a panorama pans. `hold_secs` is the segment length; `coverage` is
+/// the fraction (0..=1] of the image's overflow beyond the frame that the
+/// pan travels (less than 1 only for extremely long images, centered).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PanoMotion {
+    pub hold_secs: f64,
+    pub coverage: f64,
+}
+
+/// Hold length and travel for a panorama of this display aspect.
+pub fn pano_motion(aspect: f64) -> PanoMotion {
+    let elongation = if aspect >= 1.0 { aspect } else { 1.0 / aspect };
+    // Frame-widths (or heights) of image beyond the frame.
+    let overflow = (elongation / FRAME_ASPECT - 1.0).max(0.0);
+    let mut hold =
+        (PANO_BASE_SECS + PANO_SECS_PER_ASPECT * elongation).clamp(PANO_MIN_SECS, PANO_MAX_SECS);
+    if overflow / hold > PANO_MAX_SPEED {
+        hold = (overflow / PANO_MAX_SPEED).min(PANO_LONG_SECS);
+    }
+    let coverage = if overflow > 0.0 {
+        (PANO_MAX_SPEED * hold / overflow).min(1.0)
+    } else {
+        1.0
+    };
+    PanoMotion {
+        hold_secs: hold,
+        coverage,
+    }
+}
+
+/// Hold for a collage of `n` photos (1 = a solo still): `still_secs`
+/// scaled so more photos get more time (n=2: 1.25x, 3: 1.5x, 4: 1.75x).
+pub fn collage_hold_secs(n: usize, still_secs: f64) -> f64 {
+    still_secs * (0.75 + 0.25 * n.max(1) as f64)
+}
 
 /// How long the hero film should be.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -115,6 +173,7 @@ pub fn parse_film_length(spec: &str) -> Result<FilmLength, String> {
 fn estimate_hero_secs<'e, 'c>(
     entries: impl IntoIterator<Item = &'e PlanEntry>,
     chapter_of: impl Fn(&str) -> &'c str,
+    pano_secs_of: impl Fn(&str) -> Option<f64>,
 ) -> f64 {
     let mut total = EST_FIXED_SECS;
     let mut segments = 4usize; // the fixed cards
@@ -122,12 +181,17 @@ fn estimate_hero_secs<'e, 'c>(
     for e in entries {
         let chapter = chapter_of(&e.asset_id);
         match e.rendition {
+            // A panorama is always solo, with its own pan hold.
+            Rendition::Still if pano_secs_of(&e.asset_id).is_some() => {
+                total += pano_secs_of(&e.asset_id).unwrap_or(EST_STILL_SECS);
+                segments += 1;
+                run = None;
+            }
             Rendition::Still => match &mut run {
                 Some((c, n)) if *c == chapter && *n < MAX_COLLAGE => {
                     // Growing a solo still into a collage, or a collage by one.
-                    if *n == 1 {
-                        total += EST_COLLAGE_SECS - EST_STILL_SECS;
-                    }
+                    total += collage_hold_secs(*n + 1, EST_STILL_SECS)
+                        - collage_hold_secs(*n, EST_STILL_SECS);
                     *n += 1;
                 }
                 _ => {
@@ -166,6 +230,7 @@ fn select_hero_by_budget<'a>(
     cands: Vec<PlanEntry>,
     chapter_of: impl Fn(&str) -> &'a str + Copy,
     score_of: impl Fn(&str) -> f32,
+    pano_secs_of: impl Fn(&str) -> Option<f64> + Copy,
     budget_secs: f64,
 ) -> Vec<PlanEntry> {
     // Chapters in story order, each with its candidates best-first.
@@ -193,6 +258,7 @@ fn select_hero_by_budget<'a>(
                 .filter(|(_, p)| **p)
                 .map(|(e, _)| e),
             chapter_of,
+            pano_secs_of,
         )
     };
     // Every chapter's best entry, weakest dropped first if over budget
@@ -224,7 +290,7 @@ fn select_hero_by_budget<'a>(
         .iter()
         .map(|(_, m)| {
             if picked[m[0]] {
-                estimate_hero_secs([&cands[m[0]]], chapter_of) - EST_FIXED_SECS
+                estimate_hero_secs([&cands[m[0]]], chapter_of, pano_secs_of) - EST_FIXED_SECS
                     + EST_CUT_OVERLAP_SECS
             } else {
                 0.0
@@ -531,7 +597,17 @@ pub fn build_plan_with_length(
         }
     };
     let chapter_label = |id: &str| cluster_of.get(id).map_or(UNGROUPED, String::as_str);
-    let hero = select_hero_by_budget(hero, chapter_label, score_of, budget_secs);
+    // Panoramas pan solo for longer than a plain still; the estimator
+    // needs each one's hold to fill the budget honestly.
+    let pano_hold: HashMap<&str, f64> = assets
+        .iter()
+        .filter_map(|a| {
+            let asp = a.display_aspect().filter(|&x| is_panorama(x))?;
+            Some((a.id.as_str(), pano_motion(asp).hold_secs))
+        })
+        .collect();
+    let pano_secs_of = |id: &str| pano_hold.get(id).copied();
+    let hero = select_hero_by_budget(hero, chapter_label, score_of, pano_secs_of, budget_secs);
 
     // Group by cluster label in story order (drives chapters and reels).
     let mut groups: Vec<(&str, Vec<&Asset>)> = vec![];
@@ -1386,9 +1462,11 @@ mod tests {
     }
 
     fn hero_secs(plan: &Plan, clusters: &HashMap<String, String>) -> f64 {
-        estimate_hero_secs(&plan.hero, |id| {
-            clusters.get(id).map_or(UNGROUPED, String::as_str)
-        })
+        estimate_hero_secs(
+            &plan.hero,
+            |id| clusters.get(id).map_or(UNGROUPED, String::as_str),
+            |_| None,
+        )
     }
 
     #[test]
@@ -1642,9 +1720,63 @@ mod tests {
             still("y3"),
         ];
         let segs = 4 + 5;
+        // 4-photo collage 7.0, solo 4.0, clips 6.0 + 2.5, solo 4.0.
         let want =
-            EST_FIXED_SECS + 6.0 + 4.0 + 6.0 + 2.5 + 4.0 - EST_CUT_OVERLAP_SECS * (segs - 1) as f64;
-        assert!((estimate_hero_secs(&entries, ch) - want).abs() < 1e-9);
+            EST_FIXED_SECS + 7.0 + 4.0 + 6.0 + 2.5 + 4.0 - EST_CUT_OVERLAP_SECS * (segs - 1) as f64;
+        assert!((estimate_hero_secs(&entries, ch, |_| None) - want).abs() < 1e-9);
+    }
+
+    #[test]
+    fn panorama_detection_and_hold() {
+        assert!(is_panorama(4.4));
+        assert!(is_panorama(2.0));
+        assert!(is_panorama(0.5));
+        assert!(!is_panorama(1.99));
+        assert!(!is_panorama(16.0 / 9.0));
+        assert!(!is_panorama(0.75));
+        assert!(!is_panorama(0.0) && !is_panorama(f64::NAN));
+        // Holds grow with aspect inside 6..=8 s; full travel up to ~6:1.
+        let mid = pano_motion(2.0);
+        assert!((PANO_MIN_SECS..=PANO_MAX_SECS).contains(&mid.hold_secs));
+        let wide = pano_motion(4.4);
+        assert!(wide.hold_secs >= mid.hold_secs && wide.hold_secs <= PANO_MAX_SECS);
+        assert_eq!(wide.coverage, 1.0);
+        // Tall mirrors wide.
+        assert_eq!(pano_motion(0.25), pano_motion(4.0));
+        // Extreme: longer hold, bounded speed, partial coverage.
+        let huge = pano_motion(12.0);
+        assert!(huge.hold_secs > PANO_MAX_SECS && huge.hold_secs <= PANO_LONG_SECS);
+        assert!(huge.coverage < 1.0);
+        let overflow = 12.0 / (16.0 / 9.0) - 1.0;
+        assert!(overflow * huge.coverage / huge.hold_secs <= PANO_MAX_SPEED + 1e-9);
+    }
+
+    #[test]
+    fn panorama_is_solo_with_own_hold_in_estimate() {
+        let still = |id: &str| PlanEntry {
+            asset_id: id.into(),
+            content_hash: None,
+            size_bytes: 0,
+            mtime: 0,
+            rendition: Rendition::Still,
+        };
+        let entries = [still("x1"), still("p"), still("x2"), still("x3")];
+        let pano = |id: &str| (id == "p").then_some(8.0);
+        // x1 solo, pano breaks the run, x2+x3 collage of 2 (5.0).
+        let want = EST_FIXED_SECS + 4.0 + 8.0 + 5.0 - EST_CUT_OVERLAP_SECS * (4 + 3 - 1) as f64;
+        assert!((estimate_hero_secs(&entries, |_| "X", pano) - want).abs() < 1e-9);
+    }
+
+    #[test]
+    fn display_aspect_applies_rotation() {
+        let mut a = asset("a", 0, AssetKind::Photo);
+        assert_eq!(a.display_aspect(), None);
+        a.width = Some(16350);
+        a.height = Some(3686);
+        assert!(is_panorama(a.display_aspect().unwrap()));
+        a.rotation_deg = 90;
+        assert!(a.display_aspect().unwrap() < 0.5);
+        assert!(is_panorama(a.display_aspect().unwrap()));
     }
 
     #[test]

@@ -67,6 +67,74 @@ pub fn glide(caps: &Capabilities, frames: u32, w: u32, h: u32, variant: usize) -
     )
 }
 
+/// Supersampled short side of a panorama strip: the strip is scaled to
+/// this height (wide) or `PANO_SS * 16 / 9` width (tall) before panning.
+const PANO_SS: u32 = 1296;
+
+/// Smooth side-to-side (or top-to-bottom for tall images) pan over a whole
+/// panorama, no zoompan. The photo is scaled to fill the frame on its short
+/// side, so it covers the frame with no bars or blurred fill, then the same
+/// sub-pixel `perspective` window technique as [`glide`] slides across it
+/// with smoothstep easing and lanczos-downscales to `w`x`h`. `aspect` is
+/// the display width / height; `coverage` the fraction of the overflow to
+/// travel (see `triptape_core::plan::pano_motion`); `reverse` flips the
+/// direction. Without `perspective` it holds the centered crop instead.
+pub fn pano_pan(
+    caps: &Capabilities,
+    frames: u32,
+    w: u32,
+    h: u32,
+    aspect: f64,
+    coverage: f64,
+    reverse: bool,
+) -> String {
+    let frame = f64::from(w) / f64::from(h);
+    let tall = aspect < 1.0;
+    // Scale so the strip fills the frame on its short side.
+    let fill = if tall {
+        format!(
+            "scale={}:-2:flags=lanczos",
+            (f64::from(PANO_SS) * frame).round()
+        )
+    } else {
+        format!("scale=-2:{PANO_SS}:flags=lanczos")
+    };
+    if !caps.perspective {
+        let centered = if tall {
+            format!("crop=iw:trunc(iw*{h}/{w}/2)*2")
+        } else {
+            format!("crop=trunc(ih*{w}/{h}/2)*2:ih")
+        };
+        return format!("{fill},{centered},scale={w}:{h}:flags=lanczos,setsar=1");
+    }
+    // Visible window as a fraction of the strip along the pan axis.
+    let win = if tall { aspect / frame } else { frame / aspect }.clamp(0.01, 1.0);
+    let denom = frames.saturating_sub(1).max(1);
+    let p = format!("(min(in-1\\,{denom})/{denom})");
+    let eased = format!("({p}*{p}*(3-2*{p}))");
+    let eased = if reverse {
+        format!("(1-{eased})")
+    } else {
+        eased
+    };
+    // Where the window's leading edge sits within the slack, centered on
+    // 0.5 and narrowed by `coverage`.
+    let slack = format!("(0.5+({eased}-0.5)*{coverage:.4})");
+    let (x0, x1, y0, y1) = if tall {
+        let top = format!("H*(1-{win:.5})*{slack}");
+        let bottom = format!("H*((1-{win:.5})*{slack}+{win:.5})");
+        ("0".to_string(), "W".to_string(), top, bottom)
+    } else {
+        let left = format!("W*(1-{win:.5})*{slack}");
+        let right = format!("W*((1-{win:.5})*{slack}+{win:.5})");
+        (left, right, "0".to_string(), "H".to_string())
+    };
+    format!(
+        "{fill},setsar=1,{hold},perspective=x0='{x0}':y0='{y0}':x1='{x1}':y1='{y0}':x2='{x0}':y2='{y1}':x3='{x1}':y3='{y1}':interpolation=cubic:eval=frame,scale={w}:{h}:flags=lanczos,setsar=1",
+        hold = hold_still(frames),
+    )
+}
+
 /// Path as an owned FFmpeg CLI argument.
 pub fn path_arg(p: &Path) -> String {
     p.to_string_lossy().into_owned()
