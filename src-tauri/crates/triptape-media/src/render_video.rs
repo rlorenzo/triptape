@@ -2592,7 +2592,10 @@ mod tests {
         };
         let dir = PathBuf::from(dir);
         let ffmpeg_bin = std::env::var("TRIPTAPE_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
-        let ffprobe_bin = ffmpeg_bin.replace("ffmpeg", "ffprobe");
+        let ffprobe_bin = std::path::Path::new(&ffmpeg_bin)
+            .with_file_name("ffprobe")
+            .to_string_lossy()
+            .into_owned();
         let caps = crate::ffmpeg::probe_capabilities(&ffmpeg_bin, &ffprobe_bin);
         let res = Resolution::from_flag(
             &std::env::var("TRIPTAPE_BENCH_RES").unwrap_or_else(|_| "4k".into()),
