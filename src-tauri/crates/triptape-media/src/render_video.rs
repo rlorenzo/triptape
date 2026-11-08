@@ -1642,11 +1642,11 @@ fn render_collage_segment(
         k.part("res", &format!("{:?}", res.dims()));
         k.args(&hold_args(
             caps,
-            Path::new("<IN>"),
+            Path::new(KEY_IN),
             dur,
             variant,
             res,
-            Path::new("<OUT>"),
+            Path::new(KEY_OUT),
         ));
         k.finish()
     };
@@ -2042,6 +2042,11 @@ fn hold_args(
     graph_segment_args(img, dur, hold_graph(caps, variant, frames, res), out)
 }
 
+/// Stand-ins for the input and output paths when a segment's ffmpeg
+/// arguments are hashed into its key: the recipe, not where it runs.
+const KEY_IN: &str = "<IN>";
+const KEY_OUT: &str = "<OUT>";
+
 /// Cache key of a still entry, before anything is decoded. The source's
 /// identity stands in for its pixels (and so for the aspect that picks hold
 /// or pan); the generated hold arguments, and the pan arguments for a
@@ -2061,16 +2066,22 @@ fn still_key(
         .num("still_secs", still_secs)
         .num("max_secs", max_secs)
         .part("aspect", &format!("{:?}", r.aspect));
-    let (input, output) = (Path::new("<IN>"), Path::new("<OUT>"));
-    k.args(&hold_args(caps, input, still_secs, variant, res, output));
+    k.args(&hold_args(
+        caps,
+        Path::new(KEY_IN),
+        still_secs,
+        variant,
+        res,
+        Path::new(KEY_OUT),
+    ));
     // Any panorama aspect will do: its pan arguments fingerprint the pan code.
     let reference = 3.0;
     let dur = pano_motion(reference).hold_secs;
     k.args(&graph_segment_args(
-        input,
+        Path::new(KEY_IN),
         dur,
         pano_graph(dur, reference, pano_coverage(reference, dur), variant, res),
-        output,
+        Path::new(KEY_OUT),
     ));
     k.finish()
 }

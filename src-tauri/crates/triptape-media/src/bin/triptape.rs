@@ -618,13 +618,10 @@ fn export_cmd(flags: &HashMap<String, String>) {
         println!("video: {v}");
     }
     if let Some(c) = &report.segment_cache {
-        println!("video: {}", c.summary());
-        if c.stored > 0 || c.evicted > 0 {
-            println!(
-                "segment cache: {} new, {} evicted ({})",
-                c.stored, c.evicted, c.dir
-            );
-        }
+        println!(
+            "video: segments reused {}/{} from cache ({} new, {} evicted; {})",
+            c.reused, c.total, c.stored, c.evicted, c.dir
+        );
     }
     for r in &report.reels {
         println!("reel: {r}");

@@ -52,13 +52,6 @@ pub struct SegmentCacheReport {
     pub evicted: usize,
 }
 
-impl SegmentCacheReport {
-    /// `segments reused 158/160 from cache`.
-    pub fn summary(&self) -> String {
-        format!("segments reused {}/{} from cache", self.reused, self.total)
-    }
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Skipped {
     pub keepsake: String,

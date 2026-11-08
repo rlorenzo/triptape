@@ -293,16 +293,16 @@ impl SegmentCache {
             lease_path: Mutex::new(None),
             stats: Mutex::new(UseStats::default()),
         };
-        let pid = std::process::id();
-        let path = cache.dir.join("leases").join(format!(
-            "{pid}-{}-{}.lease",
-            now_ms(),
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
         let lease = Lease {
-            pid,
+            pid: std::process::id(),
             started_ms: now_ms(),
         };
+        let path = cache.dir.join("leases").join(format!(
+            "{}-{}-{}.lease",
+            lease.pid,
+            lease.started_ms,
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         // Written aside and renamed in: a half-written lease would read as
         // stale to another process and be swept.
         let tmp = cache.tmp_name();
@@ -480,35 +480,15 @@ fn touch(path: &Path) {
     }
 }
 
-/// Give `dst` its own reference to `src`'s data: hard link, else APFS clone,
-/// else a full copy (different volumes). Replaces `dst`.
+/// Give `dst` its own reference to `src`'s data: hard link, else a copy
+/// (different volumes; on macOS `fs::copy` clones on APFS first). Replaces
+/// `dst`.
 fn place(src: &Path, dst: &Path) -> std::io::Result<()> {
     let _ = std::fs::remove_file(dst);
     if std::fs::hard_link(src, dst).is_ok() {
         return Ok(());
     }
-    #[cfg(target_os = "macos")]
-    if clone_file(src, dst).is_ok() {
-        return Ok(());
-    }
     std::fs::copy(src, dst).map(|_| ())
-}
-
-#[cfg(target_os = "macos")]
-fn clone_file(src: &Path, dst: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = |p: &Path| {
-        std::ffi::CString::new(p.as_os_str().as_bytes())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-    };
-    let (s, d) = (c(src)?, c(dst)?);
-    // SAFETY: both pointers are valid NUL-terminated strings for the call.
-    let rc = unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 0) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
 }
 
 /// Free bytes on the volume holding `path` (or its nearest existing parent,
