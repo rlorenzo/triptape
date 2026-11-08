@@ -182,6 +182,13 @@ pub fn pano_motion(aspect: f64) -> PanoMotion {
     }
 }
 
+/// Whether a caption counts: any non-blank text. A captioned still plays
+/// solo so its words describe only that photo, never join a collage; the
+/// renderer and [`estimate_hero_secs`] both decide through this.
+pub fn has_caption(caption: Option<&str>) -> bool {
+    caption.is_some_and(|c| !c.trim().is_empty())
+}
+
 /// Hold for a collage of `n` photos (1 = a solo still): `still_secs`
 /// scaled so more photos get more time (n=2: 1.25x, 3: 1.5x, 4: 1.75x).
 pub fn collage_hold_secs(n: usize, still_secs: f64) -> f64 {
@@ -273,11 +280,13 @@ enum Seg<'c> {
 /// same-chapter stills grouped into collages, clips padded to
 /// [`MIN_SEGMENT_SECS`], and every cut overlapped by the transition the
 /// renderer assigns it (opening and closing cut 0.7 s, chapter breaks and
-/// card cuts cycling 0.8/0.5/0.5 s, others ~0.54 s).
+/// card cuts cycling 0.8/0.5/0.5 s, others ~0.54 s). Panoramas and
+/// captioned stills (`captioned`) always play solo.
 pub fn estimate_hero_secs<'e, 'c>(
     entries: impl IntoIterator<Item = &'e PlanEntry>,
     chapter_of: impl Fn(&str) -> &'c str,
     pano_secs_of: impl Fn(&str) -> Option<f64>,
+    captioned: impl Fn(&str) -> bool,
     cards: HeroCards,
 ) -> f64 {
     let mut segs: Vec<(Seg<'c>, f64)> = vec![(Seg::Title, EST_TITLE_SECS)];
@@ -290,8 +299,9 @@ pub fn estimate_hero_secs<'e, 'c>(
         let chapter = chapter_of(&e.asset_id);
         let pano_secs = pano_secs_of(&e.asset_id);
         match e.rendition {
-            // A panorama is always solo, with its own pan hold.
-            Rendition::Still if pano_secs.is_some() => {
+            // A panorama (with its own pan hold) or a captioned still is
+            // always solo, and breaks the run.
+            Rendition::Still if pano_secs.is_some() || captioned(&e.asset_id) => {
                 segs.push((Seg::Chapter(chapter), pano_secs.unwrap_or(EST_STILL_SECS)));
                 run = None;
             }
@@ -376,6 +386,7 @@ fn select_hero_by_budget<'a>(
     score_of: impl Fn(&PlanEntry) -> f32,
     similar: impl Fn(&str, &str) -> bool,
     pano_secs_of: impl Fn(&str) -> Option<f64> + Copy,
+    captioned: impl Fn(&str) -> bool + Copy,
     budget: HeroBudget,
 ) -> Vec<PlanEntry> {
     // Chapters in story order, each with its candidates best-first.
@@ -404,6 +415,7 @@ fn select_hero_by_budget<'a>(
                 .map(|(e, _)| e),
             chapter_of,
             pano_secs_of,
+            captioned,
             budget.cards,
         )
     };
@@ -1026,6 +1038,7 @@ pub fn build_plan_with_length(
         entry_score,
         similar,
         pano_secs_of,
+        |id| has_caption(by_id.get(id).and_then(|a| a.user_caption.as_deref())),
         budget,
     );
 
@@ -2277,6 +2290,7 @@ mod tests {
             &plan.hero,
             |id| clusters.get(id).map_or(UNGROUPED, String::as_str),
             |_| None,
+            |id| has_caption(plan.captions.get(id).map(String::as_str)),
             HeroCards {
                 route: !plan.map_polyline.is_empty(),
                 places: plan.chapters.iter().any(|c| c.place.is_some()),
@@ -2548,7 +2562,9 @@ mod tests {
             route: true,
             places: true,
         };
-        assert!((estimate_hero_secs(&entries, ch, |_| None, cards) - 33.18).abs() < 1e-9);
+        assert!(
+            (estimate_hero_secs(&entries, ch, |_| None, |_| false, cards) - 33.18).abs() < 1e-9
+        );
         // Without a route or places only the title card remains.
         let bare = HeroCards {
             route: false,
@@ -2556,7 +2572,57 @@ mod tests {
         };
         // 2.5 + 7 + 4 + 6 + 2.5 + 4 = 26 s; cuts 0.7 + 0.54 + 0.8 + 0.54 +
         // 0.7 = 3.28 s.
-        assert!((estimate_hero_secs(&entries, ch, |_| None, bare) - 22.72).abs() < 1e-9);
+        assert!((estimate_hero_secs(&entries, ch, |_| None, |_| false, bare) - 22.72).abs() < 1e-9);
+    }
+
+    #[test]
+    fn captioned_stills_play_solo_in_the_estimate() {
+        let bare = HeroCards {
+            route: false,
+            places: false,
+        };
+        let est = |ids: &[&str], caps: &[(&str, &str)]| {
+            let entries: Vec<PlanEntry> = ids.iter().map(|i| still_entry(i)).collect();
+            let caps: HashMap<&str, &str> = caps.iter().copied().collect();
+            estimate_hero_secs(
+                &entries,
+                |_| "X",
+                |_| None,
+                |id| has_caption(caps.get(id).copied()),
+                bare,
+            )
+        };
+        // Middle: collage of 2 (5 s), solo (4 s), collage of 2 (5 s); cuts
+        // 0.7 + 0.54 + 0.7 = 1.94 s, the title 2.5 s.
+        let mid = est(&["a", "b", "c", "d", "e"], &[("c", "Ferry")]);
+        assert!((mid - 14.56).abs() < 1e-9, "{mid}");
+        // Leading and trailing captioned stills never join their neighbours.
+        let lead = est(&["a", "b", "c"], &[("a", "Ferry")]);
+        let trail = est(&["a", "b", "c"], &[("c", "Ferry")]);
+        assert!((lead - 10.1).abs() < 1e-9, "{lead}");
+        assert!((trail - 10.1).abs() < 1e-9, "{trail}");
+        // A blank caption is no caption: all three still collage.
+        let blank = est(&["a", "b", "c"], &[("a", "  ")]);
+        assert!((blank - 7.8).abs() < 1e-9, "{blank}");
+        assert!(!has_caption(Some(" \n")) && has_caption(Some(" x ")) && !has_caption(None));
+    }
+
+    #[test]
+    fn edited_captions_count_as_captions() {
+        let assets = vec![asset("a", 1_714_557_600, AssetKind::Photo)];
+        let base = build_plan(&assets, &HashMap::new(), &HashMap::new());
+        let edits = PlanEdits {
+            caption_overrides: [("a".to_string(), "Breakfast view".to_string())].into(),
+            ..Default::default()
+        };
+        let out = apply_edits(&base, &assets, &edits);
+        assert!(has_caption(out.captions.get("a").map(String::as_str)));
+        let blank = PlanEdits {
+            caption_overrides: [("a".to_string(), "   ".to_string())].into(),
+            ..Default::default()
+        };
+        let out = apply_edits(&base, &assets, &blank);
+        assert!(!has_caption(out.captions.get("a").map(String::as_str)));
     }
 
     #[test]
@@ -2617,7 +2683,9 @@ mod tests {
             route: false,
             places: false,
         };
-        assert!((estimate_hero_secs(&entries, |_| "X", pano, bare) - 17.56).abs() < 1e-9);
+        assert!(
+            (estimate_hero_secs(&entries, |_| "X", pano, |_| false, bare) - 17.56).abs() < 1e-9
+        );
     }
 
     #[test]
@@ -2735,6 +2803,7 @@ mod tests {
             score_of,
             similar,
             |_| None,
+            |_| false,
             HeroBudget {
                 ceiling_secs,
                 cards: NO_CARDS,
@@ -2754,7 +2823,13 @@ mod tests {
             still_entry("b1"),
         ];
         let scores = [("a1", 0.9), ("a2", 0.8), ("a3", 0.7), ("b1", 0.6)];
-        let reps = estimate_hero_secs([&cands[0], &cands[3]], letter, |_| None, NO_CARDS);
+        let reps = estimate_hero_secs(
+            [&cands[0], &cands[3]],
+            letter,
+            |_| None,
+            |_| false,
+            NO_CARDS,
+        );
         // Room for a still after the reps, not for a second 8 s clip.
         let got = pick(cands, &scores, reps + 4.0, |_, _| false);
         assert_eq!(got, vec!["a1", "a3", "b1"], "{got:?}");
@@ -2776,7 +2851,7 @@ mod tests {
             let pair = |p: &str, q: &str| (x == p && y == q) || (x == q && y == p);
             pair("a1", "a2")
         };
-        let reps = estimate_hero_secs([&cands()[0]], letter, |_| None, NO_CARDS);
+        let reps = estimate_hero_secs([&cands()[0]], letter, |_| None, |_| false, NO_CARDS);
         let tight = pick(cands(), &scores, reps + 7.0, twin);
         assert_eq!(tight, vec!["a1", "a3", "a4"], "twin skipped: {tight:?}");
         // With budget to spare the twin comes back in the second pass.
@@ -2791,7 +2866,8 @@ mod tests {
             .map(|i| clip_entry(&format!("a{i:02}"), 3.0))
             .collect();
         cands.extend((0..4).map(|i| clip_entry(&format!("b{i:02}"), 3.0)));
-        let ceiling = estimate_hero_secs(&cands[..0], letter, |_| None, NO_CARDS) + 20.0 * 2.5;
+        let ceiling =
+            estimate_hero_secs(&cands[..0], letter, |_| None, |_| false, NO_CARDS) + 20.0 * 2.5;
         let got = pick(cands, &[], ceiling, |_, _| false);
         let big = got.iter().filter(|i| i.starts_with('a')).count() as f64;
         let small = got.iter().filter(|i| i.starts_with('b')).count() as f64;
@@ -2892,7 +2968,13 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v))
         .collect();
         // Room for exactly one still.
-        let one = estimate_hero_secs([&still_entry("x")], |_| UNGROUPED, |_| None, NO_CARDS);
+        let one = estimate_hero_secs(
+            [&still_entry("x")],
+            |_| UNGROUPED,
+            |_| None,
+            |_| false,
+            NO_CARDS,
+        );
         let plan = build_plan_with_length(
             &assets,
             &HashMap::new(),
@@ -3151,11 +3233,12 @@ mod tests {
     #[test]
     fn route_and_places_cards_shift_the_estimate() {
         let e = [still_entry("a1")];
-        let bare = estimate_hero_secs(&e, letter, |_| None, NO_CARDS);
+        let bare = estimate_hero_secs(&e, letter, |_| None, |_| false, NO_CARDS);
         let full = estimate_hero_secs(
             &e,
             letter,
             |_| None,
+            |_| false,
             HeroCards {
                 route: true,
                 places: true,
@@ -3166,7 +3249,7 @@ mod tests {
         assert!((full - bare - 10.0).abs() < 1e-9, "{full}");
         // No entries: nothing but the title, and no overlap to subtract.
         assert_eq!(
-            estimate_hero_secs([], letter, |_| None, NO_CARDS),
+            estimate_hero_secs([], letter, |_| None, |_| false, NO_CARDS),
             EST_TITLE_SECS
         );
     }
@@ -3310,6 +3393,7 @@ mod tests {
                 score_of,
                 |_, _| false,
                 |_| None,
+                |_| false,
                 budget(ceiling),
             )
             .iter()

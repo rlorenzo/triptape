@@ -14,8 +14,8 @@ use crate::segment_cache::SegmentCache;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{
-    collage_hold_secs, is_panorama, pano_coverage, pano_motion, MAX_CLIP_SECS, MAX_COLLAGE,
-    MIN_SEGMENT_SECS,
+    collage_hold_secs, has_caption, is_panorama, pano_coverage, pano_motion, MAX_CLIP_SECS,
+    MAX_COLLAGE, MIN_SEGMENT_SECS,
 };
 use triptape_core::types::{Plan, PlanEntry, Rendition};
 
@@ -1682,9 +1682,12 @@ fn cached_segment(
 }
 
 /// Whether an entry may join a collage: a still that is not a panorama
-/// (panoramas pan solo).
+/// (panoramas pan solo) and has no caption (a caption describes one photo,
+/// so a captioned still plays solo; same rule as the plan's timing model).
 fn collage_eligible(e: &ResolvedEntry) -> bool {
-    matches!(e.entry.rendition, Rendition::Still) && !e.aspect.is_some_and(is_panorama)
+    matches!(e.entry.rendition, Rendition::Still)
+        && !e.aspect.is_some_and(is_panorama)
+        && !has_caption(e.caption.as_deref())
 }
 
 /// Under this width / height a photo counts as a portrait, which the
@@ -2220,11 +2223,22 @@ mod tests {
         for film in 0..12 {
             let chapters = 3 + film * 2;
             let mut entries: Vec<PlanEntry> = vec![];
+            // Some stills carry a caption (some only whitespace, which
+            // does not count): captioned ones must play solo.
+            let mut captions: HashMap<String, String> = HashMap::new();
             for ch in 0..chapters {
                 for k in 0..(1 + next(6) as usize) {
                     let still = next(5) < 3;
                     let id = format!("c{ch:02}e{k}");
                     let secs = 1.0 + next(8) as f64;
+                    let caption = match next(5) {
+                        0 => Some("Mia on the ferry"),
+                        1 => Some("  "),
+                        _ => None,
+                    };
+                    if let Some(c) = caption {
+                        captions.insert(id.clone(), c.into());
+                    }
                     entries.push(PlanEntry {
                         asset_id: id,
                         window: 0,
@@ -2260,7 +2274,10 @@ mod tests {
                 // -- renderer replay: groups of consecutive same-chapter stills.
                 let mut groups: Vec<Vec<&PlanEntry>> = vec![];
                 for e in &entries {
-                    let is_still = |e: &PlanEntry| matches!(e.rendition, Rendition::Still);
+                    let is_still = |e: &PlanEntry| {
+                        matches!(e.rendition, Rendition::Still)
+                            && !has_caption(captions.get(&e.asset_id).map(String::as_str))
+                    };
                     match groups.last_mut() {
                         Some(g)
                             if g.len() < MAX_COLLAGE
@@ -2341,6 +2358,7 @@ mod tests {
                     &entries,
                     |id| CHAPTER_LABELS[id[1..3].parse::<usize>().unwrap()],
                     |_| None,
+                    |id| has_caption(captions.get(id).map(String::as_str)),
                     cards,
                 );
                 let err = (est - actual).abs() / actual;
@@ -2559,6 +2577,19 @@ mod tests {
         let unknown = card_entry("u", Path::new("u.jpg"));
         assert!(!collage_eligible(&pano));
         assert!(collage_eligible(&plain) && collage_eligible(&unknown));
+    }
+
+    #[test]
+    fn captioned_stills_never_join_collages() {
+        let with = |c: Option<&str>| ResolvedEntry {
+            caption: c.map(String::from),
+            ..card_entry("s", Path::new("s.jpg"))
+        };
+        assert!(!collage_eligible(&with(Some("Mia on the ferry"))));
+        assert!(!collage_eligible(&with(Some(" x "))));
+        // Blank captions are no captions.
+        assert!(collage_eligible(&with(Some("  "))));
+        assert!(collage_eligible(&with(None)));
     }
 
     #[test]
@@ -3007,7 +3038,7 @@ mod tests {
                 },
                 still_path: p,
                 motion_path: None,
-                caption: if i == 1 {
+                caption: if i == 2 {
                     Some("Golden Gate at sunset".into())
                 } else {
                     None
@@ -3019,7 +3050,7 @@ mod tests {
             });
         }
         let mut captions = HashMap::new();
-        captions.insert("a1".to_string(), "Golden Gate at sunset".to_string());
+        captions.insert("a2".to_string(), "Golden Gate at sunset".to_string());
         let plan = Plan {
             plan_version: 1,
             schema_version: 1,
@@ -3093,8 +3124,8 @@ mod tests {
         }
         assert_eq!(names[0], "circle_open");
         assert_eq!(names[names.len() - 1], "circle_close");
-        // The caption on the collage's second photo survives grouping, and
-        // the EDL names both photos on screen.
+        // The captioned photo plays solo (keeping its caption), and the EDL
+        // names the two uncaptioned photos collaged before it.
         let srt = std::fs::read_to_string(v.srt_path.as_ref().expect("sidecar")).unwrap();
         assert!(srt.contains("Golden Gate at sunset"));
         assert_eq!(
