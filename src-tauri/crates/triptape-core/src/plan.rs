@@ -113,6 +113,11 @@ const SAME_MOMENT_PHASH_DISTANCE: u32 = 14;
 /// quality (the rest is the absolute quality). Kept small so story signals
 /// (people, captions) still outrank a few percentiles of sharpness.
 const REL_QUALITY_WEIGHT: f32 = 0.2;
+/// Weight of an asset's capped colourfulness percentile within its
+/// chapter, on the same scale as [`REL_QUALITY_WEIGHT`]'s percentile term
+/// but centred (the chapter median adds nothing). Small: colour breaks ties
+/// between similar frames, it never outranks people or sharpness.
+const COLOUR_WEIGHT: f32 = 0.10;
 /// Live Photos per chapter that keep their motion in the hero film; the
 /// rest play as stills so they can form collages.
 pub const MOTION_PER_CHAPTER: usize = 1;
@@ -1063,6 +1068,22 @@ fn same_moment(a: &Asset, b: &Asset) -> bool {
     dt <= SAME_MOMENT_SECS && crate::hash::phash_distance(p, q) <= SAME_MOMENT_PHASH_DISTANCE
 }
 
+/// Mid-rank percentile (0..1) of `v` in an ascending `sorted` slice.
+fn midrank_pct(sorted: &[f32], v: f32) -> f32 {
+    let less = sorted.partition_point(|&q| q < v);
+    let same = sorted.partition_point(|&q| q <= v) - less;
+    (less as f32 + same as f32 / 2.0) / sorted.len() as f32
+}
+
+/// One chapter member for ranking.
+struct ChapterMember<'a> {
+    id: &'a str,
+    quality: f32,
+    bonus: f32,
+    /// Capped colourfulness; `None` when unknown.
+    colour: Option<f32>,
+}
+
 /// Story score per asset: technical quality made relative to the asset's
 /// chapter, plus its story bonuses.
 ///
@@ -1072,35 +1093,43 @@ fn same_moment(a: &Asset, b: &Asset) -> bool {
 /// percentile within its chapter (mid-rank, so a lone asset sits at 0.5)
 /// is blended in at [`REL_QUALITY_WEIGHT`], so a chapter's sharpest frames
 /// are favoured over equal frames of a dull chapter without letting
-/// sharpness beat people or captions. Assets without a score are left out.
+/// sharpness beat people or captions. Colourfulness, capped at
+/// [`crate::score::COLOUR_CAP`], is ranked the same way and blended in,
+/// centred, at [`COLOUR_WEIGHT`]. Assets without a score are left out.
 fn relative_scores<'a>(
     ordered: &[&Asset],
     chapter_of: impl Fn(&str) -> &'a str,
     scores: &HashMap<String, Score>,
 ) -> HashMap<String, f32> {
-    let mut by_chapter: HashMap<&str, Vec<(&str, f32, f32)>> = HashMap::new();
+    let mut by_chapter: HashMap<&str, Vec<ChapterMember>> = HashMap::new();
     for a in ordered {
         let Some(s) = scores.get(&a.id).or(a.score.as_ref()) else {
             continue;
         };
-        by_chapter.entry(chapter_of(&a.id)).or_default().push((
-            a.id.as_str(),
-            s.tech_quality(),
-            s.bonus,
-        ));
+        by_chapter
+            .entry(chapter_of(&a.id))
+            .or_default()
+            .push(ChapterMember {
+                id: a.id.as_str(),
+                quality: s.tech_quality(),
+                bonus: s.bonus,
+                colour: s.colourfulness.map(|c| c.min(crate::score::COLOUR_CAP)),
+            });
     }
     let mut out = HashMap::new();
     for members in by_chapter.values() {
-        let n = members.len() as f32;
-        let mut sorted: Vec<f32> = members.iter().map(|m| m.1).collect();
-        sorted.sort_by(f32::total_cmp);
-        for &(id, quality, bonus) in members {
-            let less = sorted.partition_point(|&q| q < quality);
-            let same = sorted.partition_point(|&q| q <= quality) - less;
-            let pct = (less as f32 + same as f32 / 2.0) / n;
-            let relative = (1.0 - REL_QUALITY_WEIGHT) * quality
-                + REL_QUALITY_WEIGHT * crate::score::squeeze_quality(pct);
-            out.insert(id.to_string(), (relative + bonus).clamp(0.0, 1.0));
+        let mut qualities: Vec<f32> = members.iter().map(|m| m.quality).collect();
+        qualities.sort_by(f32::total_cmp);
+        let mut colours: Vec<f32> = members.iter().filter_map(|m| m.colour).collect();
+        colours.sort_by(f32::total_cmp);
+        for m in members {
+            let pct = midrank_pct(&qualities, m.quality);
+            // Assets without colour data (old scores, video) stay neutral.
+            let colour_pct = m.colour.map_or(0.5, |c| midrank_pct(&colours, c));
+            let relative = (1.0 - REL_QUALITY_WEIGHT) * m.quality
+                + REL_QUALITY_WEIGHT * crate::score::squeeze_quality(pct)
+                + COLOUR_WEIGHT * crate::score::TECH_SPAN * (colour_pct - 0.5);
+            out.insert(m.id.to_string(), (relative + m.bonus).clamp(0.0, 1.0));
         }
     }
     out
@@ -2771,6 +2800,78 @@ mod tests {
         let lone = vec![&assets[0]];
         let rel = relative_scores(&lone, |_| "x", &scores);
         assert!((rel["a1"] - 0.60).abs() < 0.1 * REL_QUALITY_WEIGHT + 1e-6);
+    }
+
+    fn with_colour(quality: f32, colour: Option<f32>) -> Score {
+        Score {
+            colourfulness: colour,
+            ..with_bonus(quality, 0.0)
+        }
+    }
+
+    #[test]
+    fn colour_is_ranked_within_the_chapter_not_across() {
+        let assets: Vec<Asset> = ["a1", "a2", "a3", "b1", "b2", "b3"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| asset(id, 100 + i as i64, AssetKind::Photo))
+            .collect();
+        // Chapter b is a dim night: every frame is far less colourful than
+        // chapter a, yet b3 is still b's most colourful and b1 its flattest.
+        let colour = |id: &str| match id {
+            "a1" => 20.0,
+            "a2" => 45.0,
+            "a3" => 70.0,
+            "b1" => 1.0,
+            "b2" => 3.0,
+            _ => 6.0,
+        };
+        let scores: HashMap<String, Score> = assets
+            .iter()
+            .map(|a| (a.id.clone(), with_colour(0.6, Some(colour(&a.id)))))
+            .collect();
+        let ordered: Vec<&Asset> = assets.iter().collect();
+        let rel = relative_scores(&ordered, letter, &scores);
+        assert!(rel["a3"] > rel["a2"] && rel["a2"] > rel["a1"], "{rel:?}");
+        assert!(rel["b3"] > rel["b1"], "{rel:?}");
+        // Equal rank in each chapter, so the dull chapter is not penalised.
+        assert!((rel["b3"] - rel["a3"]).abs() < 1e-6, "{rel:?}");
+        assert!((rel["b1"] - rel["a1"]).abs() < 1e-6, "{rel:?}");
+    }
+
+    #[test]
+    fn colour_is_capped_small_and_neutral_when_missing() {
+        let assets = [
+            asset("vivid", 100, AssetKind::Photo),
+            asset("garish", 101, AssetKind::Photo),
+            asset("old", 102, AssetKind::Photo),
+        ];
+        let ordered: Vec<&Asset> = assets.iter().collect();
+        let cap = crate::score::COLOUR_CAP;
+        let scores: HashMap<String, Score> = [
+            ("vivid", with_colour(0.6, Some(cap))),
+            ("garish", with_colour(0.6, Some(cap * 3.0))),
+            ("old", with_colour(0.6, None)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let rel = relative_scores(&ordered, |_| "x", &scores);
+        // Above the cap ties with the cap; a missing value sits mid-chapter.
+        assert_eq!(rel["vivid"], rel["garish"], "{rel:?}");
+        assert!((rel["old"] - rel["vivid"]).abs() < 1e-6, "{rel:?}");
+        // The whole colour effect stays under half a people bonus.
+        let flat = HashMap::from([
+            ("vivid".to_string(), with_colour(0.6, Some(0.0))),
+            ("garish".to_string(), with_colour(0.6, Some(cap))),
+        ]);
+        let two: Vec<&Asset> = assets[..2].iter().collect();
+        let rel = relative_scores(&two, |_| "x", &flat);
+        let spread = rel["garish"] - rel["vivid"];
+        assert!(
+            spread > 0.0 && spread < crate::score::PEOPLE_BONUS[0] / 2.0,
+            "{spread}"
+        );
     }
 
     #[test]
