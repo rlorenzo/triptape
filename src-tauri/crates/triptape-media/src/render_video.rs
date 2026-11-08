@@ -202,7 +202,9 @@ pub struct VideoOptions {
     pub overlap_secs: f64,
     pub title_secs: f64,
     pub map_secs: f64,
-    pub music_path: Option<PathBuf>,
+    /// Music playlist in order; crossfaded, cycled only if shorter than the
+    /// film. Empty (or all unusable) falls back to the bundled theme.
+    pub music_paths: Vec<PathBuf>,
     /// Keep the original film audio at 0.12 under a ducked music bed.
     /// Default (false) mutes it: the music is the primary audio.
     pub keep_ambience: bool,
@@ -224,7 +226,7 @@ impl Default for VideoOptions {
             overlap_secs: 0.6,
             title_secs: 2.5,
             map_secs: 3.0,
-            music_path: None,
+            music_paths: Vec::new(),
             keep_ambience: false,
             typst_bin: "typst".into(),
             resolution: Resolution::default(),
@@ -256,7 +258,20 @@ pub struct Edl {
     pub segments: Vec<EdlSegment>,
     pub total_secs: f64,
     pub captions_sidecar: Option<String>,
+    pub music: EdlMusic,
     pub fallbacks: Vec<String>,
+}
+
+/// The music bed as rendered: playlist, crossfade seams (bed time = film
+/// time, the bed starts with the film), and how the film ends.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EdlMusic {
+    pub tracks: Vec<String>,
+    pub crossfade_secs: f64,
+    pub crossfade_curve: String,
+    pub seams: Vec<crate::music::Seam>,
+    pub ends_naturally: bool,
+    pub fade_out_secs: f64,
 }
 
 #[derive(Debug)]
@@ -898,24 +913,24 @@ pub fn render_hero_video(
         fallbacks.push("loudnorm absent: flat resample, no loudness pass".into());
         "anull"
     };
-    // Resolve the music file: an existing --music wins; otherwise the
-    // bundled theme track is materialized into the work dir.
-    let music_path = match opts.music_path.as_deref().filter(|m| m.exists()) {
-        Some(m) => m.to_path_buf(),
-        None => {
-            if let Some(m) = &opts.music_path {
-                fallbacks.push(format!(
-                    "music file {} missing; bundled theme instead",
-                    m.display()
-                ));
-            }
+    // Resolve the playlist: existing --music files win; with none usable
+    // the bundled theme track is materialized into the work dir.
+    let playlist = crate::music::load_playlist(
+        &caps.ffmpeg_bin,
+        &caps.ffprobe_bin,
+        &opts.music_paths,
+        &mut fallbacks,
+        || {
             let bundled = work_dir.join("triptape-theme.mp3");
             std::fs::write(&bundled, DEFAULT_MUSIC_BYTES)
                 .map_err(|e| crate::MediaError::Io(e.to_string()))?;
-            fallbacks.push("bundled triptape-theme music bed".into());
-            bundled
-        }
-    };
+            Ok(bundled)
+        },
+    )?;
+    let bed_plan = crate::music::plan_bed(
+        &playlist.iter().map(|t| t.duration_secs).collect::<Vec<_>>(),
+        total,
+    );
     // Captions: the sidecar SRT is always written; with libass the final
     // pass also burns it into the picture. Segment 0 starts at 0; every
     // later segment starts at its xfade cut.
@@ -932,17 +947,14 @@ pub fn render_hero_video(
     };
     let burn_srt =
         (srt_count > 0 && caps.can_burn_captions()).then(|| ffmpeg::subtitles_filter(&srt_path));
-    let fade_out_start = (total - 1.5).max(0.0);
-    let music_chain = format!(
-        "[1:a]atrim=0:{total:.3},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,afade=t=in:st=0:d=1,afade=t=out:st={fade_out_start:.3}:d=1.5"
-    );
+    let bed_graph = crate::music::bed_filter(&bed_plan, &playlist, 1, total);
     let audio_graph = if opts.keep_ambience {
         format!(
-            "[0:a]volume=0.12,aresample=48000,aformat=channel_layouts=stereo[film];{music_chain}[m0];[m0][film]sidechaincompress=threshold=0.02:ratio=8:attack=200:release=800[duck];[film][duck]amix=inputs=2:duration=first:dropout_transition=0,{norm}[aout]"
+            "[0:a]volume=0.12,aresample=48000,aformat=channel_layouts=stereo[film];{bed_graph};[mbed][film]sidechaincompress=threshold=0.02:ratio=8:attack=200:release=800[duck];[film][duck]amix=inputs=2:duration=first:dropout_transition=0,{norm}[aout]"
         )
     } else {
         // Muted film audio: the music bed alone is the soundtrack.
-        format!("{music_chain},{norm}[aout]")
+        format!("{bed_graph};[mbed]{norm}[aout]")
     };
     let (audio_graph, video_map) = match burn_srt {
         Some(sub) => (
@@ -955,10 +967,6 @@ pub fn render_hero_video(
         "-y".into(),
         "-i".into(),
         s(&acc),
-        "-stream_loop".into(),
-        "-1".into(),
-        "-i".into(),
-        s(&music_path),
         "-filter_complex".into(),
         audio_graph,
         "-map".into(),
@@ -966,6 +974,13 @@ pub fn render_hero_video(
         "-map".into(),
         "[aout]".into(),
     ];
+    // Insert one -i per bed placement right after the film input.
+    let music_inputs: Vec<String> = bed_plan
+        .uses
+        .iter()
+        .flat_map(|u| ["-i".to_string(), s(&playlist[u.track].path)])
+        .collect();
+    final_args.splice(3..3, music_inputs);
     final_args.extend(ffmpeg::x264_aac("medium", 19));
     final_args.extend(opts.resolution.x264_level_args());
     final_args.extend(["-r".into(), "30".into(), s(out_mp4)]);
@@ -1014,6 +1029,24 @@ pub fn render_hero_video(
             .collect(),
         total_secs: (total * 1000.0).round() / 1000.0,
         captions_sidecar: srt_opt.clone(),
+        music: EdlMusic {
+            tracks: playlist
+                .iter()
+                .map(|t| t.path.to_string_lossy().into_owned())
+                .collect(),
+            crossfade_secs: crate::music::CROSSFADE_SECS,
+            crossfade_curve: crate::music::CROSSFADE_CURVE.into(),
+            seams: bed_plan
+                .seams
+                .iter()
+                .map(|x| crate::music::Seam {
+                    at_secs: (x.at_secs * 1000.0).round() / 1000.0,
+                    ..x.clone()
+                })
+                .collect(),
+            ends_naturally: bed_plan.ends_naturally,
+            fade_out_secs: bed_plan.fade_out_secs,
+        },
         fallbacks: fallbacks.clone(),
     };
     let edl_path = out_mp4.with_extension("edl.json");
@@ -3091,7 +3124,7 @@ mod tests {
                 trip_name: "Smoke Trip".into(),
                 still_secs: 1.5,
                 title_secs: 1.0,
-                music_path: None,
+                music_paths: Vec::new(),
                 keep_ambience: false,
                 typst_bin: "typst".into(),
                 resolution: Resolution::Hd1080,
@@ -3430,7 +3463,7 @@ mod tests {
                 trip_name: "Short Clip Trip".into(),
                 still_secs: 1.5,
                 title_secs: 1.0,
-                music_path: None,
+                music_paths: Vec::new(),
                 keep_ambience: false,
                 typst_bin: "typst".into(),
                 resolution: Resolution::Hd1080,
