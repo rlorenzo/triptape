@@ -991,6 +991,14 @@ fn export_blocking(
         only: "all".to_string(),
         resolution: triptape_media::resolution::Resolution::default(),
         jobs: None,
+        // The same dir the CLI uses, so `triptape cache` sees the app's
+        // segments: macOS ~/Library/Caches/app.triptape.desktop/segments.
+        segment_cache: triptape_media::segment_cache::default_dir().map(|dir| {
+            triptape_media::segment_cache::SegmentCacheConfig {
+                dir,
+                max_bytes: None,
+            }
+        }),
         progress: triptape_media::progress::Progress::new(std::sync::Arc::new(
             ExportProgress::new(app, &job.id, "all"),
         )),
