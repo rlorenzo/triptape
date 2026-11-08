@@ -766,6 +766,7 @@ mod tests {
         let p = db.create_project("trip", "/tmp/trip").unwrap();
         let edits = crate::plan::PlanEdits {
             excluded: vec!["a1".into()],
+            included: vec!["a9".into()],
             swaps: vec![("a2".into(), "a3".into())],
             place_overrides: [("a1".to_string(), "Our Hotel".to_string())].into(),
             caption_overrides: [("a3".to_string(), "Sunset".to_string())].into(),

@@ -265,6 +265,22 @@ impl StoryData {
             .collect())
     }
 
+    /// Only assets of a scan-time chapter can be pinned into the film
+    /// (the plan needs the chapter to trade a shot off against).
+    pub fn check_include(&self, asset_id: &str) -> Result<(), String> {
+        if self
+            .0
+            .base
+            .chapters
+            .iter()
+            .any(|c| c.asset_ids.iter().any(|id| id == asset_id))
+        {
+            Ok(())
+        } else {
+            Err("asset is not in any chapter".to_string())
+        }
+    }
+
     /// A swap replaces a current video/reel pick with a different asset of
     /// the same scan-time chapter, not yet picked in a keepsake `from` is in;
     /// anything else would do nothing, shorten that keepsake, or move a pick

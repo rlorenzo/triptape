@@ -250,6 +250,13 @@ export async function setAssetExcluded(projectId: string, assetId: string, exclu
   });
 }
 
+export async function setAssetIncluded(projectId: string, assetId: string, included: boolean): Promise<StoryView> {
+  if (isTauri()) return invoke("set_asset_included", { projectId, assetId, included });
+  return demoEdit((s) => {
+    for (const ch of s.chapters) for (const e of ch.entries) if (e.id === assetId) e.inHero = included;
+  });
+}
+
 export async function swapAsset(projectId: string, fromAssetId: string, toAssetId: string): Promise<StoryView> {
   if (isTauri()) return invoke("swap_asset", { projectId, fromAssetId, toAssetId });
   return demoEdit((s) => {

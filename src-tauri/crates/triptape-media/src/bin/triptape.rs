@@ -4,14 +4,16 @@
 //! ```sh
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON]
+//! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...] [--list]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F] [--keep-ambience] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //! ```
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
+use triptape_core::plan::PlanEdits;
 use triptape_core::{
-    cluster,
+    asset_ref, cluster,
     db::{Db, EditedPlan},
     hash, jobs, livephoto, metadata, plan as planmod, privacy, proxies, scan, score,
     types::*,
@@ -619,15 +621,228 @@ fn export_cmd(flags: &HashMap<String, String>) {
     println!("wrote {}", out.join("export.json").display());
 }
 
+/// Parsed `edit` arguments. `--include`, `--exclude`, `--uninclude` and
+/// `--unexclude` each take one or more asset references (id, file name or
+/// path) and may repeat.
+#[derive(Debug, Default, PartialEq)]
+struct EditArgs {
+    db: Option<PathBuf>,
+    project: Option<String>,
+    list: bool,
+    include: Vec<String>,
+    exclude: Vec<String>,
+    uninclude: Vec<String>,
+    unexclude: Vec<String>,
+}
+
+fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
+    let mut out = EditArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i]
+            .strip_prefix("--")
+            .ok_or_else(|| format!("unexpected argument {:?}", args[i]))?;
+        i += 1;
+        let mut values = vec![];
+        while i < args.len() && !args[i].starts_with("--") {
+            values.push(args[i].clone());
+            i += 1;
+        }
+        let single = |values: Vec<String>| match <[String; 1]>::try_from(values) {
+            Ok([v]) => Ok(v),
+            Err(_) => Err(format!("--{flag} wants exactly one value")),
+        };
+        match flag {
+            "db" => out.db = Some(single(values)?.into()),
+            "project" => out.project = Some(single(values)?),
+            "list" if values.is_empty() => out.list = true,
+            "list" => return Err("--list takes no value".to_string()),
+            "include" | "exclude" | "uninclude" | "unexclude" => {
+                if values.is_empty() {
+                    return Err(format!("--{flag} wants at least one asset"));
+                }
+                match flag {
+                    "include" => out.include.extend(values),
+                    "exclude" => out.exclude.extend(values),
+                    "uninclude" => out.uninclude.extend(values),
+                    _ => out.unexclude.extend(values),
+                }
+            }
+            other => return Err(format!("unknown flag --{other}")),
+        }
+    }
+    Ok(out)
+}
+
+/// File name of an asset for messages, with ` (+MOV)` for a companion.
+fn asset_label(a: &Asset) -> String {
+    let name = |p: &Path| {
+        p.file_name()
+            .map_or_else(String::new, |f| f.to_string_lossy().into_owned())
+    };
+    format!("{} [{}]", name(&a.path), a.id)
+}
+
+/// Print the Story-editor edits with file names.
+fn print_edits(edits: &planmod::PlanEdits, assets: &[Asset]) {
+    let show = |id: &String| {
+        assets
+            .iter()
+            .find(|a| a.id == *id)
+            .map_or_else(|| format!("{id} (not in project)"), asset_label)
+    };
+    for (title, ids) in [("included", &edits.included), ("excluded", &edits.excluded)] {
+        println!("{title}: {}", ids.len());
+        for id in ids {
+            println!("  {}", show(id));
+        }
+    }
+    println!("swaps: {}", edits.swaps.len());
+    for (from, to) in &edits.swaps {
+        println!("  {} -> {}", show(from), show(to));
+    }
+    println!(
+        "place overrides: {}, caption overrides: {}",
+        edits.place_overrides.len(),
+        edits.caption_overrides.len()
+    );
+}
+
+fn edit_cmd(args: &[String]) {
+    let a = parse_edit_args(args).unwrap_or_else(|e| die("edit", e));
+    let db_path = a.db.clone().unwrap_or_else(|| die("edit", "missing --db"));
+    let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
+    let ep = db
+        .edited_plan(a.project.as_deref())
+        .unwrap_or_else(|e| die("plan", e))
+        .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
+    let mut edits = ep.edits.clone();
+    let resolve = |query: &String| {
+        asset_ref::resolve_asset(&ep.assets, query)
+            .unwrap_or_else(|e| die("edit", e))
+            .clone()
+    };
+    // Resolve everything first so a bad reference changes nothing.
+    let includes: Vec<Asset> = a.include.iter().map(resolve).collect();
+    for asset in &includes {
+        if !ep
+            .base
+            .chapters
+            .iter()
+            .any(|c| c.asset_ids.contains(&asset.id))
+        {
+            die(
+                "edit",
+                format!("{} is not in any chapter of the plan", asset_label(asset)),
+            );
+        }
+    }
+    let excludes: Vec<Asset> = a.exclude.iter().map(resolve).collect();
+    let uninc: Vec<Asset> = a.uninclude.iter().map(resolve).collect();
+    let unexc: Vec<Asset> = a.unexclude.iter().map(resolve).collect();
+    let changed =
+        !(includes.is_empty() && excludes.is_empty() && uninc.is_empty() && unexc.is_empty());
+    for (assets, verb, apply) in [
+        (
+            &uninc,
+            "uninclude",
+            PlanEdits::set_included as fn(&mut PlanEdits, String, bool),
+        ),
+        (&unexc, "unexclude", PlanEdits::set_excluded),
+        (&excludes, "exclude", PlanEdits::set_excluded),
+        (&includes, "include", PlanEdits::set_included),
+    ] {
+        for asset in assets {
+            apply(
+                &mut edits,
+                asset.id.clone(),
+                matches!(verb, "include" | "exclude"),
+            );
+            println!("{verb}: {}", asset_label(asset));
+        }
+    }
+    if changed {
+        db.save_plan_edits(&ep.project_id, &edits)
+            .unwrap_or_else(|e| die("save edits", e));
+    }
+    if changed || a.list {
+        print_edits(&edits, &ep.assets);
+    }
+    if changed {
+        // Show where each included shot landed in the film.
+        let after = db
+            .edited_plan(Some(&ep.project_id))
+            .unwrap_or_else(|e| die("plan", e))
+            .unwrap_or_else(|| die("plan", "plan disappeared"));
+        let hero = &after.edited.hero;
+        for asset in &includes {
+            match hero.iter().position(|e| e.asset_id == asset.id) {
+                Some(i) => {
+                    let around = |j: Option<usize>| {
+                        j.and_then(|j| hero.get(j))
+                            .and_then(|e| after.assets.iter().find(|x| x.id == e.asset_id))
+                            .map_or_else(|| "(start/end)".to_string(), asset_label)
+                    };
+                    println!(
+                        "film: {} after {} before {} ({:?})",
+                        asset_label(asset),
+                        around(i.checked_sub(1)),
+                        around(Some(i + 1)),
+                        hero[i].rendition
+                    );
+                }
+                None => println!("film: {} is not in the film", asset_label(asset)),
+            }
+        }
+        println!("film now has {} shots", hero.len());
+    } else if !a.list {
+        die(
+            "edit",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude or --list",
+        );
+    }
+}
+
 fn main() {
     let (cmd, flags) = parse_args();
     match cmd.as_str() {
         "scan" => scan_cmd(&flags),
         "plan" => plan_cmd(&flags),
         "export" => export_cmd(&flags),
+        "edit" => edit_cmd(&std::env::args().skip(2).collect::<Vec<_>>()),
         _ => {
-            eprintln!("unknown command {cmd}; want scan|plan|export");
+            eprintln!("unknown command {cmd}; want scan|plan|edit|export");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn edit_args_take_several_values_per_flag() {
+        let a = parse_edit_args(&args(
+            "--db t.db --include IMG_1060.JPG a2 --exclude x --include b --list",
+        ))
+        .unwrap();
+        assert_eq!(a.db, Some(PathBuf::from("t.db")));
+        assert_eq!(a.include, ["IMG_1060.JPG", "a2", "b"]);
+        assert_eq!(a.exclude, ["x"]);
+        assert!(a.list);
+    }
+
+    #[test]
+    fn edit_args_reject_bad_input() {
+        assert!(parse_edit_args(&args("--include")).is_err());
+        assert!(parse_edit_args(&args("--bogus x")).is_err());
+        assert!(parse_edit_args(&args("stray")).is_err());
+        assert!(parse_edit_args(&args("--db a b")).is_err());
+        assert!(parse_edit_args(&args("--list x")).is_err());
     }
 }
