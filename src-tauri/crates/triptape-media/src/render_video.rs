@@ -10,6 +10,7 @@
 use crate::ffmpeg::{self, path_arg as s, Capabilities};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use triptape_core::plan::{MAX_CLIP_SECS, MAX_COLLAGE, MIN_SEGMENT_SECS};
 use triptape_core::types::{Plan, PlanEntry, Rendition};
 
 /// Crossfade applied at the cut *into* a segment (PLAN.md Sec 9, 6-pack).
@@ -250,9 +251,6 @@ pub struct VideoOutput {
     pub duration_secs: f64,
     pub fallbacks: Vec<String>,
 }
-
-/// Most stills shown together in one collage segment.
-const MAX_COLLAGE: usize = 4;
 
 /// Hard ceiling for a short film (PLAN.md: "short" is <=30 s).
 const SHORT_FILM_SECS: f64 = 30.0;
@@ -989,9 +987,6 @@ fn srt_ts(t: f64) -> String {
     )
 }
 
-/// Minimum on-screen time for a hero segment; shorter clips flash by.
-const MIN_SEGMENT_SECS: f64 = 2.5;
-
 /// Seconds to freeze-pad a clip to: the minimum hold, limited by what is left
 /// of the short-mode budget. `None` when the clip already reaches that.
 fn clip_pad_target(probed: f64, budget: f64) -> Option<f64> {
@@ -1051,7 +1046,7 @@ fn render_entry_segment(
         } => {
             let src = r.motion_path.as_ref().unwrap_or(&r.still_path);
             let len = (trim_end - trim_start)
-                .clamp(0.5, 30.0)
+                .clamp(0.5, MAX_CLIP_SECS)
                 .min(max_secs.max(0.5));
             // Live motion (≤3 s class) may run short; reels/video allow that.
             let out = work_dir.join(format!("seg_{idx:03}.mp4"));

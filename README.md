@@ -27,7 +27,7 @@ npm run dev                 # browser preview (demo state, no Tauri)
 CLI (`triptape-media` bin `triptape` — headless, no UI):
 
 ```sh
-cargo run -p triptape-media --bin triptape -- scan --folder /path/to/trip --db trip.db --cache /tmp/cache
+cargo run -p triptape-media --bin triptape -- scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|600|10m]
 cargo run -p triptape-media --bin triptape -- plan --db trip.db --out plan.json
 cargo run -p triptape-media --bin triptape -- export --db trip.db --out ~/Movies/TripTape/trip
 ```

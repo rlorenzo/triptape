@@ -80,7 +80,7 @@
 - Time + GPS clustering into days and places.
 - Face detection on-device (count and boxes only in MVP core; naming is opt-in).
 - One shared AI plan (shot list, hero selects, reel selects, chapters, caption drafts, map route, music pick).
-- Trip Video export: 1080p, 3–5 minutes, Ken Burns stills, Live Photo motion clips, trimmed clips, modern 6-pack transitions (Section 9), title/location cards, captions, music ducking, loudness-normalized.
+- Trip Video export: 1080p, length scaled to the trip (~3 min for a weekend, ~10 min for a month; `scan --length` overrides), Ken Burns stills, Live Photo motion clips, trimmed clips, modern 6-pack transitions (Section 9), title/location cards, captions, music ducking, loudness-normalized.
 - Reels export: 3–5 clips, 1080×1920, 15–30 seconds each, smart static crop, burned-in captions (fewer/shorter for small trips, Section 5.4).
 - Photo Book export: screen proof PDF + per-page JPEG set for Mixbook / MILK / VistaPrint + generic press PDF. See Section 11.
 - Animated map segment in the hero video (MVP: styled route card + push-in; full fly-through is later).
@@ -116,7 +116,7 @@
 
 - Rule: each keepsake has an eligibility threshold. Below it, the Export card shows a smaller variant or a disabled state with a plain-language reason. Never pad with repeated shots, never fail silently.
 - Trip Video:
-  - Target 3–5 min when the plan has enough distinct, usable moments (≈40+ after dedupe). Otherwise duration scales down to the content (floor ~30 s, ~4–6 s per still, clip trims at scored length).
+  - Full film when the plan has enough distinct, usable moments (≈40+ after dedupe): target length `100 s × √(trip days)`, clamped to 2–12 min, or the `scan --length` request (30 s–60 min). The plan fills that time budget: every chapter gets its best shot, then remaining time goes to chapters in proportion to √(chapter size), best shots first. Otherwise duration scales down to the content (floor ~30 s, ~4–6 s per still, clip trims at scored length).
   - Fewer than ~5 usable assets: offer a "short" (≤30 s) slideshow, labeled as such.
 - Reels Pack:
   - Pack size = number of distinct qualifying moments, capped at 5. 1–2 reels is a valid pack; 0 disables the card ("Not enough distinct moments for a reel").
