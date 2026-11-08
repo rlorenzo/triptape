@@ -91,13 +91,15 @@ impl Resolution {
         }
     }
 
-    /// Estimated peak memory of one hero segment render (the supersampled
-    /// canvas through ffmpeg, or a four-photo collage composed in memory),
-    /// used to cap how many run at once.
+    /// Peak memory of one hero segment render, used to cap how many run at
+    /// once. Measured on a 10-core M-series as ffmpeg's resident size for a
+    /// still-hold segment (the supersampled canvas through zoompan): ~1.7 GB
+    /// at 1080p, ~3.8 GB at 4K, with ~9.6 GB aggregate seen at 4K once clips
+    /// and collages were in the mix, so 4K is rounded well up.
     pub fn segment_peak_bytes(self) -> u64 {
         match self {
-            Self::Hd1080 => 700_000_000,
-            Self::Uhd4k => 2_500_000_000,
+            Self::Hd1080 => 1_800_000_000,
+            Self::Uhd4k => 5_000_000_000,
         }
     }
 
