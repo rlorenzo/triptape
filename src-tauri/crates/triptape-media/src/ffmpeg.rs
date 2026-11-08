@@ -39,6 +39,31 @@ pub fn fit_over_blur(
     )
 }
 
+/// Filter-graph fragment (a complete simple filtergraph on the implicit
+/// input) showing each frame whole, centred in `w`x`h` over a blurred
+/// cover-fill of itself. The frame is first fitted to `w`x`h` (`lanczos`
+/// when upscaling), then `tonemap` (an HDR chain) runs on that fitted
+/// frame, converted to 8-bit before the overlay; the fill is built from a
+/// 1/8 copy and scaled back up (bilinear: it holds no detail), so the
+/// blur stays cheap per frame even at 4K. Kept apart from
+/// [`fit_over_blur`], which builds a full-size blur once for a still and
+/// labels its input for multi-input graphs.
+pub fn video_contain_over_blur(
+    caps: &Capabilities,
+    w: u32,
+    h: u32,
+    lanczos: bool,
+    tonemap: Option<&str>,
+) -> String {
+    let (sw, sh) = ((w / 8).max(2) & !1, (h / 8).max(2) & !1);
+    let blur = if caps.gblur { ",gblur=sigma=4" } else { "" };
+    let flags = if lanczos { ":flags=lanczos" } else { "" };
+    let tone = tonemap.map_or(String::new(), |t| format!(",{t},format=yuv420p"));
+    format!(
+        "scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2{flags}{tone},split[a][b];[a]scale={sw}:{sh}:force_original_aspect_ratio=increase,crop={sw}:{sh}{blur},scale={w}:{h}:flags=bilinear[bg];[bg][b]overlay=(W-w)/2:(H-h)/2,setsar=1"
+    )
+}
+
 /// Hold a one-frame input for `frames` frames at a true 30 fps. The filters
 /// before this run once, so a costly composite is not rebuilt per frame
 /// the way an input-side `-loop 1` would.
@@ -58,6 +83,26 @@ pub fn hold_still(frames: u32) -> String {
 /// re-crops at coarse integer steps, so stills would freeze or jitter.
 /// Without `perspective` the frame holds static at `w`x`h` instead.
 pub fn glide(caps: &Capabilities, frames: u32, w: u32, h: u32, variant: usize) -> String {
+    glide_depth(caps, frames, w, h, variant, GLIDE_DEPTH)
+}
+
+/// Window divisor of the standard glide: the window shrinks to
+/// `(D-1)/D` of the frame, i.e. a 1.05x push at 21.
+pub const GLIDE_DEPTH: u32 = 21;
+/// Gentler divisor for clips shown whole over a blurred fill (about 1.5x
+/// less movement: the full subject is on screen, so it must not crowd the
+/// edges).
+pub const GLIDE_DEPTH_GENTLE: u32 = 64;
+
+/// [`glide`] with an explicit window divisor (see [`GLIDE_DEPTH`]).
+pub fn glide_depth(
+    caps: &Capabilities,
+    frames: u32,
+    w: u32,
+    h: u32,
+    variant: usize,
+    depth: u32,
+) -> String {
     if !caps.perspective {
         return format!("scale={w}:{h}:flags=lanczos,setsar=1");
     }
@@ -65,11 +110,12 @@ pub fn glide(caps: &Capabilities, frames: u32, w: u32, h: u32, variant: usize) -
     // Frame progress 0..=1; perspective's `in` counts from 1.
     let p = format!("(min(in-1\\,{denom})/{denom})");
     // Window size as a fraction of the frame, and where its slack sits.
+    let d1 = depth - 1;
     let (size, slack) = match variant % 4 {
-        0 => (format!("(1-{p}/21)"), "0.5".to_string()),
-        1 => (format!("((20+{p})/21)"), "0.5".to_string()),
-        2 => ("(20/21)".to_string(), p),
-        _ => ("(20/21)".to_string(), format!("(1-{p})")),
+        0 => (format!("(1-{p}/{depth})"), "0.5".to_string()),
+        1 => (format!("(({d1}+{p})/{depth})"), "0.5".to_string()),
+        2 => (format!("({d1}/{depth})"), p),
+        _ => (format!("({d1}/{depth})"), format!("(1-{p})")),
     };
     let left = format!("W*(1-{size})*{slack}");
     let right = format!("W*((1-{size})*{slack}+{size})");
@@ -767,6 +813,9 @@ pub struct ProbeInfo {
     pub audio_rate: u32,
     pub audio_channels: u32,
     pub color_transfer: String,
+    /// Display rotation in degrees from the stream's display matrix or
+    /// `rotate` tag (iPhone portrait clips are landscape-coded with 90).
+    pub rotation: i32,
 }
 
 /// Audio codecs ffmpeg cannot decode or the MP4 muxer cannot take. iPhone 16
@@ -777,6 +826,16 @@ pub fn is_unusable_audio_codec(codec: &str) -> bool {
 }
 
 impl ProbeInfo {
+    /// Width and height as displayed: ffmpeg autorotates by default, so a
+    /// 90/270 degree stream arrives with the two swapped.
+    pub fn display_dims(&self) -> (u32, u32) {
+        if self.rotation.rem_euclid(180) == 90 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        }
+    }
+
     /// Input specifier for the usable audio stream of input 0, e.g. `0:a:0`.
     pub fn audio_spec(&self) -> String {
         format!("0:a:{}", self.audio_index)
@@ -825,7 +884,10 @@ pub fn ffprobe_file(ffprobe_bin: &str, path: &Path) -> Result<ProbeInfo, super::
 }
 
 /// Fold `ffprobe -show_streams -show_format -of json` output into [`ProbeInfo`].
-fn parse_probe(v: &serde_json::Value, path: &Path) -> Result<ProbeInfo, super::MediaError> {
+pub(crate) fn parse_probe(
+    v: &serde_json::Value,
+    path: &Path,
+) -> Result<ProbeInfo, super::MediaError> {
     let mut info = ProbeInfo::default();
     if let Some(d) = v
         .pointer("/format/duration")
@@ -851,6 +913,7 @@ fn parse_probe(v: &serde_json::Value, path: &Path) -> Result<ProbeInfo, super::M
                     .and_then(|r| r.as_str())
                     .and_then(parse_rate)
                     .unwrap_or(0.0);
+                info.rotation = stream_rotation(s);
                 info.color_transfer = s
                     .get("color_transfer")
                     .and_then(|c| c.as_str())
@@ -884,6 +947,23 @@ fn parse_probe(v: &serde_json::Value, path: &Path) -> Result<ProbeInfo, super::M
         )));
     }
     Ok(info)
+}
+
+/// Rotation of a video stream: display-matrix side data, else the legacy
+/// `rotate` tag. 0 when neither is present.
+fn stream_rotation(s: &serde_json::Value) -> i32 {
+    let side = s
+        .get("side_data_list")
+        .and_then(|l| l.as_array())
+        .into_iter()
+        .flatten()
+        .find_map(|d| d.get("rotation").and_then(|r| r.as_f64()));
+    let tag = || {
+        s.pointer("/tags/rotate")
+            .and_then(|r| r.as_str())
+            .and_then(|r| r.parse::<f64>().ok())
+    };
+    side.or_else(tag).map_or(0, |r| r.round() as i32)
 }
 
 fn parse_rate(s: &str) -> Option<f64> {

@@ -1379,33 +1379,61 @@ fn render_entry_segment(
             let has_audio = probe.as_ref().is_none_or(|i| i.has_audio);
             // Upscaled first so the push-in samples, not smears.
             let (pw, ph) = res.clip_prescale();
+            // Framing follows the displayed (autorotated) aspect.
+            let display = probe.as_ref().map(ffmpeg::ProbeInfo::display_dims);
+            let framing = display.map_or(ClipFraming::Cover, |(w, h)| {
+                clip_framing(f64::from(w) / f64::from(h.max(1)))
+            });
             // Lanczos where the source is smaller than the pre-scale (the
             // upscale must not smear); the default filter for downscales,
             // where lanczos only costs time.
-            let upscaling = probe
-                .as_ref()
-                .is_some_and(|i| i.width < pw || i.height < ph);
-            let flags = if upscaling { ":flags=lanczos" } else { "" };
-            let mut vf = format!(
-                "scale={pw}:{ph}:force_original_aspect_ratio=increase{flags},crop={pw}:{ph},setsar=1"
-            );
-            if let Some(info) = &probe {
-                if let Some(chain) = ffmpeg::tonemap_chain(caps, &info.color_transfer) {
-                    vf.push(',');
-                    vf.push_str(&chain);
-                    fallbacks.push(format!(
-                        "{} HDR tone-mapped ({})",
-                        r.entry.asset_id, info.color_transfer
+            let upscaling = display.is_some_and(|(w, h)| match framing {
+                ClipFraming::Cover => w < pw || h < ph,
+                ClipFraming::Contain => w < pw && h < ph,
+            });
+            let tonemap = probe.as_ref().and_then(|i| {
+                let chain = ffmpeg::tonemap_chain(caps, &i.color_transfer)?;
+                fallbacks.push(format!(
+                    "{} HDR tone-mapped ({})",
+                    r.entry.asset_id, i.color_transfer
+                ));
+                Some(chain)
+            });
+            // Normalized to 30 fps before any per-frame work: 60 fps
+            // sources would otherwise composite twice the frames, and the
+            // glide's progress counts frames.
+            let mut vf = String::from("fps=30,");
+            match framing {
+                ClipFraming::Cover => {
+                    let flags = if upscaling { ":flags=lanczos" } else { "" };
+                    vf.push_str(&format!(
+                        "scale={pw}:{ph}:force_original_aspect_ratio=increase{flags},crop={pw}:{ph},setsar=1"
                     ));
+                    if let Some(chain) = &tonemap {
+                        vf.push(',');
+                        vf.push_str(chain);
+                    }
                 }
+                ClipFraming::Contain => vf.push_str(&ffmpeg::video_contain_over_blur(
+                    caps,
+                    pw,
+                    ph,
+                    upscaling,
+                    tonemap.as_deref(),
+                )),
             }
-            // Slow glide push-in on clips (1.0 -> 1.05), matching the
-            // stills' Ken Burns drift so cuts don't sit static. Normalized
-            // to 30 fps first: the glide's progress counts frames.
+            // Slow glide push-in on clips (1.0 -> 1.05, gentler when the
+            // clip is shown whole), matching the stills' Ken Burns drift
+            // so cuts don't sit static.
             let frames = (len * 30.0).round().max(1.0) as u32;
-            vf.push_str(&format!(
-                ",fps=30,{}",
-                ffmpeg::glide(caps, frames, res.width(), res.height(), 0)
+            vf.push(',');
+            vf.push_str(&ffmpeg::glide_depth(
+                caps,
+                frames,
+                res.width(),
+                res.height(),
+                0,
+                framing.glide_depth(),
             ));
             vf.push_str(",format=yuv420p");
             let mut args: Vec<String> = vec![
@@ -1444,6 +1472,42 @@ fn render_entry_segment(
             caps.run(&args, &out)?;
             Ok((out, len, "clip".into()))
         }
+    }
+}
+
+/// Most of a clip's area a 16:9 cover crop may cut away before the clip is
+/// shown whole over a blurred fill instead. 16:10 (0.10) and 16:9 itself
+/// cover; 3:2 (0.16), 4:3 (0.25), squares and portraits (0.44 and up) do
+/// not.
+const MAX_CLIP_CROP: f64 = 0.15;
+
+/// How a video clip fills the 16:9 frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipFraming {
+    /// Scale to cover and crop the overflow (clips close to 16:9).
+    Cover,
+    /// Whole frame, centred over a blurred copy of itself.
+    Contain,
+}
+
+impl ClipFraming {
+    /// Glide window divisor: contained clips keep the whole subject on
+    /// screen, so they push in more gently.
+    fn glide_depth(self) -> u32 {
+        match self {
+            Self::Cover => ffmpeg::GLIDE_DEPTH,
+            Self::Contain => ffmpeg::GLIDE_DEPTH_GENTLE,
+        }
+    }
+}
+
+/// Framing for a clip of displayed aspect `aspect` (width / height, after
+/// rotation metadata is applied).
+fn clip_framing(aspect: f64) -> ClipFraming {
+    if crop_loss(aspect, 16.0 / 9.0) <= MAX_CLIP_CROP {
+        ClipFraming::Cover
+    } else {
+        ClipFraming::Contain
     }
 }
 
@@ -1500,14 +1564,23 @@ fn collage_eligible(e: &ResolvedEntry) -> bool {
     matches!(e.entry.rendition, Rendition::Still) && !e.aspect.is_some_and(is_panorama)
 }
 
-/// Under this width / height a photo counts as a portrait for layout.
+/// Under this width / height a photo counts as a portrait, which the
+/// collage layout never puts in a stacked (half-height) cell.
 const PORTRAIT_BELOW: f64 = 0.95;
 /// Most of a photo a collage cell may crop away before the photo is
-/// shown whole over its own blurred fill instead.
-const MAX_CELL_CROP: f64 = 0.30;
+/// shown whole over its own blurred fill instead. Faces survive because
+/// the crop keeps the top ([`CROP_FOCUS_Y`]); beyond this the layout and
+/// the renderer both treat the cell as a poor fit.
+const MAX_CELL_CROP: f64 = 0.35;
 /// Focal height for cover crops that must cut height: people sit in the
 /// upper part of a portrait, so keep the top (0 = top, 0.5 = centre).
 const CROP_FOCUS_Y: f64 = 0.35;
+/// Weight of fill that [`fill_cell`] contains rather than covers, against
+/// one that crops the same amount: shown whole beats cut off, but blur
+/// still wastes the cell.
+const CONTAIN_PENALTY: f64 = 0.6;
+/// Layout tie-break: cost per pair of photos out of capture order.
+const REORDER_PENALTY: f64 = 0.01;
 
 /// One collage cell: which member it holds and its rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1519,72 +1592,163 @@ struct CollageCell {
     h: u32,
 }
 
-/// Lay out a collage by photo orientation (`aspects` are width / height in
-/// member order). 2: side by side, widths following the photos' aspects.
-/// 3: three portrait columns, else one big cell (the lone portrait, or the
-/// widest photo) beside two stacked. 4: 2x2, or four columns when mostly
-/// portraits. Cells tile the canvas exactly.
+/// Column structures tried per photo count: each entry is how many cells
+/// (1 whole, 2 stacked) its column holds, left to right.
+fn column_shapes(n: usize) -> &'static [&'static [usize]] {
+    match n {
+        1 => &[&[1]],
+        2 => &[&[1, 1]],
+        3 => &[&[1, 1, 1], &[1, 2], &[2, 1]],
+        4 => &[&[1, 1, 1, 1], &[2, 2], &[1, 1, 2], &[2, 1, 1], &[1, 2, 1]],
+        _ => &[],
+    }
+}
+
+fn permutations(n: usize) -> Vec<Vec<usize>> {
+    fn go(cur: &mut Vec<usize>, left: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+        if left.is_empty() {
+            out.push(cur.clone());
+            return;
+        }
+        for i in 0..left.len() {
+            let m = left.remove(i);
+            cur.push(m);
+            go(cur, left, out);
+            cur.pop();
+            left.insert(i, m);
+        }
+    }
+    let mut out = vec![];
+    go(&mut vec![], &mut (0..n).collect(), &mut out);
+    out
+}
+
+/// Badness of showing a `sa`-aspect photo in a `ca`-aspect cell: the share
+/// cropped away while it still covers, then a discounted rate for the
+/// share of the cell wasted on blur once it is shown whole.
+fn cell_penalty(sa: f64, ca: f64) -> f64 {
+    let loss = crop_loss(sa, ca);
+    if loss <= MAX_CELL_CROP {
+        loss
+    } else {
+        MAX_CELL_CROP + CONTAIN_PENALTY * (loss - MAX_CELL_CROP)
+    }
+}
+
+/// Cells for `order` (members, left to right and top to bottom) arranged
+/// into columns of `shape`, with column widths following `weights`.
+fn build_columns(
+    order: &[usize],
+    shape: &[usize],
+    weights: &[f64],
+    w: u32,
+    h: u32,
+) -> Vec<CollageCell> {
+    let total: f64 = weights.iter().sum();
+    let (mut cells, mut x, mut acc, mut next) = (vec![], 0u32, 0.0, 0usize);
+    for (k, (&count, wt)) in shape.iter().zip(weights).enumerate() {
+        acc += wt;
+        let right = if k + 1 == shape.len() {
+            w
+        } else {
+            (f64::from(w) * acc / total).round() as u32
+        };
+        let (cw, half) = (right - x, h / 2);
+        for j in 0..count {
+            let (y, ch) = if count == 1 {
+                (0, h)
+            } else if j == 0 {
+                (0, half)
+            } else {
+                (half, h - half)
+            };
+            cells.push(CollageCell {
+                member: order[next],
+                x,
+                y,
+                w: cw,
+                h: ch,
+            });
+            next += 1;
+        }
+        x = right;
+    }
+    cells
+}
+
+/// Ideal width of each column of `shape` filled by `order`: the width at
+/// which its cells match their photos' mean aspect. `None` when a portrait
+/// would land in a stacked (short) cell.
+fn ideal_column_widths(
+    order: &[usize],
+    shape: &[usize],
+    aspects: &[f64],
+    h: u32,
+) -> Option<Vec<f64>> {
+    let mut at = 0;
+    shape
+        .iter()
+        .map(|&count| {
+            let members = &order[at..at + count];
+            at += count;
+            if count > 1 && members.iter().any(|&m| aspects[m] < PORTRAIT_BELOW) {
+                return None;
+            }
+            let mean = members.iter().map(|&m| aspects[m]).sum::<f64>() / count as f64;
+            Some(mean * f64::from(h) / count as f64)
+        })
+        .collect()
+}
+
+/// Lay out a collage by photo shape (`aspects` are width / height in
+/// member order). Every column arrangement (a row of full-height cells,
+/// some columns split in two) of every ordering is scored by how much of
+/// each photo its cell crops or wastes; the cheapest wins, with a small
+/// preference for capture order. Portraits never go in a stacked (short)
+/// cell, so selfies get tall columns and landscapes share the rest.
+/// Cells tile the canvas exactly.
 fn collage_layout(aspects: &[f64], w: u32, h: u32) -> Vec<CollageCell> {
     let n = aspects.len().min(MAX_COLLAGE);
-    let portraits: Vec<usize> = (0..n).filter(|&i| aspects[i] < PORTRAIT_BELOW).collect();
-    let cell = |member, x, y, w, h| CollageCell { member, x, y, w, h };
-    // Full-height columns in `order`, widths by weight.
-    let columns = |order: &[usize], weights: &[f64]| {
-        let total: f64 = weights.iter().sum();
-        let (mut x, mut acc) = (0u32, 0.0);
-        order
+    let total_area = f64::from(w) * f64::from(h);
+    let fit = |cells: &[CollageCell]| -> f64 {
+        cells
             .iter()
-            .zip(weights)
-            .enumerate()
-            .map(|(k, (&m, wt))| {
-                acc += wt;
-                let right = if k + 1 == order.len() {
-                    w
-                } else {
-                    (f64::from(w) * acc / total).round() as u32
-                };
-                let c = cell(m, x, 0, right - x, h);
-                x = right;
-                c
+            .map(|c| {
+                let ca = f64::from(c.w) / f64::from(c.h);
+                cell_penalty(aspects[c.member], ca) * f64::from(c.w) * f64::from(c.h) / total_area
             })
-            .collect::<Vec<_>>()
+            .sum()
     };
-    let (hw, hh) = (w / 2, h / 2);
-    match n {
-        0 => vec![],
-        1 => vec![cell(0, 0, 0, w, h)],
-        2 => {
-            let share = (aspects[0] / (aspects[0] + aspects[1])).clamp(0.35, 0.65);
-            columns(&[0, 1], &[share, 1.0 - share])
-        }
-        3 if portraits.len() == 3 => columns(&[0, 1, 2], &[1.0; 3]),
-        3 => {
-            let big = match portraits.as_slice() {
-                [only] => *only,
-                _ => (0..3)
-                    .max_by(|&a, &b| aspects[a].total_cmp(&aspects[b]))
-                    .unwrap_or(0),
+    let mut best: Option<(f64, Vec<CollageCell>)> = None;
+    for order in permutations(n) {
+        let inversions = (0..n)
+            .flat_map(|i| (i + 1..n).map(move |j| (i, j)))
+            .filter(|&(i, j)| order[i] > order[j])
+            .count();
+        let reorder = REORDER_PENALTY * inversions as f64;
+        for shape in column_shapes(n) {
+            let Some(ideal) = ideal_column_widths(&order, shape, aspects, h) else {
+                continue;
             };
-            let bw = if aspects[big] < PORTRAIT_BELOW {
-                hw
-            } else {
-                (f64::from(w) * 0.58).round() as u32
-            };
-            let rest: Vec<usize> = (0..3).filter(|&i| i != big).collect();
-            vec![
-                cell(big, 0, 0, bw, h),
-                cell(rest[0], bw, 0, w - bw, hh),
-                cell(rest[1], bw, hh, w - bw, h - hh),
-            ]
+            // Candidate widths: each column's ideal (floored so no column
+            // collapses below half the mean), a sqrt-damped blend, and
+            // equal columns.
+            let mean_ideal = ideal.iter().sum::<f64>() / ideal.len() as f64;
+            let floored: Vec<f64> = ideal.iter().map(|&v| v.max(0.5 * mean_ideal)).collect();
+            let damped = floored.iter().map(|v| v.sqrt()).collect();
+            let sets = [floored, damped, vec![1.0; ideal.len()]];
+            for weights in &sets {
+                let cells = build_columns(&order, shape, weights, w, h);
+                let sc = fit(&cells) + reorder;
+                // Strictly better only, so earlier (closer to capture
+                // order) candidates win ties despite float noise.
+                if best.as_ref().is_none_or(|(b, _)| sc < *b - 1e-9) {
+                    best = Some((sc, cells));
+                }
+            }
         }
-        _ if portraits.len() >= 3 => columns(&[0, 1, 2, 3], &[1.0; 4]),
-        _ => vec![
-            cell(0, 0, 0, hw, hh),
-            cell(1, hw, 0, w - hw, hh),
-            cell(2, 0, hh, hw, h - hh),
-            cell(3, hw, hh, w - hw, h - hh),
-        ],
     }
+    best.map(|(_, cells)| cells).unwrap_or_default()
 }
 
 /// Fraction of a `sa`-aspect photo cut away to cover a `ca`-aspect cell.
@@ -2036,33 +2200,141 @@ mod tests {
         let cells = collage_layout(&[0.75, 0.75], 2880, 1620);
         assert!(cells.iter().all(|c| c.h == 1620 && c.y == 0));
         assert_eq!((cells[0].w, cells[1].w), (1440, 1440));
-        // A portrait + landscape pair splits by aspect, never past 65/35.
+        // A portrait + landscape pair: full-height columns, the landscape
+        // wider, each cell near its photo's shape.
         let mixed = collage_layout(&[1.5, 0.75], 2880, 1620);
-        assert!(mixed[0].w > mixed[1].w && mixed[0].w <= 1872);
+        assert!(mixed.iter().all(|c| c.h == 1620));
+        assert!(mixed[0].w > mixed[1].w);
+        let pa = f64::from(mixed[1].w) / f64::from(mixed[1].h);
+        assert!(crop_loss(0.75, pa) < 0.1, "portrait cell aspect {pa}");
     }
 
     #[test]
-    fn three_photos_get_one_big_cell_for_the_odd_one_out() {
-        // Lone portrait leads, landscapes stack beside it.
-        let cells = collage_layout(&[1.5, 0.75, 1.5], 2880, 1620);
-        let big = cells[0];
-        assert_eq!((big.member, big.h, big.x), (1, 1620, 0));
-        assert!(cells[1..].iter().all(|c| c.x == big.w && c.h == 810));
-        // All landscape: the widest photo gets the big (wider) cell.
-        let cells = collage_layout(&[1.5, 1.78, 1.33], 2880, 1620);
-        assert_eq!(cells[0].member, 1);
-        assert!(cells[0].w > 1440);
-        // Three portraits: three columns.
+    fn portraits_get_tall_columns_never_stacked_cells() {
+        const L: f64 = 1.5;
+        const P: f64 = 0.75;
+        // The reviewed case: one landscape + two portrait selfies. Every
+        // portrait owns a full-height column that crops it by <= the cap.
+        for aspects in [[L, P, P], [P, L, P], [P, P, L]] {
+            let cells = collage_layout(&aspects, 3840, 2160);
+            for c in &cells {
+                if aspects[c.member] < PORTRAIT_BELOW {
+                    assert_eq!(c.h, 2160, "portrait in a short cell: {c:?}");
+                    let ca = f64::from(c.w) / f64::from(c.h);
+                    assert!(crop_loss(P, ca) <= MAX_CELL_CROP, "{c:?} ca={ca}");
+                }
+            }
+        }
+        // Mixed fours keep portraits tall too, with landscapes stacked.
+        let mixed = [L, P, P, L];
+        let cells = collage_layout(&mixed, 3840, 2160);
+        assert!(cells
+            .iter()
+            .filter(|c| mixed[c.member] == P)
+            .all(|c| c.h == 2160));
+        assert!(cells.iter().any(|c| c.h == 1080));
+        // Three portraits: three equal columns.
         let cols = collage_layout(&[0.7, 0.75, 0.8], 2880, 1620);
         assert!(cols.iter().all(|c| c.h == 1620 && c.w == 960));
     }
 
     #[test]
+    fn degenerate_collages_fill_the_canvas() {
+        assert!(collage_layout(&[], 2880, 1620).is_empty());
+        let one = collage_layout(&[0.75], 2880, 1620);
+        assert_eq!(
+            one,
+            vec![CollageCell {
+                member: 0,
+                x: 0,
+                y: 0,
+                w: 2880,
+                h: 1620
+            }]
+        );
+    }
+
+    #[test]
+    fn landscapes_stack_beside_a_lone_portrait_or_share_a_big_cell() {
+        // Lone portrait: tall column; landscapes stack opposite it.
+        let cells = collage_layout(&[1.5, 0.75, 1.5], 2880, 1620);
+        let tall = cells.iter().find(|c| c.member == 1).unwrap();
+        assert_eq!(tall.h, 1620);
+        assert!(cells.iter().filter(|c| c.member != 1).all(|c| c.h == 810));
+        // All landscape: one big cell beside two stacked.
+        let cells = collage_layout(&[1.5, 1.5, 1.5], 2880, 1620);
+        assert_eq!(cells.iter().filter(|c| c.h == 1620).count(), 1);
+        assert_eq!(cells.iter().filter(|c| c.h == 810).count(), 2);
+    }
+
+    #[test]
     fn four_photos_grid_unless_mostly_portrait() {
-        let grid = collage_layout(&[1.5, 1.5, 0.75, 1.5], 2880, 1620);
+        let grid = collage_layout(&[1.5, 1.5, 1.5, 1.5], 2880, 1620);
         assert!(grid.iter().all(|c| c.w == 1440 && c.h == 810));
         let cols = collage_layout(&[0.75; 4], 2880, 1620);
         assert!(cols.iter().all(|c| c.h == 1620 && c.w == 720));
+    }
+
+    #[test]
+    fn clip_framing_follows_displayed_aspect() {
+        // 16:9 and 16:10 landscapes keep the cover crop.
+        assert_eq!(clip_framing(16.0 / 9.0), ClipFraming::Cover);
+        assert_eq!(clip_framing(1.6), ClipFraming::Cover);
+        assert_eq!(clip_framing(2.0), ClipFraming::Cover);
+        // 4:3, 3:2 Live Photos and 2.39:1 would lose too much.
+        assert_eq!(clip_framing(4.0 / 3.0), ClipFraming::Contain);
+        assert_eq!(clip_framing(1.5), ClipFraming::Contain);
+        assert_eq!(clip_framing(2.39), ClipFraming::Contain);
+        // Squares and portraits (a 3840x2160 stream rotated 90) are whole.
+        assert_eq!(clip_framing(1.0), ClipFraming::Contain);
+        assert_eq!(clip_framing(9.0 / 16.0), ClipFraming::Contain);
+        assert_eq!(clip_framing(3.0 / 4.0), ClipFraming::Contain);
+    }
+
+    #[test]
+    fn rotated_streams_report_displayed_dimensions() {
+        let v: serde_json::Value = serde_json::json!({"streams": [{
+            "codec_type": "video", "width": 3840, "height": 2160,
+            "side_data_list": [{"side_data_type": "Display Matrix", "rotation": -90}]
+        }]});
+        let info = ffmpeg::parse_probe(&v, Path::new("x.mov")).unwrap();
+        assert_eq!(info.display_dims(), (2160, 3840));
+        let v = serde_json::json!({"streams": [{
+            "codec_type": "video", "width": 1920, "height": 1080,
+            "tags": {"rotate": "270"}
+        }]});
+        let info = ffmpeg::parse_probe(&v, Path::new("x.mov")).unwrap();
+        assert_eq!(info.display_dims(), (1080, 1920));
+        let v = serde_json::json!({"streams": [{
+            "codec_type": "video", "width": 1920, "height": 1080
+        }]});
+        let info = ffmpeg::parse_probe(&v, Path::new("x.mov")).unwrap();
+        assert_eq!(info.display_dims(), (1920, 1080));
+    }
+
+    #[test]
+    fn contained_clip_graph_blurs_a_small_copy_and_glides_gently() {
+        let caps = ffmpeg::Capabilities {
+            gblur: true,
+            perspective: true,
+            ..Default::default()
+        };
+        let g = ffmpeg::video_contain_over_blur(&caps, 3840, 2160, false, None);
+        assert!(
+            g.contains("scale=480:270:force_original_aspect_ratio=increase"),
+            "{g}"
+        );
+        assert!(
+            g.contains("scale=3840:2160:force_original_aspect_ratio=decrease"),
+            "{g}"
+        );
+        assert!(g.contains("overlay=(W-w)/2:(H-h)/2"), "{g}");
+        let gentle = ffmpeg::glide_depth(&caps, 90, 3840, 2160, 0, ffmpeg::GLIDE_DEPTH_GENTLE);
+        assert!(gentle.contains("/64"), "{gentle}");
+        assert_eq!(
+            ffmpeg::glide(&caps, 90, 3840, 2160, 0),
+            ffmpeg::glide_depth(&caps, 90, 3840, 2160, 0, 21)
+        );
     }
 
     #[test]
@@ -2343,6 +2615,69 @@ mod tests {
             taken_at: None,
             tz_offset_secs: None,
             aspect: None,
+        }
+    }
+
+    /// A landscape-coded stream with a 90 degree display matrix (how iPhones
+    /// store portrait clips) plus a native odd-sized portrait clip both render
+    /// whole over a blurred fill into a clean 1080p segment (odd fitted sizes
+    /// once broke zscale's subsampling check).
+    #[test]
+    fn portrait_clips_render_whole_into_a_landscape_frame() {
+        let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
+        if !caps.libx264 || !caps.perspective || !caps.gblur {
+            eprintln!("ffmpeg caps insufficient; skipping portrait clip test");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let st = std::process::Command::new(&caps.ffmpeg_bin)
+                .args(["-v", "error", "-y"])
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        };
+        let path = |name: &str| temp.path().join(name).to_string_lossy().into_owned();
+        let testsrc = |size: &str, name: &str| {
+            let out = path(name);
+            let src = format!("testsrc2=s={size}:r=30:d=2");
+            run(&["-f", "lavfi", "-i", &src, "-pix_fmt", "yuv420p", &out]);
+            out
+        };
+        let flat = testsrc("640x360", "flat.mp4");
+        let rotated = path("rotated.mp4");
+        run(&[
+            "-display_rotation",
+            "90",
+            "-i",
+            &flat,
+            "-c",
+            "copy",
+            &rotated,
+        ]);
+        let native = testsrc("358x638", "native.mp4");
+        for (name, src) in [("rotated", rotated), ("native", native)] {
+            let src = PathBuf::from(src);
+            let probe = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &src).unwrap();
+            let (dw, dh) = probe.display_dims();
+            assert!(dh > dw, "{name}: displayed {dw}x{dh} should be portrait");
+            let r = clip_entry(name, src, 1.5);
+            let mut fb = vec![];
+            let (out, _, kind) = render_entry_segment(
+                &caps,
+                &r,
+                0,
+                3.0,
+                10.0,
+                Resolution::Hd1080,
+                temp.path(),
+                &mut fb,
+            )
+            .unwrap();
+            assert_eq!(kind, "clip");
+            let info = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &out).unwrap();
+            assert_eq!((info.width, info.height), (1920, 1080), "{name}");
         }
     }
 
@@ -3378,6 +3713,46 @@ mod tests {
         // A lone worker keeps ffmpeg's default threading.
         assert_eq!(thread_share(1), None);
         assert!(thread_share(2).unwrap() >= 2);
+    }
+
+    /// Visual check of clip framing, a portrait collage and the map card on
+    /// real copies in `TRIPTAPE_BENCH_DIR` (portrait.mov, portrait2.mov,
+    /// live.mov, land.mov, c1..c3.HEIC); writes `vis_*.mp4` there.
+    #[test]
+    #[ignore = "needs real media via TRIPTAPE_BENCH_DIR"]
+    fn visual_check_framing() {
+        let Ok(dir) = std::env::var("TRIPTAPE_BENCH_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let (caps, res) = bench_setup();
+        let work = dir.join(format!("work_{}", res.label()));
+        std::fs::create_dir_all(&work).unwrap();
+        let mut fb = vec![];
+        for (i, name) in ["portrait.mov", "portrait2.mov", "live.mov", "land.mov"]
+            .iter()
+            .enumerate()
+        {
+            let r = clip_entry(name, dir.join(name), 3.0);
+            let t = std::time::Instant::now();
+            let (o, _, _) =
+                render_entry_segment(&caps, &r, i, 4.0, 99.0, res, &work, &mut fb).unwrap();
+            eprintln!("VIS {name}: {:.2}s", t.elapsed().as_secs_f64());
+            std::fs::copy(&o, dir.join(format!("vis_{}_{name}.mp4", res.label()))).unwrap();
+        }
+        let members: Vec<ResolvedEntry> = ["c1.HEIC", "c2.HEIC", "c3.HEIC"]
+            .map(|n| card_entry(n, &dir.join(n)))
+            .to_vec();
+        let refs: Vec<&ResolvedEntry> = members.iter().collect();
+        let (o, _, _) = render_collage_segment(&caps, &refs, 9, 4.0, res, &work).unwrap();
+        std::fs::copy(&o, dir.join(format!("vis_{}_collage.mp4", res.label()))).unwrap();
+        let (w, h) = res.dims();
+        let card = dir.join(format!("map_{}.png", res.label()));
+        let route = [(35.7, 139.8), (34.7, 135.5), (1.35, 103.8)];
+        crate::map::save_route_card(&route, &[0], w, h, &card).unwrap();
+        let out = dir.join(format!("vis_{}_map.mp4", res.label()));
+        crate::map::render_map_push_in(&caps, &card, &out, 3.0, 0, res).unwrap();
+        eprintln!("fallbacks: {fb:?}");
     }
 
     #[test]
