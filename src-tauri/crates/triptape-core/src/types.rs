@@ -67,6 +67,10 @@ pub struct Asset {
     /// Caption embedded in the file by the user (EXIF/XMP), if any.
     /// Wins over auto-generated place captions in plans.
     pub user_caption: Option<String>,
+    /// How many people the photo library tagged in this asset (a count
+    /// only, never the names: they are personal data and stay out of logs,
+    /// plans and exports). `None` when untagged or unknown.
+    pub people_count: Option<u32>,
     /// Local quality/story score, filled by background scoring after ingest.
     /// `None` until scored (or when scoring was skipped).
     pub score: Option<Score>,
@@ -93,6 +97,7 @@ impl Asset {
             rotation_deg: 0,
             pairing_confidence: None,
             user_caption: None,
+            people_count: None,
             score: None,
         }
     }
@@ -189,8 +194,13 @@ pub struct Score {
     pub exposure: f32,
     /// 0..1 blur estimate (1 = very blurry).
     pub blur: f32,
-    /// Combined 0..1 quality.
+    /// Combined 0..1 story score: compressed technical quality plus
+    /// [`Score::bonus`].
     pub total: f32,
+    /// Story-signal part of `total` (people, caption, video, place). The
+    /// plan subtracts it to rank technical quality relative to a chapter.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bonus: f32,
     /// Whether this asset is a story highlight.
     pub highlight: bool,
     /// One short string per contributing signal.
@@ -199,6 +209,10 @@ pub struct Score {
     /// at ingest. `None` keeps the start-of-clip trim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clip_window: Option<(f64, f64)>,
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
 }
 
 /// Durable job state machine.

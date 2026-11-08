@@ -75,35 +75,55 @@ const HASH_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// hold stays short while decode/ffmpeg work stays lock-free.
 const SCORE_FLUSH_FILES: usize = 25;
 
-/// Score one asset for the background ingest pass, mirroring the CLI
-/// (`triptape-media`'s `triptape` binary) constants.
+/// One asset's background scoring result.
+#[derive(Debug, Clone, PartialEq)]
+struct Scored {
+    score: Score,
+    /// Perceptual hash of the pixels scored (thumbnail or poster frame);
+    /// `None` when nothing decoded.
+    phash: Option<u64>,
+}
+
+/// Score and fingerprint one asset for the background ingest pass,
+/// mirroring the CLI (`triptape-media`'s `triptape` binary) constants.
 ///
-/// Videos use the fixed GPS-novelty proxy plus a best-window analysis.
-/// Stills and Live Photos score their still image, preferring the existing 320 px ffmpeg thumbnail
-/// (same `source_cache_key` + `cache_path` convention as `get_thumbnail`,
-/// so scoring warms the Library thumbnail cache) and falling back to the
+/// Every kind is read through its existing 320 px ffmpeg thumbnail (same
+/// `source_cache_key` + `cache_path` convention as `get_thumbnail`, so
+/// scoring warms the Library thumbnail cache; videos use their poster
+/// frame). Stills and Live Photos score that image and fall back to the
 /// source file when the thumbnail cannot be made or decoded; unscorable
-/// stills get the CLI neutral fallback. Pure per-file work: never fails,
+/// stills get the CLI neutral fallback. The pHash comes from the same
+/// pixels, so HEIC stills, Live Photos and videos get one too. Videos
+/// score by the quality of their best playback window (plus people and
+/// caption signals) and keep that window. Pure per-file work: never fails,
 /// never touches the Db.
-fn score_asset_with_cache(cache_dir: &Path, a: &Asset) -> Score {
+fn score_asset_with_cache(cache_dir: &Path, a: &Asset) -> Scored {
+    let signals = score::StorySignals::for_asset(a);
+    let thumb = proxies::source_cache_key(&a.id, &a.path)
+        .ok()
+        .map(|key| proxies::cache_path(cache_dir, "thumb", &key, ".jpg"))
+        .filter(|dst| triptape_media::ffmpeg::render_thumb("ffmpeg", &a.path, a.kind, dst).is_ok())
+        .and_then(|dst| hash::open_image(&dst));
     if a.kind == AssetKind::Video {
-        let mut s = score::video_proxy_score(a.gps.is_some());
-        // Best playback window for the hero film; any failure keeps the
-        // start-of-clip trim.
-        s.clip_window = a
-            .duration_secs
-            .and_then(|d| triptape_media::clip_analysis::best_clip_window("ffmpeg", &a.path, d));
-        return s;
+        // Any failure keeps the start-of-clip trim and a neutral quality.
+        let analysis = a.duration_secs.map_or_else(Default::default, |d| {
+            triptape_media::clip_analysis::analyze_clip("ffmpeg", &a.path, d)
+        });
+        let mut score = score::score_video(analysis.quality, &signals);
+        score.clip_window = analysis.window;
+        return Scored {
+            score,
+            phash: thumb.as_ref().map(hash::average_hash_from_image),
+        };
     }
-    if let Ok(key) = proxies::source_cache_key(&a.id, &a.path) {
-        let dst = proxies::cache_path(cache_dir, "thumb", &key, ".jpg");
-        if triptape_media::ffmpeg::render_thumb("ffmpeg", &a.path, a.kind, &dst).is_ok() {
-            if let Some(s) = score::score_still_file(&dst) {
-                return s;
-            }
-        }
+    let pixels = thumb.or_else(|| hash::open_image(&a.path));
+    Scored {
+        score: pixels
+            .as_ref()
+            .and_then(|p| score::score_still_image(p, &signals))
+            .unwrap_or_else(|| score::fallback_score_with(&signals)),
+        phash: pixels.as_ref().map(hash::average_hash_from_image),
     }
-    score::score_still_file(&a.path).unwrap_or_else(score::fallback_score)
 }
 
 /// Upper bound on concurrent scoring workers: each one holds a full-size
@@ -123,7 +143,7 @@ fn score_assets_parallel(
     cache_dir: &Path,
     assets: &[Asset],
     workers: usize,
-    mut on_score: impl FnMut(&Asset, Score, usize, usize),
+    mut on_score: impl FnMut(&Asset, Scored, usize, usize),
 ) {
     triptape_core::parallel::for_each_parallel(
         assets,
@@ -268,21 +288,22 @@ fn background_hash_job(
             .collect();
         let score_total = unscored.len();
         if score_total > 0 {
-            let flush_scores = |pending: &mut Vec<(String, Score)>| -> Result<(), String> {
-                if pending.is_empty() {
-                    return Ok(());
-                }
-                let db = lock()?;
-                db.in_transaction(|db| {
-                    for (id, s) in pending.iter() {
-                        db.update_asset_score(id, s)?;
+            let flush_scores =
+                |pending: &mut Vec<(String, Score, Option<u64>)>| -> Result<(), String> {
+                    if pending.is_empty() {
+                        return Ok(());
                     }
-                    Ok::<(), String>(())
-                })?;
-                pending.clear();
-                Ok(())
-            };
-            let mut pending_scores: Vec<(String, Score)> = vec![];
+                    let db = lock()?;
+                    db.in_transaction(|db| {
+                        for (id, s, phash) in pending.iter() {
+                            db.update_asset_scoring(id, s, *phash)?;
+                        }
+                        Ok::<(), String>(())
+                    })?;
+                    pending.clear();
+                    Ok(())
+                };
+            let mut pending_scores: Vec<(String, Score, Option<u64>)> = vec![];
             // Decode/score work fans out over worker threads; persists and
             // progress stay on this thread via the completion callback,
             // which fires once per scored asset in completion order.
@@ -291,7 +312,7 @@ fn background_hash_job(
                 .unwrap_or(SCORE_WORKERS_MAX)
                 .min(SCORE_WORKERS_MAX);
             score_assets_parallel(&cache_dir, &unscored, workers, |a, s, done, total| {
-                pending_scores.push((a.id.clone(), s));
+                pending_scores.push((a.id.clone(), s.score, s.phash));
                 if pending_scores.len() >= SCORE_FLUSH_FILES
                     && flush_scores(&mut pending_scores).is_ok()
                 {
@@ -338,7 +359,15 @@ fn background_hash_job(
             .iter()
             .filter_map(|a| a.score.clone().map(|s| (a.id.clone(), s)))
             .collect();
-        let plan = planmod::build_plan(&assets, &cluster_of, &scores);
+        // Near-duplicates (same moment, similar pixels) stay in the library
+        // but only the best shot of each stack enters the plan, as in the CLI.
+        let suppressed = cluster::suppressed_ids(&cluster::collapse_near_dupes(&assets, &scores));
+        let plan_assets: Vec<Asset> = assets
+            .iter()
+            .filter(|a| !suppressed.contains(&a.id))
+            .cloned()
+            .collect();
+        let plan = planmod::build_plan(&plan_assets, &cluster_of, &scores);
         let db = lock()?;
         db.insert_plan(project_id, &plan, "local")?;
         db.update_job(job_id, JobState::Done, 1.0, Some("done"), None)?;

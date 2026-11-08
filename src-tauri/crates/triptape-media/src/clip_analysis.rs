@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use triptape_core::clip_window::{
     audio_rms_buckets, laplacian_variance, mean_abs_diff, mean_luma, pick_window, score_samples,
-    wants_window, RawSample, SAMPLE_SECS,
+    wants_window, window_quality, RawSample, MIN_ANALYZED_SECS, SAMPLE_SECS,
 };
 
 /// Analysis frame width in pixels.
@@ -108,14 +108,42 @@ fn measure(ffmpeg_bin: &str, path: &Path) -> Option<Vec<RawSample>> {
     )
 }
 
+/// What ingest learns about a video clip.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ClipAnalysis {
+    /// Best `(start, end)` playback window in seconds; `None` when the clip
+    /// plays whole.
+    pub window: Option<(f64, f64)>,
+    /// Mean sample score (0..1) over the part that will play; `None` when
+    /// the clip was too short to analyse or analysis failed.
+    pub quality: Option<f32>,
+}
+
+/// Analyse a clip once: best playback window plus the quality of what plays.
+/// Clips at or under [`MIN_ANALYZED_SECS`] are not decoded and yield the
+/// default (no window, no quality).
+pub fn analyze_clip(ffmpeg_bin: &str, path: &Path, duration_secs: f64) -> ClipAnalysis {
+    if !duration_secs.is_finite() || duration_secs <= MIN_ANALYZED_SECS {
+        return ClipAnalysis::default();
+    }
+    let Some(raw) = measure(ffmpeg_bin, path) else {
+        return ClipAnalysis::default();
+    };
+    let scores = score_samples(&raw);
+    let window = pick_window(&scores, duration_secs);
+    ClipAnalysis {
+        window,
+        quality: window_quality(&scores, window),
+    }
+}
+
 /// Best `(start, end)` playback window of a video clip, in seconds. `None`
 /// when the clip is short enough to play whole or analysis failed.
 pub fn best_clip_window(ffmpeg_bin: &str, path: &Path, duration_secs: f64) -> Option<(f64, f64)> {
     if !wants_window(duration_secs) {
         return None;
     }
-    let raw = measure(ffmpeg_bin, path)?;
-    pick_window(&score_samples(&raw), duration_secs)
+    analyze_clip(ffmpeg_bin, path, duration_secs).window
 }
 
 #[cfg(test)]
@@ -127,6 +155,14 @@ mod tests {
         let p = Path::new("/nonexistent/clip.mov");
         assert_eq!(best_clip_window("ffmpeg-does-not-exist", p, 30.0), None);
         assert_eq!(best_clip_window("ffmpeg", p, 30.0), None);
+    }
+
+    #[test]
+    fn unanalysable_clips_report_no_window_and_no_quality() {
+        let p = Path::new("/nonexistent/clip.mov");
+        assert_eq!(analyze_clip("ffmpeg", p, 30.0), ClipAnalysis::default());
+        assert_eq!(analyze_clip("ffmpeg", p, 1.5), ClipAnalysis::default());
+        assert_eq!(analyze_clip("ffmpeg", p, f64::NAN), ClipAnalysis::default());
     }
 
     #[test]

@@ -101,14 +101,42 @@ pub fn score_still(stats: &FrameStats) -> Score {
         total,
         highlight: false,
         reasons,
-        clip_window: None,
+        ..Default::default()
     }
 }
+
+/// Technical quality (sharpness/exposure, 0..1) is squeezed into
+/// `TECH_FLOOR..TECH_FLOOR + TECH_SPAN` before story signals are added. On
+/// real trips ~80% of stills land at 0.6..0.9 technically, so left at full
+/// scale the sharpest-but-dullest frame outranked every photo of people.
+/// Squeezed, the whole technical spread (~0.13) is smaller than the
+/// smallest people bonus, so who and what is in the shot decides first and
+/// sharpness breaks ties.
+pub const TECH_FLOOR: f32 = 0.30;
+pub const TECH_SPAN: f32 = 0.45;
+/// `total` at or above this marks a story highlight.
+pub const HIGHLIGHT_THRESHOLD: f32 = 0.65;
+/// Score bonus by people tagged in the photo: a lone person is a portrait,
+/// a pair is a moment shared, three or more is the whole group together.
+/// Counts come from the photo library's own tags (count only).
+pub const PEOPLE_BONUS: [f32; 3] = [0.10, 0.18, 0.28];
+/// Bonus for a caption the user wrote themselves: they cared about it.
+pub const CAPTION_BONUS: f32 = 0.10;
+/// Bonus for a real video clip, so footage competes with stills for film
+/// time (a clip also costs more screen time, which the plan accounts for).
+pub const CLIP_BONUS: f32 = 0.08;
+/// Technical quality assumed for a clip nothing could be analysed from.
+pub const NEUTRAL_CLIP_QUALITY: f32 = 0.5;
 
 /// Story signals that can promote an asset to a highlight.
 #[derive(Debug, Clone, Default)]
 pub struct StorySignals {
-    pub face_count: u32,
+    /// People tagged in the photo (0 = none or unknown).
+    pub people_count: u32,
+    /// The user wrote a caption for this asset.
+    pub has_caption: bool,
+    /// The asset is a real video clip, not a still or Live Photo.
+    pub is_clip: bool,
     /// 0..1 speech/laughter/ambience energy (from motion audio).
     pub audio_energy: f32,
     /// 0..1 movement in the motion clip.
@@ -117,32 +145,76 @@ pub struct StorySignals {
     pub gps_novelty: f32,
 }
 
-/// Highlight score: quality base plus story-signal bonuses, with reasons.
-/// `for_print` disables motion-only signals (audio/movement) — a lively
-/// clip never outranks its still for print.
-pub fn highlight_score(base: &Score, signals: &StorySignals, for_print: bool) -> Score {
-    let mut out = base.clone();
+impl StorySignals {
+    /// Signals an ingested asset carries before any pixel analysis: its
+    /// people tag count, caption, kind and (for clips) GPS.
+    pub fn for_asset(a: &crate::types::Asset) -> Self {
+        let is_clip = a.kind == crate::types::AssetKind::Video;
+        Self {
+            people_count: a.people_count.unwrap_or(0),
+            has_caption: a.user_caption.is_some(),
+            is_clip,
+            gps_novelty: if is_clip && a.gps.is_some() { 0.6 } else { 0.0 },
+            ..Default::default()
+        }
+    }
+}
+
+/// Bonus for `n` tagged people: [`PEOPLE_BONUS`], saturating at three.
+pub fn people_bonus(n: u32) -> f32 {
+    match n {
+        0 => 0.0,
+        n => PEOPLE_BONUS[(n as usize - 1).min(PEOPLE_BONUS.len() - 1)],
+    }
+}
+
+/// Total story bonus for `signals`, with one reason string per signal.
+/// `for_print` drops motion-only signals (audio/movement) and the clip
+/// bonus: a lively clip never outranks its still for print.
+fn signal_bonus(signals: &StorySignals, for_print: bool) -> (f32, Vec<String>) {
     let mut bonus = 0.0f32;
-    if signals.face_count > 0 {
-        bonus += 0.15 + 0.05 * (signals.face_count.min(4) as f32 - 1.0);
-        out.reasons.push(format!("{} face(s)", signals.face_count));
+    let mut reasons = vec![];
+    if signals.people_count > 0 {
+        bonus += people_bonus(signals.people_count);
+        reasons.push(match signals.people_count {
+            1 => "1 person".to_string(),
+            n => format!("{n} people"),
+        });
+    }
+    if signals.has_caption {
+        bonus += CAPTION_BONUS;
+        reasons.push("your caption".to_string());
     }
     if !for_print {
+        if signals.is_clip {
+            bonus += CLIP_BONUS;
+            reasons.push("video clip".to_string());
+        }
         if signals.audio_energy > 0.5 {
             bonus += 0.15;
-            out.reasons.push("lively audio".to_string());
+            reasons.push("lively audio".to_string());
         }
         if signals.movement > 0.5 {
             bonus += 0.10;
-            out.reasons.push("good movement".to_string());
+            reasons.push("good movement".to_string());
         }
     }
     if signals.gps_novelty > 0.5 {
         bonus += 0.10;
-        out.reasons.push("unique place".to_string());
+        reasons.push("unique place".to_string());
     }
-    out.total = (base.total + bonus).clamp(0.0, 1.0);
-    out.highlight = out.total >= 0.65;
+    (bonus, reasons)
+}
+
+/// Highlight score: compressed technical quality plus story-signal
+/// bonuses, with reasons. See [`TECH_FLOOR`] for why quality is squeezed.
+pub fn highlight_score(base: &Score, signals: &StorySignals, for_print: bool) -> Score {
+    let mut out = base.clone();
+    let (bonus, reasons) = signal_bonus(signals, for_print);
+    out.reasons.extend(reasons);
+    out.bonus = bonus;
+    out.total = (TECH_FLOOR + TECH_SPAN * base.total.clamp(0.0, 1.0) + bonus).clamp(0.0, 1.0);
+    out.highlight = out.total >= HIGHLIGHT_THRESHOLD;
     out
 }
 
@@ -155,36 +227,57 @@ pub fn fallback_score() -> Score {
     }
 }
 
-/// Fixed CLI proxy score for videos: a neutral base plus a GPS-novelty
-/// bonus, passed through [`highlight_score`] exactly like the CLI scan.
-pub fn video_proxy_score(has_gps: bool) -> Score {
-    let sig = StorySignals {
-        gps_novelty: if has_gps { 0.6 } else { 0.0 },
-        ..Default::default()
-    };
-    let base = Score {
-        total: 0.55,
-        sharpness: 0.5,
-        exposure: 0.6,
-        ..Default::default()
-    };
-    highlight_score(&base, &sig, false)
+/// [`fallback_score`] plus whatever story signals the asset carries: an
+/// unscorable photo of five friends still beats an unscorable street.
+pub fn fallback_score_with(signals: &StorySignals) -> Score {
+    let (bonus, reasons) = signal_bonus(signals, false);
+    let mut s = fallback_score();
+    s.reasons = reasons;
+    s.bonus = bonus;
+    s.total = (s.total + bonus).clamp(0.0, 1.0);
+    s.highlight = bonus > 0.0 && s.total >= HIGHLIGHT_THRESHOLD;
+    s
 }
 
-/// Score an already-decoded still: luma stats → [`score_still`] → default
-/// story signals. Returns `None` when the pixels carry no frame stats.
-pub fn score_still_image(img: &image::DynamicImage) -> Option<Score> {
+/// Score for a video clip from its best playback window: `window_quality`
+/// is the mean per-sample clip score (0..1) over the window the film will
+/// play, or `None` when the clip could not be analysed (neutral quality).
+/// `signals` carries people/caption/GPS; the clip bonus applies on top.
+pub fn score_video(window_quality: Option<f32>, signals: &StorySignals) -> Score {
+    let analysed = window_quality.is_some();
+    let quality = window_quality.map_or(NEUTRAL_CLIP_QUALITY, |q| q.clamp(0.0, 1.0));
+    let base = Score {
+        total: quality,
+        sharpness: quality,
+        exposure: quality,
+        reasons: vec![if analysed {
+            "best-window clip quality".to_string()
+        } else {
+            "clip not analysed".to_string()
+        }],
+        ..Default::default()
+    };
+    let signals = StorySignals {
+        is_clip: true,
+        ..signals.clone()
+    };
+    highlight_score(&base, &signals, false)
+}
+
+/// Score an already-decoded still: luma stats → [`score_still`] → story
+/// signals. Returns `None` when the pixels carry no frame stats.
+pub fn score_still_image(img: &image::DynamicImage, signals: &StorySignals) -> Option<Score> {
     let gray = img.to_luma8();
     let stats = frame_stats(gray.as_raw(), gray.width(), gray.height())?;
     let base = score_still(&stats);
-    Some(highlight_score(&base, &StorySignals::default(), false))
+    Some(highlight_score(&base, signals, false))
 }
 
 /// Score a still from a file on disk (a photo, or a cached thumbnail of
 /// one). Returns `None` when the file cannot be decoded or carries no
-/// frame stats; callers apply [`fallback_score`].
-pub fn score_still_file(path: &std::path::Path) -> Option<Score> {
-    score_still_image(&image::open(path).ok()?)
+/// frame stats; callers apply [`fallback_score_with`].
+pub fn score_still_file(path: &std::path::Path, signals: &StorySignals) -> Option<Score> {
+    score_still_image(&image::open(path).ok()?, signals)
 }
 
 #[cfg(test)]
@@ -225,16 +318,56 @@ mod tests {
         assert!(s.reasons.iter().any(|r| r.contains("blurry")));
     }
 
+    fn people(n: u32) -> StorySignals {
+        StorySignals {
+            people_count: n,
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn faces_promote_highlight() {
+    fn people_bonus_grows_with_group_size_and_saturates() {
+        assert_eq!(people_bonus(0), 0.0);
+        let (one, two, three, ten) = (
+            people_bonus(1),
+            people_bonus(2),
+            people_bonus(3),
+            people_bonus(10),
+        );
+        assert!(0.0 < one && one < two && two < three, "{one} {two} {three}");
+        assert_eq!(three, ten);
         let base = score_still(&stats(0.5, 0.02, 0.06));
+        let plain = highlight_score(&base, &StorySignals::default(), false);
+        let group = highlight_score(&base, &people(5), false);
+        assert!(group.total > plain.total + 0.25);
+        assert!(group.reasons.iter().any(|r| r.contains("5 people")));
+        assert!((group.total - plain.total - group.bonus).abs() < 1e-6);
+    }
+
+    #[test]
+    fn people_outrank_sharpness_but_sharpness_still_breaks_ties() {
+        // The sharpest possible frame of nobody vs. a soft frame of a pair.
+        let crisp = highlight_score(&score_still(&stats(0.5, 0.02, 0.2)), &people(0), false);
+        let soft_pair = highlight_score(&score_still(&stats(0.5, 0.02, 0.03)), &people(2), false);
+        assert!(soft_pair.total > crisp.total, "{soft_pair:?} vs {crisp:?}");
+        // Same people: the sharper frame wins.
+        let sharp_pair = highlight_score(&score_still(&stats(0.5, 0.02, 0.08)), &people(2), false);
+        assert!(sharp_pair.total > soft_pair.total);
+    }
+
+    #[test]
+    fn caption_adds_a_bonus() {
+        let base = score_still(&stats(0.5, 0.02, 0.06));
+        let plain = highlight_score(&base, &StorySignals::default(), false);
         let sig = StorySignals {
-            face_count: 2,
+            has_caption: true,
             ..Default::default()
         };
-        let h = highlight_score(&base, &sig, false);
-        assert!(h.total > base.total);
-        assert!(h.reasons.iter().any(|r| r.contains("face")));
+        let cap = highlight_score(&base, &sig, false);
+        assert!((cap.total - plain.total - CAPTION_BONUS).abs() < 1e-6);
+        assert!(cap.reasons.iter().any(|r| r.contains("caption")));
+        // Captions and people still count for print.
+        assert!((highlight_score(&base, &sig, true).total - cap.total).abs() < 1e-6);
     }
 
     #[test]
@@ -243,12 +376,14 @@ mod tests {
         let sig = StorySignals {
             audio_energy: 0.9,
             movement: 0.9,
+            is_clip: true,
             ..Default::default()
         };
         let print = highlight_score(&base, &sig, true);
         let video = highlight_score(&base, &sig, false);
+        let none = highlight_score(&base, &StorySignals::default(), false);
         assert!(video.total > print.total);
-        assert!((print.total - base.total).abs() < 1e-6);
+        assert!((print.total - none.total).abs() < 1e-6);
     }
 
     #[test]
@@ -293,8 +428,8 @@ mod tests {
 
     #[test]
     fn sharp_clean_still_beats_flat_dark_still() {
-        let sharp = score_still_image(&checkerboard(32)).unwrap();
-        let dark = score_still_image(&flat_dark(32)).unwrap();
+        let sharp = score_still_image(&checkerboard(32), &StorySignals::default()).unwrap();
+        let dark = score_still_image(&flat_dark(32), &StorySignals::default()).unwrap();
         assert!(sharp.total > dark.total, "{sharp:?} vs {dark:?}");
         assert!(sharp.highlight, "{sharp:?}");
         assert!(!dark.highlight, "{dark:?}");
@@ -305,31 +440,70 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sharp_path = dir.path().join("sharp.png");
         checkerboard(32).save(&sharp_path).unwrap();
-        let sharp = score_still_file(&sharp_path).unwrap();
+        let sharp = score_still_file(&sharp_path, &StorySignals::default()).unwrap();
         assert!(sharp.total > 0.65, "{sharp:?}");
 
         let dark_path = dir.path().join("dark.png");
         flat_dark(32).save(&dark_path).unwrap();
-        let dark = score_still_file(&dark_path).unwrap();
+        let dark = score_still_file(&dark_path, &StorySignals::default()).unwrap();
         assert!(dark.total < sharp.total, "{dark:?} vs {sharp:?}");
 
-        assert!(score_still_file(&dir.path().join("missing.png")).is_none());
+        assert!(
+            score_still_file(&dir.path().join("missing.png"), &StorySignals::default()).is_none()
+        );
         let junk = dir.path().join("junk.png");
         std::fs::write(&junk, b"not an image").unwrap();
-        assert!(score_still_file(&junk).is_none());
+        assert!(score_still_file(&junk, &StorySignals::default()).is_none());
     }
 
     #[test]
-    fn video_proxy_matches_cli_constants() {
-        // CLI: base total 0.55, GPS novelty 0.6 bonus 0.10, highlight >= 0.65.
-        let plain = video_proxy_score(false);
-        assert_eq!(plain.total, 0.55);
-        assert!(!plain.highlight);
-        let gps = video_proxy_score(true);
-        assert!((gps.total - 0.65).abs() < 1e-6, "{gps:?}");
-        assert!(gps.highlight);
-        assert!(gps.reasons.iter().any(|r| r.contains("unique place")));
+    fn video_score_follows_window_quality_and_signals() {
+        let none = StorySignals::default();
+        let lo = score_video(Some(0.2), &none);
+        let hi = score_video(Some(0.9), &none);
+        assert!(hi.total > lo.total + 0.2, "{hi:?} vs {lo:?}");
+        assert!(hi.reasons.iter().any(|r| r.contains("video clip")));
+        // Unanalysed clips get a neutral quality, never a highlight alone.
+        let unknown = score_video(None, &none);
+        assert!(!unknown.highlight, "{unknown:?}");
+        assert!(unknown.total > lo.total && unknown.total < hi.total);
+        // People, captions and GPS lift a clip like any other asset.
+        let sig = StorySignals {
+            people_count: 3,
+            has_caption: true,
+            gps_novelty: 0.6,
+            ..Default::default()
+        };
+        let rich = score_video(Some(0.5), &sig);
+        assert!(rich.highlight, "{rich:?}");
+        assert!(rich.total > score_video(Some(0.5), &none).total + 0.3);
+        assert!(rich.reasons.iter().any(|r| r.contains("unique place")));
+    }
+
+    #[test]
+    fn signals_for_asset_read_people_caption_and_kind() {
+        use crate::types::{Asset, AssetKind};
+        let mut photo = Asset::new("p", "/t/p.heic".into(), AssetKind::Photo);
+        photo.people_count = Some(2);
+        photo.user_caption = Some("Dinner".into());
+        photo.gps = Some((1.0, 2.0));
+        let s = StorySignals::for_asset(&photo);
+        assert_eq!((s.people_count, s.has_caption, s.is_clip), (2, true, false));
+        assert_eq!(s.gps_novelty, 0.0, "stills keep the old no-GPS-bonus rule");
+        let mut clip = Asset::new("v", "/t/v.mov".into(), AssetKind::Video);
+        clip.gps = Some((1.0, 2.0));
+        let s = StorySignals::for_asset(&clip);
+        assert!(s.is_clip && s.gps_novelty > 0.5);
+    }
+
+    #[test]
+    fn fallback_is_neutral_unless_signals_say_otherwise() {
         assert_eq!(fallback_score().total, 0.5);
         assert!(!fallback_score().highlight);
+        let plain = fallback_score_with(&StorySignals::default());
+        assert_eq!(plain.total, 0.5);
+        assert!(!plain.highlight);
+        let group = fallback_score_with(&people(4));
+        assert!(group.total > 0.75 && group.highlight, "{group:?}");
     }
 }
