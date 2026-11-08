@@ -1831,6 +1831,7 @@ mod tests {
             caption: None,
             taken_at: None,
             tz_offset_secs: None,
+            aspect: None,
         }
     }
 
