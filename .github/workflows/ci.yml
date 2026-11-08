@@ -75,11 +75,12 @@ jobs:
         with:
           tool: cargo-deny,cargo-audit
       - name: Install deadwood
-        run: cargo install --locked --git https://github.com/rlorenzo/deadwood --rev 1fd13d0c8e5222bb48788451ce5a32e6770129dd deadwood-rs
+        run: cargo install --locked --git https://github.com/rlorenzo/deadwood-rs --rev 53348b0b283abe59d3fbabb5946441f08189cca7 deadwood-rs
       - name: Dead Rust code and dependencies (deadwood)
-        # deadwood resolves lib names with `cargo metadata --frozen`; without a
-        # populated registry it falls back to package names and misflags
-        # kamadak-exif (imported as `exif`) as unused.
+        # deadwood reads lib names and proc-macro sources from the registry
+        # cache via `cargo metadata --frozen`. Without it, it falls back to
+        # package names (misflagging kamadak-exif, imported as `exif`) and can't
+        # see that `tauri::generate_context!` expands to `serde_json`.
         run: |
           cargo fetch --locked
           deadwood check .
