@@ -429,6 +429,8 @@ fn export_inner(
                 &resolved,
                 &reels_dir,
                 &ReelOptions {
+                    // Reels are short: they loop the first playlist track
+                    // rather than building the crossfaded bed.
                     music_path: opts.music_paths.first().cloned(),
                     slideshows,
                     typst_bin: opts.typst_bin.clone(),

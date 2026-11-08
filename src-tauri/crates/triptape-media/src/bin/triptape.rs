@@ -1053,6 +1053,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn music_flag_repeats_and_semicolons() {
         let mut f = HashMap::new();
@@ -1068,8 +1070,6 @@ mod tests {
         assert_eq!(music_list("single.wav"), vec![PathBuf::from("single.wav")]);
         assert!(music_list("").is_empty());
     }
-
-    use super::*;
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()

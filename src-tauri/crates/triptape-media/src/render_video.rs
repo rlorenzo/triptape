@@ -173,11 +173,6 @@ pub fn assign_transitions(
     out
 }
 
-/// Bundled fallback score (`resources/music/triptape-theme.mp3`): the hero
-/// film always has a music bed, even when the user passes no `--music`.
-static DEFAULT_MUSIC_BYTES: &[u8] =
-    include_bytes!("../../../../resources/music/triptape-theme.mp3");
-
 /// Resolved source files for one plan entry (export layer fills this).
 #[derive(Debug, Clone)]
 pub struct ResolvedEntry {
@@ -258,20 +253,8 @@ pub struct Edl {
     pub segments: Vec<EdlSegment>,
     pub total_secs: f64,
     pub captions_sidecar: Option<String>,
-    pub music: EdlMusic,
+    pub music: crate::music::EdlMusic,
     pub fallbacks: Vec<String>,
-}
-
-/// The music bed as rendered: playlist, crossfade seams (bed time = film
-/// time, the bed starts with the film), and how the film ends.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct EdlMusic {
-    pub tracks: Vec<String>,
-    pub crossfade_secs: f64,
-    pub crossfade_curve: String,
-    pub seams: Vec<crate::music::Seam>,
-    pub ends_naturally: bool,
-    pub fade_out_secs: f64,
 }
 
 #[derive(Debug)]
@@ -919,13 +902,8 @@ pub fn render_hero_video(
         &caps.ffmpeg_bin,
         &caps.ffprobe_bin,
         &opts.music_paths,
+        work_dir,
         &mut fallbacks,
-        || {
-            let bundled = work_dir.join("triptape-theme.mp3");
-            std::fs::write(&bundled, DEFAULT_MUSIC_BYTES)
-                .map_err(|e| crate::MediaError::Io(e.to_string()))?;
-            Ok(bundled)
-        },
     )?;
     let bed_plan = crate::music::plan_bed(
         &playlist.iter().map(|t| t.duration_secs).collect::<Vec<_>>(),
@@ -947,6 +925,7 @@ pub fn render_hero_video(
     };
     let burn_srt =
         (srt_count > 0 && caps.can_burn_captions()).then(|| ffmpeg::subtitles_filter(&srt_path));
+    // Input 0 is the film; the bed placements follow as inputs 1..
     let bed_graph = crate::music::bed_filter(&bed_plan, &playlist, 1, total);
     let audio_graph = if opts.keep_ambience {
         format!(
@@ -963,24 +942,18 @@ pub fn render_hero_video(
         ),
         None => (audio_graph, "0:v".to_string()),
     };
-    let mut final_args: Vec<String> = vec![
-        "-y".into(),
-        "-i".into(),
-        s(&acc),
+    let mut final_args: Vec<String> = vec!["-y".into(), "-i".into(), s(&acc)];
+    for m in crate::music::bed_inputs(&bed_plan, &playlist) {
+        final_args.extend(["-i".into(), s(m)]);
+    }
+    final_args.extend([
         "-filter_complex".into(),
         audio_graph,
         "-map".into(),
         video_map,
         "-map".into(),
         "[aout]".into(),
-    ];
-    // Insert one -i per bed placement right after the film input.
-    let music_inputs: Vec<String> = bed_plan
-        .uses
-        .iter()
-        .flat_map(|u| ["-i".to_string(), s(&playlist[u.track].path)])
-        .collect();
-    final_args.splice(3..3, music_inputs);
+    ]);
     final_args.extend(ffmpeg::x264_aac("medium", 19));
     final_args.extend(opts.resolution.x264_level_args());
     final_args.extend(["-r".into(), "30".into(), s(out_mp4)]);
@@ -1029,24 +1002,7 @@ pub fn render_hero_video(
             .collect(),
         total_secs: (total * 1000.0).round() / 1000.0,
         captions_sidecar: srt_opt.clone(),
-        music: EdlMusic {
-            tracks: playlist
-                .iter()
-                .map(|t| t.path.to_string_lossy().into_owned())
-                .collect(),
-            crossfade_secs: crate::music::CROSSFADE_SECS,
-            crossfade_curve: crate::music::CROSSFADE_CURVE.into(),
-            seams: bed_plan
-                .seams
-                .iter()
-                .map(|x| crate::music::Seam {
-                    at_secs: (x.at_secs * 1000.0).round() / 1000.0,
-                    ..x.clone()
-                })
-                .collect(),
-            ends_naturally: bed_plan.ends_naturally,
-            fade_out_secs: bed_plan.fade_out_secs,
-        },
+        music: bed_plan.edl(&playlist),
         fallbacks: fallbacks.clone(),
     };
     let edl_path = out_mp4.with_extension("edl.json");

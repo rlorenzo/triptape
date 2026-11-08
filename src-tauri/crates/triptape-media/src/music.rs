@@ -9,27 +9,34 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Bundled fallback score (`resources/music/triptape-theme.mp3`): the hero
+/// film always has a music bed, even when the user passes no `--music`.
+static DEFAULT_MUSIC_BYTES: &[u8] =
+    include_bytes!("../../../../resources/music/triptape-theme.mp3");
+
 /// Overlap at every track seam.
-pub const CROSSFADE_SECS: f64 = 4.0;
+const CROSSFADE_SECS: f64 = 4.0;
 /// `acrossfade` curve for both sides of a seam.
-pub const CROSSFADE_CURVE: &str = "qsin";
+const CROSSFADE_CURVE: &str = "qsin";
 /// A seam never eats more than this share of either neighbouring track.
 const MAX_SEAM_SHARE: f64 = 0.4;
 /// Tracks shorter than this are skipped as unusable.
-pub const MIN_TRACK_SECS: f64 = 1.0;
+const MIN_TRACK_SECS: f64 = 1.0;
 /// Fade-in at the start of the film.
-pub const FADE_IN_SECS: f64 = 1.0;
+const FADE_IN_SECS: f64 = 1.0;
 /// Fade-out at the film end when the track is cut mid-flow.
-pub const FINAL_FADE_SECS: f64 = 1.5;
+const FINAL_FADE_SECS: f64 = 1.5;
 /// If the film ends within this long of the last track's own end, the track
 /// is close to resolving by itself: a softer, longer fade is used.
-pub const NATURAL_END_WINDOW_SECS: f64 = 10.0;
+const NATURAL_END_WINDOW_SECS: f64 = 10.0;
 /// Fade-out used in the natural-end case.
-pub const NATURAL_END_FADE_SECS: f64 = 3.0;
+const NATURAL_END_FADE_SECS: f64 = 3.0;
 /// Per-track gain adjustment is clamped to this many dB either way.
 const MAX_GAIN_DB: f64 = 6.0;
 /// Hard cap on placements (guards against pathological tiny tracks).
 const MAX_USES: usize = 512;
+/// Gains closer to 0 dB than this skip the `volume` filter.
+const GAIN_EPSILON_DB: f64 = 0.05;
 
 /// One playable file with its probed duration and loudness-match gain.
 #[derive(Debug, Clone)]
@@ -68,6 +75,42 @@ pub struct BedPlan {
     /// True when the film end lands in the last window of the final track.
     pub ends_naturally: bool,
     pub fade_out_secs: f64,
+}
+
+/// The music bed as rendered, for the EDL: playlist, crossfade seams (bed
+/// time = film time, the bed starts with the film), and how the film ends.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EdlMusic {
+    pub tracks: Vec<String>,
+    pub crossfade_secs: f64,
+    pub crossfade_curve: String,
+    pub seams: Vec<Seam>,
+    pub ends_naturally: bool,
+    pub fade_out_secs: f64,
+}
+
+impl BedPlan {
+    /// EDL record of this plan over `tracks`, seam times rounded to ms.
+    pub fn edl(&self, tracks: &[Track]) -> EdlMusic {
+        EdlMusic {
+            tracks: tracks
+                .iter()
+                .map(|t| t.path.to_string_lossy().into_owned())
+                .collect(),
+            crossfade_secs: CROSSFADE_SECS,
+            crossfade_curve: CROSSFADE_CURVE.into(),
+            seams: self
+                .seams
+                .iter()
+                .map(|x| Seam {
+                    at_secs: (x.at_secs * 1000.0).round() / 1000.0,
+                    ..x.clone()
+                })
+                .collect(),
+            ends_naturally: self.ends_naturally,
+            fade_out_secs: self.fade_out_secs,
+        }
+    }
 }
 
 fn seam_len(prev: f64, next: f64) -> f64 {
@@ -125,15 +168,24 @@ pub fn plan_bed(durations: &[f64], total: f64) -> BedPlan {
     }
 }
 
+/// Input files for [`bed_filter`], one per placement in `plan.uses` order;
+/// each must be passed as its own `-i`, starting at `first_input`.
+pub fn bed_inputs<'a>(plan: &BedPlan, tracks: &'a [Track]) -> Vec<&'a Path> {
+    plan.uses
+        .iter()
+        .map(|u| tracks[u.track].path.as_path())
+        .collect()
+}
+
 /// Filter-graph fragment producing the finished bed as `[mbed]`: every
 /// placement is a separate input (`first_input`, `first_input + 1`, ...,
-/// in `plan.uses` order), normalised to 48 kHz stereo float, gain-matched,
+/// in [`bed_inputs`] order), normalised to 48 kHz stereo float, gain-matched,
 /// joined with `acrossfade`, trimmed to `total`, faded in and out.
 pub fn bed_filter(plan: &BedPlan, tracks: &[Track], first_input: usize, total: f64) -> String {
     let mut g = String::new();
     for (n, u) in plan.uses.iter().enumerate() {
         let gain = tracks[u.track].gain_db;
-        let vol = if gain.abs() > 0.05 {
+        let vol = if gain.abs() > GAIN_EPSILON_DB {
             format!(",volume={gain:.2}dB")
         } else {
             String::new()
@@ -162,7 +214,7 @@ pub fn bed_filter(plan: &BedPlan, tracks: &[Track], first_input: usize, total: f
 }
 
 /// Duration of an audio file via ffprobe (`ffprobe_file` insists on video).
-pub fn probe_audio_secs(ffprobe_bin: &str, path: &Path) -> Result<f64, crate::MediaError> {
+fn probe_audio_secs(ffprobe_bin: &str, path: &Path) -> Result<f64, crate::MediaError> {
     let out = Command::new(ffprobe_bin)
         .args([
             "-v",
@@ -187,14 +239,14 @@ pub fn probe_audio_secs(ffprobe_bin: &str, path: &Path) -> Result<f64, crate::Me
 
 /// Probe the playlist: skip missing or unreadable files (noting each in
 /// `fallbacks`), then measure loudness for gain matching when there is more
-/// than one distinct track. `bundled` supplies the built-in score when no
-/// listed file is usable.
+/// than one track. With no listed file usable, the bundled score is written
+/// into `work_dir` and used instead.
 pub fn load_playlist(
     ffmpeg_bin: &str,
     ffprobe_bin: &str,
     paths: &[PathBuf],
+    work_dir: &Path,
     fallbacks: &mut Vec<String>,
-    bundled: impl FnOnce() -> Result<PathBuf, crate::MediaError>,
 ) -> Result<Vec<Track>, crate::MediaError> {
     let mut tracks: Vec<Track> = Vec::new();
     for p in paths {
@@ -212,7 +264,9 @@ pub fn load_playlist(
         }
     }
     if tracks.is_empty() {
-        let b = bundled()?;
+        let b = work_dir.join("triptape-theme.mp3");
+        std::fs::write(&b, DEFAULT_MUSIC_BYTES)
+            .map_err(|e| crate::MediaError::Io(e.to_string()))?;
         let d = probe_audio_secs(ffprobe_bin, &b)?;
         fallbacks.push("bundled triptape-theme music bed".into());
         return Ok(vec![Track {
@@ -222,10 +276,17 @@ pub fn load_playlist(
         }]);
     }
     if tracks.len() > 1 {
-        let lufs: Vec<Option<f64>> = tracks
-            .iter()
-            .map(|t| measure_lufs(ffmpeg_bin, &t.path))
-            .collect();
+        // Each measurement is a full decode: run them concurrently.
+        let lufs: Vec<Option<f64>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = tracks
+                .iter()
+                .map(|t| scope.spawn(|| measure_lufs(ffmpeg_bin, &t.path)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().ok().flatten())
+                .collect()
+        });
         for (t, g) in tracks.iter_mut().zip(match_gains(&lufs)) {
             t.gain_db = g;
         }
@@ -234,7 +295,7 @@ pub fn load_playlist(
 }
 
 /// Integrated loudness (LUFS) of a file via `ebur128`; `None` on any failure.
-pub fn measure_lufs(ffmpeg_bin: &str, path: &Path) -> Option<f64> {
+fn measure_lufs(ffmpeg_bin: &str, path: &Path) -> Option<f64> {
     let out = Command::new(ffmpeg_bin)
         .args(["-hide_banner", "-nostats", "-i"])
         .arg(path)
@@ -260,7 +321,7 @@ fn parse_integrated_lufs(stderr: &str) -> Option<f64> {
 
 /// Per-track gains pulling each track toward the playlist's mean loudness
 /// (clamped); tracks without a measurement stay at 0 dB.
-pub fn match_gains(lufs: &[Option<f64>]) -> Vec<f64> {
+fn match_gains(lufs: &[Option<f64>]) -> Vec<f64> {
     let known: Vec<f64> = lufs.iter().flatten().copied().collect();
     if known.len() < 2 {
         return vec![0.0; lufs.len()];
@@ -401,6 +462,45 @@ mod tests {
         assert_eq!(match_gains(&[Some(-10.0), Some(-40.0)]), vec![-6.0, 6.0]);
     }
 
+    #[test]
+    fn bed_inputs_follow_uses_and_edl_rounds_seams() {
+        let t = tracks(&[100.0 / 3.0, 50.0]);
+        let p = plan_bed(&[t[0].duration_secs, t[1].duration_secs], 120.0);
+        let inputs = bed_inputs(&p, &t);
+        assert_eq!(inputs.len(), p.uses.len());
+        for (m, u) in inputs.iter().zip(&p.uses) {
+            assert_eq!(*m, t[u.track].path.as_path());
+        }
+        let e = p.edl(&t);
+        assert_eq!(e.tracks, ["t0.wav", "t1.wav"]);
+        assert_eq!(e.seams.len(), p.seams.len());
+        for (r, x) in e.seams.iter().zip(&p.seams) {
+            assert!((r.at_secs - x.at_secs).abs() <= 0.0005);
+            assert_eq!(r.at_secs, (r.at_secs * 1000.0).round() / 1000.0);
+            assert_eq!(r.from_track, x.from_track);
+        }
+        assert_eq!(e.fade_out_secs, p.fade_out_secs);
+    }
+
+    /// No usable listed file: missing paths are noted and the bundled theme
+    /// is written to the work dir and probed.
+    #[test]
+    fn real_ffmpeg_falls_back_to_bundled_theme() {
+        let Some((ffmpeg, ffprobe)) = full_ffmpeg() else {
+            eprintln!("ffmpeg-full missing; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut fb = Vec::new();
+        let missing = dir.path().join("nope.wav");
+        let t = load_playlist(&ffmpeg, &ffprobe, &[missing], dir.path(), &mut fb).unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].path, dir.path().join("triptape-theme.mp3"));
+        assert!(t[0].duration_secs > MIN_TRACK_SECS);
+        assert!(fb.iter().any(|f| f.contains("missing; skipped")), "{fb:?}");
+        assert!(fb.iter().any(|f| f.contains("bundled")), "{fb:?}");
+    }
+
     fn full_ffmpeg() -> Option<(String, String)> {
         let dir = "/opt/homebrew/opt/ffmpeg-full/bin";
         let (f, p) = (format!("{dir}/ffmpeg"), format!("{dir}/ffprobe"));
@@ -434,10 +534,8 @@ mod tests {
         let paths = vec![a, b];
         for total in [6.0_f64, 25.0] {
             let mut fb = Vec::new();
-            let tracks = load_playlist(&ffmpeg, &ffprobe, &paths, &mut fb, || {
-                Err(crate::MediaError::Io("no bundled".into()))
-            })
-            .unwrap_or_else(|e| panic!("{e}: {fb:?}"));
+            let tracks = load_playlist(&ffmpeg, &ffprobe, &paths, dir.path(), &mut fb)
+                .unwrap_or_else(|e| panic!("{e}: {fb:?}"));
             assert_eq!(tracks.len(), 2);
             let plan = plan_bed(
                 &tracks.iter().map(|t| t.duration_secs).collect::<Vec<_>>(),
@@ -450,8 +548,8 @@ mod tests {
             let out = dir.path().join("bed.wav");
             let mut cmd = Command::new(&ffmpeg);
             cmd.args(["-y", "-v", "error"]);
-            for u in &plan.uses {
-                cmd.arg("-i").arg(&tracks[u.track].path);
+            for m in bed_inputs(&plan, &tracks) {
+                cmd.arg("-i").arg(m);
             }
             let st = cmd
                 .args(["-filter_complex", &graph, "-map", "[mbed]"])
@@ -502,10 +600,8 @@ mod tests {
             .unwrap_or(620.0);
         let paths: Vec<PathBuf> = list.split(';').map(PathBuf::from).collect();
         let mut fb = Vec::new();
-        let tracks = load_playlist(&ffmpeg, &ffprobe, &paths, &mut fb, || {
-            Err(crate::MediaError::Io("no bundled".into()))
-        })
-        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let tracks = load_playlist(&ffmpeg, &ffprobe, &paths, dir.path(), &mut fb).unwrap();
         let plan = plan_bed(
             &tracks.iter().map(|t| t.duration_secs).collect::<Vec<_>>(),
             total,
@@ -524,8 +620,8 @@ mod tests {
         );
         let mut cmd = Command::new(&ffmpeg);
         cmd.args(["-y", "-v", "error"]);
-        for u in &plan.uses {
-            cmd.arg("-i").arg(&tracks[u.track].path);
+        for m in bed_inputs(&plan, &tracks) {
+            cmd.arg("-i").arg(m);
         }
         let st = cmd
             .args([
