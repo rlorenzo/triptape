@@ -141,7 +141,7 @@ fn concat_pair(
         "[a]".into(),
     ];
     args.extend(quality_tail(out));
-    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out)
+    caps.run(&args, out)
 }
 
 /// A motion highlight shorter than this is extended with its chapter
@@ -302,7 +302,10 @@ pub fn render_reels(
     }
 
     let mut reels: Vec<ReelFile> = vec![];
+    let total = resolved.len().min(5);
     for (i, r) in resolved.iter().take(5).enumerate() {
+        caps.progress.check_cancelled()?;
+        caps.progress.counted("reels", "reel", i, total);
         let src = r.motion_path.as_ref().unwrap_or(&r.still_path);
         if !src.exists() {
             fallbacks.push(format!(
@@ -320,6 +323,9 @@ pub fn render_reels(
         let slides: &[PathBuf] = opts.slideshows.get(i).map_or(&[], Vec::as_slice);
         let dur = match render_one_reel(caps, r, src, &out, opts, slides, &mut fallbacks) {
             Ok(d) => d,
+            // `caps.run` already discarded its `.partial`; `out` is either a
+            // previous export's reel or a fully encoded new one — keep it.
+            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
             Err(e) => {
                 fallbacks.push(format!("reel {} failed ({e}); skipped", r.entry.asset_id));
                 let _ = std::fs::remove_file(&out);
@@ -359,7 +365,7 @@ pub fn render_reels(
             "3".into(),
             s(&cover),
         ];
-        ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &cover_args, &cover)?;
+        caps.run(&cover_args, &cover)?;
         if let Some(c) = &r.caption {
             if !c.trim().is_empty() {
                 std::fs::write(
@@ -394,6 +400,9 @@ pub fn render_reels(
             caption: r.caption.clone(),
         });
     }
+
+    caps.progress.check_cancelled()?;
+    caps.progress.counted("reels", "reel", total, total);
 
     // Per-reel failures are tolerated, but a pack with zero reels from a
     // nonempty selection is a render failure, not a success.
@@ -508,7 +517,7 @@ fn render_clip_reel(
                 "[aout]".into(),
             ]);
             args.extend(quality_tail(out));
-            return ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out);
+            return caps.run(&args, out);
         }
         fallbacks.push("reel music missing; source audio only".into());
     }
@@ -521,7 +530,7 @@ fn render_clip_reel(
         "[aout]".into(),
     ]);
     args.extend(quality_tail(out));
-    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out)
+    caps.run(&args, out)
 }
 
 /// Planned slideshow duration: crossfades overlap adjacent slides.
@@ -645,7 +654,7 @@ fn render_slideshow_reel(
         "[aout]".into(),
     ]);
     args.extend(quality_tail(out));
-    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out)
+    caps.run(&args, out)
 }
 
 fn render_still_reel(
@@ -687,7 +696,7 @@ fn render_still_reel_png(
         frames.to_string(),
     ]);
     args.extend(quality_tail(out));
-    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out)
+    caps.run(&args, out)
 }
 
 #[cfg(test)]
