@@ -674,22 +674,21 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
     Ok(out)
 }
 
-/// File name of an asset for messages, with ` (+MOV)` for a companion.
+/// File name and id of an asset, for messages.
 fn asset_label(a: &Asset) -> String {
-    let name = |p: &Path| {
-        p.file_name()
-            .map_or_else(String::new, |f| f.to_string_lossy().into_owned())
-    };
-    format!("{} [{}]", name(&a.path), a.id)
+    let name = a
+        .path
+        .file_name()
+        .map_or_else(String::new, |f| f.to_string_lossy().into_owned());
+    format!("{name} [{}]", a.id)
 }
 
 /// Print the Story-editor edits with file names.
-fn print_edits(edits: &planmod::PlanEdits, assets: &[Asset]) {
+fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
     let show = |id: &String| {
-        assets
-            .iter()
-            .find(|a| a.id == *id)
-            .map_or_else(|| format!("{id} (not in project)"), asset_label)
+        by_id
+            .get(id.as_str())
+            .map_or_else(|| format!("{id} (not in project)"), |a| asset_label(a))
     };
     for (title, ids) in [("included", &edits.included), ("excluded", &edits.excluded)] {
         println!("{title}: {}", ids.len());
@@ -710,54 +709,63 @@ fn print_edits(edits: &planmod::PlanEdits, assets: &[Asset]) {
 
 fn edit_cmd(args: &[String]) {
     let a = parse_edit_args(args).unwrap_or_else(|e| die("edit", e));
-    let db_path = a.db.clone().unwrap_or_else(|| die("edit", "missing --db"));
-    let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
+    let db_path = a.db.as_ref().unwrap_or_else(|| die("edit", "missing --db"));
+    let db = Db::open(db_path).unwrap_or_else(|e| die("open db", e));
     let ep = db
         .edited_plan(a.project.as_deref())
         .unwrap_or_else(|e| die("plan", e))
         .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
-    let mut edits = ep.edits.clone();
-    let resolve = |query: &String| {
-        asset_ref::resolve_asset(&ep.assets, query)
-            .unwrap_or_else(|e| die("edit", e))
-            .clone()
+    let by_id: HashMap<&str, &Asset> = ep.assets.iter().map(|x| (x.id.as_str(), x)).collect();
+    let resolve = |refs: &[String]| -> Vec<&Asset> {
+        refs.iter()
+            .map(|q| asset_ref::resolve_asset(&ep.assets, q).unwrap_or_else(|e| die("edit", e)))
+            .collect()
     };
     // Resolve everything first so a bad reference changes nothing.
-    let includes: Vec<Asset> = a.include.iter().map(resolve).collect();
-    for asset in &includes {
-        if !ep
-            .base
-            .chapters
-            .iter()
-            .any(|c| c.asset_ids.contains(&asset.id))
-        {
-            die(
-                "edit",
-                format!("{} is not in any chapter of the plan", asset_label(asset)),
-            );
-        }
+    let includes = resolve(&a.include);
+    if let Some(asset) = includes
+        .iter()
+        .find(|x| ep.base.chapter_of(&x.id).is_none())
+    {
+        die(
+            "edit",
+            format!("{} is not in any chapter of the plan", asset_label(asset)),
+        );
     }
-    let excludes: Vec<Asset> = a.exclude.iter().map(resolve).collect();
-    let uninc: Vec<Asset> = a.uninclude.iter().map(resolve).collect();
-    let unexc: Vec<Asset> = a.unexclude.iter().map(resolve).collect();
-    let changed =
-        !(includes.is_empty() && excludes.is_empty() && uninc.is_empty() && unexc.is_empty());
-    for (assets, verb, apply) in [
+    type Setter = fn(&mut PlanEdits, String, bool);
+    // Un-dos first, then removals, then pins.
+    let ops: [(Vec<&Asset>, &str, Setter, bool); 4] = [
         (
-            &uninc,
+            resolve(&a.uninclude),
             "uninclude",
-            PlanEdits::set_included as fn(&mut PlanEdits, String, bool),
+            PlanEdits::set_included,
+            false,
         ),
-        (&unexc, "unexclude", PlanEdits::set_excluded),
-        (&excludes, "exclude", PlanEdits::set_excluded),
-        (&includes, "include", PlanEdits::set_included),
-    ] {
+        (
+            resolve(&a.unexclude),
+            "unexclude",
+            PlanEdits::set_excluded,
+            false,
+        ),
+        (
+            resolve(&a.exclude),
+            "exclude",
+            PlanEdits::set_excluded,
+            true,
+        ),
+        (includes, "include", PlanEdits::set_included, true),
+    ];
+    let changed = ops.iter().any(|(assets, ..)| !assets.is_empty());
+    if !changed && !a.list {
+        die(
+            "edit",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude or --list",
+        );
+    }
+    let mut edits = ep.edits.clone();
+    for (assets, verb, set, on) in &ops {
         for asset in assets {
-            apply(
-                &mut edits,
-                asset.id.clone(),
-                matches!(verb, "include" | "exclude"),
-            );
+            set(&mut edits, asset.id.clone(), *on);
             println!("{verb}: {}", asset_label(asset));
         }
     }
@@ -765,42 +773,30 @@ fn edit_cmd(args: &[String]) {
         db.save_plan_edits(&ep.project_id, &edits)
             .unwrap_or_else(|e| die("save edits", e));
     }
-    if changed || a.list {
-        print_edits(&edits, &ep.assets);
+    print_edits(&edits, &by_id);
+    if !changed {
+        return;
     }
-    if changed {
-        // Show where each included shot landed in the film.
-        let after = db
-            .edited_plan(Some(&ep.project_id))
-            .unwrap_or_else(|e| die("plan", e))
-            .unwrap_or_else(|| die("plan", "plan disappeared"));
-        let hero = &after.edited.hero;
-        for asset in &includes {
-            match hero.iter().position(|e| e.asset_id == asset.id) {
-                Some(i) => {
-                    let around = |j: Option<usize>| {
-                        j.and_then(|j| hero.get(j))
-                            .and_then(|e| after.assets.iter().find(|x| x.id == e.asset_id))
-                            .map_or_else(|| "(start/end)".to_string(), asset_label)
-                    };
-                    println!(
-                        "film: {} after {} before {} ({:?})",
-                        asset_label(asset),
-                        around(i.checked_sub(1)),
-                        around(Some(i + 1)),
-                        hero[i].rendition
-                    );
-                }
-                None => println!("film: {} is not in the film", asset_label(asset)),
-            }
+    // Show where each included shot landed in the film.
+    let hero = planmod::apply_edits(&ep.base, &ep.assets, &edits).hero;
+    let label_at = |j: Option<usize>| {
+        j.and_then(|j| hero.get(j))
+            .and_then(|e| by_id.get(e.asset_id.as_str()))
+            .map_or_else(|| "(start/end)".to_string(), |x| asset_label(x))
+    };
+    for asset in &ops[3].0 {
+        match hero.iter().position(|e| e.asset_id == asset.id) {
+            Some(i) => println!(
+                "film: {} after {} before {} ({:?})",
+                asset_label(asset),
+                label_at(i.checked_sub(1)),
+                label_at(Some(i + 1)),
+                hero[i].rendition
+            ),
+            None => println!("film: {} is not in the film", asset_label(asset)),
         }
-        println!("film now has {} shots", hero.len());
-    } else if !a.list {
-        die(
-            "edit",
-            "nothing to do: pass --include/--exclude/--uninclude/--unexclude or --list",
-        );
     }
+    println!("film now has {} shots", hero.len());
 }
 
 fn main() {

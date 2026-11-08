@@ -7,7 +7,7 @@
 //! Sec 5.4 degradation eligibility lives here too.
 
 use crate::clip_window::MAX_WINDOW_SECS;
-use crate::cluster::{gps_outliers, story_order};
+use crate::cluster::{gps_outliers, story_key, story_order};
 use crate::types::{Asset, AssetKind, Chapter, MusicPick, Plan, PlanEntry, Rendition, Score};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -595,14 +595,26 @@ impl PlanEdits {
     }
 
     /// Replace a pick, superseding the earlier swap of the same pick. That
-    /// swap stays if a later one brought the asset back: replay needs it to
-    /// vacate its original slot first. Using an excluded asset as the
-    /// replacement restores it.
+    /// swap stays if a later swap or a pin brought the asset back: replay
+    /// needs it to vacate its original slot first, and its replacement is a
+    /// separate pick the user still holds. Using an excluded asset as the
+    /// replacement restores it. Swapping a pinned asset moves its pin to the
+    /// replacement (keeping its place in pin order), so replay neither
+    /// re-adds the swapped-out pin nor misses a replacement for a pin the
+    /// base hero never held; the swap record still covers reels and base
+    /// picks.
     pub fn swap(&mut self, from: String, to: String) {
+        let pin = self.included.iter().position(|id| *id == from);
         if let Some(i) = self.swaps.iter().rposition(|(f, _)| *f == from) {
-            if !self.swaps[i + 1..].iter().any(|(_, t)| *t == from) {
+            if pin.is_none() && !self.swaps[i + 1..].iter().any(|(_, t)| *t == from) {
                 self.swaps.remove(i);
             }
+        }
+        if let Some(i) = pin {
+            self.included[i] = to.clone();
+            let mut seen = false;
+            self.included
+                .retain(|id| *id != to || !std::mem::replace(&mut seen, true));
         }
         self.set_excluded(to.clone(), false);
         self.swaps.push((from, to));
@@ -701,12 +713,11 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
             if picks.iter().any(|e| e.asset_id == *to) {
                 picks.retain(|e| e.asset_id != *from);
             } else if let Some(entry) = picks.iter_mut().find(|e| e.asset_id == *from) {
-                *entry = plan_entry(asset, asset.score.as_ref());
-                // The film shows Live Photos as stills unless the plan
-                // picked them for motion; a swap-in is a still.
-                if is_hero && matches!(entry.rendition, Rendition::Motion { .. }) {
-                    entry.rendition = Rendition::Still;
-                }
+                *entry = if is_hero {
+                    user_hero_entry(asset)
+                } else {
+                    plan_entry(asset, asset.score.as_ref())
+                };
             }
         }
     }
@@ -732,11 +743,15 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
     out
 }
 
-/// Story-order sort key of an asset id (unknown assets sort last).
-fn story_key<'a>(by_id: &HashMap<&str, &'a Asset>, id: &'a str) -> (i64, &'a str) {
-    by_id
-        .get(id)
-        .map_or((i64::MAX, id), |a| (a.taken_at.unwrap_or(i64::MAX), id))
+/// Film entry for an asset the user put there (swap-in or pin). The film
+/// shows Live Photos as stills unless the plan picked them for motion, so a
+/// user pick is a still; clips keep their window.
+fn user_hero_entry(asset: &Asset) -> PlanEntry {
+    let mut entry = plan_entry(asset, asset.score.as_ref());
+    if matches!(entry.rendition, Rendition::Motion { .. }) {
+        entry.rendition = Rendition::Still;
+    }
+    entry
 }
 
 /// Insert the user's pinned assets into the hero (see [`apply_edits`]).
@@ -753,47 +768,48 @@ fn include_pins(
         .chain(edits.swaps.iter().map(|(_, to)| to))
         .map(String::as_str)
         .collect();
+    let score_of = |id: &str| {
+        by_id
+            .get(id)
+            .and_then(|a| a.score.as_ref())
+            .map_or(DEFAULT_SCORE, |s| s.total)
+    };
+    // Unknown assets sort last.
+    let key_of = |id: &str| by_id.get(id).map_or((i64::MAX, ""), |a| story_key(a));
     for id in &edits.included {
         let Some(asset) = by_id.get(id.as_str()) else {
             continue;
         };
-        let Some(chapter) = out.chapters.iter().find(|c| c.asset_ids.contains(id)) else {
+        let Some(chapter) = out.chapter_of(id) else {
             continue;
         };
         if dead.contains(id.as_str()) || out.hero.iter().any(|e| e.asset_id == *id) {
             continue;
         }
+        let same_chapter: HashSet<&str> = chapter.asset_ids.iter().map(String::as_str).collect();
         let weakest = out
             .hero
             .iter()
             .enumerate()
             .filter(|(_, e)| {
-                !pinned.contains(e.asset_id.as_str()) && chapter.asset_ids.contains(&e.asset_id)
+                let id = e.asset_id.as_str();
+                !pinned.contains(id) && same_chapter.contains(id)
             })
-            .min_by(|(_, a), (_, b)| {
-                let total = |e: &PlanEntry| {
-                    by_id
-                        .get(e.asset_id.as_str())
-                        .and_then(|a| a.score.as_ref())
-                        .map_or(DEFAULT_SCORE, |s| s.total)
-                };
-                total(a).total_cmp(&total(b))
-            })
+            .min_by(|(_, a), (_, b)| score_of(&a.asset_id).total_cmp(&score_of(&b.asset_id)))
             .map(|(i, _)| i);
         if let Some(i) = weakest {
             out.hero.remove(i);
         }
-        let mut entry = plan_entry(asset, asset.score.as_ref());
-        if matches!(entry.rendition, Rendition::Motion { .. }) {
-            entry.rendition = Rendition::Still;
-        }
-        let key = story_key(by_id, id);
+        // Swaps keep their slot, so the hero may be out of story order:
+        // land right after the last earlier capture, so nothing captured
+        // before the pin plays after it.
+        let key = story_key(asset);
         let at = out
             .hero
             .iter()
-            .position(|e| story_key(by_id, &e.asset_id) > key)
-            .unwrap_or(out.hero.len());
-        out.hero.insert(at, entry);
+            .rposition(|e| key_of(&e.asset_id) < key)
+            .map_or(0, |i| i + 1);
+        out.hero.insert(at, user_hero_entry(asset));
     }
 }
 
@@ -1742,6 +1758,61 @@ mod tests {
     }
 
     #[test]
+    fn swapping_a_pin_moves_the_pin_to_the_replacement() {
+        let hero = |picked: &[usize], f: &dyn Fn(&mut PlanEdits)| {
+            let (assets, base) = pin_fixture(picked);
+            let mut edits = PlanEdits::default();
+            f(&mut edits);
+            let out = apply_edits(&base, &assets, &edits);
+            (hero_ids(&out).join(","), edits.included)
+        };
+        // Pin absent from the base hero, then swapped.
+        let (ids, pins) = hero(&[0], &|e| {
+            e.set_included("b".into(), true);
+            e.swap("b".into(), "c".into());
+        });
+        assert_eq!((ids.as_str(), pins), ("c", vec!["c".to_string()]));
+        // Pin the base hero already holds, then swapped: the original stays out.
+        let (ids, _) = hero(&[0, 1], &|e| {
+            e.set_included("a".into(), true);
+            e.swap("a".into(), "c".into());
+        });
+        assert_eq!(ids, "c,b");
+        // Chained, and back to the first pin.
+        let (ids, _) = hero(&[0], &|e| {
+            e.set_included("b".into(), true);
+            e.swap("b".into(), "c".into());
+            e.swap("c".into(), "d".into());
+        });
+        assert_eq!(ids, "d");
+        let (ids, pins) = hero(&[0], &|e| {
+            e.set_included("b".into(), true);
+            e.swap("b".into(), "c".into());
+            e.swap("c".into(), "b".into());
+        });
+        assert_eq!((ids.as_str(), pins), ("b", vec!["b".to_string()]));
+        // A swapped-out pick pinned back, then swapped: both replacements stay.
+        let (ids, pins) = hero(&[0], &|e| {
+            e.swap("a".into(), "b".into());
+            e.set_included("a".into(), true);
+            e.swap("a".into(), "c".into());
+        });
+        assert_eq!((ids.as_str(), pins), ("b,c", vec!["c".to_string()]));
+    }
+
+    #[test]
+    fn pin_never_plays_before_an_earlier_capture() {
+        // Hero a, b, c; swap a -> e keeps a's slot: e, b, c. Pinning d
+        // displaces b (weakest) and must land after c, not before e.
+        let (assets, base) = pin_fixture(&[0, 1, 2]);
+        let mut edits = PlanEdits::default();
+        edits.swap("a".into(), "e".into());
+        edits.set_included("d".into(), true);
+        let out = apply_edits(&base, &assets, &edits);
+        assert_eq!(hero_ids(&out), ["e", "c", "d"]);
+    }
+
+    #[test]
     fn included_clips_keep_their_window_and_live_photos_are_stills() {
         let mut v = asset("v", 1_714_557_600, AssetKind::Video);
         v.duration_secs = Some(40.0);
@@ -1772,6 +1843,29 @@ mod tests {
             }
         );
         assert_eq!(out.hero[1].rendition, Rendition::Still);
+    }
+
+    #[test]
+    fn pins_outside_the_plan_or_removed_are_skipped() {
+        let (assets, mut base) = pin_fixture(&[0, 2]);
+        // "e" drops out of every chapter: nothing to trade it against.
+        for ch in &mut base.chapters {
+            ch.asset_ids.retain(|id| id != "e");
+        }
+        let mut edits = PlanEdits::default();
+        edits.set_included("e".into(), true);
+        edits.set_included("ghost".into(), true);
+        edits.set_included("d".into(), true);
+        // A pin that is also removed (hand-edited JSON) stays out.
+        edits.excluded.push("d".into());
+        assert_eq!(hero_ids(&apply_edits(&base, &assets, &edits)), ["a", "c"]);
+    }
+
+    #[test]
+    fn chapter_of_finds_the_member_chapter() {
+        let (_, base) = pin_fixture(&[]);
+        assert!(base.chapter_of("c").is_some());
+        assert!(base.chapter_of("ghost").is_none());
     }
 
     #[test]
