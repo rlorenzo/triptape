@@ -541,7 +541,7 @@ pub struct PlanEdits {
     /// Asset id of any chapter member -> user place label for that chapter.
     #[serde(default)]
     pub place_overrides: BTreeMap<String, String>,
-    /// Asset id -> user caption (beats embedded and place captions).
+    /// Asset id -> user caption (beats the caption embedded in the file).
     #[serde(default)]
     pub caption_overrides: BTreeMap<String, String>,
 }
@@ -594,15 +594,9 @@ fn set_override(map: &mut BTreeMap<String, String>, key: String, value: Option<S
     };
 }
 
-/// Rename a chapter; members captioned with the old place follow the rename.
-fn rename_chapter(ch: &mut Chapter, label: &str, captions: &mut HashMap<String, String>) {
-    if let Some(old) = ch.place.replace(label.to_string()) {
-        for id in &ch.asset_ids {
-            if captions.get(id).is_some_and(|c| *c == old) {
-                captions.insert(id.clone(), label.to_string());
-            }
-        }
-    }
+/// Rename a chapter.
+fn rename_chapter(ch: &mut Chapter, label: &str) {
+    ch.place = Some(label.to_string());
     ch.title = label.to_string();
 }
 
@@ -631,7 +625,7 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
             .iter_mut()
             .filter(|c| c.asset_ids.contains(key))
         {
-            rename_chapter(ch, label, &mut out.captions);
+            rename_chapter(ch, label);
         }
     }
 
@@ -890,23 +884,13 @@ pub fn build_plan_with_length(
         .collect();
     reel_selects.sort_by_key(|e| story_pos[e.asset_id.as_str()]);
 
-    // Auto captions: the photo's chapter place, nothing else. Day/time
-    // live on the chapter, not on every photo; without a pinned VLM we
-    // never invent what a photo shows. Photos in unnamed places get no
-    // auto caption (empty in Story review, ready for the user's words).
-    // A caption the user embedded in the file itself always wins.
-    let captions: HashMap<String, String> = chapters
+    // Captions are the user's own words only: a caption embedded in the file
+    // (EXIF/XMP) or typed in the Story editor. The chapter place is never
+    // copied onto each photo: the film's lower third already names it, and
+    // the book and reels fall back to the chapter place at export time.
+    let captions: HashMap<String, String> = ordered
         .iter()
-        .filter_map(|c| c.place.as_deref().map(|p| (c, p)))
-        .flat_map(|(c, p)| {
-            c.asset_ids
-                .iter()
-                .map(move |id| (id.clone(), p.to_string()))
-        })
-        .chain(ordered.iter().filter_map(|a| {
-            let caption = a.user_caption.clone()?;
-            Some((a.id.clone(), caption))
-        }))
+        .filter_map(|a| Some((a.id.clone(), a.user_caption.clone()?)))
         .collect();
 
     Plan {
@@ -1315,12 +1299,12 @@ mod tests {
 
     #[test]
     fn chapter_place_uses_medoid_not_mean() {
-        // Kyoto cluster plus one far outlier: still Kyoto.
+        // Fushimi Inari cluster plus one far outlier: still Fushimi Inari.
         let mut gps: Vec<(f64, f64)> = (0..8)
             .map(|i| (34.9671 + i as f64 * 0.001, 135.7727))
             .collect();
         gps.push((-33.8688, 151.2093)); // Sydney outlier
-        assert_eq!(chapter_place(&gps).as_deref(), Some("Kyoto, Japan"));
+        assert_eq!(chapter_place(&gps).as_deref(), Some("Fushimi Inari-taisha"));
         // Both sides of the antimeridian (Fiji): a raw mean would land
         // near longitude 0 and name nothing (or the wrong continent).
         let fiji = [(-16.81, -179.9), (-16.82, 179.9), (-16.80, -179.8)];
@@ -1336,12 +1320,15 @@ mod tests {
         // Past the sampling cap, the dense cluster still wins.
         let mut many = vec![(34.9671, 135.7727); 1_000];
         many.extend([(-33.8688, 151.2093); 20]);
-        assert_eq!(chapter_place(&many).as_deref(), Some("Kyoto, Japan"));
+        assert_eq!(
+            chapter_place(&many).as_deref(),
+            Some("Fushimi Inari-taisha")
+        );
     }
 
     #[test]
-    fn chapters_name_places_and_captions_follow() {
-        // Kyoto GPS on every asset: chapter is named by place, captions
+    fn chapters_name_places_without_auto_captions() {
+        // Fushimi Inari GPS on every asset: chapter is named by place, captions
         // carry the place, and the title prefers the place over the date.
         let mut assets = vec![
             asset("a", 1_714_557_600, AssetKind::Photo),
@@ -1354,17 +1341,20 @@ mod tests {
         co.insert("a".into(), "2024-05-01 · place 1".into());
         co.insert("b".into(), "2024-05-01 · place 1".into());
         let plan = build_plan(&assets, &co, &scored(&["a", "b"]));
-        assert_eq!(plan.chapters[0].place.as_deref(), Some("Kyoto, Japan"));
-        assert_eq!(plan.chapters[0].title, "Kyoto, Japan");
-        assert_eq!(plan.captions["a"], "Kyoto, Japan");
-        assert_eq!(plan.captions["b"], "Kyoto, Japan");
+        assert_eq!(
+            plan.chapters[0].place.as_deref(),
+            Some("Fushimi Inari-taisha")
+        );
+        assert_eq!(plan.chapters[0].title, "Fushimi Inari-taisha");
+        // The place is the chapter's, never copied onto each photo.
+        assert!(plan.captions.is_empty(), "got: {:?}", plan.captions);
     }
 
     #[test]
     fn edits_exclude_swap_rename_and_recaption() {
         let mk = |id: &str, t: i64| {
             let mut a = asset(id, t, AssetKind::Photo);
-            a.gps = Some((34.9671, 135.7727)); // Kyoto
+            a.gps = Some((34.9671, 135.7727)); // Fushimi Inari
             a
         };
         let assets = vec![
@@ -1377,7 +1367,10 @@ mod tests {
             co.insert(id.into(), "2024-05-01 · place 1".into());
         }
         let base = build_plan(&assets, &co, &scored(&["a", "b", "c"]));
-        assert_eq!(base.chapters[0].place.as_deref(), Some("Kyoto, Japan"));
+        assert_eq!(
+            base.chapters[0].place.as_deref(),
+            Some("Fushimi Inari-taisha")
+        );
 
         let edits = PlanEdits {
             excluded: vec!["b".into()],
@@ -1386,7 +1379,8 @@ mod tests {
             caption_overrides: [("c".to_string(), "Breakfast view".to_string())].into(),
         };
         let out = apply_edits(&base, &assets, &edits);
-        // Rename hit the chapter and its place-derived captions.
+        // Rename hit the chapter; no auto captions to follow it.
+        assert!(!out.captions.contains_key("a"));
         assert_eq!(out.chapters[0].place.as_deref(), Some("Our Ryokan"));
         assert_eq!(out.chapters[0].title, "Our Ryokan");
         // Swap replaced the hero pick in place; exclusion removed b.
@@ -1542,9 +1536,9 @@ mod tests {
     }
 
     #[test]
-    fn user_caption_beats_place_caption() {
+    fn only_user_captions_reach_the_plan() {
         let mut a = asset("a", 1_714_557_600, AssetKind::Photo);
-        a.gps = Some((34.9671, 135.7727)); // Kyoto
+        a.gps = Some((34.9671, 135.7727)); // Fushimi Inari
         a.user_caption = Some("Mia's first shinkansen ride".into());
         let mut b = asset("b", 1_714_557_900, AssetKind::Photo);
         b.gps = Some((34.9671, 135.7727));
@@ -1554,7 +1548,8 @@ mod tests {
         co.insert("b".into(), "2024-05-01 · place 1".into());
         let plan = build_plan(&assets, &co, &scored(&["a", "b"]));
         assert_eq!(plan.captions["a"], "Mia's first shinkansen ride");
-        assert_eq!(plan.captions["b"], "Kyoto, Japan");
+        assert!(!plan.captions.contains_key("b"));
+        assert_eq!(plan.captions.len(), 1);
     }
 
     #[test]
@@ -1577,7 +1572,7 @@ mod tests {
         let mut sea = asset("sea", ts("2024-05-02"), AssetKind::Photo);
         sea.gps = Some((2.221, 105.205)); // open water: names nothing
         let mut port = asset("port", ts("2024-05-02"), AssetKind::Photo);
-        port.gps = Some((34.9671, 135.7727)); // Kyoto
+        port.gps = Some((34.9671, 135.7727)); // Fushimi Inari
         let mut far = asset("far", ts("2024-06-02"), AssetKind::Photo);
         far.gps = Some((2.221, 105.205));
         let assets = vec![sea, port, far];
@@ -1594,7 +1589,7 @@ mod tests {
                 .and_then(|c| c.place.as_deref())
         };
         assert_eq!(place_of("sea"), Some("SS Test Ship"));
-        assert_eq!(place_of("port"), Some("Kyoto, Japan"));
+        assert_eq!(place_of("port"), Some("Fushimi Inari-taisha"));
         assert_eq!(place_of("far"), None);
     }
 

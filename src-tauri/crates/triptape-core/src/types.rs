@@ -65,7 +65,7 @@ pub struct Asset {
     /// Live Photo pairing confidence, when applicable.
     pub pairing_confidence: Option<PairingConfidence>,
     /// Caption embedded in the file by the user (EXIF/XMP), if any.
-    /// Wins over auto-generated place captions in plans.
+    /// The only source of plan captions besides Story-editor overrides.
     pub user_caption: Option<String>,
     /// How many people the photo library tagged in this asset (a count
     /// only, never the names: they are personal data and stay out of logs,
@@ -180,7 +180,8 @@ pub struct Plan {
     pub hero: Vec<PlanEntry>,
     pub reel_selects: Vec<PlanEntry>,
     pub chapters: Vec<Chapter>,
-    /// asset_id -> caption draft.
+    /// asset_id -> the user's own caption (embedded or typed in the Story
+    /// editor). Never the chapter place: book and reels add that at export.
     pub captions: std::collections::HashMap<String, String>,
     /// Route polyline (lat, lon) with day markers.
     pub map_polyline: Vec<(f64, f64)>,

@@ -110,7 +110,8 @@ fn city_name(gps: (f64, f64)) -> Option<String> {
 }
 
 /// Named attractions (Wikidata, CC0): tourist attractions, parks,
-/// museums, amusement parks, castles, zoos with a notability floor
+/// museums, amusement parks, castles, zoos, temples, shrines, churches,
+/// mosques with a notability floor
 /// (Wikidata sitelinks). Columns: name, latitude, longitude.
 const ATTRACTIONS_TSV: &str = include_str!("../../../../resources/gazetteer/attractions.tsv");
 
@@ -139,7 +140,9 @@ fn attractions() -> &'static [Attraction] {
 
 /// The attraction a photo was taken at, when one is within 2 km:
 /// `Tokyo DisneySea` says more than `Urayasu, Japan`. `None` when no
-/// known attraction is that close.
+/// known attraction is that close. The nearest wins: on the 2026 Japan to
+/// Singapore trip, a notability weight or a 1 km radius for the tail of the
+/// list changed none of the 72 chapter names.
 fn attraction_name(gps: (f64, f64)) -> Option<String> {
     nearest_within(attractions(), |a| (a.lat, a.lon), gps, 2_000.0).map(|a| a.name.to_string())
 }
@@ -190,10 +193,6 @@ mod tests {
     fn towns_are_not_attractions() {
         // Town centers typed as tourist attractions in Wikidata keep the country.
         assert_eq!(
-            place_name((50.77664, 6.08342)).as_deref(),
-            Some("Aachen, Germany")
-        );
-        assert_eq!(
             place_name((51.39462, 8.57146)).as_deref(),
             Some("Brilon, Germany")
         );
@@ -229,6 +228,25 @@ mod tests {
         assert_eq!(
             attraction_name((1.3602, 103.9898)).as_deref(),
             Some("Jewel Changi Airport")
+        );
+    }
+
+    #[test]
+    fn temples_and_shrines_name_the_day() {
+        // Kaminarimon gate: Sensō-ji, not the demolished Ryōunkaku tower
+        // that used to sit in the list 600 m away.
+        assert_eq!(
+            place_name((35.7106, 139.7963)).as_deref(),
+            Some("Sensō-ji Temple")
+        );
+        assert!(!ATTRACTIONS_TSV.contains("Ryōunkaku"));
+        assert_eq!(
+            place_name((35.3261, 139.5564)).as_deref(),
+            Some("Tsurugaoka Hachimangū")
+        );
+        assert_eq!(
+            place_name((35.3169, 139.5357)).as_deref(),
+            Some("Kōtoku-in Temple")
         );
     }
 

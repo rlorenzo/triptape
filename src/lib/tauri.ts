@@ -194,7 +194,7 @@ function buildDemoStory(): StoryView {
       place,
       dayIndex: c + 1,
       dateLabel: formatDay(items[0]?.takenAt),
-      entries: items.map((a, i) => ({ ...a, caption: place, inHero: i < 3, inReels: i === 0 }))
+      entries: items.map((a, i) => ({ ...a, inHero: i < 3, inReels: i === 0 }))
     };
   }).filter((c) => c.entries.length > 0);
   return { chapters, excluded: [], heroCount: 9, reelCount: 3 };
@@ -222,10 +222,8 @@ export async function setChapterPlace(projectId: string, chapterKey: string, pla
   return demoEdit((s) => {
     const ch = s.chapters.find((c) => c.key === chapterKey);
     if (ch && place) {
-      const old = ch.place;
       ch.place = place;
       ch.title = place;
-      for (const e of ch.entries) if (e.caption === old) e.caption = place;
     }
   });
 }

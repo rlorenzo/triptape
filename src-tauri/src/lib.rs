@@ -590,7 +590,7 @@ mod tests {
         a.gps = Some((34.9671, 135.7727));
         let view = AssetView::from(&a);
         assert!(view.has_gps);
-        assert_eq!(view.place.as_deref(), Some("Kyoto, Japan"));
+        assert_eq!(view.place.as_deref(), Some("Fushimi Inari-taisha"));
 
         let mut b = Asset::new("nogps", PathBuf::from("/t/nogps.jpg"), AssetKind::Photo);
         b.gps = None;
