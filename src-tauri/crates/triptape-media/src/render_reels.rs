@@ -323,10 +323,9 @@ pub fn render_reels(
         let slides: &[PathBuf] = opts.slideshows.get(i).map_or(&[], Vec::as_slice);
         let dur = match render_one_reel(caps, r, src, &out, opts, slides, &mut fallbacks) {
             Ok(d) => d,
-            Err(crate::MediaError::Cancelled) => {
-                let _ = std::fs::remove_file(&out);
-                return Err(crate::MediaError::Cancelled);
-            }
+            // `caps.run` already discarded its `.partial`; `out` is either a
+            // previous export's reel or a fully encoded new one — keep it.
+            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
             Err(e) => {
                 fallbacks.push(format!("reel {} failed ({e}); skipped", r.entry.asset_id));
                 let _ = std::fs::remove_file(&out);

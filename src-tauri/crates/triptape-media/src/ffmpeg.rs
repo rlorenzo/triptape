@@ -180,7 +180,7 @@ pub struct Capabilities {
     /// at once so their ffmpegs share the cores. `None` leaves ffmpeg's
     /// own default (all cores).
     pub threads: Option<usize>,
-    /// Cancel flag and progress sink; every [`run_ffmpeg`] call polls it.
+    /// Cancel flag and progress sink; every [`Capabilities::run`] polls it.
     pub progress: crate::progress::Progress,
 }
 
@@ -529,18 +529,6 @@ pub fn render_thumb(
     written
 }
 
-/// Run FFmpeg with `args` (whose last element must be `final_out`).
-/// Renders to a `.partial` sibling and atomically renames on success, so a
-/// file at `final_out` is always a complete render. Returns the stderr tail
-/// on failure for the redacted diagnostics bundle.
-pub fn run_ffmpeg(
-    ffmpeg_bin: &str,
-    args: &[String],
-    final_out: &Path,
-) -> Result<(), super::MediaError> {
-    run_ffmpeg_with(ffmpeg_bin, args, final_out, &RunOpts::default())
-}
-
 /// Extras for [`run_ffmpeg_with`].
 #[derive(Default)]
 pub struct RunOpts<'a> {
@@ -549,13 +537,16 @@ pub struct RunOpts<'a> {
     /// Cancel source: when it fires, ffmpeg is killed, its `.partial` is
     /// removed and `Cancelled` is returned.
     pub progress: Option<&'a crate::progress::Progress>,
-    /// Expected output length. With `on_fraction`, ffmpeg's `-progress`
-    /// stream (`out_time_us`) is turned into a `0..=1` fraction of it.
-    pub total_secs: Option<f64>,
-    pub on_fraction: Option<&'a dyn Fn(f64)>,
+    /// Expected output seconds and a callback: ffmpeg's `-progress` stream
+    /// (`out_time_us`) is turned into a `0..=1` fraction of that length.
+    pub watch: Option<(f64, &'a dyn Fn(f64))>,
 }
 
-/// [`run_ffmpeg`] with a thread cap, cancellation and encode progress.
+/// Run FFmpeg with `args` (whose last element must be `final_out`), with an
+/// optional thread cap, cancellation and encode progress. Renders to a
+/// `.partial` sibling and atomically renames on success, so a file at
+/// `final_out` is always a complete render. Returns the stderr tail on
+/// failure for the redacted diagnostics bundle.
 pub fn run_ffmpeg_with(
     ffmpeg_bin: &str,
     args: &[String],
@@ -577,33 +568,30 @@ pub fn run_ffmpeg_with(
         std::fs::create_dir_all(p).map_err(|e| super::MediaError::Io(e.to_string()))?;
     }
     let partial = partial_sibling(final_out);
-    let mut fixed: Vec<String> = args[..args.len() - 1].to_vec();
-    if let Some(n) = opts.threads {
-        // Output-side `-threads` caps the encoder; the filter-graph pool is
-        // global. Both sit before the output path.
-        let n = n.max(1).to_string();
-        fixed.extend(["-threads".into(), n.clone(), "-filter_threads".into(), n]);
+    let watch = opts.watch.filter(|(total, _)| *total > 0.0);
+    let mut fixed: Vec<String> = vec![];
+    if watch.is_some() {
+        fixed.extend(["-nostats", "-progress", "pipe:1"].map(String::from));
     }
-    let watch_progress = opts.on_fraction.is_some() && opts.total_secs.is_some_and(|t| t > 0.0);
-    if watch_progress {
-        let mut head: Vec<String> = ["-nostats", "-progress", "pipe:1"]
-            .map(String::from)
-            .to_vec();
-        head.append(&mut fixed);
-        fixed = head;
+    fixed.extend_from_slice(&args[..args.len() - 1]);
+    if let Some(n) = opts.threads {
+        // Output-side `-threads` caps the encoder; the simple and complex
+        // filter-graph pools are global. All sit before the output path.
+        let n = n.max(1).to_string();
+        fixed.extend([
+            "-threads".into(),
+            n.clone(),
+            "-filter_threads".into(),
+            n.clone(),
+            "-filter_complex_threads".into(),
+            n,
+        ]);
     }
     fixed.push(partial.to_string_lossy().into_owned());
-    if opts.progress.is_none() && !watch_progress {
-        let out = Command::new(ffmpeg_bin)
-            .args(&fixed)
-            .output()
-            .map_err(|e| super::MediaError::Ffmpeg(format!("spawn {ffmpeg_bin}: {e}")))?;
-        return finish_ffmpeg(out.status, &out.stderr, &partial, final_out);
-    }
     let mut child = Command::new(ffmpeg_bin)
         .args(&fixed)
         .stdin(std::process::Stdio::null())
-        .stdout(if watch_progress {
+        .stdout(if watch.is_some() {
             std::process::Stdio::piped()
         } else {
             std::process::Stdio::null()
@@ -635,41 +623,48 @@ pub fn run_ffmpeg_with(
             }
         })
     });
+    let join_pipes = |out_thread: Option<std::thread::JoinHandle<()>>| {
+        if let Some(t) = out_thread {
+            let _ = t.join();
+        }
+        err_thread.join().unwrap_or_default()
+    };
     let mut last_reported = u64::MAX;
-    let status = loop {
+    // Short calls (most of them) exit within a few ms, so the poll starts
+    // tight and backs off to the cancel-latency ceiling.
+    let mut nap = std::time::Duration::from_millis(1);
+    let waited = loop {
         if opts.progress.is_some_and(|p| p.is_cancelled()) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = err_thread.join();
-            if let Some(t) = out_thread {
-                let _ = t.join();
-            }
-            let _ = std::fs::remove_file(&partial);
-            return Err(super::MediaError::Cancelled);
+            break Err(super::MediaError::Cancelled);
         }
         match child.try_wait() {
-            Ok(Some(st)) => break st,
+            Ok(Some(st)) => break Ok(st),
             Ok(None) => {}
-            Err(e) => {
-                let _ = child.kill();
-                let _ = std::fs::remove_file(&partial);
-                return Err(super::MediaError::Ffmpeg(format!("wait {ffmpeg_bin}: {e}")));
-            }
+            Err(e) => break Err(super::MediaError::Ffmpeg(format!("wait {ffmpeg_bin}: {e}"))),
         }
-        if let (Some(cb), Some(total)) = (opts.on_fraction, opts.total_secs) {
+        if let Some((total, cb)) = watch {
             let us = out_time_us.load(std::sync::atomic::Ordering::Relaxed);
             if us != last_reported {
                 last_reported = us;
                 cb((us as f64 / 1e6 / total).clamp(0.0, 1.0));
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(std::time::Duration::from_millis(25));
     };
-    let stderr = err_thread.join().unwrap_or_default();
-    if let Some(t) = out_thread {
-        let _ = t.join();
+    match waited {
+        Ok(status) => {
+            let stderr = join_pipes(out_thread);
+            finish_ffmpeg(status, &stderr, &partial, final_out)
+        }
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            join_pipes(out_thread);
+            let _ = std::fs::remove_file(&partial);
+            Err(e)
+        }
     }
-    finish_ffmpeg(status, &stderr, &partial, final_out)
 }
 
 /// Promote the `.partial` on success; on failure delete it and report the
@@ -696,17 +691,26 @@ fn finish_ffmpeg(
 impl Capabilities {
     /// [`run_ffmpeg_with`] using this context's thread cap and cancel flag.
     pub fn run(&self, args: &[String], final_out: &Path) -> Result<(), super::MediaError> {
-        self.run_progress(args, final_out, None, None)
+        self.run_with(args, final_out, None)
     }
 
-    /// [`Capabilities::run`] that also reports `total_secs`-relative encode
-    /// progress to `on_fraction`.
+    /// [`Capabilities::run`] that also reports encode progress, as a
+    /// fraction of `total_secs` of output, to `on_fraction`.
     pub fn run_progress(
         &self,
         args: &[String],
         final_out: &Path,
-        total_secs: Option<f64>,
-        on_fraction: Option<&dyn Fn(f64)>,
+        total_secs: f64,
+        on_fraction: &dyn Fn(f64),
+    ) -> Result<(), super::MediaError> {
+        self.run_with(args, final_out, Some((total_secs, on_fraction)))
+    }
+
+    fn run_with(
+        &self,
+        args: &[String],
+        final_out: &Path,
+        watch: Option<(f64, &dyn Fn(f64))>,
     ) -> Result<(), super::MediaError> {
         run_ffmpeg_with(
             &self.ffmpeg_bin,
@@ -715,8 +719,7 @@ impl Capabilities {
             &RunOpts {
                 threads: self.threads,
                 progress: Some(&self.progress),
-                total_secs,
-                on_fraction,
+                watch,
             },
         )
     }
@@ -1442,8 +1445,7 @@ mod tests {
             &out,
             &RunOpts {
                 threads: Some(3),
-                total_secs: Some(4.0),
-                on_fraction: Some(&|f| seen.lock().unwrap().push(f)),
+                watch: Some((4.0, &|f| seen.lock().unwrap().push(f))),
                 ..Default::default()
             },
         )
@@ -1455,12 +1457,32 @@ mod tests {
         assert!(*seen.last().unwrap() >= 0.5, "{seen:?}");
         assert!(out.exists() && !partial_sibling(&out).exists());
         let logged = std::fs::read_to_string(dir.path().join("args.txt")).unwrap();
-        assert!(logged.contains("-threads 3 -filter_threads 3"), "{logged}");
+        assert!(
+            logged.contains("-threads 3 -filter_threads 3 -filter_complex_threads 3"),
+            "{logged}"
+        );
         assert!(logged.contains("-progress pipe:1"), "{logged}");
         assert!(
             logged.trim_end().ends_with(".partial.mp4"),
             "output is the partial: {logged}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_run_reports_stderr_and_removes_the_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_ffmpeg(dir.path(), ": > \"$last\"; echo boom >&2; exit 3");
+        let out = dir.path().join("o.mp4");
+        let args = vec!["-y".to_string(), out.to_string_lossy().into_owned()];
+        let res = run_ffmpeg_with(&bin, &args, &out, &RunOpts::default());
+        let Err(crate::MediaError::Ffmpeg(msg)) = res else {
+            panic!("{res:?}");
+        };
+        assert!(msg.contains("exit 3") && msg.contains("boom"), "{msg}");
+        assert!(!out.exists() && !partial_sibling(&out).exists());
+        let logged = std::fs::read_to_string(dir.path().join("args.txt")).unwrap();
+        assert!(!logged.contains("-progress") && !logged.contains("-threads"));
     }
 
     #[cfg(unix)]
@@ -1471,10 +1493,10 @@ mod tests {
         let out = dir.path().join("o.mp4");
         let args = vec!["-y".to_string(), out.to_string_lossy().into_owned()];
         let progress = crate::progress::Progress::default();
-        let flag = progress.cancel_flag();
+        let handle = progress.clone();
         let canceller = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(300));
-            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            handle.cancel();
         });
         let started = std::time::Instant::now();
         let res = run_ffmpeg_with(

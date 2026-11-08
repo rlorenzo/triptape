@@ -44,11 +44,19 @@ fn emit(app: &tauri::AppHandle, job: &Job) {
 /// so the DB row and the event stream never disagree. Emitting from a
 /// `spawn_blocking` worker is fine (`AppHandle` is shared); callers throttle
 /// to ~5 Hz (one emit per 200 ms) rather than one event per file.
-fn report_ingest(app: &tauri::AppHandle, db: &Db, job_id: &str, progress: f32, step: &str) {
+/// Returns `false` (and writes nothing) when the job was already cancelled, so
+/// a late progress tick never revives a cancelled row back to `Running`.
+/// Callers hold the Db lock, so the check and the update cannot interleave
+/// with `cancel_job`.
+fn report_ingest(app: &tauri::AppHandle, db: &Db, job_id: &str, progress: f32, step: &str) -> bool {
+    if matches!(db.get_job(job_id), Ok(Some(j)) if j.state == JobState::Cancelled) {
+        return false;
+    }
     let _ = db.update_job(job_id, JobState::Running, progress, Some(step), None);
     if let Ok(Some(job)) = db.get_job(job_id) {
         emit(app, &job);
     }
+    true
 }
 
 /// Minimum gap between progress emits (~5 Hz ceiling for the event stream).
@@ -909,7 +917,10 @@ impl triptape_media::progress::ProgressSink for ExportProgress {
         let state = self.app.state::<AppState>();
         let db = state.db.lock();
         if let Ok(db) = db {
-            report_ingest(&self.app, &db, &self.job_id, progress, &event.text());
+            if !report_ingest(&self.app, &db, &self.job_id, progress, &event.text()) {
+                self.cancelled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 

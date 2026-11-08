@@ -7,9 +7,9 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use triptape_core::jobs::CancelFlag;
 
 /// One progress report from a renderer.
 #[derive(Debug, Clone, PartialEq)]
@@ -113,14 +113,14 @@ pub trait ProgressSink: Send + Sync {
 #[derive(Clone, Default)]
 pub struct Progress {
     sink: Option<Arc<dyn ProgressSink>>,
-    cancel: Arc<AtomicBool>,
+    cancel: CancelFlag,
 }
 
 impl std::fmt::Debug for Progress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Progress")
             .field("sink", &self.sink.is_some())
-            .field("cancelled", &self.cancel.load(Ordering::Relaxed))
+            .field("cancelled", &self.cancel.is_cancelled())
             .finish()
     }
 }
@@ -129,21 +129,17 @@ impl Progress {
     pub fn new(sink: Arc<dyn ProgressSink>) -> Self {
         Self {
             sink: Some(sink),
-            cancel: Arc::default(),
+            cancel: CancelFlag::new(),
         }
     }
 
-    /// The flag [`Progress::is_cancelled`] watches; set it to stop the render.
-    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancel)
-    }
-
+    /// Stop the render; clones of this handle share the flag.
     pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        self.cancel.cancel();
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancel.load(Ordering::Relaxed) || self.sink.as_ref().is_some_and(|s| s.cancelled())
+        self.cancel.is_cancelled() || self.sink.as_ref().is_some_and(|s| s.cancelled())
     }
 
     /// `Err(Cancelled)` once a cancel was requested, for `?` at loop heads.
@@ -260,6 +256,9 @@ fn percent(f: f64) -> u32 {
     (f.clamp(0.0, 1.0) * 100.0).floor() as u32
 }
 
+/// Completions the console ETA averages over.
+const ETA_WINDOW: usize = 12;
+
 /// Minimum gap between in-place redraws on a terminal.
 const TTY_REDRAW: Duration = Duration::from_millis(250);
 
@@ -303,7 +302,7 @@ impl<W: Write + Send> ConsoleProgress<W> {
                 keepsake: None,
                 keepsake_start: now,
                 phase_start: now,
-                eta: EtaEstimator::new(12),
+                eta: EtaEstimator::new(ETA_WINDOW),
                 last_draw: None,
                 last_bucket: None,
                 line_open: false,
@@ -337,7 +336,7 @@ impl<W: Write + Send> ConsoleProgress<W> {
             }
             st.phase = Some(key);
             st.phase_start = now;
-            st.eta = EtaEstimator::new(12);
+            st.eta = EtaEstimator::new(ETA_WINDOW);
             st.last_draw = None;
             st.last_bucket = None;
         }
@@ -345,55 +344,58 @@ impl<W: Write + Send> ConsoleProgress<W> {
         let elapsed = now
             .saturating_duration_since(st.keepsake_start)
             .as_secs_f64();
-        // (done, total, fraction) drives ETA and cadence.
-        let (frac, last, small) = match event {
+        // Fraction, phase-complete and short-phase flags drive the cadence.
+        let (frac, last, small, eta) = match event {
             ProgressEvent::Counted { done, total, .. } => {
                 st.eta.record(in_phase, *done);
+                let eta = (done < total).then(|| st.eta.eta(*done, *total)).flatten();
                 (
                     *done as f64 / (*total).max(1) as f64,
                     done >= total,
                     *total <= 20,
+                    eta,
                 )
             }
-            ProgressEvent::Step { fraction, .. } => (fraction.unwrap_or(0.0), false, false),
-        };
-        let eta = match event {
-            ProgressEvent::Counted { done, total, .. } if done < total => st.eta.eta(*done, *total),
-            ProgressEvent::Counted { .. } => None,
-            // A step's own fraction is its rate; ignore the first sliver.
-            ProgressEvent::Step {
-                fraction: Some(f), ..
-            } if *f >= 0.02 && *f < 1.0 => Some(in_phase * (1.0 - f) / f),
-            ProgressEvent::Step { .. } => None,
-        };
-        let line = format_line(event, elapsed, eta);
-
-        if self.tty {
-            let due = st
-                .last_draw
-                .is_none_or(|t| now.saturating_duration_since(t) >= TTY_REDRAW);
-            if due || last {
-                st.last_draw = Some(now);
-                let _ = write!(st.out, "\r\x1b[2K{line}");
-                let _ = st.out.flush();
-                st.line_open = true;
+            ProgressEvent::Step { fraction, .. } => {
+                // A step's own fraction is its rate; ignore the first sliver.
+                let eta = fraction
+                    .filter(|f| (0.02..1.0).contains(f))
+                    .map(|f| in_phase * (1.0 - f) / f);
+                (fraction.unwrap_or(0.0), false, false, eta)
             }
+        };
+
+        // Decide first, so the line is only formatted when it is written.
+        let draw = if self.tty {
+            last || st
+                .last_draw
+                .is_none_or(|t| now.saturating_duration_since(t) >= TTY_REDRAW)
         } else {
             let bucket = percent(frac) / 5;
-            let is_step = matches!(event, ProgressEvent::Step { .. });
             // Steps print at 10% marks (and once without a fraction);
             // counted phases every item when short, else each 5%.
-            let print = if is_step {
-                st.last_bucket.is_none() || (bucket / 2 > st.last_bucket.unwrap_or(0) / 2)
+            let print = if matches!(event, ProgressEvent::Step { .. }) {
+                st.last_bucket.is_none_or(|b| bucket / 2 > b / 2)
             } else {
                 small || last || st.last_bucket.is_none_or(|b| bucket > b)
             };
             if print {
                 st.last_bucket = Some(bucket);
-                let _ = writeln!(st.out, "{line}");
-                let _ = st.out.flush();
             }
+            print
+        };
+        if !draw {
+            return;
         }
+        let line = format_line(event, elapsed, eta);
+        if self.tty {
+            st.last_draw = Some(now);
+            let _ = write!(st.out, "\r\x1b[2K{line}");
+            st.line_open = true;
+        } else {
+            let _ = writeln!(st.out, "{line}");
+        }
+        let _ = st.out.flush();
     }
 }
 

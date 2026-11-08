@@ -594,8 +594,8 @@ pub fn render_hero_video(
                       out: GroupOutcome| {
         fallbacks.extend(out.fallbacks);
         if let Some(seg) = out.seg {
-            if let Some((lead, members)) = out.collage {
-                collage_members.insert(lead, members);
+            if !out.collage_members.is_empty() {
+                collage_members.insert(seg.0.entry.asset_id.clone(), out.collage_members);
             }
             segs.push(seg);
         }
@@ -864,14 +864,9 @@ pub fn render_hero_video(
         ]);
         args.extend(ffmpeg::x264_aac("veryfast", 12));
         args.push(s(&acc));
-        caps.run_progress(
-            &args,
-            &acc,
-            Some(total),
-            Some(&|f| {
-                progress.step("video", "assembling transitions", Some(f));
-            }),
-        )?;
+        caps.run_progress(&args, &acc, total, &|f| {
+            progress.step("video", "assembling transitions", Some(f));
+        })?;
     }
 
     // 6. Final pass: the music bed is the PRIMARY audio (looped, trimmed to
@@ -959,7 +954,7 @@ pub fn render_hero_video(
     let final_label = "final pass (music, captions, encode)";
     progress.step("video", final_label, Some(0.0));
     let on_final = |f: f64| progress.step("video", final_label, Some(f));
-    match caps.run_progress(&final_args, out_mp4, Some(total), Some(&on_final)) {
+    match caps.run_progress(&final_args, out_mp4, total, &on_final) {
         Ok(()) => {}
         Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
         // Music bed is mandatory: a failed mix fails the film (the old
@@ -1017,7 +1012,7 @@ pub fn render_hero_video(
 
 /// Bake the lower-third PNG (1200x200 at 1080p, 2x that at 4K) onto `seg` in
 /// place (`overlay=48:H-160` in 1080p units, visible
-/// `between(t,0.3,segdur)`). `run_ffmpeg` writes a partial sibling and
+/// `between(t,0.3,segdur)`). `caps.run` writes a partial sibling and
 /// renames, so a failure never leaves a torn segment.
 fn apply_lower_third(
     caps: &Capabilities,
@@ -1168,8 +1163,9 @@ struct GroupOutcome {
     /// Entry shown (a collage carries all members' captions), segment file,
     /// probed seconds, kind. `None` when the group failed and was skipped.
     seg: Option<(ResolvedEntry, PathBuf, f64, String)>,
-    /// Lead asset id and every member id, for collage segments.
-    collage: Option<(String, Vec<String>)>,
+    /// Every member id when the segment is a collage (keyed by the lead,
+    /// `seg.0.entry.asset_id`); empty otherwise.
+    collage_members: Vec<String>,
     fallbacks: Vec<String>,
 }
 
@@ -1189,8 +1185,8 @@ impl SegmentLimits {
     };
 }
 
-/// Render, probe and (for short clips) freeze-pad one group. A failed render is a fallback note, not an error: only
-/// a cancel comes back as `Err`.
+/// Render, probe and (for short clips) freeze-pad one group. A failed render
+/// is a fallback note, not an error: only a cancel comes back as `Err`.
 fn render_group(
     caps: &Capabilities,
     present: &[&ResolvedEntry],
@@ -1223,7 +1219,7 @@ fn render_group(
             fallbacks.push(format!("{} skipped: {e}", r.entry.asset_id));
             return Ok(GroupOutcome {
                 seg: None,
-                collage: None,
+                collage_members: vec![],
                 fallbacks,
             });
         }
@@ -1254,17 +1250,14 @@ fn render_group(
     // A collage segment carries every member's caption and id, so the
     // sidecar and EDL account for all the photos on screen.
     let mut seg_entry = r.clone();
-    let mut collage = None;
+    let mut collage_members = vec![];
     if present.len() > 1 {
         seg_entry.caption = collage_caption(present);
-        collage = Some((
-            r.entry.asset_id.clone(),
-            present.iter().map(|m| m.entry.asset_id.clone()).collect(),
-        ));
+        collage_members = present.iter().map(|m| m.entry.asset_id.clone()).collect();
     }
     Ok(GroupOutcome {
         seg: Some((seg_entry, seg_path, dur, kind)),
-        collage,
+        collage_members,
         fallbacks,
     })
 }
