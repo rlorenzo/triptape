@@ -619,7 +619,7 @@ mod tests {
             preset: render_book::BookPreset::P1,
             trip_name: "t".into(),
             typst_bin: "typst".into(),
-            music_path: None,
+            music_paths: Vec::new(),
             keep_ambience: false,
             only: "reels".into(),
             resolution: Default::default(),
