@@ -541,7 +541,7 @@ fn slideshow_duration(n: usize, slide_secs: f64, fade_secs: f64, xfade: bool) ->
 /// landscape source squashes it into the portrait frame, and its
 /// integer-step re-cropping makes stills jitter.
 fn slideshow_frame_vf(caps: &Capabilities, i: usize, slide_secs: f64) -> String {
-    let base = ffmpeg::fit_over_blur(caps, &format!("[{i}:v]"), 1620, 2880, &i.to_string());
+    let base = ffmpeg::fit_over_blur(caps, &format!("[{i}:v]"), 1620, 2880, &i.to_string(), 40);
     let frames = (slide_secs * 30.0).round().max(1.0) as u32;
     format!(
         "{base},{},{},format=yuv420p[v{i}]",

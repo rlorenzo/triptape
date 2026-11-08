@@ -8,6 +8,7 @@ use crate::ffmpeg::Capabilities;
 use crate::render_book::{self, BookOptions, BookPhoto};
 use crate::render_reels::{self, ReelOptions};
 use crate::render_video::{self, ResolvedEntry, VideoOptions};
+use crate::resolution::Resolution;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{check_source_integrity, plan_eligibility, Integrity};
@@ -24,6 +25,8 @@ pub struct ExportOptions {
     pub keep_ambience: bool,
     /// "all" (default), or one keepsake: "video" | "reels" | "book".
     pub only: String,
+    /// Hero film frame size (default 4K). Reels stay 1080x1920.
+    pub resolution: Resolution,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -172,7 +175,8 @@ pub fn export_all(
     let mut map_card: Option<PathBuf> = None;
     if !plan.map_polyline.is_empty() {
         let card = work.join("route_card.png");
-        match crate::map::save_route_card(&plan.map_polyline, &[], 1920, 1080, &card) {
+        let (card_w, card_h) = opts.resolution.dims();
+        match crate::map::save_route_card(&plan.map_polyline, &[], card_w, card_h, &card) {
             Ok(note) => {
                 report.attribution.push(note);
                 map_card = Some(card);
@@ -222,6 +226,7 @@ pub fn export_all(
                 music_path: opts.music_path.clone(),
                 keep_ambience: opts.keep_ambience,
                 typst_bin: opts.typst_bin.clone(),
+                resolution: opts.resolution,
                 ..Default::default()
             },
         ) {

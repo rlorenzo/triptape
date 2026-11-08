@@ -2,7 +2,7 @@
 
 Free, open-source desktop app (Tauri v2 + Rust) that turns a messy folder of
 family vacation photos/videos into three keepsakes from one curation pass:
-a Trip Video (1080p hero film), a Reels Pack (3–5 vertical clips), and a
+a Trip Video (4K hero film, 1080p optional via `export --resolution 1080p`), a Reels Pack (3–5 vertical clips), and a
 Photo Book (print-ready PDF + per-page JPEGs). See [PLAN.md](PLAN.md) —
 the source of truth until code exists.
 

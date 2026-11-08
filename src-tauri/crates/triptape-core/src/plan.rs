@@ -56,9 +56,10 @@ const PANO_SECS_PER_ASPECT: f64 = 0.8;
 /// Fastest allowed average pan, in frame-widths per second (the eased
 /// pan peaks at 1.5x this mid-travel). Very wide images
 /// first hold longer (up to [`PANO_LONG_SECS`]), then pan less of their
-/// width rather than whip across it.
+/// width (centered) rather than whip across it or hold past the cap.
 pub const PANO_MAX_SPEED: f64 = 0.3;
-pub const PANO_LONG_SECS: f64 = 12.0;
+/// Longest a panorama stays on screen.
+pub const PANO_LONG_SECS: f64 = 10.0;
 /// Output frame aspect the pan is measured against.
 const FRAME_ASPECT: f64 = 16.0 / 9.0;
 /// Minimum on-screen time for a hero segment; shorter clips are
@@ -2032,9 +2033,16 @@ mod tests {
         // Extreme: longer hold, bounded speed, partial coverage.
         let huge = pano_motion(12.0);
         assert!(huge.hold_secs > PANO_MAX_SECS && huge.hold_secs <= PANO_LONG_SECS);
+        assert_eq!(huge.hold_secs, 10.0, "on-screen cap is 10 s");
         assert!(huge.coverage < 1.0);
         let overflow = 12.0 / (16.0 / 9.0) - 1.0;
         assert!(overflow * huge.coverage / huge.hold_secs <= PANO_MAX_SPEED + 1e-9);
+        // No aspect ever holds past the 10 s cap or beats the speed bound.
+        for aspect in [2.0, 3.0, 4.4, 6.0, 7.5, 12.0, 30.0, 0.5, 0.25, 0.1] {
+            let m = pano_motion(aspect);
+            assert!(m.hold_secs <= 10.0 + 1e-9, "{aspect}: {m:?}");
+            assert!(m.coverage > 0.0 && m.coverage <= 1.0, "{aspect}: {m:?}");
+        }
         // A shortened pan travels less, at the same speed bound.
         let short = pano_coverage(12.0, MIN_SEGMENT_SECS);
         assert!(short < huge.coverage);

@@ -7,6 +7,7 @@ pub mod map;
 pub mod render_book;
 pub mod render_reels;
 pub mod render_video;
+pub mod resolution;
 pub mod titlecard;
 
 #[derive(Debug, thiserror::Error)]
