@@ -1,6 +1,7 @@
 //! triptape-core: scan, hash, EXIF, proxies, SQLite, job types. Pure Rust,
 //! testable headless without the Tauri UI.
 
+pub mod clip_window;
 pub mod cluster;
 pub mod db;
 pub mod geo;

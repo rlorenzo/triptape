@@ -78,8 +78,8 @@ const SCORE_FLUSH_FILES: usize = 25;
 /// Score one asset for the background ingest pass, mirroring the CLI
 /// (`triptape-media`'s `triptape` binary) constants.
 ///
-/// Videos use the fixed GPS-novelty proxy. Stills and Live Photos score
-/// their still image, preferring the existing 320 px ffmpeg thumbnail
+/// Videos use the fixed GPS-novelty proxy plus a best-window analysis.
+/// Stills and Live Photos score their still image, preferring the existing 320 px ffmpeg thumbnail
 /// (same `source_cache_key` + `cache_path` convention as `get_thumbnail`,
 /// so scoring warms the Library thumbnail cache) and falling back to the
 /// source file when the thumbnail cannot be made or decoded; unscorable
@@ -87,7 +87,13 @@ const SCORE_FLUSH_FILES: usize = 25;
 /// never touches the Db.
 fn score_asset_with_cache(cache_dir: &Path, a: &Asset) -> Score {
     if a.kind == AssetKind::Video {
-        return score::video_proxy_score(a.gps.is_some());
+        let mut s = score::video_proxy_score(a.gps.is_some());
+        // Best playback window for the hero film; any failure keeps the
+        // start-of-clip trim.
+        s.clip_window = a
+            .duration_secs
+            .and_then(|d| triptape_media::clip_analysis::best_clip_window("ffmpeg", &a.path, d));
+        return s;
     }
     if let Ok(key) = proxies::source_cache_key(&a.id, &a.path) {
         let dst = proxies::cache_path(cache_dir, "thumb", &key, ".jpg");

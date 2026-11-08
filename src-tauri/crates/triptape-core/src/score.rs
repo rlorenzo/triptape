@@ -101,6 +101,7 @@ pub fn score_still(stats: &FrameStats) -> Score {
         total,
         highlight: false,
         reasons,
+        clip_window: None,
     }
 }
 

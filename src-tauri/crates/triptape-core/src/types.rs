@@ -195,6 +195,10 @@ pub struct Score {
     pub highlight: bool,
     /// One short string per contributing signal.
     pub reasons: Vec<String>,
+    /// Best `(start, end)` window in seconds for a long video clip, picked
+    /// at ingest. `None` keeps the start-of-clip trim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_window: Option<(f64, f64)>,
 }
 
 /// Durable job state machine.

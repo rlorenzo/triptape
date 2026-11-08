@@ -859,11 +859,13 @@ mod tests {
             total: 0.85,
             highlight: true,
             reasons: vec!["clean exposure, good detail".into()],
+            clip_window: Some((4.5, 10.5)),
         });
         db.upsert_asset(&p.id, &a).unwrap();
         let got = db.list_assets(&p.id).unwrap();
         assert_eq!(got.len(), 1);
         let s = got[0].score.as_ref().expect("score round trip");
+        assert_eq!(s.clip_window, Some((4.5, 10.5)));
         assert!((s.total - 0.85).abs() < 1e-6);
         assert!((s.sharpness - 0.8).abs() < 1e-6);
         assert!(s.highlight);
