@@ -91,6 +91,16 @@ impl Resolution {
         }
     }
 
+    /// Estimated peak memory of one hero segment render (the supersampled
+    /// canvas through ffmpeg, or a four-photo collage composed in memory),
+    /// used to cap how many run at once.
+    pub fn segment_peak_bytes(self) -> u64 {
+        match self {
+            Self::Hd1080 => 700_000_000,
+            Self::Uhd4k => 2_500_000_000,
+        }
+    }
+
     /// Rough bytes the whole export may need on disk (intermediates plus
     /// outputs), for the free-space precheck.
     pub fn export_disk_estimate(self) -> u64 {

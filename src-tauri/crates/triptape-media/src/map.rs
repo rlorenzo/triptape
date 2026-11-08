@@ -280,7 +280,7 @@ pub fn render_map_push_in(
         vec!["-shortest".into(), out_mp4.to_string_lossy().into_owned()],
     ]
     .concat();
-    super::ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out_mp4)
+    caps.run(&args, out_mp4)
 }
 
 #[cfg(test)]

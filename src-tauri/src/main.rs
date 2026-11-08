@@ -848,6 +848,93 @@ fn load_plan_assets(
     Ok((plan.edited, plan.assets, name))
 }
 
+/// Export progress for the app: the same `job://progress` stream and job row
+/// ingest uses, fed by the renderers' [`ProgressEvent`]s, plus the cancel
+/// signal (the job row going `cancelled`) the renderers poll.
+struct ExportProgress {
+    app: tauri::AppHandle,
+    job_id: String,
+    /// `(keepsake, start, end)` slices of the job's 0..1 bar.
+    bands: Vec<(&'static str, f32, f32)>,
+    last_emit: std::sync::Mutex<(std::time::Instant, f32)>,
+    last_cancel_poll: std::sync::Mutex<std::time::Instant>,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl ExportProgress {
+    fn new(app: &tauri::AppHandle, job_id: &str, only: &str) -> Self {
+        // Rough share of an export's time per keepsake.
+        let weights = [("video", 0.6f32), ("reels", 0.25), ("book", 0.15)];
+        let chosen: Vec<_> = weights
+            .into_iter()
+            .filter(|(k, _)| only == "all" || only == *k)
+            .collect();
+        let sum: f32 = chosen.iter().map(|(_, w)| w).sum();
+        let mut at = 0.0;
+        let bands = chosen
+            .into_iter()
+            .map(|(k, w)| {
+                let band = (k, at, at + w / sum);
+                at = band.2;
+                band
+            })
+            .collect();
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        Self {
+            app: app.clone(),
+            job_id: job_id.to_string(),
+            bands,
+            last_emit: std::sync::Mutex::new((long_ago, 0.0)),
+            last_cancel_poll: std::sync::Mutex::new(long_ago),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl triptape_media::progress::ProgressSink for ExportProgress {
+    fn report(&self, event: &triptape_media::progress::ProgressEvent) {
+        let Some(&(_, lo, hi)) = self.bands.iter().find(|b| b.0 == event.keepsake()) else {
+            return;
+        };
+        let overall = event.keepsake_fraction().map(|f| lo + (hi - lo) * f as f32);
+        let mut last = self.last_emit.lock().unwrap_or_else(|e| e.into_inner());
+        // Never move the bar backwards between phases or on a step with no
+        // fraction; throttle like ingest (the final tick always goes out).
+        let progress = overall.unwrap_or(last.1).max(last.1);
+        let finished = matches!(event, triptape_media::progress::ProgressEvent::Counted { done, total, .. } if done == total);
+        if last.0.elapsed() < PROGRESS_EMIT_INTERVAL && !finished {
+            return;
+        }
+        *last = (std::time::Instant::now(), progress);
+        let state = self.app.state::<AppState>();
+        let db = state.db.lock();
+        if let Ok(db) = db {
+            report_ingest(&self.app, &db, &self.job_id, progress, &event.text());
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.cancelled.load(Ordering::Relaxed) {
+            return true;
+        }
+        let mut polled = self
+            .last_cancel_poll
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if polled.elapsed() < std::time::Duration::from_millis(250) {
+            return false;
+        }
+        *polled = std::time::Instant::now();
+        let state = self.app.state::<AppState>();
+        let gone = state.db.lock().is_ok_and(
+            |db| matches!(db.get_job(&self.job_id), Ok(Some(j)) if j.state == JobState::Cancelled),
+        );
+        self.cancelled.store(gone, Ordering::Relaxed);
+        gone
+    }
+}
+
 /// Renders run on a blocking worker so ffmpeg/typst never stall the async
 /// executor (and with it `cancel_job` / `get_assets`).
 async fn run_export(
@@ -895,6 +982,10 @@ fn export_blocking(
         keep_ambience: false,
         only: "all".to_string(),
         resolution: triptape_media::resolution::Resolution::default(),
+        jobs: None,
+        progress: triptape_media::progress::Progress::new(std::sync::Arc::new(
+            ExportProgress::new(app, &job.id, "all"),
+        )),
     };
     let rendered = triptape_media::export::export_all(&caps, &plan, &assets, &out_dir, &opts)
         .map_err(|e| e.to_string());

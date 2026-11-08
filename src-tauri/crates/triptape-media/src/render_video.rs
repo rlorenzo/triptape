@@ -209,6 +209,9 @@ pub struct VideoOptions {
     pub typst_bin: String,
     /// Output frame size (default 4K).
     pub resolution: Resolution,
+    /// Segments rendered at once; `None` picks [`default_jobs`]. Short mode
+    /// always renders sequentially (its budget couples the segments).
+    pub jobs: Option<usize>,
 }
 
 impl Default for VideoOptions {
@@ -224,6 +227,7 @@ impl Default for VideoOptions {
             keep_ambience: false,
             typst_bin: "typst".into(),
             resolution: Resolution::default(),
+            jobs: None,
         }
     }
 }
@@ -567,84 +571,97 @@ pub fn render_hero_video(
             _ => groups.push(vec![r]),
         }
     }
-    for (idx, group) in groups.iter().enumerate() {
-        let present: Vec<&ResolvedEntry> = group
-            .iter()
-            .copied()
-            .filter(|r| {
-                let ok =
-                    r.still_path.exists() || r.motion_path.as_ref().is_some_and(|p| p.exists());
-                if !ok {
-                    fallbacks.push(format!("{} missing on disk; skipped", r.entry.asset_id));
-                }
-                ok
-            })
-            .collect();
-        let Some(&r) = present.first() else { continue };
-        // Below the 0.5 s clip floor nothing more fits.
-        if budget < 0.5 {
-            fallbacks.push(format!(
-                "short variant: {} and later dropped to fit ~30 s",
-                r.entry.asset_id
-            ));
-            break;
-        }
-        let rendered = if present.len() == 1 {
-            let cap = fair_share(budget, groups.len() - idx);
-            render_entry_segment(
-                caps,
-                r,
-                idx,
-                still_secs,
-                cap,
-                opts.resolution,
-                work_dir,
-                &mut fallbacks,
-            )
-        } else {
-            render_collage_segment(caps, &present, idx, still_secs, opts.resolution, work_dir)
-        };
-        let (seg_path, dur, kind) = match rendered {
-            Ok(v) => v,
-            Err(e) => {
-                fallbacks.push(format!("{} skipped: {e}", r.entry.asset_id));
-                continue;
+    // Segment renders are independent unless a short-mode budget couples
+    // them (each one's cap and freeze-pad depend on what earlier ones left),
+    // so full mode fans out over `jobs` workers and short mode stays
+    // sequential. Both paths go through `render_group`, and results are
+    // folded back in group order, so the segment list, timeline and
+    // fallbacks do not depend on the worker count.
+    let progress = caps.progress.clone();
+    let jobs = if opts.short_mode {
+        1
+    } else {
+        opts.jobs
+            .unwrap_or_else(|| default_jobs(opts.resolution))
+            .max(1)
+    };
+    let job_caps = Capabilities {
+        threads: thread_share(jobs),
+        ..caps.clone()
+    };
+    let mut absorb = |segs: &mut Vec<(ResolvedEntry, PathBuf, f64, String)>,
+                      fallbacks: &mut Vec<String>,
+                      out: GroupOutcome| {
+        fallbacks.extend(out.fallbacks);
+        if let Some(seg) = out.seg {
+            if let Some((lead, members)) = out.collage {
+                collage_members.insert(lead, members);
             }
-        };
-        // Record the actual encoded duration: Live Photo trims and short
-        // sources routinely encode shorter than planned, and an xfade offset
-        // past the accumulated length truncates the whole chain (the film's
-        // video ended at the title while music played on). Budget, overlays
-        // and timeline math all read this value.
-        let probed = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &seg_path)
-            .ok()
-            .map(|p| p.duration_secs)
-            .filter(|d| *d > 0.0)
-            .unwrap_or(dur);
-        // Flash frames are unwatchable: a sub-2.5s clip (most Live Photo
-        // motions) is freeze-padded on its last frame to a minimum hold.
-        let dur = match clip_pad_target(probed, budget).filter(|_| kind == "clip") {
-            Some(target) => match pad_segment_freeze(caps, &seg_path, target) {
-                Ok(()) => target,
-                Err(e) => {
-                    fallbacks.push(format!("{} freeze-pad failed ({e})", r.entry.asset_id));
-                    probed
-                }
-            },
-            None => probed,
-        };
-        budget -= dur;
-        // A collage segment carries every member's caption and id, so the
-        // sidecar and EDL account for all the photos on screen.
-        let mut seg_entry = r.clone();
-        if present.len() > 1 {
-            seg_entry.caption = collage_caption(&present);
-            collage_members.insert(
-                r.entry.asset_id.clone(),
-                present.iter().map(|m| m.entry.asset_id.clone()).collect(),
-            );
+            segs.push(seg);
         }
-        segs.push((seg_entry, seg_path, dur, kind));
+    };
+    if opts.short_mode {
+        progress.counted("video", "segment", 0, groups.len());
+        for (idx, group) in groups.iter().enumerate() {
+            progress.check_cancelled()?;
+            let (present, missing) = split_present(group);
+            fallbacks.extend(missing);
+            let Some(&r) = present.first() else { continue };
+            // Below the 0.5 s clip floor nothing more fits.
+            if budget < 0.5 {
+                fallbacks.push(format!(
+                    "short variant: {} and later dropped to fit ~30 s",
+                    r.entry.asset_id
+                ));
+                break;
+            }
+            let limits = SegmentLimits {
+                cap: fair_share(budget, groups.len() - idx),
+                budget,
+            };
+            let out = render_group(&job_caps, &present, idx, still_secs, limits, opts, work_dir)?;
+            if let Some(seg) = &out.seg {
+                budget -= seg.2;
+            }
+            absorb(&mut segs, &mut fallbacks, out);
+            progress.counted("video", "segment", idx + 1, groups.len());
+        }
+    } else {
+        let plans: Vec<(Vec<&ResolvedEntry>, Vec<String>)> =
+            groups.iter().map(|g| split_present(g)).collect();
+        let work: Vec<usize> = (0..plans.len())
+            .filter(|&i| !plans[i].0.is_empty())
+            .collect();
+        progress.counted("video", "segment", 0, work.len());
+        let mut results: Vec<Option<Result<GroupOutcome, crate::MediaError>>> =
+            (0..plans.len()).map(|_| None).collect();
+        triptape_core::parallel::for_each_parallel(
+            &work,
+            jobs,
+            |&idx| {
+                progress.check_cancelled()?;
+                render_group(
+                    &job_caps,
+                    &plans[idx].0,
+                    idx,
+                    still_secs,
+                    SegmentLimits::NONE,
+                    opts,
+                    work_dir,
+                )
+            },
+            |wi, res, done, total| {
+                results[work[wi]] = Some(res);
+                progress.counted("video", "segment", done, total);
+            },
+        );
+        progress.check_cancelled()?;
+        for (idx, (_, missing)) in plans.into_iter().enumerate() {
+            fallbacks.extend(missing);
+            if let Some(res) = results[idx].take() {
+                absorb(&mut segs, &mut fallbacks, res?);
+            }
+        }
     }
     if segs.len() <= 1 {
         return Err(crate::MediaError::Ffmpeg(
@@ -727,7 +744,10 @@ pub fn render_hero_video(
             .iter()
             .flat_map(|c| c.asset_ids.iter().map(move |id| (id.as_str(), c)))
             .collect();
-        for (i, (r, seg_mp4, dur, _)) in segs.iter().enumerate() {
+        // Each overlay rewrites its own segment file, so they run alongside
+        // one another; notes are folded back in segment order.
+        let mut todo: Vec<(usize, String)> = vec![];
+        for (i, (r, _, _, _)) in segs.iter().enumerate() {
             let id = r.entry.asset_id.as_str();
             if id == "title" || id == "credits" {
                 continue;
@@ -745,19 +765,40 @@ pub fn render_hero_video(
                 None
             };
             let Some((top, bottom)) = lines else { continue };
-            let doc = crate::titlecard::lower_third_doc(&top, bottom.as_deref());
-            let png = work_dir.join(format!("ov_{i:03}.png"));
-            if let Err(e) = crate::titlecard::render_text_png(
-                &opts.typst_bin,
-                &doc,
-                &png,
-                opts.resolution.ppi(),
-            )
-            .and_then(|()| apply_lower_third(caps, seg_mp4, &png, *dur, opts.resolution))
-            {
-                fallbacks.push(format!("overlay skipped for {id}: {e}"));
-            }
+            todo.push((
+                i,
+                crate::titlecard::lower_third_doc(&top, bottom.as_deref()),
+            ));
         }
+        progress.counted("video", "overlay", 0, todo.len());
+        let mut notes: Vec<Option<String>> = vec![None; todo.len()];
+        triptape_core::parallel::for_each_parallel(
+            &todo,
+            jobs,
+            |(i, doc)| -> Result<Option<String>, crate::MediaError> {
+                progress.check_cancelled()?;
+                let (r, seg_mp4, dur, _) = &segs[*i];
+                let png = work_dir.join(format!("ov_{i:03}.png"));
+                Ok(crate::titlecard::render_text_png(
+                    &opts.typst_bin,
+                    doc,
+                    &png,
+                    opts.resolution.ppi(),
+                )
+                .and_then(|()| apply_lower_third(&job_caps, seg_mp4, &png, *dur, opts.resolution))
+                .err()
+                .filter(|e| !matches!(e, crate::MediaError::Cancelled))
+                .map(|e| format!("overlay skipped for {}: {e}", r.entry.asset_id)))
+            },
+            |ti, res, done, total| {
+                if let Ok(note) = res {
+                    notes[ti] = note;
+                }
+                progress.counted("video", "overlay", done, total);
+            },
+        );
+        progress.check_cancelled()?;
+        fallbacks.extend(notes.into_iter().flatten());
     }
 
     // 4. Transitions + per-cut overlaps.
@@ -786,6 +827,9 @@ pub fn render_hero_video(
     // encode is near-lossless (CRF 12); the final music pass is the only
     // other generation.
     let acc = work_dir.join("chain_final.mp4");
+    let total = durations.iter().sum::<f64>() - cut_overlaps.iter().sum::<f64>();
+    progress.check_cancelled()?;
+    progress.step("video", "assembling transitions", Some(0.0));
     {
         let mut args: Vec<String> = vec!["-y".into()];
         for (_, p, _, _) in &segs {
@@ -820,14 +864,20 @@ pub fn render_hero_video(
         ]);
         args.extend(ffmpeg::x264_aac("veryfast", 12));
         args.push(s(&acc));
-        ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, &acc)?;
+        caps.run_progress(
+            &args,
+            &acc,
+            Some(total),
+            Some(&|f| {
+                progress.step("video", "assembling transitions", Some(f));
+            }),
+        )?;
     }
 
     // 6. Final pass: the music bed is the PRIMARY audio (looped, trimmed to
     // the film, faded in/out); the original film audio is muted, or kept at
     // 0.12 ducked under the music with --keep-ambience. Loudnorm lands on
     // the mix, never on raw clip noise.
-    let total = durations.iter().sum::<f64>() - cut_overlaps.iter().sum::<f64>();
     let norm = if caps.loudnorm {
         ffmpeg::LOUDNORM
     } else {
@@ -905,10 +955,16 @@ pub fn render_hero_video(
     final_args.extend(ffmpeg::x264_aac("medium", 19));
     final_args.extend(opts.resolution.x264_level_args());
     final_args.extend(["-r".into(), "30".into(), s(out_mp4)]);
-    if let Err(e) = ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &final_args, out_mp4) {
+    progress.check_cancelled()?;
+    let final_label = "final pass (music, captions, encode)";
+    progress.step("video", final_label, Some(0.0));
+    let on_final = |f: f64| progress.step("video", final_label, Some(f));
+    match caps.run_progress(&final_args, out_mp4, Some(total), Some(&on_final)) {
+        Ok(()) => {}
+        Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
         // Music bed is mandatory: a failed mix fails the film (the old
         // film-audio-only path is exactly the raw-clip-noise bug).
-        return Err(crate::MediaError::Ffmpeg(format!("music mix failed: {e}")));
+        Err(e) => return Err(crate::MediaError::Ffmpeg(format!("music mix failed: {e}"))),
     }
 
     // 7. Verify + EDL + sidecar SRT.
@@ -1011,7 +1067,7 @@ pub(crate) fn burn_png_overlay(
     .chain(ffmpeg::x264_aac("veryfast", crf))
     .chain(["-shortest".into(), s(video)])
     .collect();
-    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, video)
+    caps.run(&args, video)
 }
 
 fn write_captions_srt(
@@ -1085,7 +1141,187 @@ fn pad_segment_freeze(
     .chain(ffmpeg::x264_aac("veryfast", 16))
     .chain([s(seg)])
     .collect();
-    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, seg)
+    caps.run(&args, seg)
+}
+
+/// Split a collage group into the members whose sources still exist and the
+/// fallback notes for those that vanished.
+fn split_present<'a>(group: &[&'a ResolvedEntry]) -> (Vec<&'a ResolvedEntry>, Vec<String>) {
+    let mut missing = vec![];
+    let present = group
+        .iter()
+        .copied()
+        .filter(|r| {
+            let ok = r.still_path.exists() || r.motion_path.as_ref().is_some_and(|p| p.exists());
+            if !ok {
+                missing.push(format!("{} missing on disk; skipped", r.entry.asset_id));
+            }
+            ok
+        })
+        .collect();
+    (present, missing)
+}
+
+/// One rendered hero segment: what to push on the timeline plus the
+/// fallback notes it produced, in the order the sequential loop wrote them.
+struct GroupOutcome {
+    /// Entry shown (a collage carries all members' captions), segment file,
+    /// probed seconds, kind. `None` when the group failed and was skipped.
+    seg: Option<(ResolvedEntry, PathBuf, f64, String)>,
+    /// Lead asset id and every member id, for collage segments.
+    collage: Option<(String, Vec<String>)>,
+    fallbacks: Vec<String>,
+}
+
+/// Short-mode time limits for one segment: `cap` bounds a single entry's
+/// length, `budget` what is left of the film for the freeze-pad. Full mode
+/// has no budget.
+#[derive(Clone, Copy)]
+struct SegmentLimits {
+    cap: f64,
+    budget: f64,
+}
+
+impl SegmentLimits {
+    const NONE: Self = Self {
+        cap: f64::INFINITY,
+        budget: f64::INFINITY,
+    };
+}
+
+/// Render, probe and (for short clips) freeze-pad one group. A failed render is a fallback note, not an error: only
+/// a cancel comes back as `Err`.
+fn render_group(
+    caps: &Capabilities,
+    present: &[&ResolvedEntry],
+    idx: usize,
+    still_secs: f64,
+    limits: SegmentLimits,
+    opts: &VideoOptions,
+    work_dir: &Path,
+) -> Result<GroupOutcome, crate::MediaError> {
+    let r = present[0];
+    let mut fallbacks = vec![];
+    let rendered = if present.len() == 1 {
+        render_entry_segment(
+            caps,
+            r,
+            idx,
+            still_secs,
+            limits.cap,
+            opts.resolution,
+            work_dir,
+            &mut fallbacks,
+        )
+    } else {
+        render_collage_segment(caps, present, idx, still_secs, opts.resolution, work_dir)
+    };
+    let (seg_path, dur, kind) = match rendered {
+        Ok(v) => v,
+        Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
+        Err(e) => {
+            fallbacks.push(format!("{} skipped: {e}", r.entry.asset_id));
+            return Ok(GroupOutcome {
+                seg: None,
+                collage: None,
+                fallbacks,
+            });
+        }
+    };
+    // Record the actual encoded duration: Live Photo trims and short
+    // sources routinely encode shorter than planned, and an xfade offset
+    // past the accumulated length truncates the whole chain (the film's
+    // video ended at the title while music played on). Budget, overlays
+    // and timeline math all read this value.
+    let probed = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &seg_path)
+        .ok()
+        .map(|p| p.duration_secs)
+        .filter(|d| *d > 0.0)
+        .unwrap_or(dur);
+    // Flash frames are unwatchable: a sub-2.5s clip (most Live Photo
+    // motions) is freeze-padded on its last frame to a minimum hold.
+    let dur = match clip_pad_target(probed, limits.budget).filter(|_| kind == "clip") {
+        Some(target) => match pad_segment_freeze(caps, &seg_path, target) {
+            Ok(()) => target,
+            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
+            Err(e) => {
+                fallbacks.push(format!("{} freeze-pad failed ({e})", r.entry.asset_id));
+                probed
+            }
+        },
+        None => probed,
+    };
+    // A collage segment carries every member's caption and id, so the
+    // sidecar and EDL account for all the photos on screen.
+    let mut seg_entry = r.clone();
+    let mut collage = None;
+    if present.len() > 1 {
+        seg_entry.caption = collage_caption(present);
+        collage = Some((
+            r.entry.asset_id.clone(),
+            present.iter().map(|m| m.entry.asset_id.clone()).collect(),
+        ));
+    }
+    Ok(GroupOutcome {
+        seg: Some((seg_entry, seg_path, dur, kind)),
+        collage,
+        fallbacks,
+    })
+}
+
+/// Hero segments rendered at once by default: a quarter of the cores (the
+/// single-threaded stages between encodes leave the rest idle for the other
+/// workers), cut down so the workers' peak memory stays within half of RAM.
+pub fn default_jobs(res: Resolution) -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    jobs_for(cores, total_memory_bytes(), res)
+}
+
+/// [`default_jobs`] for explicit machine facts. Unknown memory assumes 8 GiB.
+pub fn jobs_for(cores: usize, mem_bytes: Option<u64>, res: Resolution) -> usize {
+    let by_cpu = (cores / 4).max(1);
+    let mem = mem_bytes.unwrap_or(8 << 30);
+    let by_mem = (mem / 2 / res.segment_peak_bytes()).max(1) as usize;
+    by_cpu.min(by_mem)
+}
+
+/// ffmpeg threads per concurrent worker: ffmpeg's own default is 1.5x the
+/// cores for one process, so split that between the workers. `None` for a
+/// lone worker keeps the unrestricted default.
+fn thread_share(jobs: usize) -> Option<usize> {
+    if jobs <= 1 {
+        return None;
+    }
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    Some((cores * 3 / 2 / jobs).max(2))
+}
+
+/// Physical RAM in bytes, when the OS says.
+pub fn total_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb: u64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("MemTotal:"))?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        Some(kb * 1024)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
 }
 
 /// Normalize one plan entry to a uniform segment. Returns (path, secs, kind).
@@ -1206,7 +1442,7 @@ fn render_entry_segment(
             ]);
             args.extend(ffmpeg::x264_aac("veryfast", 16));
             args.extend(["-shortest".into(), s(&out)]);
-            ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, &out)?;
+            caps.run(&args, &out)?;
             Ok((out, len, "clip".into()))
         }
     }
@@ -1550,7 +1786,7 @@ fn render_graph_segment(
         vec!["-shortest".into(), s(out)],
     ]
     .concat();
-    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out)
+    caps.run(&args, out)
 }
 
 #[cfg(test)]
@@ -2904,6 +3140,238 @@ mod tests {
                 std::fs::copy(&o, work.join(format!("{label}.mp4"))).unwrap();
             });
         }
+    }
+
+    /// Five solid stills across two chapters (a trio and a pair collage).
+    fn parallel_fixture(dir: &Path) -> (Plan, Vec<ResolvedEntry>) {
+        let mut entries = vec![];
+        let mut chapters: Vec<triptape_core::types::Chapter> = vec![];
+        for i in 0..5usize {
+            let img: image::RgbImage = image::ImageBuffer::from_pixel(
+                320 + 16 * i as u32,
+                240,
+                image::Rgb([(i * 20) as u8, 90, 200 - (i * 10) as u8]),
+            );
+            let p = dir.join(format!("still_{i}.png"));
+            img.save(&p).unwrap();
+            let id = format!("a{i}");
+            if i % 3 == 0 {
+                chapters.push(triptape_core::types::Chapter {
+                    title: format!("Day {}", chapters.len() + 1),
+                    ..Default::default()
+                });
+            }
+            chapters.last_mut().unwrap().asset_ids.push(id.clone());
+            entries.push(ResolvedEntry {
+                entry: PlanEntry {
+                    asset_id: id,
+                    content_hash: None,
+                    size_bytes: 0,
+                    mtime: 0,
+                    rendition: Rendition::Still,
+                },
+                still_path: p,
+                motion_path: None,
+                caption: (i % 3 == 0).then(|| format!("Caption {i}")),
+                taken_at: None,
+                tz_offset_secs: None,
+                aspect: Some(f64::from(320 + 16 * i as u32) / 240.0),
+            });
+        }
+        let plan = Plan {
+            plan_version: 1,
+            schema_version: 1,
+            hero: vec![],
+            reel_selects: vec![],
+            chapters,
+            captions: HashMap::new(),
+            map_polyline: vec![],
+            music: triptape_core::types::MusicPick {
+                track: "bundled".into(),
+                rationale: "default".into(),
+            },
+        };
+        (plan, entries)
+    }
+
+    fn parallel_caps() -> Option<Capabilities> {
+        let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
+        (caps.libx264 && caps.xfade && caps.loudnorm && caps.perspective).then_some(caps)
+    }
+
+    fn parallel_opts(jobs: usize) -> VideoOptions {
+        VideoOptions {
+            trip_name: "Parallel".into(),
+            still_secs: 1.0,
+            title_secs: 0.5,
+            resolution: Resolution::Hd1080,
+            jobs: Some(jobs),
+            // No Typst: keeps the test independent of installed fonts.
+            typst_bin: "typst-not-installed".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn parallel_render_matches_sequential_order_and_timeline() {
+        let Some(caps) = parallel_caps() else {
+            eprintln!("ffmpeg caps insufficient; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (plan, entries) = parallel_fixture(dir.path());
+        let run = |jobs: usize| {
+            let work = dir.path().join(format!("work{jobs}"));
+            let out = dir.path().join(format!("hero{jobs}.mp4"));
+            let seen = std::sync::Arc::new(Collect::default());
+            let caps = Capabilities {
+                progress: crate::progress::Progress::new(seen.clone()),
+                ..caps.clone()
+            };
+            let v = render_hero_video(
+                &caps,
+                &plan,
+                &entries,
+                None,
+                &work,
+                &out,
+                &parallel_opts(jobs),
+            )
+            .expect("render");
+            let edl: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&v.edl_path).unwrap()).unwrap();
+            (edl, v.fallbacks, seen)
+        };
+        let (edl1, fb1, seen1) = run(1);
+        let (edl3, fb3, seen3) = run(3);
+        // Same segments, order, probed durations, offsets and notes.
+        assert_eq!(edl1["segments"], edl3["segments"]);
+        assert_eq!(edl1["total_secs"], edl3["total_secs"]);
+        assert_eq!(edl1["cut_overlaps_secs"], edl3["cut_overlaps_secs"]);
+        assert_eq!(fb1, fb3);
+        assert!(edl1["segments"].as_array().unwrap().len() >= 3);
+        // Collages happened, so the plan exercised both group kinds.
+        assert!(edl1["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.get("collage_asset_ids").is_some()));
+        // Progress counted every segment once, ending complete, both ways.
+        for seen in [seen1, seen3] {
+            let counts = seen.counts("segment");
+            let total = counts.last().unwrap().1;
+            assert_eq!(counts.last().unwrap().0, total);
+            let dones: Vec<usize> = counts.iter().map(|c| c.0).collect();
+            assert!(dones.windows(2).all(|w| w[0] <= w[1]), "{dones:?}");
+        }
+    }
+
+    #[test]
+    fn cancel_mid_parallel_render_leaves_no_partials() {
+        let Some(caps) = parallel_caps() else {
+            eprintln!("ffmpeg caps insufficient; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (plan, entries) = parallel_fixture(dir.path());
+        // Cancels as soon as the first segment reports done, with the
+        // other workers mid-encode.
+        let seen = std::sync::Arc::new(Collect::cancel_after_segments(1));
+        let caps = Capabilities {
+            progress: crate::progress::Progress::new(seen.clone()),
+            ..caps
+        };
+        let work = dir.path().join("work");
+        let out = dir.path().join("hero.mp4");
+        let res = render_hero_video(&caps, &plan, &entries, None, &work, &out, &parallel_opts(3));
+        assert!(matches!(res, Err(crate::MediaError::Cancelled)), "{res:?}");
+        assert!(!out.exists());
+        let mut leftovers = vec![];
+        let mut stack = vec![dir.path().to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(d).unwrap().flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if e.path().is_dir() {
+                    stack.push(e.path());
+                } else if name.contains(".partial") {
+                    leftovers.push(name);
+                }
+            }
+        }
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// Records counted events; optionally asks for cancel after N segments.
+    #[derive(Default)]
+    struct Collect {
+        events: std::sync::Mutex<Vec<crate::progress::ProgressEvent>>,
+        cancel_after: Option<usize>,
+        stop: std::sync::atomic::AtomicBool,
+    }
+
+    impl Collect {
+        fn cancel_after_segments(n: usize) -> Self {
+            Self {
+                cancel_after: Some(n),
+                ..Default::default()
+            }
+        }
+
+        fn counts(&self, unit: &str) -> Vec<(usize, usize)> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    crate::progress::ProgressEvent::Counted {
+                        unit: u,
+                        done,
+                        total,
+                        ..
+                    } if *u == unit => Some((*done, *total)),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    impl crate::progress::ProgressSink for Collect {
+        fn report(&self, e: &crate::progress::ProgressEvent) {
+            if let (
+                Some(n),
+                crate::progress::ProgressEvent::Counted {
+                    unit: "segment",
+                    done,
+                    ..
+                },
+            ) = (self.cancel_after, e)
+            {
+                if *done >= n {
+                    self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            self.events.lock().unwrap().push(e.clone());
+        }
+
+        fn cancelled(&self) -> bool {
+            self.stop.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn job_count_follows_cores_and_memory() {
+        // A quarter of the cores, at least one.
+        assert_eq!(jobs_for(10, Some(64 << 30), Resolution::Hd1080), 2);
+        assert_eq!(jobs_for(16, Some(64 << 30), Resolution::Hd1080), 4);
+        assert_eq!(jobs_for(2, Some(64 << 30), Resolution::Uhd4k), 1);
+        // Memory caps 4K: half of 16 GiB over the 4K estimate.
+        let mem = 16u64 << 30;
+        let by_mem = (mem / 2 / Resolution::Uhd4k.segment_peak_bytes()) as usize;
+        assert_eq!(jobs_for(32, Some(mem), Resolution::Uhd4k), by_mem.max(1));
+        assert_eq!(jobs_for(32, Some(1 << 30), Resolution::Uhd4k), 1);
+        // A lone worker keeps ffmpeg's default threading.
+        assert_eq!(thread_share(1), None);
+        assert!(thread_share(2).unwrap() >= 2);
     }
 
     #[test]

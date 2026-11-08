@@ -5,6 +5,7 @@
 //! and never failed silently.
 
 use crate::ffmpeg::Capabilities;
+use crate::progress::Progress;
 use crate::render_book::{self, BookOptions, BookPhoto};
 use crate::render_reels::{self, ReelOptions};
 use crate::render_video::{self, ResolvedEntry, VideoOptions};
@@ -27,6 +28,10 @@ pub struct ExportOptions {
     pub only: String,
     /// Hero film frame size (default 4K). Reels stay 1080x1920.
     pub resolution: Resolution,
+    /// Hero segments rendered at once; `None` picks the machine default.
+    pub jobs: Option<usize>,
+    /// Progress sink and cancel flag (default: silent, never cancelled).
+    pub progress: Progress,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -143,6 +148,27 @@ pub fn export_all(
     out_dir: &Path,
     opts: &ExportOptions,
 ) -> Result<ExportReport, crate::MediaError> {
+    // Every renderer polls the one cancel flag through its capabilities.
+    let caps = &crate::ffmpeg::Capabilities {
+        progress: opts.progress.clone(),
+        ..caps.clone()
+    };
+    let out = export_inner(caps, plan, assets, out_dir, opts);
+    if matches!(out, Err(crate::MediaError::Cancelled)) {
+        // Leave no intermediates behind; finished outputs and `.partial`
+        // siblings are already gone (a killed encode removes its own).
+        let _ = std::fs::remove_dir_all(out_dir.join(".work"));
+    }
+    out
+}
+
+fn export_inner(
+    caps: &Capabilities,
+    plan: &Plan,
+    assets: &[triptape_core::types::Asset],
+    out_dir: &Path,
+    opts: &ExportOptions,
+) -> Result<ExportReport, crate::MediaError> {
     // Validate the keepsake selector before touching the output dir, so a
     // typo (e.g. "reel") fails loudly instead of exporting nothing.
     if !matches!(opts.only.as_str(), "all" | "video" | "reels" | "book") {
@@ -227,6 +253,7 @@ pub fn export_all(
                 keep_ambience: opts.keep_ambience,
                 typst_bin: opts.typst_bin.clone(),
                 resolution: opts.resolution,
+                jobs: opts.jobs,
                 ..Default::default()
             },
         ) {
@@ -234,6 +261,7 @@ pub fn export_all(
                 report.video = Some(out_mp4.to_string_lossy().into_owned());
                 report.fallbacks.extend(v.fallbacks);
             }
+            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
             Err(e) => report.skipped.push(Skipped {
                 keepsake: "video".into(),
                 reason: format!("render failed: {e}"),
@@ -303,6 +331,7 @@ pub fn export_all(
                     report.reels = r.reels.iter().map(|f| f.path.clone()).collect();
                     report.fallbacks.extend(r.fallbacks);
                 }
+                Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
                 Err(e) => report.skipped.push(Skipped {
                     keepsake: "reels".into(),
                     reason: format!("render failed: {e}"),
@@ -374,12 +403,14 @@ pub fn export_all(
                 trip_name: opts.trip_name.clone(),
                 typst_bin: opts.typst_bin.clone(),
                 ffmpeg_bin: caps.ffmpeg_bin.clone(),
+                progress: opts.progress.clone(),
             },
         ) {
             Ok(b) => {
                 report.book_pages = b.counted_pages;
                 report.fallbacks.extend(b.fallbacks);
             }
+            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
             Err(e) => report.skipped.push(Skipped {
                 keepsake: "book".into(),
                 reason: format!("preflight/render blocked: {e}"),

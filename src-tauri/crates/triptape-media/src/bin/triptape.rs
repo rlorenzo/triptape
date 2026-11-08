@@ -4,7 +4,7 @@
 //! ```sh
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON]
-//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F] [--keep-ambience] [--resolution 4k|1080p]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F] [--keep-ambience] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -17,7 +17,12 @@ use triptape_core::{
     types::*,
 };
 use triptape_media::{
-    clip_analysis, export::export_all, export::ExportOptions, ffmpeg, render_book::BookPreset,
+    clip_analysis,
+    export::export_all,
+    export::ExportOptions,
+    ffmpeg,
+    progress::{ConsoleProgress, Progress},
+    render_book::BookPreset,
     resolution::Resolution,
 };
 
@@ -564,7 +569,19 @@ fn export_cmd(flags: &HashMap<String, String>) {
     }
 
     let keep_ambience = flags.get("keep-ambience").is_some_and(|v| v != "false");
-    let report = export_all(
+    // Hero segments rendered at once (default: cores / 4, memory permitting).
+    let jobs = flags.get("jobs").map(|v| match v.parse::<usize>() {
+        Ok(n) if n >= 1 => n,
+        _ => die("jobs", format!("want a whole number >= 1, got {v:?}")),
+    });
+    // Progress goes to stderr so stdout stays the plain result listing.
+    let console = std::sync::Arc::new(ConsoleProgress::stderr());
+    let progress = if flags.get("quiet").is_some_and(|v| v != "false") {
+        Progress::default()
+    } else {
+        Progress::new(console.clone())
+    };
+    let exported = export_all(
         &caps,
         &plan,
         &assets,
@@ -577,9 +594,12 @@ fn export_cmd(flags: &HashMap<String, String>) {
             keep_ambience,
             only,
             resolution,
+            jobs,
+            progress,
         },
-    )
-    .unwrap_or_else(|e| die("export", e));
+    );
+    console.finish();
+    let report = exported.unwrap_or_else(|e| die("export", e));
 
     if let Some(v) = &report.video {
         println!("video: {v}");
