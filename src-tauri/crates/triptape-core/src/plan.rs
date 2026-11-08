@@ -29,12 +29,216 @@ const MEDOID_MAX_FIXES: usize = 256;
 /// Hero lists longer than this drop entries below [`HERO_MIN_SCORE`].
 const HERO_TRIM_ABOVE: usize = 40;
 const HERO_MIN_SCORE: f32 = 0.35;
-/// Hard cap on hero entries. At ~4 s per still plus clip trims this
-/// holds a roughly 4-6 minute film; same-chapter stills are also grouped
-/// into collages at render time, so each day can show several photos.
-/// Above the cap, keep each chapter's best entry, then the best-scored
-/// remainder, restored to story order.
-const HERO_CAP: usize = 110;
+
+/// Auto film length: this many seconds per square root of trip days, so a
+/// weekend gets ~3 min, a week ~4.5 min and a month ~10 min (bigger trips
+/// get a longer film, but not linearly longer).
+pub const AUTO_SECS_PER_SQRT_DAY: f64 = 100.0;
+/// Auto length floor and ceiling.
+pub const AUTO_MIN_FILM_SECS: f64 = 120.0;
+pub const AUTO_MAX_FILM_SECS: f64 = 720.0;
+/// Bounds for a user-requested length (`scan --length`).
+pub const MIN_FILM_SECS: f64 = 30.0;
+pub const MAX_FILM_SECS: f64 = 3600.0;
+
+// Hero timing model. Mirrors the renderer (`triptape-media` render_video:
+// `VideoOptions` defaults, collage hold, clip freeze-pad, transition
+// overlaps, closing cards) so the plan can fill a time budget. Keep in sync.
+/// Solo still hold.
+const EST_STILL_SECS: f64 = 4.0;
+/// Collage hold (renderer: `still_secs * 1.5`).
+const EST_COLLAGE_SECS: f64 = 6.0;
+/// Most stills per collage (renderer `MAX_COLLAGE`).
+const EST_MAX_COLLAGE: usize = 4;
+/// Clips shorter than this are freeze-padded up to it.
+const EST_MIN_CLIP_SECS: f64 = 2.5;
+/// Average transition overlap per cut.
+const EST_CUT_OVERLAP_SECS: f64 = 0.55;
+/// Title, opening map, closing map and places card.
+const EST_FIXED_SECS: f64 = 2.5 + 3.0 + 4.5 + 4.5;
+
+/// How long the hero film should be.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum FilmLength {
+    /// Scale with the trip ([`auto_film_secs`]).
+    #[default]
+    Auto,
+    /// A requested length in seconds.
+    Secs(f64),
+}
+
+/// Default film length for a trip spanning `trip_days` calendar days.
+pub fn auto_film_secs(trip_days: usize) -> f64 {
+    (AUTO_SECS_PER_SQRT_DAY * (trip_days.max(1) as f64).sqrt())
+        .clamp(AUTO_MIN_FILM_SECS, AUTO_MAX_FILM_SECS)
+}
+
+/// Parse a film length: `auto`, plain seconds (`600`), or `10m`, `90s`,
+/// `4m30s`. Lengths outside [`MIN_FILM_SECS`]..=[`MAX_FILM_SECS`] are refused.
+pub fn parse_film_length(spec: &str) -> Result<FilmLength, String> {
+    let s = spec.trim().to_ascii_lowercase();
+    if s == "auto" {
+        return Ok(FilmLength::Auto);
+    }
+    let bad = || format!("film length {spec:?}: want auto, seconds, or e.g. 10m / 4m30s");
+    let secs = if let Ok(n) = s.parse::<f64>() {
+        n
+    } else {
+        let (mins, rest) = match s.split_once('m') {
+            Some((m, r)) => (m.parse::<f64>().map_err(|_| bad())?, r),
+            None => (0.0, s.as_str()),
+        };
+        let secs = match rest.strip_suffix('s') {
+            Some(n) => n.parse::<f64>().map_err(|_| bad())?,
+            None if rest.is_empty() => 0.0,
+            None => return Err(bad()),
+        };
+        mins * 60.0 + secs
+    };
+    if !secs.is_finite() || !(MIN_FILM_SECS..=MAX_FILM_SECS).contains(&secs) {
+        return Err(format!(
+            "film length {spec:?} must be between {MIN_FILM_SECS} s and {} min",
+            MAX_FILM_SECS / 60.0
+        ));
+    }
+    Ok(FilmLength::Secs(secs))
+}
+
+/// Estimated rendered seconds for hero entries in story order, grouping
+/// consecutive same-chapter stills into collages the way the renderer does.
+fn estimate_hero_secs<'e, 'c>(
+    entries: impl IntoIterator<Item = &'e PlanEntry>,
+    chapter_of: impl Fn(&str) -> &'c str,
+) -> f64 {
+    let mut total = EST_FIXED_SECS;
+    let mut segments = 4usize; // the fixed cards
+    let mut run: Option<(&str, usize)> = None; // (chapter, stills in collage)
+    for e in entries {
+        let chapter = chapter_of(&e.asset_id);
+        match e.rendition {
+            Rendition::Still => match &mut run {
+                Some((c, n)) if *c == chapter && *n < EST_MAX_COLLAGE => {
+                    // Growing a solo still into a collage, or a collage by one.
+                    if *n == 1 {
+                        total += EST_COLLAGE_SECS - EST_STILL_SECS;
+                    }
+                    *n += 1;
+                }
+                _ => {
+                    total += EST_STILL_SECS;
+                    segments += 1;
+                    run = Some((chapter, 1));
+                }
+            },
+            Rendition::Motion {
+                trim_start,
+                trim_end,
+            }
+            | Rendition::Clip {
+                trim_start,
+                trim_end,
+            } => {
+                total += (trim_end - trim_start)
+                    .clamp(0.5, 30.0)
+                    .max(EST_MIN_CLIP_SECS);
+                segments += 1;
+                run = None;
+            }
+        }
+    }
+    total - EST_CUT_OVERLAP_SECS * segments.saturating_sub(1) as f64
+}
+
+/// Pick hero entries (given in story order) to fill `budget_secs`.
+///
+/// Every chapter first gets its best entry (dropping the weakest chapters'
+/// picks only if even those overrun the budget). Remaining time is dealt
+/// out one entry at a time to the chapter with the fewest picks relative
+/// to `sqrt(chapter size)`, taking that chapter's best remaining entry, so
+/// big days get more screen time without crowding out small ones. Stops at
+/// the first pick that would overrun the budget. Keeps story order.
+fn select_hero_by_budget<'a>(
+    cands: Vec<PlanEntry>,
+    chapter_of: impl Fn(&str) -> &'a str + Copy,
+    score_of: impl Fn(&str) -> f32,
+    budget_secs: f64,
+) -> Vec<PlanEntry> {
+    // Chapters in story order, each with its candidates best-first.
+    let mut chapters: Vec<(&str, Vec<usize>)> = vec![];
+    for (i, e) in cands.iter().enumerate() {
+        let c = chapter_of(&e.asset_id);
+        match chapters.iter_mut().find(|(l, _)| *l == c) {
+            Some((_, m)) => m.push(i),
+            None => chapters.push((c, vec![i])),
+        }
+    }
+    for (_, members) in &mut chapters {
+        members.sort_by(|&x, &y| {
+            score_of(&cands[y].asset_id)
+                .total_cmp(&score_of(&cands[x].asset_id))
+                .then(x.cmp(&y))
+        });
+    }
+    let mut picked = vec![false; cands.len()];
+    let estimate = |picked: &[bool]| {
+        estimate_hero_secs(
+            cands
+                .iter()
+                .zip(picked)
+                .filter(|(_, p)| **p)
+                .map(|(e, _)| e),
+            chapter_of,
+        )
+    };
+    // Every chapter's best entry, weakest dropped first if over budget.
+    let mut reps: Vec<usize> = chapters.iter().map(|(_, m)| m[0]).collect();
+    for &r in &reps {
+        picked[r] = true;
+    }
+    reps.sort_by(|&x, &y| {
+        score_of(&cands[x].asset_id)
+            .total_cmp(&score_of(&cands[y].asset_id))
+            .then(y.cmp(&x))
+    });
+    for &r in &reps {
+        if estimate(&picked) <= budget_secs || picked.iter().filter(|p| **p).count() <= 1 {
+            break;
+        }
+        picked[r] = false;
+    }
+    // Deal the rest of the budget across chapters.
+    let mut taken: Vec<usize> = chapters
+        .iter()
+        .map(|(_, m)| usize::from(picked[m[0]]))
+        .collect();
+    loop {
+        let next = chapters
+            .iter()
+            .enumerate()
+            .filter(|(ci, (_, m))| taken[*ci] < m.len())
+            .min_by(|(a, (_, ma)), (b, (_, mb))| {
+                let share = |ci: usize, n: usize| taken[ci] as f64 / (n as f64).sqrt();
+                share(*a, ma.len())
+                    .total_cmp(&share(*b, mb.len()))
+                    .then(a.cmp(b))
+            })
+            .map(|(ci, _)| ci);
+        let Some(ci) = next else { break };
+        let i = chapters[ci].1[taken[ci]];
+        picked[i] = true;
+        if estimate(&picked) > budget_secs {
+            picked[i] = false;
+            break;
+        }
+        taken[ci] += 1;
+    }
+    cands
+        .into_iter()
+        .zip(picked)
+        .filter_map(|(e, p)| p.then_some(e))
+        .collect()
+}
+
 /// Reel pack size and quality bar (the first [`MIN_REELS`] picks skip the bar).
 const MAX_REELS: usize = 5;
 const MIN_REELS: usize = 3;
@@ -258,6 +462,17 @@ pub fn build_plan_with_overrides(
     scores: &HashMap<String, Score>,
     overrides: &[PlaceOverride],
 ) -> Plan {
+    build_plan_with_length(assets, cluster_of, scores, overrides, FilmLength::Auto)
+}
+
+/// [`build_plan_with_overrides`] with a chosen hero film length.
+pub fn build_plan_with_length(
+    assets: &[Asset],
+    cluster_of: &HashMap<String, String>,
+    scores: &HashMap<String, Score>,
+    overrides: &[PlaceOverride],
+    length: FilmLength,
+) -> Plan {
     let ordered = story_order(assets);
     let score_of = |id: &str| scores.get(id).map_or(DEFAULT_SCORE, |s| s.total);
 
@@ -276,32 +491,16 @@ pub fn build_plan_with_overrides(
     if hero.len() > HERO_TRIM_ABOVE {
         hero.retain(|e| score_of(&e.asset_id) >= HERO_MIN_SCORE);
     }
-    if hero.len() > HERO_CAP {
-        let mut ranked: Vec<usize> = (0..hero.len()).collect();
-        ranked.sort_by(|&x, &y| {
-            score_of(&hero[y].asset_id)
-                .total_cmp(&score_of(&hero[x].asset_id))
-                .then(x.cmp(&y))
-        });
-        // Reserve each chapter's best entry first so the cap never erases a
-        // chapter from the film; remaining slots go to the best scores.
-        let label = |i: usize| {
-            cluster_of
-                .get(&hero[i].asset_id)
-                .map_or(UNGROUPED, String::as_str)
-        };
-        let mut seen_label: HashSet<&str> = HashSet::new();
-        let (reps, rest): (Vec<usize>, Vec<usize>) = ranked
-            .into_iter()
-            .partition(|&i| seen_label.insert(label(i)));
-        let keep: HashSet<usize> = reps.into_iter().chain(rest).take(HERO_CAP).collect();
-        let mut i = 0;
-        hero.retain(|_| {
-            let k = keep.contains(&i);
-            i += 1;
-            k
-        });
-    }
+    let local_date = |a: &Asset| crate::metadata::local_date(a.taken_at?, a.tz_offset_secs);
+    let budget_secs = match length {
+        FilmLength::Secs(s) => s,
+        FilmLength::Auto => {
+            let days: HashSet<_> = ordered.iter().filter_map(|a| local_date(a)).collect();
+            auto_film_secs(days.len())
+        }
+    };
+    let chapter_label = |id: &str| cluster_of.get(id).map_or(UNGROUPED, String::as_str);
+    let hero = select_hero_by_budget(hero, chapter_label, |id| score_of(id), budget_secs);
 
     // Group by cluster label in story order (drives chapters and reels).
     let mut groups: Vec<(&str, Vec<&Asset>)> = vec![];
@@ -368,7 +567,6 @@ pub fn build_plan_with_overrides(
     // (bundled gazetteer, never a network lookup). The day is shown once
     // per chapter (overlays, book day-marker pages) — photos inside a
     // chapter need no per-photo timestamp.
-    let local_date = |a: &Asset| crate::metadata::local_date(a.taken_at?, a.tz_offset_secs);
     let trip_start = ordered.iter().filter_map(|a| local_date(a)).min();
     let chapters: Vec<Chapter> = groups
         .into_iter()
@@ -499,7 +697,7 @@ fn plan_entry(a: &Asset) -> PlanEntry {
 /// Per-keepsake eligibility for a thin trip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Eligibility {
-    /// Hero film variant: "full" (3–5 min), "short" (≤30 s slideshow), or "disabled".
+    /// Hero film variant: "full" (length from [`FilmLength`]), "short" (≤30 s slideshow), or "disabled".
     pub video: &'static str,
     pub video_reason: String,
     /// Number of reels in the pack (0 disables the card).
@@ -1091,9 +1289,8 @@ mod tests {
         assert!(matches!(r, Integrity::Missing { .. }));
     }
 
-    #[test]
-    fn hero_caps_keeping_story_order() {
-        let assets: Vec<Asset> = (0..130)
+    fn photos(n: i64) -> Vec<Asset> {
+        (0..n)
             .map(|i| {
                 asset(
                     &format!("a{i:02}"),
@@ -1101,7 +1298,18 @@ mod tests {
                     AssetKind::Photo,
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    fn hero_secs(plan: &Plan, clusters: &HashMap<String, String>) -> f64 {
+        estimate_hero_secs(&plan.hero, |id| {
+            clusters.get(id).map_or(UNGROUPED, String::as_str)
+        })
+    }
+
+    #[test]
+    fn hero_fills_length_keeping_story_order() {
+        let assets = photos(130);
         let mut scores = HashMap::new();
         for i in 0..130 {
             scores.insert(
@@ -1112,16 +1320,17 @@ mod tests {
                 },
             );
         }
-        let plan = build_plan(&assets, &HashMap::new(), &scores);
-        assert_eq!(
-            plan.hero.len(),
-            110,
-            "hero capped at 110: {}",
+        let none = HashMap::new();
+        let plan = build_plan_with_length(&assets, &none, &scores, &[], FilmLength::Secs(120.0));
+        let secs = hero_secs(&plan, &none);
+        assert!(
+            plan.hero.len() < 130 && secs <= 120.0 && secs > 110.0,
+            "fills ~120 s: {} entries, {secs:.1} s",
             plan.hero.len()
         );
         assert!(
             plan.hero.iter().all(|e| e.asset_id != "a00"),
-            "lowest scorer dropped by cap"
+            "lowest scorer dropped first"
         );
         let ids: Vec<&str> = plan.hero.iter().map(|e| e.asset_id.as_str()).collect();
         let mut sorted = ids.clone();
@@ -1130,16 +1339,21 @@ mod tests {
     }
 
     #[test]
-    fn hero_cap_keeps_every_chapter() {
-        let assets: Vec<Asset> = (0..111)
-            .map(|i| {
-                asset(
-                    &format!("a{i:02}"),
-                    1_714_557_600 + i * 60,
-                    AssetKind::Photo,
-                )
-            })
-            .collect();
+    fn longer_film_shows_more() {
+        let assets = photos(130);
+        let none = HashMap::new();
+        let len = |secs| {
+            build_plan_with_length(&assets, &none, &HashMap::new(), &[], FilmLength::Secs(secs))
+                .hero
+                .len()
+        };
+        assert!(len(60.0) < len(120.0));
+        assert_eq!(len(3600.0), 130, "a long enough film keeps everything");
+    }
+
+    #[test]
+    fn hero_length_keeps_every_chapter() {
+        let assets = photos(111);
         let mut scores = HashMap::new();
         let mut clusters = HashMap::new();
         for i in 0..111 {
@@ -1158,12 +1372,94 @@ mod tests {
             );
             clusters.insert(id, day.to_string());
         }
-        let plan = build_plan(&assets, &clusters, &scores);
-        assert_eq!(plan.hero.len(), 110);
+        let plan = build_plan_with_length(&assets, &clusters, &scores, &[], FilmLength::Secs(60.0));
+        assert!(plan.hero.len() < 111);
         assert!(
             plan.hero.iter().any(|e| e.asset_id == "a110"),
             "lower-scored chapter keeps its best shot"
         );
+    }
+
+    #[test]
+    fn big_chapters_get_more_time_but_not_all() {
+        // Day 1 has 100 photos, Day 2 has 4: Day 2 is shown in full well
+        // before Day 1 is, and Day 1 still gets the larger share.
+        let assets = photos(104);
+        let clusters: HashMap<String, String> = (0..104)
+            .map(|i| {
+                let day = if i < 100 { "Day 1" } else { "Day 2" };
+                (format!("a{i:02}"), day.to_string())
+            })
+            .collect();
+        let plan = build_plan_with_length(
+            &assets,
+            &clusters,
+            &HashMap::new(),
+            &[],
+            FilmLength::Secs(60.0),
+        );
+        let day2 = plan
+            .hero
+            .iter()
+            .filter(|e| clusters[&e.asset_id] == "Day 2")
+            .count();
+        let day1 = plan.hero.len() - day2;
+        assert!(day1 > day2 && day2 >= 2, "day1={day1} day2={day2}");
+    }
+
+    #[test]
+    fn auto_length_scales_with_trip_days() {
+        assert_eq!(auto_film_secs(0), AUTO_MIN_FILM_SECS);
+        assert_eq!(auto_film_secs(1), AUTO_MIN_FILM_SECS);
+        assert!((auto_film_secs(7) - 264.6).abs() < 0.1);
+        assert!((auto_film_secs(34) - 583.1).abs() < 0.1);
+        assert_eq!(auto_film_secs(500), AUTO_MAX_FILM_SECS);
+    }
+
+    #[test]
+    fn parses_film_lengths() {
+        assert_eq!(parse_film_length("auto"), Ok(FilmLength::Auto));
+        assert_eq!(parse_film_length("600"), Ok(FilmLength::Secs(600.0)));
+        assert_eq!(parse_film_length("10m"), Ok(FilmLength::Secs(600.0)));
+        assert_eq!(parse_film_length(" 4M30s "), Ok(FilmLength::Secs(270.0)));
+        assert_eq!(parse_film_length("90s"), Ok(FilmLength::Secs(90.0)));
+        for bad in ["", "ten", "10h", "5", "2h", "-60", "NaN", "m", "1m2"] {
+            assert!(parse_film_length(bad).is_err(), "{bad:?} should fail");
+        }
+    }
+
+    #[test]
+    fn estimate_matches_renderer_grouping() {
+        let still = |id: &str| PlanEntry {
+            asset_id: id.into(),
+            content_hash: None,
+            size_bytes: 0,
+            mtime: 0,
+            rendition: Rendition::Still,
+        };
+        let clip = |id: &str, len: f64| PlanEntry {
+            rendition: Rendition::Clip {
+                trim_start: 0.0,
+                trim_end: len,
+            },
+            ..still(id)
+        };
+        let ch = |id: &str| if id.starts_with('x') { "X" } else { "Y" };
+        // x1..x5 -> collage(4) + solo; clip breaks the run; 1 s clip pads to 2.5.
+        let entries = [
+            still("x1"),
+            still("x2"),
+            still("x3"),
+            still("x4"),
+            still("x5"),
+            clip("y1", 6.0),
+            clip("y2", 1.0),
+            still("y3"),
+        ];
+        let segs = 4 + 5;
+        let want =
+            EST_FIXED_SECS + 6.0 + 4.0 + 6.0 + 2.5 + 4.0 - EST_CUT_OVERLAP_SECS * (segs - 1) as f64;
+        assert!((estimate_hero_secs(&entries, ch) - want).abs() < 1e-9);
     }
 
     #[test]

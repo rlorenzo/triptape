@@ -2,7 +2,7 @@
 //! `export` all eligible keepsakes (hero film, reels pack, photo book).
 //!
 //! ```sh
-//! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache
+//! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F] [--keep-ambience]
 //! ```
@@ -278,7 +278,13 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         }
         None => vec![],
     };
-    let p = planmod::build_plan_with_overrides(&plan_assets, &cluster_of, &scores, &overrides);
+    // Hero film length: scales with the trip unless `--length` asks for one
+    // (`auto`, seconds, or e.g. `10m`).
+    let length = match flags.get("length") {
+        Some(spec) => planmod::parse_film_length(spec).unwrap_or_else(|e| die("length", e)),
+        None => planmod::FilmLength::Auto,
+    };
+    let p = planmod::build_plan_with_length(&plan_assets, &cluster_of, &scores, &overrides, length);
     let elig = planmod::plan_eligibility(
         plan_assets.len(),
         plan_assets
