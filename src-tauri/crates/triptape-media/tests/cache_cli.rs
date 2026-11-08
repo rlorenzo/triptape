@@ -74,7 +74,14 @@ fn clear_keeps_entries_a_running_export_uses() {
 
 #[test]
 fn unknown_cache_command_fails() {
-    let (ok, _) = triptape(&["cache", "polish"]);
+    // Always name a scratch dir: no test may touch the user's real cache.
+    let t = tempfile::tempdir().unwrap();
+    let (ok, _) = triptape(&[
+        "cache",
+        "polish",
+        "--segment-cache",
+        t.path().to_str().unwrap(),
+    ]);
     assert!(!ok);
 }
 

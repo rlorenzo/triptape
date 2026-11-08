@@ -3003,7 +3003,8 @@ mod tests {
 
     /// Full hero pipeline on synthetic stills: Typst title + lower-thirds,
     /// per-cut transitions, and the bundled music bed (no --music passed).
-    /// Writes to /tmp/hero-smoke so RMS can be measured after the run.
+    /// Works in a per-test temp dir (set `KEEP_HERO_SMOKE=1` to keep it and
+    /// print its path, to measure RMS after the run).
     /// Skips quietly when ffmpeg/typst are unavailable.
     #[test]
     fn hero_smoke_bundled_music_and_overlays() {
@@ -3018,8 +3019,11 @@ mod tests {
             eprintln!("typst missing; skipping hero smoke");
             return;
         }
-        let dir = PathBuf::from("/tmp/hero-smoke");
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        if std::env::var_os("KEEP_HERO_SMOKE").is_some() {
+            eprintln!("hero smoke kept in {}", temp.keep().display());
+        }
         std::fs::create_dir_all(dir.join("work")).unwrap();
         // Three solid stills (red/green/blue) as PNG sources.
         let mut entries = vec![];
@@ -3813,21 +3817,22 @@ mod tests {
         let (first, edl1, dur1) = run("a", &entries);
         assert_eq!(
             (first.hits, first.misses, first.stored),
-            (0, 2, 2),
+            (0, 4, 4),
             "{first:?}"
         );
         let (second, edl2, dur2) = run("b", &entries);
-        assert_eq!((second.hits, second.misses), (2, 0), "{second:?}");
+        assert_eq!((second.hits, second.misses), (4, 0), "{second:?}");
         assert_eq!(edl1, edl2, "cached film has the same timeline");
         assert!((dur1 - dur2).abs() < 0.05, "{dur1} vs {dur2}");
 
-        // Replace one shot of the pair collage (a3, a4): that group only.
-        let changed = &entries[4].still_path;
+        // Groups: a0 solo (captioned), a1+a2 collage, a3 solo (captioned), a4
+        // solo. Replace a collage member: that group only re-renders.
+        let changed = &entries[2].still_path;
         image::ImageBuffer::from_pixel(400, 240, image::Rgb([250u8, 10, 10]))
             .save(changed)
             .unwrap();
         let (third, _, _) = run("c", &entries);
-        assert_eq!((third.hits, third.misses), (1, 1), "{third:?}");
+        assert_eq!((third.hits, third.misses), (3, 1), "{third:?}");
     }
 
     /// Inserting a shot must not change the recipe (so the cache key) of
