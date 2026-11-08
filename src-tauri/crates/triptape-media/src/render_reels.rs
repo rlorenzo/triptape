@@ -482,12 +482,9 @@ fn render_clip_reel(
         s(src),
     ];
     // Silent sources get a synthesized silent track (verify requires audio).
-    // Source audio specifier: first usable stream (never iPhone `apple_apac`).
-    let src_a = probe
-        .as_ref()
-        .map_or_else(|| "0:a:0".to_string(), ffmpeg::ProbeInfo::audio_spec);
+    // Source audio: first usable stream (never iPhone `apple_apac`).
     let (audio_in, music_in) = if has_audio {
-        (src_a, 1)
+        (ffmpeg::audio_spec(probe.as_ref()), 1)
     } else {
         fallbacks.push(format!(
             "{} has no audio; silent track added",

@@ -819,10 +819,8 @@ pub fn render_hero_video(
         let _ = std::fs::remove_file(&srt_path);
         None
     };
-    let burn_srt = srt_opt
-        .as_ref()
-        .filter(|_| caps.can_burn_captions())
-        .map(|p| ffmpeg::subtitles_filter(Path::new(p)));
+    let burn_srt =
+        (srt_count > 0 && caps.can_burn_captions()).then(|| ffmpeg::subtitles_filter(&srt_path));
     let fade_out_start = (total - 1.5).max(0.0);
     let music_chain = format!(
         "[1:a]atrim=0:{total:.3},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,afade=t=in:st=0:d=1,afade=t=out:st={fade_out_start:.3}:d=1.5"
@@ -1103,9 +1101,7 @@ fn render_entry_segment(
             let audio_in = if has_audio {
                 // Only the first usable stream: iPhone spatial `apple_apac`
                 // tracks cannot be muxed to MP4 and sank the whole clip.
-                probe
-                    .as_ref()
-                    .map_or_else(|| "0:a:0".to_string(), ffmpeg::ProbeInfo::audio_spec)
+                ffmpeg::audio_spec(probe.as_ref())
             } else {
                 fallbacks.push(format!(
                     "{} has no audio; silent track added",
@@ -1487,10 +1483,26 @@ mod tests {
         assert_eq!(chapter_overlay(None, None, None), None);
     }
 
-    /// Full hero pipeline on synthetic stills: Typst title + lower-thirds,
-    /// per-cut transitions, and the bundled music bed (no --music passed).
-    /// Writes to /tmp/hero-smoke so RMS can be measured after the run.
-    /// Skips quietly when ffmpeg/typst are unavailable.
+    fn clip_entry(id: &str, src: PathBuf, trim_end: f64) -> ResolvedEntry {
+        ResolvedEntry {
+            entry: PlanEntry {
+                asset_id: id.into(),
+                content_hash: None,
+                size_bytes: 0,
+                mtime: 0,
+                rendition: Rendition::Clip {
+                    trim_start: 0.0,
+                    trim_end,
+                },
+            },
+            still_path: src.clone(),
+            motion_path: Some(src),
+            caption: None,
+            taken_at: None,
+            tz_offset_secs: None,
+        }
+    }
+
     /// Regression: iPhone clips carry a second, spatial `apple_apac` audio
     /// track that the MP4 muxer cannot take; `-map 0:a` mapped it and sank
     /// the clip (ffmpeg exit 234). ffmpeg cannot synthesize apac, so a second
@@ -1530,23 +1542,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(made.success());
-        let r = ResolvedEntry {
-            entry: PlanEntry {
-                asset_id: "c1".into(),
-                content_hash: None,
-                size_bytes: 0,
-                mtime: 0,
-                rendition: Rendition::Clip {
-                    trim_start: 0.0,
-                    trim_end: 2.0,
-                },
-            },
-            still_path: src.clone(),
-            motion_path: Some(src),
-            caption: None,
-            taken_at: None,
-            tz_offset_secs: None,
-        };
+        let r = clip_entry("c1", src, 2.0);
         let mut fallbacks = vec![];
         let (out, secs, kind) =
             render_entry_segment(&caps, &r, 0, 3.0, 10.0, temp.path(), &mut fallbacks).unwrap();
@@ -1575,23 +1571,7 @@ mod tests {
         let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
         let temp = tempfile::tempdir().unwrap();
         let src = PathBuf::from(src);
-        let r = ResolvedEntry {
-            entry: PlanEntry {
-                asset_id: "apac".into(),
-                content_hash: None,
-                size_bytes: 0,
-                mtime: 0,
-                rendition: Rendition::Clip {
-                    trim_start: 0.0,
-                    trim_end: 3.0,
-                },
-            },
-            still_path: src.clone(),
-            motion_path: Some(src),
-            caption: None,
-            taken_at: None,
-            tz_offset_secs: None,
-        };
+        let r = clip_entry("apac", src, 3.0);
         let mut fallbacks = vec![];
         let (out, _, _) =
             render_entry_segment(&caps, &r, 0, 3.0, 10.0, temp.path(), &mut fallbacks).unwrap();
@@ -1603,6 +1583,10 @@ mod tests {
         );
     }
 
+    /// Full hero pipeline on synthetic stills: Typst title + lower-thirds,
+    /// per-cut transitions, and the bundled music bed (no --music passed).
+    /// Writes to /tmp/hero-smoke so RMS can be measured after the run.
+    /// Skips quietly when ffmpeg/typst are unavailable.
     #[test]
     fn hero_smoke_bundled_music_and_overlays() {
         use triptape_core::types::Plan;

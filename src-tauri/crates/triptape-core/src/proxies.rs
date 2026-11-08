@@ -74,16 +74,19 @@ pub fn thumb_args(src: &Path, dst: &Path) -> Vec<String> {
 }
 
 /// FFmpeg args for a 720p H.264/AAC proxy (poster frames: see `poster_args`).
-pub fn proxy_args(src: &Path, dst: &Path) -> Vec<String> {
+/// `audio_map` is the probed usable audio stream (e.g. `0:a:1`); `None` makes
+/// a silent proxy.
+pub fn proxy_args(src: &Path, dst: &Path, audio_map: Option<&str>) -> Vec<String> {
     let vf = format!("scale=-2:{PROXY_HEIGHT}");
     // Explicit maps: ffmpeg's default audio pick prefers the stream with the
     // most channels, which on iPhone clips is the undecodable spatial
-    // `apple_apac` track rather than the AAC one. `?` keeps silent clips valid.
+    // `apple_apac` track rather than the AAC one.
+    let mut maps = strs(&["-map", "0:v:0"]);
+    match audio_map {
+        Some(a) => maps.extend(strs(&["-map", a])),
+        None => maps.push("-an".to_string()),
+    }
     let opts = strs(&[
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
         "-vf",
         &vf,
         "-c:v",
@@ -97,7 +100,8 @@ pub fn proxy_args(src: &Path, dst: &Path) -> Vec<String> {
         "-movflags",
         "+faststart",
     ]);
-    ffmpeg_args(&[], src, &opts, dst)
+    maps.extend(opts);
+    ffmpeg_args(&[], src, &maps, dst)
 }
 
 /// FFmpeg args to extract a single poster frame at `at_secs` (e.g. ~1.5 s
@@ -260,21 +264,33 @@ mod tests {
 
     #[test]
     fn proxy_args_are_720p_h264() {
-        let args = proxy_args(Path::new("in.MOV"), Path::new("out.mp4"));
+        let args = proxy_args(Path::new("in.MOV"), Path::new("out.mp4"), Some("0:a:0?"));
         assert!(args.iter().any(|a| a == "libx264"));
         assert!(args.iter().any(|a| a.contains("720")));
     }
 
-    /// iPhone clips carry a spatial `apple_apac` track that ffmpeg's default
-    /// "most channels" pick would choose; the proxy must map one AAC track.
-    #[test]
-    fn proxy_args_map_one_explicit_audio_stream() {
-        let args = proxy_args(Path::new("in.MOV"), Path::new("out.mp4"));
-        let maps: Vec<&str> = args
-            .windows(2)
+    fn maps(args: &[String]) -> Vec<&str> {
+        args.windows(2)
             .filter(|w| w[0] == "-map")
             .map(|w| w[1].as_str())
-            .collect();
-        assert_eq!(maps, ["0:v:0", "0:a:0?"]);
+            .collect()
+    }
+
+    /// iPhone clips carry a spatial `apple_apac` track that ffmpeg's default
+    /// "most channels" pick would choose; the proxy maps only the probed
+    /// usable stream (APAC-before-AAC layouts pass `0:a:1`).
+    #[test]
+    fn proxy_args_map_probed_audio_stream() {
+        let args = proxy_args(Path::new("in.MOV"), Path::new("out.mp4"), Some("0:a:1"));
+        assert_eq!(maps(&args), ["0:v:0", "0:a:1"]);
+        assert!(!args.iter().any(|a| a == "-an"));
+    }
+
+    /// APAC-only (no usable audio): video only, explicitly silent.
+    #[test]
+    fn proxy_args_without_usable_audio_are_silent() {
+        let args = proxy_args(Path::new("in.MOV"), Path::new("out.mp4"), None);
+        assert_eq!(maps(&args), ["0:v:0"]);
+        assert!(args.iter().any(|a| a == "-an"));
     }
 }

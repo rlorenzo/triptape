@@ -208,7 +208,7 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     triptape_core::parallel::for_each_parallel(
         &videos,
         workers,
-        |(_, path, dur)| clip_analysis::best_clip_window(&ffmpeg, path, *dur),
+        |(_, path, dur)| clip_analysis::best_clip_window(&ffmpeg, &ffprobe, path, *dur),
         |idx, window, _, _| {
             if let Some(s) = scores.get_mut(&videos[idx].0) {
                 s.clip_window = window;
@@ -280,7 +280,8 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         };
         if let Some(h) = key {
             let dst = proxies::cache_path(&cache, "proxy", h, ".mp4");
-            let args = proxies::proxy_args(src, &dst);
+            let audio = ffmpeg::audio_map(&ffprobe, src);
+            let args = proxies::proxy_args(src, &dst, audio.as_deref());
             if proxies::run_ffmpeg(&ffmpeg, &args, &dst).is_ok() {
                 proxies_n += 1;
             }

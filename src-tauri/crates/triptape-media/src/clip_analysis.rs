@@ -47,7 +47,7 @@ fn input_args(path: &Path, pre: &[&str], tail: &[&str]) -> Vec<String> {
 }
 
 /// Raw per-sample measurements for a clip, or `None` when no frames decode.
-fn measure(ffmpeg_bin: &str, path: &Path) -> Option<Vec<RawSample>> {
+fn measure(ffmpeg_bin: &str, audio_map: Option<&str>, path: &Path) -> Option<Vec<RawSample>> {
     let vf = format!(
         "fps={},scale={FRAME_W}:{FRAME_H},format=gray",
         1.0 / SAMPLE_SECS
@@ -62,18 +62,20 @@ fn measure(ffmpeg_bin: &str, path: &Path) -> Option<Vec<RawSample>> {
             "-an", "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
         ],
     );
-    let audio_args = input_args(
-        path,
-        &[],
-        // One explicit stream: ffmpeg's best-stream pick can land on the
-        // undecodable spatial `apple_apac` track. Optional for silent clips.
-        &[
-            "-vn", "-map", "0:a:0?", "-ac", "1", "-ar", &rate, "-f", "s16le", "pipe:1",
-        ],
-    );
+    // One explicit, probed stream: ffmpeg's best-stream pick can land on the
+    // undecodable spatial `apple_apac` track. No usable audio: video only.
+    let audio_args = audio_map.map(|a| {
+        input_args(
+            path,
+            &[],
+            &[
+                "-vn", "-map", a, "-ac", "1", "-ar", &rate, "-f", "s16le", "pipe:1",
+            ],
+        )
+    });
     // The two decodes are independent: run the audio one alongside.
     let (video, audio) = std::thread::scope(|s| {
-        let audio = s.spawn(|| run_capture(ffmpeg_bin, &audio_args));
+        let audio = s.spawn(|| run_capture(ffmpeg_bin, audio_args.as_ref()?));
         let video = run_capture(ffmpeg_bin, &video_args);
         (video, audio.join().ok().flatten())
     });
@@ -114,11 +116,17 @@ fn measure(ffmpeg_bin: &str, path: &Path) -> Option<Vec<RawSample>> {
 
 /// Best `(start, end)` playback window of a video clip, in seconds. `None`
 /// when the clip is short enough to play whole or analysis failed.
-pub fn best_clip_window(ffmpeg_bin: &str, path: &Path, duration_secs: f64) -> Option<(f64, f64)> {
+pub fn best_clip_window(
+    ffmpeg_bin: &str,
+    ffprobe_bin: &str,
+    path: &Path,
+    duration_secs: f64,
+) -> Option<(f64, f64)> {
     if !wants_window(duration_secs) {
         return None;
     }
-    let raw = measure(ffmpeg_bin, path)?;
+    let audio = crate::ffmpeg::audio_map(ffprobe_bin, path);
+    let raw = measure(ffmpeg_bin, audio.as_deref(), path)?;
     pick_window(&score_samples(&raw), duration_secs)
 }
 
@@ -129,14 +137,17 @@ mod tests {
     #[test]
     fn missing_ffmpeg_or_file_yields_no_window() {
         let p = Path::new("/nonexistent/clip.mov");
-        assert_eq!(best_clip_window("ffmpeg-does-not-exist", p, 30.0), None);
-        assert_eq!(best_clip_window("ffmpeg", p, 30.0), None);
+        assert_eq!(
+            best_clip_window("ffmpeg-does-not-exist", "ffprobe", p, 30.0),
+            None
+        );
+        assert_eq!(best_clip_window("ffmpeg", "ffprobe", p, 30.0), None);
     }
 
     #[test]
     fn short_clips_skip_analysis() {
         let p = Path::new("/nonexistent/clip.mov");
-        assert_eq!(best_clip_window("ffmpeg", p, 1.5), None);
-        assert_eq!(best_clip_window("ffmpeg", p, f64::NAN), None);
+        assert_eq!(best_clip_window("ffmpeg", "ffprobe", p, 1.5), None);
+        assert_eq!(best_clip_window("ffmpeg", "ffprobe", p, f64::NAN), None);
     }
 }

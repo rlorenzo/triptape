@@ -120,10 +120,10 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// Captions can only be burned in when libass (the `subtitles` filter)
-    /// exists; otherwise renderers emit a sidecar SRT plus a note.
+    /// Captions burn in through libass's `subtitles` filter; without it
+    /// renderers emit a sidecar SRT plus a note.
     pub fn can_burn_captions(&self) -> bool {
-        self.libass && self.subtitles
+        self.subtitles
     }
 
     /// Full HDR->SDR chain needs zscale; otherwise tonemap alone is the
@@ -138,20 +138,22 @@ impl Capabilities {
 /// escaping"): level one escapes backslash, quote and colon; level two
 /// backslash, quote, comma, semicolon and brackets.
 fn escape_filter_value(v: &str) -> String {
-    let level1: String = v
-        .chars()
-        .flat_map(|c| match c {
-            '\\' | '\'' | ':' => vec!['\\', c],
-            _ => vec![c],
-        })
-        .collect();
-    level1
-        .chars()
-        .flat_map(|c| match c {
-            '\\' | '\'' | ',' | ';' | '[' | ']' => vec!['\\', c],
-            _ => vec![c],
-        })
-        .collect()
+    backslash_escape(
+        &backslash_escape(v, &['\\', '\'', ':']),
+        &['\\', '\'', ',', ';', '[', ']'],
+    )
+}
+
+/// Prefix every char of `v` found in `special` with a backslash.
+fn backslash_escape(v: &str, special: &[char]) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        if special.contains(&c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// `subtitles` filter burning the SRT at `srt` into a 1920x1080 frame: white
@@ -558,6 +560,22 @@ impl ProbeInfo {
     }
 }
 
+/// Audio specifier for input 0: the probed usable stream, or the first audio
+/// stream when the probe failed.
+pub fn audio_spec(probe: Option<&ProbeInfo>) -> String {
+    probe.map_or_else(|| "0:a:0".to_string(), ProbeInfo::audio_spec)
+}
+
+/// `-map` value for a source's audio: the first usable stream, `None` when the
+/// probe finds no usable audio (e.g. `apple_apac` only), and the optional
+/// first stream when the probe itself fails.
+pub fn audio_map(ffprobe_bin: &str, path: &Path) -> Option<String> {
+    match ffprobe_file(ffprobe_bin, path) {
+        Ok(info) => info.has_audio.then(|| info.audio_spec()),
+        Err(_) => Some("0:a:0?".to_string()),
+    }
+}
+
 /// Probe one media file; errors when ffprobe fails or finds no streams.
 pub fn ffprobe_file(ffprobe_bin: &str, path: &Path) -> Result<ProbeInfo, super::MediaError> {
     let out = Command::new(ffprobe_bin)
@@ -884,6 +902,14 @@ mod tests {
         let info = parse_probe(&v, Path::new("x.mov")).unwrap();
         assert_eq!(info.audio_spec(), "0:a:1");
         assert_eq!(info.audio_rate, 48000);
+    }
+
+    #[test]
+    fn audio_spec_defaults_to_first_stream_without_probe() {
+        assert_eq!(audio_spec(None), "0:a:0");
+        let v = probe_json(&format!("{VIDEO},{APAC},{AAC}"));
+        let info = parse_probe(&v, Path::new("x.mov")).unwrap();
+        assert_eq!(audio_spec(Some(&info)), "0:a:1");
     }
 
     #[test]
