@@ -2046,10 +2046,13 @@ mod tests {
                     let still = next(5) < 3;
                     let id = format!("c{ch:02}e{k}");
                     let secs = 1.0 + next(8) as f64;
-                    match next(5) {
-                        0 => drop(captions.insert(id.clone(), "Mia on the ferry".into())),
-                        1 => drop(captions.insert(id.clone(), "  ".into())),
-                        _ => {}
+                    let caption = match next(5) {
+                        0 => Some("Mia on the ferry"),
+                        1 => Some("  "),
+                        _ => None,
+                    };
+                    if let Some(c) = caption {
+                        captions.insert(id.clone(), c.into());
                     }
                     entries.push(PlanEntry {
                         asset_id: id,

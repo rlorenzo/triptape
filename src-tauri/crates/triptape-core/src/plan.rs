@@ -299,14 +299,10 @@ pub fn estimate_hero_secs<'e, 'c>(
         let chapter = chapter_of(&e.asset_id);
         let pano_secs = pano_secs_of(&e.asset_id);
         match e.rendition {
-            // A panorama is always solo, with its own pan hold.
-            Rendition::Still if pano_secs.is_some() => {
+            // A panorama (with its own pan hold) or a captioned still is
+            // always solo, and breaks the run.
+            Rendition::Still if pano_secs.is_some() || captioned(&e.asset_id) => {
                 segs.push((Seg::Chapter(chapter), pano_secs.unwrap_or(EST_STILL_SECS)));
-                run = None;
-            }
-            // A captioned still is solo too, and breaks the run.
-            Rendition::Still if captioned(&e.asset_id) => {
-                segs.push((Seg::Chapter(chapter), EST_STILL_SECS));
                 run = None;
             }
             Rendition::Still => match &mut run {
@@ -2608,7 +2604,6 @@ mod tests {
         // A blank caption is no caption: all three still collage.
         let blank = est(&["a", "b", "c"], &[("a", "  ")]);
         assert!((blank - 7.8).abs() < 1e-9, "{blank}");
-        // Blank means no caption.
         assert!(!has_caption(Some(" \n")) && has_caption(Some(" x ")) && !has_caption(None));
     }
 
