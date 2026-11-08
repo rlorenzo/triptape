@@ -25,9 +25,10 @@ pub const MAP_ATTRIBUTION: &str = "© OpenStreetMap contributors";
 ///
 /// * Plain styled background (no tile basemap per the G3 fallback).
 /// * Route polyline in accent, place pins as dots, day markers as rings.
-/// * Solid attribution bar along the bottom (text itself would need a
-///   bundled font + drawtext/libass, both absent here; the attribution
-///   string ships in `ATTRIBUTION.txt` and the EDL).
+/// * The map covers the full frame. There is deliberately no attribution
+///   bar: it painted a light strip across the bottom of the video. The
+///   basemap is Natural Earth (public domain), so no on-frame credit is
+///   owed; [`MAP_ATTRIBUTION`] still ships in `ATTRIBUTION.txt` and the EDL.
 pub fn draw_route_card(
     route: &[(f64, f64)],
     day_markers: &[usize],
@@ -40,30 +41,23 @@ pub fn draw_route_card(
     // (4K) multiply them so the card looks the same, just sharper.
     let k = (h / 1080).max(1) as i32;
     let mut img = RgbImage::from_pixel(w, h, WATER);
-    let bar_h = (h as f32 * 0.045).ceil() as u32;
     // Unwrap longitudes first: Los Angeles -> Tokyo crosses the Pacific
     // (102° of span). Raw min/max spans 258° the long way round and
     // crushes the trip into a corner of a half-planet map.
     let route = &unwrap_longitudes(route);
     if !route.is_empty() {
-        paint_land(&mut img, &RouteFit::new(route, w, h - bar_h), k as u32);
-    }
-    // Attribution bar (bottom 4%): light strip so the note is visible.
-    for y in (h - bar_h)..h {
-        for x in 0..w {
-            img.put_pixel(x, y, Rgb([232, 236, 241]));
-        }
+        paint_land(&mut img, &RouteFit::new(route, w, h), k as u32);
     }
     // Graticule: faint grid so the card reads as a map, not a black card.
     let grid = Rgb([31, 44, 63]);
     for gx in 1..8 {
         let x = w * gx / 8;
-        for y in 0..(h - bar_h) {
+        for y in 0..h {
             img.put_pixel(x, y, grid);
         }
     }
     for gy in 1..6 {
-        let y = (h - bar_h) * gy / 6;
+        let y = h * gy / 6;
         for x in 0..w {
             img.put_pixel(x, y, grid);
         }
@@ -71,7 +65,7 @@ pub fn draw_route_card(
     if route.is_empty() {
         return img;
     }
-    let fit = RouteFit::new(route, w, h - bar_h);
+    let fit = RouteFit::new(route, w, h);
     let pts: Vec<(i32, i32)> = route.iter().map(|&gps| fit.project(gps)).collect();
     // Route line: dark amber glow under the bright accent core.
     for (col, r) in [(Rgb([146, 102, 30]), 4 * k), (Rgb([245, 178, 66]), 2 * k)] {
@@ -373,11 +367,7 @@ mod tests {
         let white = Rgb([255, 255, 255]);
         for (w, h, k) in [(1920, 1080, 1), (3840, 2160, 2)] {
             let img = draw_route_card(&route, &[], w, h);
-            let fit = RouteFit::new(
-                &unwrap_longitudes(&route),
-                w,
-                h - (h as f32 * 0.045).ceil() as u32,
-            );
+            let fit = RouteFit::new(&unwrap_longitudes(&route), w, h);
             let (x, y) = fit.project(route[0]);
             // Start pin: white ring from 8k to 11k px, so 10 px out is
             // ring at 1080p and colored core at 4K.
@@ -388,12 +378,18 @@ mod tests {
     }
 
     #[test]
-    fn card_geometry_and_bar() {
+    fn card_geometry_and_full_frame_map() {
         let route = vec![(35.0, 139.0), (36.0, 140.0)];
         let img = draw_route_card(&route, &[0], 320, 200);
         assert_eq!((img.width(), img.height()), (320, 200));
-        // Attribution bar: bottom row is the light strip.
-        assert_eq!(*img.get_pixel(10, 199), Rgb([232, 236, 241]));
+        // The map reaches the last row: no light strip along the bottom.
+        let strip = Rgb([232, 236, 241]);
+        assert!(
+            img.rows().all(|mut r| r.all(|p| *p != strip)),
+            "attribution strip still painted"
+        );
+        // Water or land, not an overlay: the bottom row is map-toned.
+        assert!([WATER, LAND].contains(img.get_pixel(10, 199)));
         // Empty route still yields a valid card.
         let empty = draw_route_card(&[], &[], 320, 200);
         assert_eq!((empty.width(), empty.height()), (320, 200));
