@@ -364,18 +364,19 @@ pub fn export_all(
                     }
                 },
             };
+            let chapter = chapter_of.get(a.id.as_str()).copied();
             book_photos.push(BookPhoto {
                 asset_id: a.id.clone(),
                 path: a.path.clone(),
                 width: w,
                 height: h,
+                // The user's caption, else the chapter place.
                 caption: plan
                     .captions
                     .get(&a.id)
-                    .map(String::as_str)
-                    .or_else(|| chapter_place(plan, &a.id))
-                    .map(String::from),
-                chapter: chapter_of.get(a.id.as_str()).copied(),
+                    .or_else(|| chapter.and_then(|i| plan.chapters[i].place.as_ref()))
+                    .cloned(),
+                chapter,
             });
         }
         // Story order: keep db order (taken_at, id).

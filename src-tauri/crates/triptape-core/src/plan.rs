@@ -21,7 +21,10 @@ pub fn dateline(dt: &chrono::DateTime<chrono::Utc>) -> String {
     format!("{} · {}", dt.format(DAY_FORMAT), dt.format("%-I:%M %p"))
 }
 
-pub const PLAN_VERSION: u32 = 1;
+/// 2: `captions` holds only the user's words (no auto place captions).
+pub const PLAN_VERSION: u32 = 2;
+/// Last plan version whose `captions` copied the chapter place onto photos.
+const AUTO_PLACE_CAPTIONS_VERSION: u32 = 1;
 
 /// Score assumed for assets missing from the score map.
 const DEFAULT_SCORE: f32 = 0.5;
@@ -600,14 +603,37 @@ fn rename_chapter(ch: &mut Chapter, label: &str) {
     ch.title = label.to_string();
 }
 
+/// Migrate a plan saved before captions became the user's words only: its
+/// captions mixed the chapter place with embedded captions, so rebuild them
+/// from the assets' own `user_caption`. Story-editor overrides are applied
+/// on top by [`apply_edits`], as for current plans.
+fn with_user_captions_only(plan: &Plan, by_id: &HashMap<&str, &Asset>) -> Plan {
+    let mut out = plan.clone();
+    out.captions = plan
+        .chapters
+        .iter()
+        .flat_map(|c| &c.asset_ids)
+        .filter_map(|id| Some((id.clone(), by_id.get(id.as_str())?.user_caption.clone()?)))
+        .collect();
+    out.plan_version = PLAN_VERSION;
+    out
+}
+
 /// Apply user edits to a stored plan. Pure and deterministic:
 /// place overrides first (they rename whole chapters), then swaps,
 /// then exclusions, then caption overrides on top.
 pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
+    let by_id: HashMap<&str, &Asset> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
+    let legacy;
+    let plan = if plan.plan_version <= AUTO_PLACE_CAPTIONS_VERSION {
+        legacy = with_user_captions_only(plan, &by_id);
+        &legacy
+    } else {
+        plan
+    };
     if edits.is_empty() {
         return plan.clone();
     }
-    let by_id: HashMap<&str, &Asset> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
     let dead: HashSet<&str> = edits.excluded.iter().map(String::as_str).collect();
     // Swaps and captions only land on assets in this plan's book flow.
     let in_plan: HashSet<&str> = plan
@@ -1328,8 +1354,8 @@ mod tests {
 
     #[test]
     fn chapters_name_places_without_auto_captions() {
-        // Fushimi Inari GPS on every asset: chapter is named by place, captions
-        // carry the place, and the title prefers the place over the date.
+        // Fushimi Inari GPS on every asset: chapter is named by place, the
+        // title prefers the place over the date, and no caption is invented.
         let mut assets = vec![
             asset("a", 1_714_557_600, AssetKind::Photo),
             asset("b", 1_714_557_900, AssetKind::Photo),
@@ -1550,6 +1576,52 @@ mod tests {
         assert_eq!(plan.captions["a"], "Mia's first shinkansen ride");
         assert!(!plan.captions.contains_key("b"));
         assert_eq!(plan.captions.len(), 1);
+    }
+
+    #[test]
+    fn legacy_plans_drop_auto_place_captions() {
+        // A v1 plan stored the chapter place as every photo's caption.
+        let mut a = asset("a", 1_714_557_600, AssetKind::Photo);
+        a.gps = Some((34.9671, 135.7727));
+        a.user_caption = Some("Mia's first shinkansen ride".into());
+        let mut b = asset("b", 1_714_557_900, AssetKind::Photo);
+        b.gps = Some((34.9671, 135.7727));
+        let mut c = asset("c", 1_714_558_200, AssetKind::Photo);
+        c.gps = Some((34.9671, 135.7727));
+        let assets = vec![a, b, c];
+        let co: HashMap<String, String> = ["a", "b", "c"]
+            .iter()
+            .map(|id| (id.to_string(), "2024-05-01 · place 1".to_string()))
+            .collect();
+        let mut legacy = build_plan(&assets, &co, &scored(&["a", "b", "c"]));
+        legacy.plan_version = AUTO_PLACE_CAPTIONS_VERSION;
+        for id in ["a", "b", "c"] {
+            legacy.captions.insert(id.into(), "Kyoto, Japan".into());
+        }
+
+        // No edits: the place captions go, the embedded caption is restored.
+        let out = apply_edits(&legacy, &assets, &PlanEdits::default());
+        assert_eq!(out.plan_version, PLAN_VERSION);
+        assert_eq!(out.captions["a"], "Mia's first shinkansen ride");
+        assert_eq!(out.captions.len(), 1);
+
+        // Rename plus a typed override: the override wins, nothing stale stays.
+        let edits = PlanEdits {
+            place_overrides: [("b".to_string(), "Our Ryokan".to_string())].into(),
+            caption_overrides: [("c".to_string(), "Breakfast view".to_string())].into(),
+            ..Default::default()
+        };
+        let out = apply_edits(&legacy, &assets, &edits);
+        assert_eq!(out.chapters[0].place.as_deref(), Some("Our Ryokan"));
+        assert_eq!(out.captions["a"], "Mia's first shinkansen ride");
+        assert!(!out.captions.contains_key("b"));
+        assert_eq!(out.captions["c"], "Breakfast view");
+
+        // Current plans are left as stored.
+        let mut current = legacy.clone();
+        current.plan_version = PLAN_VERSION;
+        let out = apply_edits(&current, &assets, &PlanEdits::default());
+        assert_eq!(out.captions["b"], "Kyoto, Japan");
     }
 
     #[test]
