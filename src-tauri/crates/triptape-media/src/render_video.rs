@@ -1,13 +1,15 @@
 //! Keepsake 1 — Trip Video (hero film).
 //!
-//! Pipeline: normalize every plan entry to a uniform 1080p30/s48kHz-stereo
+//! Pipeline: normalize every plan entry to a uniform 4K30 (or 1080p30, see
+//! [`Resolution`]) / s48kHz-stereo
 //! segment (Ken Burns stills, scored clip trims, title card, map push-in),
 //! then assemble with a stepwise pairwise crossfade chain (never 5+ inputs
 //! in one graph; each offset accounts for cumulative overlap), a final
-//! loudnorm single pass, 1080p libx264 CRF19 faststart, an EDL JSON, and a
+//! loudnorm single pass, libx264 CRF19 faststart, an EDL JSON, and a
 //! sidecar SRT (burned in too when ffmpeg has libass).
 
 use crate::ffmpeg::{self, path_arg as s, Capabilities};
+use crate::resolution::Resolution;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{
@@ -205,6 +207,8 @@ pub struct VideoOptions {
     pub keep_ambience: bool,
     /// Typst binary for title/lower-third text PNGs.
     pub typst_bin: String,
+    /// Output frame size (default 4K).
+    pub resolution: Resolution,
 }
 
 impl Default for VideoOptions {
@@ -219,6 +223,7 @@ impl Default for VideoOptions {
             music_path: None,
             keep_ambience: false,
             typst_bin: "typst".into(),
+            resolution: Resolution::default(),
         }
     }
 }
@@ -368,12 +373,13 @@ fn render_card_png(
     fallbacks: &mut Vec<String>,
 ) -> Result<bool, crate::MediaError> {
     if typst_ok {
-        match crate::titlecard::render_text_png(&opts.typst_bin, doc, png, 72) {
+        match crate::titlecard::render_text_png(&opts.typst_bin, doc, png, opts.resolution.ppi()) {
             Ok(()) => return Ok(true),
             Err(e) => fallbacks.push(format!("{label} text failed ({e}); solid card")),
         }
     }
-    crate::titlecard::save_title_card(&opts.trip_name, 1920, 1080, png)?;
+    let (w, h) = opts.resolution.dims();
+    crate::titlecard::save_title_card(&opts.trip_name, w, h, png)?;
     Ok(false)
 }
 
@@ -458,7 +464,14 @@ pub fn render_hero_video(
         ));
     }
     let title_mp4 = work_dir.join("seg_title.mp4");
-    render_hold_segment(caps, &title_png, opts.title_secs, 0, &title_mp4)?;
+    render_hold_segment(
+        caps,
+        &title_png,
+        opts.title_secs,
+        0,
+        opts.resolution,
+        &title_mp4,
+    )?;
     segs.push((
         card_entry("title", &title_png),
         title_mp4,
@@ -470,7 +483,14 @@ pub fn render_hero_video(
     if let Some(card) = map_card {
         if !plan.map_polyline.is_empty() {
             let map_mp4 = work_dir.join("seg_map.mp4");
-            match crate::map::render_map_push_in(caps, card, &map_mp4, opts.map_secs, 0) {
+            match crate::map::render_map_push_in(
+                caps,
+                card,
+                &map_mp4,
+                opts.map_secs,
+                0,
+                opts.resolution,
+            ) {
                 Ok(()) => segs.push((
                     card_entry("map", card),
                     map_mp4,
@@ -571,9 +591,18 @@ pub fn render_hero_video(
         }
         let rendered = if present.len() == 1 {
             let cap = fair_share(budget, groups.len() - idx);
-            render_entry_segment(caps, r, idx, still_secs, cap, work_dir, &mut fallbacks)
+            render_entry_segment(
+                caps,
+                r,
+                idx,
+                still_secs,
+                cap,
+                opts.resolution,
+                work_dir,
+                &mut fallbacks,
+            )
         } else {
-            render_collage_segment(caps, &present, idx, still_secs, work_dir)
+            render_collage_segment(caps, &present, idx, still_secs, opts.resolution, work_dir)
         };
         let (seg_path, dur, kind) = match rendered {
             Ok(v) => v,
@@ -630,7 +659,7 @@ pub fn render_hero_video(
         if !plan.map_polyline.is_empty() {
             let close_mp4 = work_dir.join("seg_closing.mp4");
             let dur = opts.map_secs + CLOSING_MAP_EXTRA_SECS;
-            match crate::map::render_map_push_in(caps, card, &close_mp4, dur, 1) {
+            match crate::map::render_map_push_in(caps, card, &close_mp4, dur, 1, opts.resolution) {
                 Ok(()) => segs.push((card_entry("closing", card), close_mp4, dur, "still".into())),
                 Err(e) => fallbacks.push(format!("closing map skipped: {e}")),
             }
@@ -647,7 +676,14 @@ pub fn render_hero_video(
             &mut fallbacks,
         )?;
         let places_mp4 = work_dir.join("seg_places.mp4");
-        render_hold_segment(caps, &png, CREDITS_SECS, segs.len(), &places_mp4)?;
+        render_hold_segment(
+            caps,
+            &png,
+            CREDITS_SECS,
+            segs.len(),
+            opts.resolution,
+            &places_mp4,
+        )?;
         segs.push((
             card_entry("credits", &png),
             places_mp4,
@@ -711,8 +747,13 @@ pub fn render_hero_video(
             let Some((top, bottom)) = lines else { continue };
             let doc = crate::titlecard::lower_third_doc(&top, bottom.as_deref());
             let png = work_dir.join(format!("ov_{i:03}.png"));
-            if let Err(e) = crate::titlecard::render_text_png(&opts.typst_bin, &doc, &png, 72)
-                .and_then(|()| apply_lower_third(caps, seg_mp4, &png, *dur))
+            if let Err(e) = crate::titlecard::render_text_png(
+                &opts.typst_bin,
+                &doc,
+                &png,
+                opts.resolution.ppi(),
+            )
+            .and_then(|()| apply_lower_third(caps, seg_mp4, &png, *dur, opts.resolution))
             {
                 fallbacks.push(format!("overlay skipped for {id}: {e}"));
             }
@@ -862,6 +903,7 @@ pub fn render_hero_video(
         "[aout]".into(),
     ];
     final_args.extend(ffmpeg::x264_aac("medium", 19));
+    final_args.extend(opts.resolution.x264_level_args());
     final_args.extend(["-r".into(), "30".into(), s(out_mp4)]);
     if let Err(e) = ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &final_args, out_mp4) {
         // Music bed is mandatory: a failed mix fails the film (the old
@@ -870,7 +912,8 @@ pub fn render_hero_video(
     }
 
     // 7. Verify + EDL + sidecar SRT.
-    let probed = ffmpeg::verify_video(&caps.ffprobe_bin, out_mp4, 1920, 1080)?;
+    let (out_w, out_h) = opts.resolution.dims();
+    let probed = ffmpeg::verify_video(&caps.ffprobe_bin, out_mp4, out_w, out_h)?;
     let edl = Edl {
         version: 1,
         trip_name: opts.trip_name.clone(),
@@ -916,18 +959,28 @@ pub fn render_hero_video(
     })
 }
 
-/// Bake a 1200x200 lower-third PNG onto `seg` in place (`overlay=48:H-160`,
-/// visible `between(t,0.3,segdur)`). `run_ffmpeg` writes a partial sibling
-/// and renames, so a failure never leaves a torn segment.
+/// Bake the lower-third PNG (1200x200 at 1080p, 2x that at 4K) onto `seg` in
+/// place (`overlay=48:H-160` in 1080p units, visible
+/// `between(t,0.3,segdur)`). `run_ffmpeg` writes a partial sibling and
+/// renames, so a failure never leaves a torn segment.
 fn apply_lower_third(
     caps: &Capabilities,
     seg: &Path,
     png: &Path,
     seg_dur: f64,
+    res: Resolution,
 ) -> Result<(), crate::MediaError> {
-    let graph =
-        format!("[0:v][1:v]overlay=48:H-160:format=yuv420:enable='between(t,0.3,{seg_dur:.3})'[v]");
+    let graph = lower_third_graph(seg_dur, res);
     burn_png_overlay(caps, seg, png, &graph, 16)
+}
+
+fn lower_third_graph(seg_dur: f64, res: Resolution) -> String {
+    let k = res.scale();
+    format!(
+        "[0:v][1:v]overlay={}:H-{}:format=yuv420:enable='between(t,0.3,{seg_dur:.3})'[v]",
+        48 * k,
+        160 * k
+    )
 }
 
 /// Re-encode `video` in place with `png` composited by `filter_graph`
@@ -1036,12 +1089,14 @@ fn pad_segment_freeze(
 }
 
 /// Normalize one plan entry to a uniform segment. Returns (path, secs, kind).
+#[allow(clippy::too_many_arguments)]
 fn render_entry_segment(
     caps: &Capabilities,
     r: &ResolvedEntry,
     idx: usize,
     still_secs: f64,
     max_secs: f64,
+    res: Resolution,
     work_dir: &Path,
     fallbacks: &mut Vec<String>,
 ) -> Result<(PathBuf, f64, String), crate::MediaError> {
@@ -1062,10 +1117,10 @@ fn render_entry_segment(
                 let dur = motion.hold_secs.min(max_secs.max(still_secs));
                 // Travel less when shortened so the pan keeps its speed bound.
                 let coverage = pano_coverage(aspect, dur);
-                render_pano_segment(caps, &png.path, dur, aspect, coverage, idx, &out)?;
+                render_pano_segment(caps, &png.path, dur, aspect, coverage, idx, res, &out)?;
                 return Ok((out, dur, "still".into()));
             }
-            render_hold_segment(caps, &png.path, still_secs, idx, &out)?;
+            render_hold_segment(caps, &png.path, still_secs, idx, res, &out)?;
             Ok((out, still_secs, "still".into()))
         }
         Rendition::Motion {
@@ -1088,9 +1143,17 @@ fn render_entry_segment(
             // acrossfade assembly always has `[n:a]` to consume.
             let has_audio = probe.as_ref().is_none_or(|i| i.has_audio);
             // Upscaled first so the push-in samples, not smears.
-            let mut vf =
-                "scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,setsar=1"
-                    .to_string();
+            let (pw, ph) = res.clip_prescale();
+            // Lanczos where the source is smaller than the pre-scale (the
+            // upscale must not smear); the default filter for downscales,
+            // where lanczos only costs time.
+            let upscaling = probe
+                .as_ref()
+                .is_some_and(|i| i.width < pw || i.height < ph);
+            let flags = if upscaling { ":flags=lanczos" } else { "" };
+            let mut vf = format!(
+                "scale={pw}:{ph}:force_original_aspect_ratio=increase{flags},crop={pw}:{ph},setsar=1"
+            );
             if let Some(info) = &probe {
                 if let Some(chain) = ffmpeg::tonemap_chain(caps, &info.color_transfer) {
                     vf.push(',');
@@ -1107,7 +1170,7 @@ fn render_entry_segment(
             let frames = (len * 30.0).round().max(1.0) as u32;
             vf.push_str(&format!(
                 ",fps=30,{}",
-                ffmpeg::glide(caps, frames, 1920, 1080, 0)
+                ffmpeg::glide(caps, frames, res.width(), res.height(), 0)
             ));
             vf.push_str(",format=yuv420p");
             let mut args: Vec<String> = vec![
@@ -1166,29 +1229,33 @@ pub(crate) fn silent_input(secs: f64) -> Vec<String> {
 /// blurred fill at 16:9, then a gentle Ken Burns move (≤1.05×) on the
 /// finished composite, varied by index. Zooming the raw photo instead
 /// both crops the subject and distorts non-16:9 sources.
-fn hold_graph(caps: &Capabilities, idx: usize, frames: u32) -> String {
-    // Supersample the composite once, hold it, then glide over it.
-    let composite = ffmpeg::fit_over_blur(caps, "[0:v]", 2880, 1620, "");
+fn hold_graph(caps: &Capabilities, idx: usize, frames: u32, res: Resolution) -> String {
+    // Supersample the composite once, hold it, then glide over it. The fill
+    // blur radius is in canvas pixels, so it scales with the resolution.
+    let (sw, sh) = res.supersample();
+    let (w, h) = res.dims();
+    let composite = ffmpeg::fit_over_blur_sigma(caps, "[0:v]", sw, sh, "", 40 * res.scale());
     let hold = ffmpeg::hold_still(frames);
-    let glide = ffmpeg::glide(caps, frames, 1920, 1080, idx);
+    let glide = ffmpeg::glide(caps, frames, w, h, idx);
     format!("{composite},{hold},{glide},format=yuv420p[v]")
 }
 
 /// Collage segment: up to four same-chapter stills composed into one
-/// 2880x1620 canvas (cover-fitted cells, dark gaps), then held with the
+/// supersample canvas (1.5x the frame; cover-fitted cells, dark gaps), then held with the
 /// usual glide. One segment shows the day's spread at once.
 fn render_collage_segment(
     caps: &Capabilities,
     members: &[&ResolvedEntry],
     idx: usize,
     still_secs: f64,
+    res: Resolution,
     work_dir: &Path,
 ) -> Result<(PathBuf, f64, String), crate::MediaError> {
     let canvas = work_dir.join(format!("collage_{idx:03}.png"));
-    compose_collage(&caps.ffmpeg_bin, members, &canvas)?;
+    compose_collage(&caps.ffmpeg_bin, members, res, &canvas)?;
     let out = work_dir.join(format!("seg_{idx:03}.mp4"));
     let dur = collage_hold_secs(members.len(), still_secs);
-    render_hold_segment(caps, &canvas, dur, idx, &out)?;
+    render_hold_segment(caps, &canvas, dur, idx, res, &out)?;
     Ok((out, dur, "still".into()))
 }
 
@@ -1346,18 +1413,18 @@ fn fill_cell(img: &image::RgbImage, cw: u32, ch: u32) -> image::RgbImage {
     }
 }
 
-/// Compose 2-4 photos into a 2880x1620 collage canvas with an
+/// Compose 2-4 photos into a supersample-size collage canvas with an
 /// orientation-aware layout ([`collage_layout`]) and thin dark gaps.
 /// Photos decode, then fill their cells, in parallel: each is an
 /// independent ffmpeg spawn plus a resize.
 fn compose_collage(
     ffmpeg_bin: &str,
     members: &[&ResolvedEntry],
+    res: Resolution,
     out: &Path,
 ) -> Result<(), crate::MediaError> {
-    const W: u32 = 2880;
-    const H: u32 = 1620;
-    const GAP: u32 = 18;
+    let (w_px, h_px) = res.supersample();
+    let gap = 18 * res.scale();
     let images = std::thread::scope(|scope| {
         let workers: Vec<_> = members
             .iter()
@@ -1379,13 +1446,13 @@ fn compose_collage(
         .iter()
         .map(|i| f64::from(i.width().max(1)) / f64::from(i.height().max(1)))
         .collect();
-    let cells = collage_layout(&aspects, W, H);
+    let cells = collage_layout(&aspects, w_px, h_px);
     let tiles: Vec<image::RgbImage> = std::thread::scope(|scope| {
         let workers: Vec<_> = cells
             .iter()
             .map(|c| {
                 let img = &images[c.member];
-                scope.spawn(move || fill_cell(img, c.w - GAP, c.h - GAP))
+                scope.spawn(move || fill_cell(img, c.w - gap, c.h - gap))
             })
             .collect();
         workers
@@ -1393,13 +1460,13 @@ fn compose_collage(
             .map(|w| w.join().expect("collage worker panicked"))
             .collect()
     });
-    let mut canvas = image::RgbImage::from_pixel(W, H, image::Rgb([13, 20, 32]));
+    let mut canvas = image::RgbImage::from_pixel(w_px, h_px, image::Rgb([13, 20, 32]));
     for (tile, c) in tiles.iter().zip(&cells) {
         image::imageops::replace(
             &mut canvas,
             tile,
-            i64::from(c.x + GAP / 2),
-            i64::from(c.y + GAP / 2),
+            i64::from(c.x + gap / 2),
+            i64::from(c.y + gap / 2),
         );
     }
     canvas
@@ -1409,6 +1476,7 @@ fn compose_collage(
 
 /// Panorama segment: pans across the whole image ([`ffmpeg::pano_pan`]);
 /// direction alternates with the segment index.
+#[allow(clippy::too_many_arguments)]
 fn render_pano_segment(
     caps: &Capabilities,
     img: &Path,
@@ -1416,12 +1484,20 @@ fn render_pano_segment(
     aspect: f64,
     coverage: f64,
     idx: usize,
+    res: Resolution,
     out: &Path,
 ) -> Result<(), crate::MediaError> {
     let frames = (dur * 30.0).round() as u32;
     let graph = format!(
         "[0:v]{},format=yuv420p[v]",
-        ffmpeg::pano_pan(caps, frames, 1920, 1080, aspect, coverage, idx % 2 == 1)
+        ffmpeg::pano_pan(
+            frames,
+            res.width(),
+            res.height(),
+            aspect,
+            coverage,
+            idx % 2 == 1
+        )
     );
     render_graph_segment(caps, img, dur, graph, out)
 }
@@ -1432,10 +1508,11 @@ fn render_hold_segment(
     img: &Path,
     dur: f64,
     idx: usize,
+    res: Resolution,
     out: &Path,
 ) -> Result<(), crate::MediaError> {
     let frames = (dur * 30.0).round() as u32;
-    let graph = hold_graph(caps, idx, frames);
+    let graph = hold_graph(caps, idx, frames, res);
     render_graph_segment(caps, img, dur, graph, out)
 }
 
@@ -1488,7 +1565,7 @@ mod tests {
             ..Default::default()
         };
         for idx in 0..4 {
-            let g = hold_graph(&caps, idx, 120);
+            let g = hold_graph(&caps, idx, 120, Resolution::Hd1080);
             // Full photo over blurred fill, motion on the composite only,
             // never past 1.05x (window floor is 20/21 of the frame).
             assert!(g.contains("[bg][fg]overlay"), "{g}");
@@ -1511,7 +1588,7 @@ mod tests {
             ..Default::default()
         };
         for idx in 0..4 {
-            let g = hold_graph(&caps, idx, 120);
+            let g = hold_graph(&caps, idx, 120, Resolution::Hd1080);
             assert!(!g.contains("zoompan"), "no zoompan jitter: {g}");
             assert!(
                 g.find("overlay").unwrap() < g.find("loop=loop=119").unwrap(),
@@ -1634,30 +1711,72 @@ mod tests {
     }
 
     #[test]
-    fn pano_graph_pans_with_perspective_not_zoompan() {
+    fn hold_graph_derives_every_size_from_the_resolution() {
         let caps = Capabilities {
+            gblur: true,
             perspective: true,
             ..Default::default()
         };
-        let g = ffmpeg::pano_pan(&caps, 240, 1920, 1080, 4.4, 1.0, false);
-        assert!(g.starts_with("scale=-2:1296"), "fills height: {g}");
-        assert!(!g.contains("zoompan") && !g.contains("blur"), "{g}");
-        assert!(g.contains("perspective=") && g.contains("lanczos"), "{g}");
+        let hd = hold_graph(&caps, 0, 120, Resolution::Hd1080);
         assert!(
-            g.find("loop=loop=239").unwrap() < g.find("perspective=").unwrap(),
-            "{g}"
+            hd.contains("scale=2880:1620") && hd.contains("scale=1920:1080"),
+            "{hd}"
+        );
+        assert!(hd.contains("gblur=sigma=40"), "{hd}");
+        let uhd = hold_graph(&caps, 0, 120, Resolution::Uhd4k);
+        assert!(
+            uhd.contains("scale=5760:3240") && uhd.contains("scale=3840:2160"),
+            "{uhd}"
+        );
+        assert!(uhd.contains("gblur=sigma=80"), "{uhd}");
+        for leaked in ["2880", "1620", "1920", "1080"] {
+            assert!(
+                !uhd.contains(leaked),
+                "{leaked} leaked into 4K graph: {uhd}"
+            );
+        }
+    }
+
+    #[test]
+    fn lower_third_overlay_scales_with_resolution() {
+        let hd = lower_third_graph(3.0, Resolution::Hd1080);
+        assert!(hd.contains("overlay=48:H-160"), "{hd}");
+        let uhd = lower_third_graph(3.0, Resolution::Uhd4k);
+        assert!(uhd.contains("overlay=96:H-320"), "{uhd}");
+    }
+
+    #[test]
+    fn pano_graph_pans_with_crop_window_not_zoompan() {
+        let g = ffmpeg::pano_pan(240, 1920, 1080, 4.4, 1.0, false);
+        // Strip short side = 2x the frame's, window = the frame at 2x.
+        assert!(g.starts_with("scale=-2:2160"), "fills 2x height: {g}");
+        assert!(g.contains("crop=w=3840:h=2160"), "{g}");
+        assert!(g.ends_with("scale=1920:1080:flags=lanczos,setsar=1"), "{g}");
+        assert!(!g.contains("zoompan") && !g.contains("blur"), "{g}");
+        assert!(!g.contains("perspective"), "no per-frame resample: {g}");
+        assert!(
+            g.find("loop=loop=239").unwrap() < g.find("crop=").unwrap(),
+            "strip scaled and held once: {g}"
         );
         // Direction flips with `reverse`; tall images scan vertically.
-        assert_ne!(g, ffmpeg::pano_pan(&caps, 240, 1920, 1080, 4.4, 1.0, true));
-        let tall = ffmpeg::pano_pan(&caps, 240, 1920, 1080, 0.25, 1.0, false);
-        assert!(tall.starts_with("scale=2304:-2"), "{tall}");
-        assert!(tall.contains("x0='0'") && tall.contains("x1='W'"), "{tall}");
-        // No perspective: a centred crop, still the right size.
-        let still = ffmpeg::pano_pan(&Capabilities::default(), 240, 1920, 1080, 4.4, 1.0, false);
+        assert_ne!(g, ffmpeg::pano_pan(240, 1920, 1080, 4.4, 1.0, true));
+        let tall = ffmpeg::pano_pan(240, 1920, 1080, 0.25, 1.0, false);
+        assert!(tall.starts_with("scale=3840:-2"), "{tall}");
         assert!(
-            still.contains("crop=") && still.ends_with("scale=1920:1080:flags=lanczos,setsar=1"),
-            "{still}"
+            tall.contains("x='0'") && tall.contains("y='floor((ih-oh)"),
+            "{tall}"
         );
+        // 4K: 2160 output short side -> 4320 strip, no 1080p numbers.
+        let uhd = ffmpeg::pano_pan(240, 3840, 2160, 4.4, 1.0, false);
+        assert!(uhd.starts_with("scale=-2:4320"), "{uhd}");
+        assert!(uhd.contains("crop=w=7680:h=4320"), "{uhd}");
+        assert!(
+            uhd.ends_with("scale=3840:2160:flags=lanczos,setsar=1"),
+            "{uhd}"
+        );
+        for leaked in ["1920", "1080"] {
+            assert!(!uhd.contains(leaked), "{leaked} leaked: {uhd}");
+        }
     }
 
     #[test]
@@ -1876,8 +1995,17 @@ mod tests {
         assert!(made.success());
         let r = clip_entry("c1", src, 2.0);
         let mut fallbacks = vec![];
-        let (out, secs, kind) =
-            render_entry_segment(&caps, &r, 0, 3.0, 10.0, temp.path(), &mut fallbacks).unwrap();
+        let (out, secs, kind) = render_entry_segment(
+            &caps,
+            &r,
+            0,
+            3.0,
+            10.0,
+            Resolution::Hd1080,
+            temp.path(),
+            &mut fallbacks,
+        )
+        .unwrap();
         assert_eq!(kind, "clip");
         assert!((secs - 2.0).abs() < 0.01);
         let info = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &out).unwrap();
@@ -1905,8 +2033,17 @@ mod tests {
         let src = PathBuf::from(src);
         let r = clip_entry("apac", src, 3.0);
         let mut fallbacks = vec![];
-        let (out, _, _) =
-            render_entry_segment(&caps, &r, 0, 3.0, 10.0, temp.path(), &mut fallbacks).unwrap();
+        let (out, _, _) = render_entry_segment(
+            &caps,
+            &r,
+            0,
+            3.0,
+            10.0,
+            Resolution::Hd1080,
+            temp.path(),
+            &mut fallbacks,
+        )
+        .unwrap();
         let info = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &out).unwrap();
         assert!(info.has_audio && info.has_video);
         assert!(
@@ -2003,6 +2140,7 @@ mod tests {
                 music_path: None,
                 keep_ambience: false,
                 typst_bin: "typst".into(),
+                resolution: Resolution::Hd1080,
                 ..Default::default()
             },
         )
@@ -2195,6 +2333,7 @@ mod tests {
             &out,
             &VideoOptions {
                 short_mode: true,
+                resolution: Resolution::Hd1080,
                 ..Default::default()
             },
         )
@@ -2329,6 +2468,7 @@ mod tests {
                 music_path: None,
                 keep_ambience: false,
                 typst_bin: "typst".into(),
+                resolution: Resolution::Hd1080,
                 ..Default::default()
             },
         )
@@ -2368,6 +2508,266 @@ mod tests {
         // Already capped to the remaining budget: nothing to pad.
         assert_eq!(clip_pad_target(0.6, 0.6), None);
         assert_eq!(clip_pad_target(3.0, 10.0), None);
+    }
+
+    /// Default (4K) hero render end to end: Typst title, caption burn-in
+    /// capable build, level 5.1 H.264, 3840x2160 output.
+    #[test]
+    fn hero_smoke_4k_default() {
+        use triptape_core::types::Plan;
+
+        let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
+        if !caps.libx264 || !caps.xfade || !caps.loudnorm || !caps.perspective {
+            eprintln!("ffmpeg caps insufficient; skipping 4K hero smoke");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let img: image::RgbImage =
+            image::ImageBuffer::from_pixel(160, 90, image::Rgb([20, 120, 90]));
+        let still = dir.join("still.png");
+        img.save(&still).unwrap();
+        let entry = ResolvedEntry {
+            entry: PlanEntry {
+                asset_id: "a0".into(),
+                content_hash: None,
+                size_bytes: 0,
+                mtime: 0,
+                rendition: Rendition::Still,
+            },
+            still_path: still,
+            motion_path: None,
+            caption: None,
+            taken_at: None,
+            tz_offset_secs: None,
+            aspect: None,
+        };
+        let plan = Plan {
+            plan_version: 1,
+            schema_version: 1,
+            hero: vec![],
+            reel_selects: vec![],
+            chapters: vec![triptape_core::types::Chapter {
+                title: "Day 1".into(),
+                asset_ids: vec!["a0".into()],
+                ..Default::default()
+            }],
+            captions: HashMap::new(),
+            map_polyline: vec![],
+            music: triptape_core::types::MusicPick {
+                track: "bundled".into(),
+                rationale: "default".into(),
+            },
+        };
+        let out = dir.join("hero4k.mp4");
+        // No `resolution` override: the default must be 4K.
+        render_hero_video(
+            &caps,
+            &plan,
+            &[entry],
+            None,
+            &dir.join("work"),
+            &out,
+            &VideoOptions {
+                trip_name: "4K Smoke".into(),
+                still_secs: 1.0,
+                title_secs: 1.0,
+                ..Default::default()
+            },
+        )
+        .expect("4k hero render");
+        let info = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &out).unwrap();
+        assert_eq!((info.width, info.height), (3840, 2160));
+        assert!(info.has_audio);
+    }
+
+    /// Visual check: full hero render of real copies (`TRIPTAPE_BENCH_DIR`,
+    /// `TRIPTAPE_BENCH_RES`, optional `TRIPTAPE_FFMPEG` for a libass build).
+    #[test]
+    #[ignore = "needs real media via TRIPTAPE_BENCH_DIR"]
+    fn bench_hero() {
+        use triptape_core::types::{Chapter, MusicPick, Plan};
+        let Ok(dir) = std::env::var("TRIPTAPE_BENCH_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let ffmpeg_bin = std::env::var("TRIPTAPE_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+        let ffprobe_bin = ffmpeg_bin.replace("ffmpeg", "ffprobe");
+        let caps = crate::ffmpeg::probe_capabilities(&ffmpeg_bin, &ffprobe_bin);
+        let res = Resolution::from_flag(
+            &std::env::var("TRIPTAPE_BENCH_RES").unwrap_or_else(|_| "4k".into()),
+        )
+        .unwrap();
+        let out_dir = dir.join(format!("hero_{}", res.label()));
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let mk = |n: &str, cap: Option<&str>, aspect: Option<f64>, clip: bool| {
+            let mut e = clip_entry(n, dir.join(n), 4.0);
+            if !clip {
+                e.entry.rendition = Rendition::Still;
+                e.motion_path = None;
+            }
+            e.caption = cap.map(String::from);
+            e.aspect = aspect;
+            e.taken_at = Some(1791288000);
+            e
+        };
+        let entries = vec![
+            mk(
+                "s1.HEIC",
+                Some("Golden hour at the temple"),
+                Some(1.333),
+                false,
+            ),
+            mk("s2.HEIC", None, Some(1.333), false),
+            mk("s3.HEIC", None, Some(1.333), false),
+            mk("s4.HEIC", None, Some(1.333), false),
+            mk(
+                "pano.HEIC",
+                Some("The whole bay, left to right"),
+                Some(4.436),
+                false,
+            ),
+            mk(
+                "portrait.jpg",
+                Some("Portrait with a caption"),
+                Some(0.5625),
+                false,
+            ),
+            mk("clip4k.mov", Some("A 4K clip"), None, true),
+        ];
+        let ch = |title: &str, day: u32, place: &str, ids: &[&str]| Chapter {
+            title: title.into(),
+            asset_ids: ids.iter().map(|s| s.to_string()).collect(),
+            place: Some(place.into()),
+            day_index: Some(day),
+            date_label: Some("Wed, Oct 8".into()),
+        };
+        let plan = Plan {
+            plan_version: 1,
+            schema_version: 1,
+            hero: vec![],
+            reel_selects: vec![],
+            chapters: vec![
+                ch(
+                    "a",
+                    1,
+                    "Kyoto, Japan",
+                    &["s1.HEIC", "s2.HEIC", "s3.HEIC", "s4.HEIC"],
+                ),
+                ch(
+                    "b",
+                    2,
+                    "Osaka, Japan",
+                    &["pano.HEIC", "portrait.jpg", "clip4k.mov"],
+                ),
+            ],
+            captions: HashMap::new(),
+            map_polyline: vec![(35.0, 135.7), (34.7, 135.5), (35.6, 139.7), (1.35, 103.8)],
+            music: MusicPick {
+                track: "bundled".into(),
+                rationale: "default".into(),
+            },
+        };
+        let (cw, ch_) = res.dims();
+        let card = out_dir.join("card.png");
+        crate::map::save_route_card(&plan.map_polyline, &[], cw, ch_, &card).unwrap();
+        let t = std::time::Instant::now();
+        let out = out_dir.join("hero.mp4");
+        let v = render_hero_video(
+            &caps,
+            &plan,
+            &entries,
+            Some(&card),
+            &out_dir.join("work"),
+            &out,
+            &VideoOptions {
+                trip_name: "Japan to Singapore".into(),
+                resolution: res,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        eprintln!(
+            "BENCH hero {}: {:.1}s wall for {:.1}s film; fallbacks {:?}",
+            res.label(),
+            t.elapsed().as_secs_f64(),
+            v.duration_secs,
+            v.fallbacks
+        );
+    }
+
+    /// Timing bench: `TRIPTAPE_BENCH_DIR=<dir with s1..s4.HEIC pano.HEIC clip4k.mov ...>`.
+    #[test]
+    #[ignore = "needs real media via TRIPTAPE_BENCH_DIR"]
+    fn bench_segments() {
+        let Ok(dir) = std::env::var("TRIPTAPE_BENCH_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
+        let res = Resolution::from_flag(
+            &std::env::var("TRIPTAPE_BENCH_RES").unwrap_or_else(|_| "4k".into()),
+        )
+        .unwrap();
+        let work = dir.join(format!("work_{}", res.label()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let still = |n: &str| ResolvedEntry {
+            entry: PlanEntry {
+                asset_id: n.into(),
+                content_hash: None,
+                size_bytes: 0,
+                mtime: 0,
+                rendition: Rendition::Still,
+            },
+            still_path: dir.join(n),
+            motion_path: None,
+            caption: None,
+            taken_at: None,
+            tz_offset_secs: None,
+            aspect: None,
+        };
+        let only = std::env::var("TRIPTAPE_BENCH_ONLY").unwrap_or_default();
+        let time = |label: &str, f: &mut dyn FnMut()| {
+            if !only.is_empty() && !only.split(',').any(|o| o == label) {
+                return;
+            }
+            let t = std::time::Instant::now();
+            f();
+            eprintln!("BENCH {label}: {:.2}s", t.elapsed().as_secs_f64());
+        };
+        let mut fb = vec![];
+        for (label, name) in [("still12mp", "s1.HEIC"), ("pano", "pano.HEIC")] {
+            let r = still(name);
+            time(label, &mut || {
+                let (o, d, _) =
+                    render_entry_segment(&caps, &r, 0, 4.0, 99.0, res, &work, &mut fb).unwrap();
+                eprintln!("  {label} dur {d:.2}s -> {}", o.display());
+                std::fs::copy(&o, work.join(format!("{label}.mp4"))).unwrap();
+            });
+        }
+        let members: Vec<ResolvedEntry> = ["s1.HEIC", "s2.HEIC", "s3.HEIC", "s4.HEIC"]
+            .map(still)
+            .to_vec();
+        let refs: Vec<&ResolvedEntry> = members.iter().collect();
+        time("collage4", &mut || {
+            let (o, _, _) = render_collage_segment(&caps, &refs, 1, 4.0, res, &work).unwrap();
+            std::fs::copy(&o, work.join("collage.mp4")).unwrap();
+        });
+        for (label, name, end) in [
+            ("clip4k", "clip4k.mov", 5.0),
+            ("clip1080", "clip1080.mov", 5.0),
+            ("live", "live.mov", 3.0),
+        ] {
+            let r = clip_entry(label, dir.join(name), end);
+            time(label, &mut || {
+                let (o, d, _) =
+                    render_entry_segment(&caps, &r, 2, 4.0, 99.0, res, &work, &mut fb).unwrap();
+                eprintln!("  {label} dur {d:.2}s");
+                std::fs::copy(&o, work.join(format!("{label}.mp4"))).unwrap();
+            });
+        }
     }
 
     #[test]

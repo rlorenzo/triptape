@@ -4,7 +4,7 @@
 //! ```sh
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON]
-//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F] [--keep-ambience]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F] [--keep-ambience] [--resolution 4k|1080p]
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -18,6 +18,7 @@ use triptape_core::{
 };
 use triptape_media::{
     clip_analysis, export::export_all, export::ExportOptions, ffmpeg, render_book::BookPreset,
+    resolution::Resolution,
 };
 
 fn parse_args() -> (String, HashMap<String, String>) {
@@ -545,9 +546,12 @@ fn export_cmd(flags: &HashMap<String, String>) {
         caps.vidstabdetect && caps.vidstabtransform,
     );
 
-    // Free-space precheck: ~2 GB estimate for the three keepsakes (the
-    // precheck applies its own 1.5x headroom).
-    if let Err(e) = jobs::free_space_precheck(&out, 2_000_000_000) {
+    // Hero film frame size: 4K unless asked otherwise (reels stay 1080x1920).
+    let resolution = Resolution::from_flag(&flag_or(flags, "resolution", "4k"))
+        .unwrap_or_else(|e| die("resolution", e));
+    // Free-space precheck: estimate for the three keepsakes, larger at 4K
+    // (the precheck applies its own 1.5x headroom).
+    if let Err(e) = jobs::free_space_precheck(&out, resolution.export_disk_estimate()) {
         die("free space", e);
     }
 
@@ -564,6 +568,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             music_path: music,
             keep_ambience,
             only: flag_or(flags, "only", "all"),
+            resolution,
         },
     )
     .unwrap_or_else(|e| die("export", e));

@@ -875,6 +875,7 @@ fn export_blocking(
         music_path: None,
         keep_ambience: false,
         only: "all".to_string(),
+        resolution: triptape_media::resolution::Resolution::default(),
     };
     let rendered = triptape_media::export::export_all(&caps, &plan, &assets, &out_dir, &opts)
         .map_err(|e| e.to_string());

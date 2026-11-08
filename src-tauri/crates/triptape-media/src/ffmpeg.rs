@@ -20,7 +20,24 @@ pub const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
 /// `tag` suffixes the internal labels so several copies can share one graph.
 /// Ends unlabeled after `setsar=1`, ready for [`hold_still`] + [`glide`].
 pub fn fit_over_blur(caps: &Capabilities, input: &str, w: u32, h: u32, tag: &str) -> String {
-    let blur = if caps.gblur { ",gblur=sigma=40" } else { "" };
+    fit_over_blur_sigma(caps, input, w, h, tag, 40)
+}
+
+/// [`fit_over_blur`] with an explicit fill blur radius; the radius is in
+/// canvas pixels, so larger canvases scale it to keep the same look.
+pub fn fit_over_blur_sigma(
+    caps: &Capabilities,
+    input: &str,
+    w: u32,
+    h: u32,
+    tag: &str,
+    sigma: u32,
+) -> String {
+    let blur = if caps.gblur {
+        format!(",gblur=sigma={sigma}")
+    } else {
+        String::new()
+    };
     format!(
         "{input}split[a{tag}][b{tag}];[a{tag}]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}{blur}[bg{tag}];[b{tag}]scale={w}:{h}:force_original_aspect_ratio=decrease[fg{tag}];[bg{tag}][fg{tag}]overlay=(W-w)/2:(H-h)/2,setsar=1"
     )
@@ -67,70 +84,48 @@ pub fn glide(caps: &Capabilities, frames: u32, w: u32, h: u32, variant: usize) -
     )
 }
 
-/// Supersampled short side of a panorama strip: the strip is scaled to
-/// this height (wide) or `PANO_SS * 16 / 9` width (tall) before panning.
-const PANO_SS: u32 = 1296;
+/// A panorama strip is scaled so its short side is this multiple of the
+/// output's short side before panning. The pan then crops a 2x window at an
+/// integer strip pixel, so position error is at most half an output pixel
+/// after the lanczos downscale, while per-frame work stays one crop plus one
+/// scale instead of a resampling `perspective` over the whole strip.
+const PANO_SS: u32 = 2;
 
 /// Smooth side-to-side (or top-to-bottom for tall images) pan over a whole
-/// panorama, no zoompan. The photo is scaled to fill the frame on its short
-/// side, so it covers the frame with no bars or blurred fill, then the same
-/// sub-pixel `perspective` window technique as [`glide`] slides across it
-/// with smoothstep easing and lanczos-downscales to `w`x`h`. `aspect` is
-/// the display width / height; `coverage` the fraction of the overflow to
-/// travel (see `triptape_core::plan::pano_motion`); `reverse` flips the
-/// direction. Without `perspective` it holds the centered crop instead.
-pub fn pano_pan(
-    caps: &Capabilities,
-    frames: u32,
-    w: u32,
-    h: u32,
-    aspect: f64,
-    coverage: f64,
-    reverse: bool,
-) -> String {
-    let frame = f64::from(w) / f64::from(h);
+/// panorama, no zoompan. The photo is scaled once so its short side is 2x
+/// the frame's ([`PANO_SS`]), covering the frame with no bars or blurred
+/// fill; a frame-sized (2x) window then slides across it with smoothstep
+/// easing and is lanczos-downscaled to `w`x`h`. `aspect` is the display
+/// width / height; `coverage` the fraction of the overflow to travel (see
+/// `triptape_core::plan::pano_motion`); `reverse` flips the direction.
+/// Needs only `scale`/`crop`/`loop`, so it works without `perspective`.
+pub fn pano_pan(frames: u32, w: u32, h: u32, aspect: f64, coverage: f64, reverse: bool) -> String {
     let tall = aspect < 1.0;
-    // Scale so the strip fills the frame on its short side.
+    // Window in strip pixels: the frame at 2x.
+    let (ww, wh) = (w * PANO_SS, h * PANO_SS);
     let fill = if tall {
-        format!(
-            "scale={}:-2:flags=lanczos",
-            (f64::from(PANO_SS) * frame).round()
-        )
+        format!("scale={ww}:-2:flags=lanczos")
     } else {
-        format!("scale=-2:{PANO_SS}:flags=lanczos")
+        format!("scale=-2:{wh}:flags=lanczos")
     };
-    if !caps.perspective {
-        let centered = if tall {
-            format!("crop=iw:trunc(iw*{h}/{w}/2)*2")
-        } else {
-            format!("crop=trunc(ih*{w}/{h}/2)*2:ih")
-        };
-        return format!("{fill},{centered},scale={w}:{h}:flags=lanczos,setsar=1");
-    }
-    // Visible window as a fraction of the strip along the pan axis.
-    let win = if tall { aspect / frame } else { frame / aspect }.clamp(0.01, 1.0);
     let denom = frames.saturating_sub(1).max(1);
-    let p = format!("(min(in-1\\,{denom})/{denom})");
+    let p = format!("(min(n\\,{denom})/{denom})");
     let eased = format!("({p}*{p}*(3-2*{p}))");
     let eased = if reverse {
         format!("(1-{eased})")
     } else {
         eased
     };
-    // Where the window's leading edge sits within the slack, centered on
-    // 0.5 and narrowed by `coverage`.
+    // Where the window sits within the slack, centered on 0.5 and narrowed
+    // by `coverage`.
     let slack = format!("(0.5+({eased}-0.5)*{coverage:.4})");
-    let (x0, x1, y0, y1) = if tall {
-        let top = format!("H*(1-{win:.5})*{slack}");
-        let bottom = format!("H*((1-{win:.5})*{slack}+{win:.5})");
-        ("0".to_string(), "W".to_string(), top, bottom)
+    let (x, y) = if tall {
+        ("0".to_string(), format!("floor((ih-oh)*{slack})"))
     } else {
-        let left = format!("W*(1-{win:.5})*{slack}");
-        let right = format!("W*((1-{win:.5})*{slack}+{win:.5})");
-        (left, right, "0".to_string(), "H".to_string())
+        (format!("floor((iw-ow)*{slack})"), "0".to_string())
     };
     format!(
-        "{fill},setsar=1,{hold},perspective=x0='{x0}':y0='{y0}':x1='{x1}':y1='{y0}':x2='{x0}':y2='{y1}':x3='{x1}':y3='{y1}':interpolation=cubic:eval=frame,scale={w}:{h}:flags=lanczos,setsar=1",
+        "{fill},setsar=1,{hold},crop=w={ww}:h={wh}:x='{x}':y='{y}':exact=1,scale={w}:{h}:flags=lanczos,setsar=1",
         hold = hold_still(frames),
     )
 }
@@ -224,10 +219,11 @@ fn backslash_escape(v: &str, special: &[char]) -> String {
     out
 }
 
-/// `subtitles` filter burning the SRT at `srt` into a 1920x1080 frame: white
-/// text, dark outline, bottom-centre and lifted clear of the 1200x200
-/// lower-third. SRT is scaled against libass's 288-line default play
-/// resolution (1080/288 = 3.75 px per unit). Paths with spaces, colons,
+/// `subtitles` filter burning the SRT at `srt` into the frame: white text,
+/// dark outline, bottom-centre and lifted clear of the lower-third. Sizes
+/// are in libass's 288-line default play resolution, so they scale with the
+/// frame height by themselves (1080p: 3.75 px per unit, 4K: 7.5), and the
+/// same style serves every output resolution. Paths with spaces, colons,
 /// commas or apostrophes are escaped for both parsing levels.
 pub fn subtitles_filter(srt: &Path) -> String {
     let style = "FontName=Helvetica,FontSize=11,PrimaryColour=&H00FFFFFF,OutlineColour=&H80000000,BorderStyle=1,Outline=1.2,Shadow=0.5,Alignment=2,MarginV=60";

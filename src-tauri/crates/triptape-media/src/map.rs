@@ -9,6 +9,7 @@
 //! in `ATTRIBUTION.txt` and in the EDL/map metadata, and drawn as a solid
 //! attribution bar note.
 
+use crate::resolution::Resolution;
 use image::{Rgb, RgbImage};
 use std::path::Path;
 use triptape_core::geo::is_land;
@@ -35,6 +36,9 @@ pub fn draw_route_card(
 ) -> RgbImage {
     let w = width.max(64);
     let h = height.max(64);
+    // Strokes, pins and land blocks are drawn in 1080p pixels; larger cards
+    // (4K) multiply them so the card looks the same, just sharper.
+    let k = (h / 1080).max(1) as i32;
     let mut img = RgbImage::from_pixel(w, h, WATER);
     let bar_h = (h as f32 * 0.045).ceil() as u32;
     // Unwrap longitudes first: Los Angeles -> Tokyo crosses the Pacific
@@ -42,7 +46,7 @@ pub fn draw_route_card(
     // crushes the trip into a corner of a half-planet map.
     let route = &unwrap_longitudes(route);
     if !route.is_empty() {
-        paint_land(&mut img, &RouteFit::new(route, w, h - bar_h));
+        paint_land(&mut img, &RouteFit::new(route, w, h - bar_h), k as u32);
     }
     // Attribution bar (bottom 4%): light strip so the note is visible.
     for y in (h - bar_h)..h {
@@ -70,19 +74,23 @@ pub fn draw_route_card(
     let fit = RouteFit::new(route, w, h - bar_h);
     let pts: Vec<(i32, i32)> = route.iter().map(|&gps| fit.project(gps)).collect();
     // Route line: dark amber glow under the bright accent core.
-    for (col, r) in [(Rgb([146, 102, 30]), 4), (Rgb([245, 178, 66]), 2)] {
+    for (col, r) in [(Rgb([146, 102, 30]), 4 * k), (Rgb([245, 178, 66]), 2 * k)] {
         for win in pts.windows(2) {
             draw_seg(&mut img, win[0], win[1], col, r);
         }
     }
     // Pins: filled dots; day markers: larger rings.
     for (i, &p) in pts.iter().enumerate() {
-        let r = if day_markers.contains(&i) { 7 } else { 4 };
+        let r = if day_markers.contains(&i) {
+            7 * k
+        } else {
+            4 * k
+        };
         draw_dot(&mut img, p, r, Rgb([255, 255, 255]));
         draw_dot(
             &mut img,
             p,
-            r.saturating_sub(2),
+            r.saturating_sub(2 * k),
             if day_markers.contains(&i) {
                 Rgb([245, 178, 66])
             } else {
@@ -93,8 +101,8 @@ pub fn draw_route_card(
     // Start (green) and end (red) pins, larger than day markers.
     if let (Some(&first), Some(&last)) = (pts.first(), pts.last()) {
         for (p, col) in [(first, Rgb([52, 199, 123])), (last, Rgb([235, 87, 87]))] {
-            draw_dot(&mut img, p, 11, Rgb([255, 255, 255]));
-            draw_dot(&mut img, p, 8, col);
+            draw_dot(&mut img, p, 11 * k, Rgb([255, 255, 255]));
+            draw_dot(&mut img, p, 8 * k, col);
         }
     }
     img
@@ -174,17 +182,17 @@ impl RouteFit {
 
 /// Paint landmasses from the bundled land grid in small blocks, so the
 /// card reads as a map of the region.
-fn paint_land(img: &mut RgbImage, fit: &RouteFit) {
-    const STEP: u32 = 4;
+fn paint_land(img: &mut RgbImage, fit: &RouteFit, k: u32) {
+    let step = 4 * k;
     let (w, plot_h) = (fit.w as u32, fit.h as u32);
-    for by in (0..plot_h).step_by(STEP as usize) {
-        for bx in (0..w).step_by(STEP as usize) {
-            let center = fit.unproject(f64::from(bx + STEP / 2), f64::from(by + STEP / 2));
+    for by in (0..plot_h).step_by(step as usize) {
+        for bx in (0..w).step_by(step as usize) {
+            let center = fit.unproject(f64::from(bx + step / 2), f64::from(by + step / 2));
             if !is_land(center) {
                 continue;
             }
-            for y in by..(by + STEP).min(plot_h) {
-                for x in bx..(bx + STEP).min(w) {
+            for y in by..(by + step).min(plot_h) {
+                for x in bx..(bx + step).min(w) {
                     img.put_pixel(x, y, LAND);
                 }
             }
@@ -234,7 +242,7 @@ pub fn save_route_card(
 }
 
 /// Render the MVP map segment: slow glide over the card (3 s class,
-/// 30 fps, 1080p with stereo silence for chain compatibility). `variant`
+/// 30 fps, at `res` with stereo silence for chain compatibility). `variant`
 /// picks the glide direction (0 push-in, 1 pull-out for the closing
 /// recap). Never zoompan: its integer-step re-cropping jitters.
 pub fn render_map_push_in(
@@ -243,13 +251,16 @@ pub fn render_map_push_in(
     out_mp4: &Path,
     duration_secs: f64,
     variant: usize,
+    res: Resolution,
 ) -> Result<(), super::MediaError> {
     let dur = duration_secs.clamp(2.0, 6.0);
     let frames = (dur * 30.0).round() as u32;
+    let (w, h) = res.dims();
+    let (sw, sh) = res.supersample();
     let vf_video = format!(
-        "scale=2880:1620:flags=lanczos,{},{},format=yuv420p",
+        "scale={sw}:{sh}:flags=lanczos,{},{},format=yuv420p",
         super::ffmpeg::hold_still(frames),
-        super::ffmpeg::glide(caps, frames, 1920, 1080, variant)
+        super::ffmpeg::glide(caps, frames, w, h, variant)
     );
     let args: Vec<String> = [
         vec![
