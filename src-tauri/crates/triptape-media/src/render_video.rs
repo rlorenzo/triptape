@@ -1221,7 +1221,7 @@ impl SegmentLimits {
 fn glide_variants(groups: &[Vec<&ResolvedEntry>]) -> Vec<usize> {
     let hashed: Vec<usize> = groups
         .iter()
-        .map(|g| g.first().map_or(0, |r| stable_variant(&r.entry.asset_id)))
+        .map(|g| g.first().map_or(0, |r| stable_variant(&r.entry)))
         .collect();
     hashed
         .iter()
@@ -1236,8 +1236,10 @@ fn glide_variants(groups: &[Vec<&ResolvedEntry>]) -> Vec<usize> {
         .collect()
 }
 
-fn stable_variant(asset_id: &str) -> usize {
-    let h = blake3::hash(asset_id.as_bytes());
+/// Hashed over the asset id and window index, so sibling windows of one clip
+/// are not forced to the same variant.
+fn stable_variant(entry: &PlanEntry) -> usize {
+    let h = blake3::hash(format!("{}#{}", entry.asset_id, entry.window).as_bytes());
     usize::from(h.as_bytes()[0]) % ffmpeg::GLIDE_VARIANTS
 }
 
@@ -3855,7 +3857,74 @@ mod tests {
         let groups = vec![vec![&a], vec![&b]];
         let v = glide_variants(&groups);
         assert_ne!(v[0], v[1]);
-        assert_eq!(v[0], stable_variant("same"));
+        assert_eq!(v[0], stable_variant(&a.entry));
+    }
+
+    /// Sibling windows of one clip differ in trim, so they get distinct keys
+    /// and (hashed with the window index) are free to differ in variant.
+    #[test]
+    fn sibling_windows_get_distinct_keys_and_variants() {
+        use crate::segment_cache::{SegmentCache, SegmentCacheConfig};
+        let Some(caps) = parallel_caps() else {
+            eprintln!("ffmpeg caps insufficient; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("long.mp4");
+        let made = std::process::Command::new(&caps.ffmpeg_bin)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=size=320x180:rate=30:duration=4")
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=4"])
+            .args(["-shortest", "-c:v", "libx264", "-c:a", "aac"])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let cfg = SegmentCacheConfig {
+            dir: dir.path().join("cache"),
+            max_bytes: None,
+        };
+        let work = dir.path().join("w");
+        std::fs::create_dir_all(&work).unwrap();
+        let cache = SegmentCache::open(&cfg, "ffmpeg test".into(), &work).unwrap();
+        let caps = Capabilities {
+            segment_cache: Some(cache.clone()),
+            ..caps
+        };
+        let mut windows: Vec<ResolvedEntry> = vec![];
+        for (w, (a, b)) in [(0.0, 1.5), (2.0, 3.5)].into_iter().enumerate() {
+            let mut r = clip_entry("long", src.clone(), b);
+            r.entry.window = w as u32;
+            r.entry.rendition = Rendition::Clip {
+                trim_start: a,
+                trim_end: b,
+            };
+            windows.push(r);
+        }
+        for (i, r) in windows.iter().enumerate() {
+            let mut fb = vec![];
+            render_entry_segment(
+                &caps,
+                r,
+                i,
+                0,
+                1.0,
+                f64::INFINITY,
+                Resolution::Hd1080,
+                &work,
+                &mut fb,
+            )
+            .unwrap();
+        }
+        let st = cache.stats();
+        assert_eq!((st.hits, st.misses, st.stored), (0, 2, 2), "{st:?}");
+        // The window index feeds the variant hash.
+        let h = |w: u32| {
+            let mut e = windows[0].entry.clone();
+            e.window = w;
+            stable_variant(&e)
+        };
+        assert!((1..64).any(|w| h(w) != h(0)), "window ignored by variant");
     }
 
     /// A trimmed clip is cached on its full recipe: the same trim hits from
