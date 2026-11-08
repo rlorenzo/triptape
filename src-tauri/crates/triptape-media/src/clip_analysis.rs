@@ -65,7 +65,11 @@ fn measure(ffmpeg_bin: &str, path: &Path) -> Option<Vec<RawSample>> {
     let audio_args = input_args(
         path,
         &[],
-        &["-vn", "-ac", "1", "-ar", &rate, "-f", "s16le", "pipe:1"],
+        // One explicit stream: ffmpeg's best-stream pick can land on the
+        // undecodable spatial `apple_apac` track. Optional for silent clips.
+        &[
+            "-vn", "-map", "0:a:0?", "-ac", "1", "-ar", &rate, "-f", "s16le", "pipe:1",
+        ],
     );
     // The two decodes are independent: run the audio one alongside.
     let (video, audio) = std::thread::scope(|s| {

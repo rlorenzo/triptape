@@ -76,7 +76,14 @@ pub fn thumb_args(src: &Path, dst: &Path) -> Vec<String> {
 /// FFmpeg args for a 720p H.264/AAC proxy (poster frames: see `poster_args`).
 pub fn proxy_args(src: &Path, dst: &Path) -> Vec<String> {
     let vf = format!("scale=-2:{PROXY_HEIGHT}");
+    // Explicit maps: ffmpeg's default audio pick prefers the stream with the
+    // most channels, which on iPhone clips is the undecodable spatial
+    // `apple_apac` track rather than the AAC one. `?` keeps silent clips valid.
     let opts = strs(&[
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
         "-vf",
         &vf,
         "-c:v",
@@ -256,5 +263,18 @@ mod tests {
         let args = proxy_args(Path::new("in.MOV"), Path::new("out.mp4"));
         assert!(args.iter().any(|a| a == "libx264"));
         assert!(args.iter().any(|a| a.contains("720")));
+    }
+
+    /// iPhone clips carry a spatial `apple_apac` track that ffmpeg's default
+    /// "most channels" pick would choose; the proxy must map one AAC track.
+    #[test]
+    fn proxy_args_map_one_explicit_audio_stream() {
+        let args = proxy_args(Path::new("in.MOV"), Path::new("out.mp4"));
+        let maps: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "-map")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(maps, ["0:v:0", "0:a:0?"]);
     }
 }

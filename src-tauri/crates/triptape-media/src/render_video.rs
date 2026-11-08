@@ -5,7 +5,7 @@
 //! then assemble with a stepwise pairwise crossfade chain (never 5+ inputs
 //! in one graph; each offset accounts for cumulative overlap), a final
 //! loudnorm single pass, 1080p libx264 CRF19 faststart, an EDL JSON, and a
-//! sidecar SRT (burned-in captions need libass, absent on this build).
+//! sidecar SRT (burned in too when ffmpeg has libass).
 
 use crate::ffmpeg::{self, path_arg as s, Capabilities};
 use std::collections::HashMap;
@@ -805,6 +805,24 @@ pub fn render_hero_video(
             bundled
         }
     };
+    // Captions: the sidecar SRT is always written; with libass the final
+    // pass also burns it into the picture. Segment 0 starts at 0; every
+    // later segment starts at its xfade cut.
+    let starts: Vec<f64> = std::iter::once(0.0)
+        .chain(offsets.iter().copied())
+        .collect();
+    let srt_path = out_mp4.with_extension("srt");
+    let srt_count = write_captions_srt(&segs, &starts, &srt_path)?;
+    let srt_opt = if srt_count > 0 {
+        Some(srt_path.to_string_lossy().into_owned())
+    } else {
+        let _ = std::fs::remove_file(&srt_path);
+        None
+    };
+    let burn_srt = srt_opt
+        .as_ref()
+        .filter(|_| caps.can_burn_captions())
+        .map(|p| ffmpeg::subtitles_filter(Path::new(p)));
     let fade_out_start = (total - 1.5).max(0.0);
     let music_chain = format!(
         "[1:a]atrim=0:{total:.3},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,afade=t=in:st=0:d=1,afade=t=out:st={fade_out_start:.3}:d=1.5"
@@ -817,6 +835,13 @@ pub fn render_hero_video(
         // Muted film audio: the music bed alone is the soundtrack.
         format!("{music_chain},{norm}[aout]")
     };
+    let (audio_graph, video_map) = match burn_srt {
+        Some(sub) => (
+            format!("[0:v]{sub}[vsub];{audio_graph}"),
+            "[vsub]".to_string(),
+        ),
+        None => (audio_graph, "0:v".to_string()),
+    };
     let mut final_args: Vec<String> = vec![
         "-y".into(),
         "-i".into(),
@@ -828,7 +853,7 @@ pub fn render_hero_video(
         "-filter_complex".into(),
         audio_graph,
         "-map".into(),
-        "0:v".into(),
+        video_map,
         "-map".into(),
         "[aout]".into(),
     ];
@@ -842,18 +867,6 @@ pub fn render_hero_video(
 
     // 7. Verify + EDL + sidecar SRT.
     let probed = ffmpeg::verify_video(&caps.ffprobe_bin, out_mp4, 1920, 1080)?;
-    // Segment 0 starts at 0; every later segment starts at its xfade cut.
-    let starts: Vec<f64> = std::iter::once(0.0)
-        .chain(offsets.iter().copied())
-        .collect();
-    let srt_path = out_mp4.with_extension("srt");
-    let srt_count = write_captions_srt(&segs, &starts, &srt_path)?;
-    let srt_opt = if srt_count > 0 {
-        Some(srt_path.to_string_lossy().into_owned())
-    } else {
-        let _ = std::fs::remove_file(&srt_path);
-        None
-    };
     let edl = Edl {
         version: 1,
         trip_name: opts.trip_name.clone(),
@@ -935,7 +948,7 @@ pub(crate) fn burn_png_overlay(
         "-map".into(),
         "[v]".into(),
         "-map".into(),
-        "0:a".into(),
+        "0:a:0".into(),
     ]
     .into_iter()
     .chain(ffmpeg::x264_aac("veryfast", crf))
@@ -1088,20 +1101,24 @@ fn render_entry_segment(
                 s(src),
             ];
             let audio_in = if has_audio {
-                "0:a"
+                // Only the first usable stream: iPhone spatial `apple_apac`
+                // tracks cannot be muxed to MP4 and sank the whole clip.
+                probe
+                    .as_ref()
+                    .map_or_else(|| "0:a:0".to_string(), ffmpeg::ProbeInfo::audio_spec)
             } else {
                 fallbacks.push(format!(
                     "{} has no audio; silent track added",
                     r.entry.asset_id
                 ));
                 args.extend(silent_input(len));
-                "1:a"
+                "1:a".to_string()
             };
             args.extend([
                 "-map".into(),
                 "0:v".into(),
                 "-map".into(),
-                audio_in.into(),
+                audio_in,
                 "-vf".into(),
                 vf,
                 "-af".into(),
@@ -1474,6 +1491,118 @@ mod tests {
     /// per-cut transitions, and the bundled music bed (no --music passed).
     /// Writes to /tmp/hero-smoke so RMS can be measured after the run.
     /// Skips quietly when ffmpeg/typst are unavailable.
+    /// Regression: iPhone clips carry a second, spatial `apple_apac` audio
+    /// track that the MP4 muxer cannot take; `-map 0:a` mapped it and sank
+    /// the clip (ffmpeg exit 234). ffmpeg cannot synthesize apac, so a second
+    /// PCM track stands in: the segment must carry exactly one audio stream.
+    #[test]
+    fn clip_with_second_audio_stream_encodes_one_track() {
+        let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
+        if !caps.libx264 || !caps.perspective {
+            eprintln!("ffmpeg caps insufficient; skipping multi-audio segment test");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("multi.mkv");
+        let made = std::process::Command::new(&caps.ffmpeg_bin)
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x180:r=30:d=3",
+            ])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=f=440:d=3",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=f=880:d=3",
+            ])
+            .args(["-map", "0", "-map", "1", "-map", "2", "-c:v", "libx264"])
+            .args(["-c:a:0", "aac", "-c:a:1", "pcm_s16le", "-ac:a:1", "24"])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let r = ResolvedEntry {
+            entry: PlanEntry {
+                asset_id: "c1".into(),
+                content_hash: None,
+                size_bytes: 0,
+                mtime: 0,
+                rendition: Rendition::Clip {
+                    trim_start: 0.0,
+                    trim_end: 2.0,
+                },
+            },
+            still_path: src.clone(),
+            motion_path: Some(src),
+            caption: None,
+            taken_at: None,
+            tz_offset_secs: None,
+        };
+        let mut fallbacks = vec![];
+        let (out, secs, kind) =
+            render_entry_segment(&caps, &r, 0, 3.0, 10.0, temp.path(), &mut fallbacks).unwrap();
+        assert_eq!(kind, "clip");
+        assert!((secs - 2.0).abs() < 0.01);
+        let info = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &out).unwrap();
+        assert!(info.has_audio && info.has_video);
+        assert!(fallbacks.is_empty(), "{fallbacks:?}");
+        let streams = std::process::Command::new(&caps.ffprobe_bin)
+            .args(["-v", "error", "-select_streams", "a", "-show_entries"])
+            .args(["stream=index", "-of", "csv=p=0"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&streams.stdout).lines().count(), 1);
+    }
+
+    /// Real iPhone clip with an `apple_apac` track: `TRIPTAPE_APAC_CLIP=<copy of
+    /// a .MOV> cargo test -p triptape-media real_apac -- --ignored`.
+    #[test]
+    #[ignore = "needs a real iPhone clip via TRIPTAPE_APAC_CLIP"]
+    fn real_apac_clip_encodes() {
+        let Ok(src) = std::env::var("TRIPTAPE_APAC_CLIP") else {
+            return;
+        };
+        let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
+        let temp = tempfile::tempdir().unwrap();
+        let src = PathBuf::from(src);
+        let r = ResolvedEntry {
+            entry: PlanEntry {
+                asset_id: "apac".into(),
+                content_hash: None,
+                size_bytes: 0,
+                mtime: 0,
+                rendition: Rendition::Clip {
+                    trim_start: 0.0,
+                    trim_end: 3.0,
+                },
+            },
+            still_path: src.clone(),
+            motion_path: Some(src),
+            caption: None,
+            taken_at: None,
+            tz_offset_secs: None,
+        };
+        let mut fallbacks = vec![];
+        let (out, _, _) =
+            render_entry_segment(&caps, &r, 0, 3.0, 10.0, temp.path(), &mut fallbacks).unwrap();
+        let info = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &out).unwrap();
+        assert!(info.has_audio && info.has_video);
+        assert!(
+            !fallbacks.iter().any(|f| f.contains("no audio")),
+            "{fallbacks:?}"
+        );
+    }
+
     #[test]
     fn hero_smoke_bundled_music_and_overlays() {
         use triptape_core::types::Plan;

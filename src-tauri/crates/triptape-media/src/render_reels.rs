@@ -4,7 +4,7 @@
 //! never looped to pad). Reframing is center-weighted: landscape sources
 //! fill the frame with a center crop, portrait sources fit over a blurred
 //! background fill (no per-frame tracking in MVP — that is the later pack).
-//! Captions ride the sidecar SRT per reel when libass is absent.
+//! Reel captions ride a sidecar SRT; the place name is burned in via a Typst overlay.
 
 use crate::ffmpeg::{self, path_arg as s, Capabilities};
 use crate::render_video::ResolvedEntry;
@@ -482,15 +482,19 @@ fn render_clip_reel(
         s(src),
     ];
     // Silent sources get a synthesized silent track (verify requires audio).
+    // Source audio specifier: first usable stream (never iPhone `apple_apac`).
+    let src_a = probe
+        .as_ref()
+        .map_or_else(|| "0:a:0".to_string(), ffmpeg::ProbeInfo::audio_spec);
     let (audio_in, music_in) = if has_audio {
-        (0, 1)
+        (src_a, 1)
     } else {
         fallbacks.push(format!(
             "{} has no audio; silent track added",
             src.file_name().unwrap_or_default().to_string_lossy()
         ));
         args.extend(crate::render_video::silent_input(len));
-        (1, 2)
+        ("1:a".to_string(), 2)
     };
     if let Some(m) = music {
         if m.exists() {
@@ -499,7 +503,7 @@ fn render_clip_reel(
             args.extend([
                 "-filter_complex".into(),
                 format!(
-                    "[0:v]{vf}[v];[{audio_in}:a]{src_af}[srca];[{music_in}:a]volume=0.2,aresample=48000,aformat=channel_layouts=stereo[mus];[srca][mus]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+                    "[0:v]{vf}[v];[{audio_in}]{src_af}[srca];[{music_in}:a]volume=0.2,aresample=48000,aformat=channel_layouts=stereo[mus];[srca][mus]amix=inputs=2:duration=first:dropout_transition=0[aout]"
                 ),
                 "-map".into(),
                 "[v]".into(),
@@ -513,7 +517,7 @@ fn render_clip_reel(
     }
     args.extend([
         "-filter_complex".into(),
-        format!("[0:v]{vf}[v];[{audio_in}:a]{src_af}[aout]"),
+        format!("[0:v]{vf}[v];[{audio_in}]{src_af}[aout]"),
         "-map".into(),
         "[v]".into(),
         "-map".into(),

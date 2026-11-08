@@ -19,7 +19,7 @@ start until G2 has a recorded outcome.
 - G1 (local, system ffmpeg — NOT the sidecar): `scripts/check-ffmpeg.sh`
   PASS on required (`libx264`, native `aac`, `xfade`, `perspective`,
   `loudnorm`); gaps reported: `zscale`, `drawtext`, `vidstab`,
-  `libass` missing. `scripts/spike-render.sh` PASS: Ken Burns
+  libass (`subtitles`/`ass`) missing. `scripts/spike-render.sh` PASS: Ken Burns
   (`zoompan`) + `xfade` + `acrossfade` + `loudnorm` render from lavfi
   inputs → `/tmp/spike-render.mp4`, ffprobe-verified 1920x1080 h264+aac
   5.5 s. No-GPU baseline + Windows + phone-playback checks still open.
