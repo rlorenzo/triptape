@@ -75,7 +75,7 @@ jobs:
         with:
           tool: cargo-deny,cargo-audit
       - name: Install deadwood
-        run: cargo install --locked --git https://github.com/rlorenzo/deadwood-rs --rev 53348b0b283abe59d3fbabb5946441f08189cca7 deadwood-rs
+        run: cargo install --locked deadwood-rs --version 1.0.0
       - name: Dead Rust code and dependencies (deadwood)
         # deadwood reads lib names and proc-macro sources from the registry
         # cache via `cargo metadata --frozen`. Without it, it falls back to
