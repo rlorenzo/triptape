@@ -637,18 +637,20 @@ impl Db {
         Ok(())
     }
 
-    /// Forget one event (its edit was undone).
+    /// Forget the events of an undone edit. `rejected_id: None` matches
+    /// every rejected shot (an undone pin, whatever it displaced).
     pub fn delete_preference_event(
         &self,
         project_id: &str,
         kind: crate::learn::EventKind,
         chosen_id: &str,
-        rejected_id: &str,
+        rejected_id: Option<&str>,
     ) -> Result<(), String> {
         self.conn
             .execute(
                 "DELETE FROM preference_events
-                 WHERE project_id=?1 AND kind=?2 AND chosen_id=?3 AND rejected_id=?4",
+                 WHERE project_id=?1 AND kind=?2 AND chosen_id=?3
+                   AND (?4 IS NULL OR rejected_id=?4)",
                 params![project_id, kind.as_str(), chosen_id, rejected_id],
             )
             .map_err(|e| e.to_string())?;

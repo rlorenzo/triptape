@@ -72,6 +72,27 @@ fn need(flags: &HashMap<String, String>, k: &str) -> PathBuf {
         .into()
 }
 
+/// The plan-shaping flags shared by `scan` and `learn --apply`:
+/// `--place-override` (user place labels for GPS-unnamed days, e.g. a ship
+/// name for days at sea: `YYYY-MM-DD..YYYY-MM-DD=Label` entries split by
+/// `;`) and `--length` (`auto`, seconds, or e.g. `10m`; default auto, so the
+/// hero film scales with the trip).
+fn plan_flags(
+    flags: &HashMap<String, String>,
+) -> (Vec<planmod::PlaceOverride>, planmod::FilmLength) {
+    let overrides = match flags.get("place-override") {
+        Some(spec) => {
+            planmod::parse_place_overrides(spec).unwrap_or_else(|e| die("place-override", e))
+        }
+        None => vec![],
+    };
+    let length = match flags.get("length") {
+        Some(spec) => planmod::parse_film_length(spec).unwrap_or_else(|e| die("length", e)),
+        None => planmod::FilmLength::Auto,
+    };
+    (overrides, length)
+}
+
 fn flag_or(flags: &HashMap<String, String>, k: &str, default: &str) -> String {
     flags
         .get(k)
@@ -302,29 +323,13 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         }
     }
 
-    let cluster_of: HashMap<String, String> = clusters
-        .iter()
-        .flat_map(|c| c.asset_ids.iter().map(|id| (id.clone(), c.label.clone())))
-        .collect();
+    let cluster_of = cluster::chapter_labels(&clusters);
     let plan_assets: Vec<Asset> = final_assets
         .iter()
         .filter(|a| !suppressed.contains(&a.id))
         .cloned()
         .collect();
-    // Optional user place labels for GPS-unnamed days (e.g. a ship name
-    // for days at sea): `YYYY-MM-DD..YYYY-MM-DD=Label` entries split by `;`.
-    let overrides = match flags.get("place-override") {
-        Some(spec) => {
-            planmod::parse_place_overrides(spec).unwrap_or_else(|e| die("place-override", e))
-        }
-        None => vec![],
-    };
-    // Hero film length: scales with the trip unless `--length` asks for one
-    // (`auto`, seconds, or e.g. `10m`).
-    let length = match flags.get("length") {
-        Some(spec) => planmod::parse_film_length(spec).unwrap_or_else(|e| die("length", e)),
-        None => planmod::FilmLength::Auto,
-    };
+    let (overrides, length) = plan_flags(flags);
     let p = planmod::build_plan_with_length(&plan_assets, &cluster_of, &scores, &overrides, length);
     let elig = planmod::plan_eligibility(
         plan_assets.len(),
@@ -861,19 +866,11 @@ fn learn_cmd(flags: &HashMap<String, String>) {
         return;
     }
     if fit.weights.is_identity() {
-        println!("apply: nothing to apply, the weights are at their defaults");
-        return;
+        // Still rebuild: after a reset or undo, the stored plan may carry
+        // weights learned earlier.
+        println!("apply: rebuilding with the default weights");
     }
-    let overrides = match flags.get("place-override") {
-        Some(spec) => {
-            planmod::parse_place_overrides(spec).unwrap_or_else(|e| die("place-override", e))
-        }
-        None => vec![],
-    };
-    let length = match flags.get("length") {
-        Some(spec) => planmod::parse_film_length(spec).unwrap_or_else(|e| die("length", e)),
-        None => planmod::FilmLength::Auto,
-    };
+    let (overrides, length) = plan_flags(flags);
     let hero_of = |db: &Db| -> Vec<String> {
         db.edited_plan(Some(&project_id))
             .unwrap_or_else(|e| die("plan", e))
@@ -884,7 +881,10 @@ fn learn_cmd(flags: &HashMap<String, String>) {
     let assets = db
         .list_assets(&project_id)
         .unwrap_or_else(|e| die("assets", e));
-    let plan = learn::replan(&assets, &fit.weights, &overrides, length);
+    let edits = db
+        .get_plan_edits(&project_id)
+        .unwrap_or_else(|e| die("edits", e));
+    let plan = learn::replan(&assets, &fit.weights, &edits, &overrides, length);
     let plan_id = db
         .insert_plan(&project_id, &plan, "learned")
         .unwrap_or_else(|e| die("insert plan", e));
@@ -896,6 +896,17 @@ fn learn_cmd(flags: &HashMap<String, String>) {
             .map_or_else(|| id.clone(), |a| asset_label(a))
     };
     println!("apply: new plan {plan_id} (your edits carry over)");
+    let edited = triptape_core::plan::apply_edits(&plan, &assets, &edits);
+    let lost = learn::unapplied_swaps(&edited, &edits);
+    if !lost.is_empty() {
+        println!(
+            "note: {} swap(s) no longer apply: the shot each replaced left the film",
+            lost.len()
+        );
+        for (from, to) in lost.iter().take(10) {
+            println!("  {} -> {} (pin it to keep it)", name(from), name(to));
+        }
+    }
     println!("film: {} shots before, {} now", before.len(), after.len());
     if !flags.contains_key("length") {
         println!("note: film length was rebuilt as auto; pass --length to match your scan");

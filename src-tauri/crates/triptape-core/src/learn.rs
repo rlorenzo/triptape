@@ -27,7 +27,7 @@
 //! on the asset rows (so features never feed back on themselves); the
 //! multipliers are applied to a copy at plan time.
 
-use crate::cluster::{cluster_assets, collapse_near_dupes, suppressed_ids};
+use crate::cluster::{chapter_labels, cluster_assets, collapse_near_dupes, suppressed_ids};
 use crate::db::Db;
 use crate::plan::{apply_edits, build_plan_with_length, FilmLength, PlaceOverride, PlanEdits};
 use crate::score::{highlight_score, StorySignals, HIGHLIGHT_THRESHOLD, TECH_FLOOR, TECH_SPAN};
@@ -195,46 +195,29 @@ pub fn features_of(a: &Asset, score: Option<&Score>) -> Features {
         .or(a.score.as_ref())
         .map_or(0.0, |sc| f64::from(sc.tech_quality() - TECH_FLOOR))
         .clamp(0.0, f64::from(TECH_SPAN));
-    let mut f = Features::new();
-    let mut put = |name: &str, v: f64| f.insert(name.to_string(), v);
-    put(
-        "people",
-        bonus_of(StorySignals {
-            people_count: s.people_count,
-            ..Default::default()
-        }),
-    );
-    put(
-        "caption",
-        bonus_of(StorySignals {
-            has_caption: s.has_caption,
-            ..Default::default()
-        }),
-    );
-    put(
-        "video",
-        bonus_of(StorySignals {
-            is_clip: s.is_clip,
-            ..Default::default()
-        }),
-    );
-    put(
-        "place",
-        bonus_of(StorySignals {
-            gps_novelty: s.gps_novelty,
-            ..Default::default()
-        }),
-    );
-    put(
-        "motion",
-        bonus_of(StorySignals {
-            audio_energy: s.audio_energy,
-            movement: s.movement,
-            ..Default::default()
-        }),
-    );
-    put("quality", quality);
-    f
+    // Each story feature's points: the scorer's bonus for that signal alone.
+    let only = |set: &dyn Fn(&mut StorySignals)| {
+        let mut x = StorySignals::default();
+        set(&mut x);
+        bonus_of(x)
+    };
+    [
+        ("people", only(&|x| x.people_count = s.people_count)),
+        ("caption", only(&|x| x.has_caption = s.has_caption)),
+        ("video", only(&|x| x.is_clip = s.is_clip)),
+        ("place", only(&|x| x.gps_novelty = s.gps_novelty)),
+        (
+            "motion",
+            only(&|x| {
+                x.audio_energy = s.audio_energy;
+                x.movement = s.movement;
+            }),
+        ),
+        ("quality", quality),
+    ]
+    .into_iter()
+    .map(|(name, v)| (name.to_string(), v))
+    .collect()
 }
 
 // -- fitting ---------------------------------------------------------------
@@ -257,18 +240,11 @@ fn sigmoid(z: f64) -> f64 {
 /// [`MIN_USABLE_EVENTS`]. Independent of input order.
 pub fn fit(events: &[PrefEvent]) -> Fit {
     const K: usize = FEATURES.len();
-    let mut rows: Vec<(&PrefEvent, [f64; K])> = events
-        .iter()
-        .filter(|e| e.informative())
-        .map(|e| (e, e.deltas()))
-        .collect();
-    rows.sort_by(|a, b| {
-        (a.0.kind, &a.0.chosen_id, &a.0.rejected_id).cmp(&(
-            b.0.kind,
-            &b.0.chosen_id,
-            &b.0.rejected_id,
-        ))
+    let mut informative: Vec<&PrefEvent> = events.iter().filter(|e| e.informative()).collect();
+    informative.sort_by(|a, b| {
+        (a.kind, &a.chosen_id, &a.rejected_id).cmp(&(b.kind, &b.chosen_id, &b.rejected_id))
     });
+    let rows: Vec<[f64; K]> = informative.iter().map(|e| e.deltas()).collect();
     let usable = rows.len();
     let mut out = Fit {
         events: events.len(),
@@ -281,13 +257,13 @@ pub fn fit(events: &[PrefEvent]) -> Fit {
     // Lipschitz bound of the gradient, so a fixed step always descends.
     let sq: f64 = rows
         .iter()
-        .map(|(_, d)| d.iter().map(|x| x * x).sum::<f64>())
+        .map(|d| d.iter().map(|x| x * x).sum::<f64>())
         .sum();
     let step = 1.0 / (BETA * BETA / 4.0 * sq + 2.0 * LAMBDA);
     let mut m = [1.0f64; K];
     for _ in 0..ITERATIONS {
         let mut grad: [f64; K] = std::array::from_fn(|k| 2.0 * LAMBDA * (m[k] - 1.0));
-        for (_, d) in &rows {
+        for d in &rows {
             let z: f64 = BETA * m.iter().zip(d).map(|(m, d)| m * d).sum::<f64>();
             let g = -BETA * sigmoid(-z);
             for k in 0..K {
@@ -325,7 +301,7 @@ pub fn explain(events: &[PrefEvent], weights: &Weights) -> Vec<String> {
         .map(|(def, m)| {
             let differing: Vec<&PrefEvent> = events
                 .iter()
-                .filter(|e| e.informative() && e.delta(def.name).abs() > EPS)
+                .filter(|e| e.delta(def.name).abs() > EPS)
                 .collect();
             let agree = |e: &&PrefEvent| (e.delta(def.name) > 0.0) == (m > 1.0);
             let with: Vec<&PrefEvent> = differing.iter().copied().filter(agree).collect();
@@ -336,8 +312,9 @@ pub fn explain(events: &[PrefEvent], weights: &Weights) -> Vec<String> {
                 (EventKind::Swap, "swapped in"),
                 (EventKind::Exclude, "kept over a removed shot"),
             ] {
-                if count(k) > 0 {
-                    parts.push(format!("{} {word}", count(k)));
+                let n = count(k);
+                if n > 0 {
+                    parts.push(format!("{n} {word}"));
                 }
             }
             format!(
@@ -409,25 +386,58 @@ pub fn adapt_scores(assets: &[Asset], w: &Weights) -> HashMap<String, Score> {
 /// Rebuild a project's plan from its stored assets with learned weights
 /// applied. Clusters and near-dupe collapse are recomputed from the assets,
 /// exactly as at scan time, so identity weights reproduce a scan's plan.
+/// Assets the user's `edits` name (pins and both sides of swaps) are never
+/// suppressed: new weights can change a dupe stack's winner, and an edit
+/// whose asset left the chapters would silently stop applying.
 pub fn replan(
     assets: &[Asset],
     w: &Weights,
+    edits: &PlanEdits,
     overrides: &[PlaceOverride],
     length: FilmLength,
 ) -> Plan {
     let scores = adapt_scores(assets, w);
-    let clusters = cluster_assets(assets);
-    let cluster_of: HashMap<String, String> = clusters
+    let cluster_of = chapter_labels(&cluster_assets(assets));
+    let mut suppressed = suppressed_ids(&collapse_near_dupes(assets, &scores));
+    for id in edits
+        .included
         .iter()
-        .flat_map(|c| c.asset_ids.iter().map(|id| (id.clone(), c.label.clone())))
-        .collect();
-    let suppressed = suppressed_ids(&collapse_near_dupes(assets, &scores));
+        .chain(edits.swaps.iter().flat_map(|(f, t)| [f, t]))
+    {
+        suppressed.remove(id);
+    }
     let plan_assets: Vec<Asset> = assets
         .iter()
         .filter(|a| !suppressed.contains(&a.id))
         .cloned()
         .collect();
     build_plan_with_length(&plan_assets, &cluster_of, &scores, overrides, length)
+}
+
+/// Saved swaps that no longer land in `edited` (the saved edits applied to
+/// a rebuilt plan): a swap replaces a pick, so when rebuilding drops the
+/// original from the film and reels the replacement has no slot. Skips
+/// swaps a later swap superseded (`to` swapped out again) and removed
+/// replacements, which are meant to be gone.
+pub fn unapplied_swaps<'a>(edited: &Plan, edits: &'a PlanEdits) -> Vec<&'a (String, String)> {
+    let picked = |id: &str| {
+        edited
+            .hero
+            .iter()
+            .chain(&edited.reel_selects)
+            .any(|e| e.asset_id == id)
+    };
+    edits
+        .swaps
+        .iter()
+        .enumerate()
+        .filter(|(i, (_, to))| {
+            !edits.swaps[i + 1..].iter().any(|(f, _)| f == to)
+                && !edits.excluded.contains(to)
+                && !picked(to)
+        })
+        .map(|(_, s)| s)
+        .collect()
 }
 
 // -- recording -------------------------------------------------------------
@@ -506,26 +516,28 @@ pub fn events_for_edit(
         }
     }
 
+    // `plan` is always `apply_edits(base, assets, &cur)`: rebuilt once per
+    // mutation of `cur`, never twice.
+    let mut plan = apply_edits(base, assets, &cur);
     for id in after
         .excluded
         .iter()
         .filter(|i| !before.excluded.contains(i))
     {
-        let was = apply_edits(base, assets, &cur);
-        let picked = was
+        let picked = plan
             .hero
             .iter()
-            .chain(&was.reel_selects)
+            .chain(&plan.reel_selects)
             .any(|e| e.asset_id == *id);
         cur.set_excluded(id.clone(), true);
+        plan = apply_edits(base, assets, &cur);
         let (Some(rejected), Some(chapter)) = (feats(id), base.chapter_of(id)) else {
             continue;
         };
         if !picked {
             continue;
         }
-        let now = apply_edits(base, assets, &cur);
-        let in_film = hero_ids(&now);
+        let in_film = hero_ids(&plan);
         let members = chapter
             .asset_ids
             .iter()
@@ -561,10 +573,9 @@ pub fn events_for_edit(
         .iter()
         .filter(|i| !before.included.contains(i) && !new_swaps.iter().any(|(_, t)| t == *i));
     for id in pins {
-        let was = apply_edits(base, assets, &cur);
         cur.set_included(id.clone(), true);
-        let now = apply_edits(base, assets, &cur);
-        let kept = hero_ids(&now);
+        let was = std::mem::replace(&mut plan, apply_edits(base, assets, &cur));
+        let kept = hero_ids(&plan);
         let Some(chosen) = feats(id) else { continue };
         for gone in hero_ids(&was)
             .into_iter()
@@ -600,16 +611,9 @@ pub fn record_edit(
     let delta = events_for_edit(&base, &assets, before, after);
     db.in_transaction(|db| {
         for (kind, chosen, rejected) in &delta.removed {
-            if rejected.is_empty() {
-                // An undone pin: whatever it displaced.
-                for e in db.list_preference_events(project_id)? {
-                    if e.kind == *kind && e.chosen_id == *chosen {
-                        db.delete_preference_event(project_id, *kind, chosen, &e.rejected_id)?;
-                    }
-                }
-            } else {
-                db.delete_preference_event(project_id, *kind, chosen, rejected)?;
-            }
+            // An empty `rejected` is an undone pin: whatever it displaced.
+            let rejected = (!rejected.is_empty()).then_some(rejected.as_str());
+            db.delete_preference_event(project_id, *kind, chosen, rejected)?;
         }
         for e in &delta.added {
             db.put_preference_event(project_id, e)?;
@@ -821,6 +825,30 @@ mod tests {
     }
 
     #[test]
+    fn delete_matches_one_rejected_shot_or_all_of_them() {
+        let (db, pid, _) = db_with_chapter();
+        let pin = |chosen: &str, rejected: &str| {
+            let mut e = ev(&[("people", 1.0)], &[]);
+            e.kind = EventKind::Include;
+            e.chosen_id = chosen.into();
+            e.rejected_id = rejected.into();
+            db.put_preference_event(&pid, &e).unwrap();
+        };
+        let inc = |c: &str, r: &str| (EventKind::Include, c.to_string(), r.to_string());
+        pin("e", "a");
+        pin("e", "b");
+        pin("d", "a");
+        db.delete_preference_event(&pid, EventKind::Include, "e", Some("b"))
+            .unwrap();
+        assert_eq!(events(&db, &pid), [inc("d", "a"), inc("e", "a")]);
+        pin("e", "b");
+        // `None` forgets everything `e` displaced, and nothing else.
+        db.delete_preference_event(&pid, EventKind::Include, "e", None)
+            .unwrap();
+        assert_eq!(events(&db, &pid), [inc("d", "a")]);
+    }
+
+    #[test]
     fn backfill_replays_edits_made_before_learning() {
         let (db, pid, _) = db_with_chapter();
         let mut edits = PlanEdits::default();
@@ -967,6 +995,55 @@ mod tests {
     }
 
     #[test]
+    fn replan_keeps_edited_assets_out_of_dupe_suppression() {
+        // Two shots of one moment: only the better one survives a plain
+        // replan, so a pin or swap naming the other would silently drop.
+        let mut best = photo("best", 0, 0, 0.9);
+        let mut twin = photo("twin", 0, 0, 0.4);
+        best.phash = Some(0xABCD_EF01_2345_6789);
+        twin.phash = best.phash;
+        let assets = vec![best, twin, photo("x", 1, 1, 0.5)];
+        let w = Weights::default();
+        let plain = replan(&assets, &w, &PlanEdits::default(), &[], FilmLength::Auto);
+        assert!(plain.chapter_of("twin").is_none());
+        let mut pinned = PlanEdits::default();
+        pinned.included.push("twin".into());
+        let kept = replan(&assets, &w, &pinned, &[], FilmLength::Auto);
+        assert!(kept.chapter_of("twin").is_some());
+        let mut swapped = PlanEdits::default();
+        swapped.swaps.push(("x".into(), "twin".into()));
+        let kept = replan(&assets, &w, &swapped, &[], FilmLength::Auto);
+        assert!(kept.chapter_of("twin").is_some());
+    }
+
+    #[test]
+    fn unapplied_swaps_lists_replacements_left_without_a_slot() {
+        let assets = vec![photo("b", 0, 1, 0.9)];
+        let edited = replan(
+            &assets,
+            &Weights::default(),
+            &PlanEdits::default(),
+            &[],
+            FilmLength::Auto,
+        );
+        assert!(edited.hero.iter().any(|e| e.asset_id == "b"));
+        // a -> b landed; c -> d lost its slot; e -> f -> g chain ends at g,
+        // which was removed.
+        let edits = PlanEdits {
+            swaps: vec![
+                ("a".into(), "b".into()),
+                ("c".into(), "d".into()),
+                ("e".into(), "f".into()),
+                ("f".into(), "g".into()),
+            ],
+            excluded: vec!["g".into()],
+            ..PlanEdits::default()
+        };
+        let lost = unapplied_swaps(&edited, &edits);
+        assert_eq!(lost, vec![&("c".to_string(), "d".to_string())]);
+    }
+
+    #[test]
     fn replan_reproduces_a_plain_build_and_learned_weights_change_scores() {
         let (_, _, assets) = db_with_chapter();
         let cluster_of: HashMap<String, String> = assets
@@ -978,7 +1055,13 @@ mod tests {
             .map(|a| (a.id.clone(), a.score.clone().unwrap()))
             .collect();
         let plain = build_plan(&assets, &cluster_of, &scores);
-        let same = replan(&assets, &Weights::default(), &[], FilmLength::Auto);
+        let same = replan(
+            &assets,
+            &Weights::default(),
+            &PlanEdits::default(),
+            &[],
+            FilmLength::Auto,
+        );
         assert_eq!(plain.to_json().unwrap(), same.to_json().unwrap());
         assert!(!same.hero.is_empty());
         // Replanning never reads or writes edits.
