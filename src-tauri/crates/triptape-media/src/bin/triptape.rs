@@ -645,8 +645,8 @@ fn export_cmd(flags: &HashMap<String, String>) {
     }
     if let Some(c) = &report.segment_cache {
         println!(
-            "video: segments reused {}/{} from cache ({} new, {} evicted; {})",
-            c.reused, c.total, c.stored, c.evicted, c.dir
+            "video: segments reused {}/{} from cache, overlays {}/{} ({} new, {} evicted; {})",
+            c.reused, c.total, c.overlays_reused, c.overlays_total, c.stored, c.evicted, c.dir
         );
     }
     for r in &report.reels {

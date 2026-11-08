@@ -47,6 +47,9 @@ pub struct SegmentCacheReport {
     pub total: usize,
     /// Fresh segments written to the cache.
     pub stored: usize,
+    /// Lower-third overlays taken from the cache / asked of it.
+    pub overlays_reused: usize,
+    pub overlays_total: usize,
     /// Fresh segments left out because the volume was low on space.
     pub skipped_low_disk: usize,
     /// Old entries removed to stay within the size cap.
@@ -247,6 +250,8 @@ fn record_cache_use(cache: &SegmentCache, evicted: usize, report: &mut ExportRep
             reused: stats.hits,
             total,
             stored: stats.stored,
+            overlays_reused: stats.overlay_hits,
+            overlays_total: stats.overlay_hits + stats.overlay_misses,
             skipped_low_disk: stats.skipped_low_disk,
             evicted,
         });

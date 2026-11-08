@@ -795,17 +795,32 @@ pub fn render_hero_video(
             |(i, doc)| -> Result<Option<String>, crate::MediaError> {
                 progress.check_cancelled()?;
                 let (r, seg_mp4, dur, _) = &segs[*i];
+                // A cached overlay replaces the segment outright and skips
+                // the Typst render and the re-encode.
+                let ov_key = job_caps.segment_cache.as_deref().and_then(|c| {
+                    let base = c.key_of(seg_mp4)?;
+                    Some((c, overlay_key(c, &base, doc, *dur, opts)))
+                });
+                if let Some((c, key)) = &ov_key {
+                    if c.fetch_overlay(key, seg_mp4) {
+                        return Ok(None);
+                    }
+                }
                 let png = work_dir.join(format!("ov_{i:03}.png"));
-                Ok(crate::titlecard::render_text_png(
+                let result = crate::titlecard::render_text_png(
                     &opts.typst_bin,
                     doc,
                     &png,
                     opts.resolution.ppi(),
                 )
-                .and_then(|()| apply_lower_third(&job_caps, seg_mp4, &png, *dur, opts.resolution))
-                .err()
-                .filter(|e| !matches!(e, crate::MediaError::Cancelled))
-                .map(|e| format!("overlay skipped for {}: {e}", r.entry.asset_id)))
+                .and_then(|()| apply_lower_third(&job_caps, seg_mp4, &png, *dur, opts.resolution));
+                if let (Ok(()), Some((c, key))) = (&result, &ov_key) {
+                    c.store_overlay(key, seg_mp4, *dur);
+                }
+                Ok(result
+                    .err()
+                    .filter(|e| !matches!(e, crate::MediaError::Cancelled))
+                    .map(|e| format!("overlay skipped for {}: {e}", r.entry.asset_id)))
             },
             |ti, res, done, total| {
                 if let Ok(note) = res {
@@ -1030,8 +1045,11 @@ fn apply_lower_third(
     res: Resolution,
 ) -> Result<(), crate::MediaError> {
     let graph = lower_third_graph(seg_dur, res);
-    burn_png_overlay(caps, seg, png, &graph, 16)
+    burn_png_overlay(caps, seg, png, &graph, LOWER_THIRD_CRF)
 }
+
+/// Quality of the re-encode that bakes a lower third into its segment.
+const LOWER_THIRD_CRF: u32 = 16;
 
 fn lower_third_graph(seg_dur: f64, res: Resolution) -> String {
     let k = res.scale();
@@ -1051,7 +1069,11 @@ pub(crate) fn burn_png_overlay(
     filter_graph: &str,
     crf: u32,
 ) -> Result<(), crate::MediaError> {
-    let args: Vec<String> = vec![
+    caps.run(&overlay_args(video, png, filter_graph, crf), video)
+}
+
+fn overlay_args(video: &Path, png: &Path, filter_graph: &str, crf: u32) -> Vec<String> {
+    vec![
         "-y".into(),
         "-i".into(),
         s(video),
@@ -1069,8 +1091,33 @@ pub(crate) fn burn_png_overlay(
     .into_iter()
     .chain(ffmpeg::x264_aac("veryfast", crf))
     .chain(["-shortest".into(), s(video)])
-    .collect();
-    caps.run(&args, video)
+    .collect()
+}
+
+/// Cache key of the lower third baked onto a segment: the base segment's key
+/// (its pixels), the overlay text, the burn recipe and the final length. The
+/// text PNG's look also rests on the Typst binary and fonts, which the key
+/// cannot see; bump `SEGMENT_CACHE_VERSION` if the card templates change.
+fn overlay_key(
+    cache: &SegmentCache,
+    base_key: &str,
+    doc: &str,
+    seg_dur: f64,
+    opts: &VideoOptions,
+) -> String {
+    let mut k = cache.key("overlay");
+    k.part("base", base_key)
+        .part("doc", doc)
+        .num("dur", seg_dur)
+        .part("ppi", &opts.resolution.ppi().to_string())
+        .part("typst", &opts.typst_bin)
+        .args(&overlay_args(
+            Path::new(KEY_IN),
+            Path::new(KEY_PNG),
+            &lower_third_graph(seg_dur, opts.resolution),
+            LOWER_THIRD_CRF,
+        ));
+    k.finish()
 }
 
 fn write_captions_srt(
@@ -2038,6 +2085,8 @@ fn hold_args(
 /// arguments are hashed into its key: the recipe, not where it runs.
 const KEY_IN: &str = "<IN>";
 const KEY_OUT: &str = "<OUT>";
+/// Stand-in for the per-segment overlay PNG, whose name carries its index.
+const KEY_PNG: &str = "<PNG>";
 
 /// Cache key of a still entry, before anything is decoded. The source's
 /// identity stands in for its pixels (and so for the aspect that picks hold
@@ -3894,6 +3943,68 @@ mod tests {
         let v = glide_variants(&groups);
         assert_ne!(v[0], v[1]);
         assert_eq!(v[0], stable_variant(&a.entry));
+    }
+
+    /// Lower thirds are cached on the base segment plus their text: a repeat
+    /// export skips them all, and changing one chapter-opening shot redoes
+    /// only that chapter's overlay.
+    #[test]
+    fn overlay_cache_reuses_unchanged_lower_thirds() {
+        use crate::segment_cache::{SegmentCache, SegmentCacheConfig};
+        let Some(caps) = parallel_caps() else {
+            eprintln!("ffmpeg caps insufficient; skipping");
+            return;
+        };
+        if !crate::titlecard::typst_available("typst") {
+            eprintln!("typst missing; skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (plan, entries) = parallel_fixture(dir.path());
+        let cfg = SegmentCacheConfig {
+            dir: dir.path().join("cache"),
+            max_bytes: None,
+        };
+        let run = |name: &str| {
+            let work = dir.path().join(name).join(".work");
+            let cache = SegmentCache::open(&cfg, "ffmpeg test".into(), &work).unwrap();
+            let caps = Capabilities {
+                segment_cache: Some(cache.clone()),
+                ..caps.clone()
+            };
+            let opts = VideoOptions {
+                typst_bin: "typst".into(),
+                ..parallel_opts(2)
+            };
+            let out = dir.path().join(format!("{name}.mp4"));
+            render_hero_video(&caps, &plan, &entries, None, &work, &out, &opts).expect("render");
+            cache.stats()
+        };
+        // Two chapters open with a0 and a3, so two lower thirds.
+        let first = run("a");
+        assert_eq!(
+            (first.overlay_hits, first.overlay_misses),
+            (0, 2),
+            "{first:?}"
+        );
+        let second = run("b");
+        assert_eq!(
+            (second.overlay_hits, second.overlay_misses),
+            (2, 0),
+            "{second:?}"
+        );
+        // Segment counts stay about segments only.
+        assert_eq!((second.hits, second.misses), (4, 0), "{second:?}");
+        // Replace the shot that opens chapter 1.
+        image::ImageBuffer::from_pixel(400, 240, image::Rgb([250u8, 10, 10]))
+            .save(&entries[0].still_path)
+            .unwrap();
+        let third = run("c");
+        assert_eq!(
+            (third.overlay_hits, third.overlay_misses),
+            (1, 1),
+            "{third:?}"
+        );
     }
 
     /// Sibling windows of one clip differ in trim, so they get distinct keys

@@ -219,6 +219,9 @@ pub struct UseStats {
     pub stored: usize,
     /// Fresh segments not cached because the volume was low on space.
     pub skipped_low_disk: usize,
+    /// Lower-third overlays taken from / re-rendered past the cache.
+    pub overlay_hits: usize,
+    pub overlay_misses: usize,
 }
 
 /// A live export, as recorded in its lease file.
@@ -265,6 +268,9 @@ pub struct SegmentCache {
     work_dir: PathBuf,
     lease_path: Mutex<Option<PathBuf>>,
     stats: Mutex<UseStats>,
+    /// Key of the entry each work-dir path was filled from or stored as, so a
+    /// later stage (the overlay) can key itself on the base segment.
+    keys_by_path: Mutex<std::collections::HashMap<PathBuf, String>>,
 }
 
 impl std::fmt::Debug for SegmentCache {
@@ -292,6 +298,7 @@ impl SegmentCache {
             work_dir: work_dir.to_path_buf(),
             lease_path: Mutex::new(None),
             stats: Mutex::new(UseStats::default()),
+            keys_by_path: Mutex::new(Default::default()),
         };
         let lease = Lease {
             pid: std::process::id(),
@@ -338,49 +345,98 @@ impl SegmentCache {
     /// return its sidecar. A miss, a torn entry, or an entry that vanished
     /// mid-way all return `None`.
     pub fn fetch(&self, key: &str, dest: &Path) -> Option<SegmentMeta> {
-        let meta = read_valid(&self.dir, key);
-        let Some(meta) = meta else {
+        let meta = self.fetch_entry(key, dest);
+        if meta.is_some() {
+            self.bump(|s| s.hits += 1);
+            self.note_key(dest, key);
+        } else {
             self.bump(|s| s.misses += 1);
-            return None;
-        };
+        }
+        meta
+    }
+
+    fn fetch_entry(&self, key: &str, dest: &Path) -> Option<SegmentMeta> {
+        let meta = read_valid(&self.dir, key)?;
         // Touch first: the lease rule protects entries used since a lease
         // began, and LRU reads the same timestamp.
         let mp4 = entry_path(&self.dir, key, "mp4");
         touch(&mp4);
         if place(&mp4, dest).is_err() {
             // Deleted between the check and the link: a miss, not an error.
-            let _ = std::fs::remove_file(dest);
-            self.bump(|s| s.misses += 1);
+            // `place` leaves `dest` as it was, so an overlay miss still has
+            // its base segment to render onto.
             return None;
         }
-        self.bump(|s| s.hits += 1);
         Some(meta)
     }
 
     /// Cache the finished segment at `produced`. Best effort: a full disk or
     /// an I/O error is swallowed because the export itself already has its
-    /// segment. Returns whether the entry was stored.
+    /// segment. Returns whether the entry is in the cache.
     pub fn store(&self, key: &str, produced: &Path, secs: f64) -> bool {
+        self.note_key(produced, key);
+        let (ok, fresh) = self.store_entry(key, produced, secs);
+        if fresh {
+            self.bump(|s| s.stored += 1);
+        }
+        ok
+    }
+
+    /// [`fetch`](Self::fetch) for a lower-third overlay: counted apart from
+    /// the segments so "reused N/M" stays about segments.
+    pub fn fetch_overlay(&self, key: &str, dest: &Path) -> bool {
+        let hit = self.fetch_entry(key, dest).is_some();
+        self.bump(|s| {
+            if hit {
+                s.overlay_hits += 1
+            } else {
+                s.overlay_misses += 1
+            }
+        });
+        hit
+    }
+
+    /// [`store`](Self::store) for a lower-third overlay.
+    pub fn store_overlay(&self, key: &str, produced: &Path, secs: f64) -> bool {
+        self.store_entry(key, produced, secs).0
+    }
+
+    /// Key the segment at `path` was fetched or offered to the cache under,
+    /// whether or not the store succeeded: it names the content either way.
+    pub fn key_of(&self, path: &Path) -> Option<String> {
+        self.keys_by_path
+            .lock()
+            .expect("keys lock")
+            .get(path)
+            .cloned()
+    }
+
+    fn note_key(&self, path: &Path, key: &str) {
+        self.keys_by_path
+            .lock()
+            .expect("keys lock")
+            .insert(path.to_path_buf(), key.to_string());
+    }
+
+    /// `(entry is in the cache, this call wrote it)`.
+    fn store_entry(&self, key: &str, produced: &Path, secs: f64) -> (bool, bool) {
         if read_valid(&self.dir, key).is_some() {
-            return true;
+            return (true, false);
         }
         if free_bytes(&self.dir).is_some_and(|f| f < LOW_DISK_BYTES) {
             self.bump(|s| s.skipped_low_disk += 1);
-            return false;
+            return (false, false);
         }
         let Ok(size) = std::fs::metadata(produced).map(|m| m.len()) else {
-            return false;
+            return (false, false);
         };
         if size == 0 {
-            return false;
+            return (false, false);
         }
         let ok = self
             .try_store(key, produced, &SegmentMeta { secs, size })
             .is_ok();
-        if ok {
-            self.bump(|s| s.stored += 1);
-        }
-        ok
+        (ok, ok)
     }
 
     fn try_store(&self, key: &str, produced: &Path, meta: &SegmentMeta) -> std::io::Result<()> {
@@ -390,7 +446,7 @@ impl SegmentCache {
         let tmp_mp4 = self.tmp_name();
         let tmp_json = self.tmp_name();
         let result = (|| {
-            place(produced, &tmp_mp4)?;
+            link_or_copy(produced, &tmp_mp4)?;
             // The data must be durable before the entry becomes visible.
             std::fs::File::open(&tmp_mp4)?.sync_all()?;
             let mut f = std::fs::File::create(&tmp_json)?;
@@ -480,15 +536,23 @@ fn touch(path: &Path) {
     }
 }
 
-/// Give `dst` its own reference to `src`'s data: hard link, else a copy
-/// (different volumes; on macOS `fs::copy` clones on APFS first). Replaces
-/// `dst`.
+/// Give the new path `dst` its own reference to `src`'s data: hard link, else
+/// a copy (different volumes; on macOS `fs::copy` clones on APFS first).
+fn link_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(src, dst).or_else(|_| std::fs::copy(src, dst).map(|_| ()))
+}
+
+/// [`link_or_copy`] onto a work-dir path that may already exist: staged in a
+/// partial sibling and renamed over `dst`, so a failure leaves any existing
+/// `dst` (an overlay's base segment) intact.
 fn place(src: &Path, dst: &Path) -> std::io::Result<()> {
-    let _ = std::fs::remove_file(dst);
-    if std::fs::hard_link(src, dst).is_ok() {
-        return Ok(());
+    let tmp = crate::ffmpeg::partial_sibling(dst);
+    let _ = std::fs::remove_file(&tmp);
+    let staged = link_or_copy(src, &tmp).and_then(|()| std::fs::rename(&tmp, dst));
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::copy(src, dst).map(|_| ())
+    staged
 }
 
 /// Free bytes on the volume holding `path` (or its nearest existing parent,
@@ -820,6 +884,48 @@ mod tests {
         assert_eq!(c2.stats().hits, 1);
         assert_eq!(c.stats().misses, 1);
         assert_eq!(c.stats().stored, 1);
+    }
+
+    /// Overlays share the store but not the segment counters, and every
+    /// fetched or offered path remembers its key for the overlay stage.
+    #[test]
+    fn overlays_are_counted_apart_and_paths_remember_keys() {
+        let t = tempfile::tempdir().unwrap();
+        let (cdir, work) = (t.path().join("c"), t.path().join("w"));
+        let c = open(&cdir, &work, None);
+        let seg_key = c.key("still").finish();
+        let seg = produce(&work, "seg_000.mp4", 1000);
+        assert_eq!(c.key_of(&seg), None);
+        assert!(c.store(&seg_key, &seg, 4.0));
+        assert_eq!(c.key_of(&seg).as_deref(), Some(seg_key.as_str()));
+
+        let ov_key = c.key("overlay").part("base", &seg_key).finish();
+        assert!(!c.fetch_overlay(&ov_key, &seg));
+        assert!(c.store_overlay(&ov_key, &seg, 4.0));
+        let dest = work.join("seg_001.mp4");
+        assert!(c.fetch_overlay(&ov_key, &dest));
+        assert_eq!(std::fs::read(&dest).unwrap().len(), 1000);
+
+        let s = c.stats();
+        assert_eq!((s.overlay_hits, s.overlay_misses), (1, 1), "{s:?}");
+        assert_eq!((s.hits, s.misses, s.stored), (0, 0, 1), "{s:?}");
+        // An overlay fetch does not rebind the path to the overlay key.
+        assert_eq!(c.key_of(&dest), None);
+    }
+
+    /// A fetch whose entry vanished mid-way must not take the existing
+    /// destination (an overlay's base segment) down with it.
+    #[test]
+    fn failed_place_keeps_existing_dest() {
+        let t = tempfile::tempdir().unwrap();
+        let dst = produce(t.path(), "seg_000.mp4", 1000);
+        assert!(place(&t.path().join("gone.mp4"), &dst).is_err());
+        assert_eq!(std::fs::read(&dst).unwrap().len(), 1000);
+        assert!(!crate::ffmpeg::partial_sibling(&dst).exists());
+
+        let src = produce(t.path(), "cached.mp4", 500);
+        place(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap().len(), 500);
     }
 
     #[test]
