@@ -8,10 +8,11 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 use triptape_core::clip_window::{
-    audio_rms_buckets, laplacian_variance, mean_abs_diff, mean_luma, pick_window, score_samples,
-    window_quality, RawSample, MIN_ANALYZED_SECS, SAMPLE_SECS,
+    audio_rms_buckets, laplacian_variance, mean_abs_diff, mean_luma, pick_windows, score_samples,
+    split_scenes, window_quality, RawSample, MIN_ANALYZED_SECS, SAMPLE_SECS,
 };
 use triptape_core::score;
+use triptape_core::types::ClipSpan;
 
 /// Analysis frame width in pixels.
 const FRAME_W: usize = 160;
@@ -116,27 +117,28 @@ fn measure(ffmpeg_bin: &str, audio_map: Option<&str>, path: &Path) -> Option<Vec
 }
 
 /// What ingest learns about a video clip.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ClipAnalysis {
-    /// Best `(start, end)` playback window in seconds; `None` when the clip
-    /// plays whole.
-    pub window: Option<(f64, f64)>,
-    /// Mean sample score (0..1) over the part that will play; `None` when
-    /// the clip was too short to analyse or analysis failed.
+    /// Playback windows in seconds, in time order (several only for long
+    /// clips with scene cuts); empty when the clip plays whole.
+    pub windows: Vec<ClipSpan>,
+    /// Mean sample score (0..1) over the clip's best window, or over the
+    /// whole clip when it plays whole; `None` when the clip was too short
+    /// to analyse or analysis failed.
     pub quality: Option<f32>,
 }
 
 impl ClipAnalysis {
     /// The clip's score: [`score::score_video`] on the window quality,
-    /// carrying the playback window it was measured over.
+    /// carrying the playback windows it was measured over.
     pub fn score(&self, signals: &score::StorySignals) -> triptape_core::types::Score {
         let mut s = score::score_video(self.quality, signals);
-        s.clip_window = self.window;
+        s.clip_windows.clone_from(&self.windows);
         s
     }
 }
 
-/// Analyse a clip once: best playback window plus the quality of what plays.
+/// Analyse a clip once: playback windows plus the quality of what plays.
 /// Clips at or under [`MIN_ANALYZED_SECS`] are not decoded and yield the
 /// default (no window, no quality).
 pub fn analyze_clip(
@@ -149,15 +151,18 @@ pub fn analyze_clip(
         return ClipAnalysis::default();
     }
     let audio = crate::ffmpeg::audio_map(ffprobe_bin, path);
-    let Some(raw) = measure(ffmpeg_bin, audio.as_deref(), path) else {
+    let Some(mut raw) = measure(ffmpeg_bin, audio.as_deref(), path) else {
         return ClipAnalysis::default();
     };
+    // Scene cuts come from the differences already measured: no extra decode.
+    let cuts = split_scenes(&mut raw, duration_secs);
     let scores = score_samples(&raw);
-    let window = pick_window(&scores, duration_secs);
-    ClipAnalysis {
-        window,
-        quality: window_quality(&scores, window),
-    }
+    let windows = pick_windows(&scores, &cuts, duration_secs);
+    let quality = match ClipSpan::best(&windows) {
+        Some((_, w)) => Some(w.quality),
+        None => window_quality(&scores, None),
+    };
+    ClipAnalysis { windows, quality }
 }
 
 #[cfg(test)]
@@ -188,12 +193,16 @@ mod tests {
     #[test]
     fn score_carries_window_and_quality() {
         let analysis = ClipAnalysis {
-            window: Some((2.0, 6.0)),
+            windows: vec![ClipSpan {
+                start: 2.0,
+                end: 6.0,
+                quality: 0.8,
+            }],
             quality: Some(0.8),
         };
         let signals = score::StorySignals::default();
         let s = analysis.score(&signals);
-        assert_eq!(s.clip_window, Some((2.0, 6.0)));
+        assert_eq!(s.clip_windows, analysis.windows);
         assert_eq!(s.total, score::score_video(Some(0.8), &signals).total);
     }
 }

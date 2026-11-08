@@ -13,7 +13,7 @@ use crate::resolution::Resolution;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{check_source_integrity, plan_eligibility, Integrity};
-use triptape_core::types::{AssetKind, Plan, PlanEntry, Rendition};
+use triptape_core::types::{distinct_assets, AssetKind, Plan, PlanEntry, Rendition};
 
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
@@ -65,22 +65,19 @@ fn chapter_place<'a>(plan: &'a Plan, asset_id: &str) -> Option<&'a str> {
 fn resolve_entry(
     plan: &Plan,
     assets: &HashMap<String, triptape_core::types::Asset>,
-    asset_id: &str,
+    entry: &PlanEntry,
 ) -> Option<ResolvedEntry> {
+    let asset_id = entry.asset_id.as_str();
     let a = assets.get(asset_id)?;
-    let entry = plan
-        .hero
-        .iter()
-        .chain(plan.reel_selects.iter())
-        .find(|e| e.asset_id == asset_id)?
-        .clone();
     let (still_path, motion_path) = match a.kind {
         AssetKind::Photo => (a.path.clone(), None),
         AssetKind::Video => (a.path.clone(), Some(a.path.clone())),
         AssetKind::LivePhoto => (a.path.clone(), a.companion_path.clone()),
     };
     Some(ResolvedEntry {
-        entry,
+        // The caller's entry, not a lookup by asset id: sibling windows of
+        // one clip share the id but not the trim.
+        entry: entry.clone(),
         still_path,
         motion_path,
         caption: plan.captions.get(asset_id).cloned(),
@@ -123,6 +120,7 @@ fn verify_source(entry: &PlanEntry, path: &Path) -> Result<(), String> {
 fn asset_snapshot(a: &triptape_core::types::Asset) -> PlanEntry {
     PlanEntry {
         asset_id: a.id.clone(),
+        window: 0,
         content_hash: a.content_hash.clone(),
         size_bytes: a.size_bytes,
         mtime: a.mtime,
@@ -139,7 +137,7 @@ fn resolve_verified(
     label: &str,
     fallbacks: &mut Vec<String>,
 ) -> Option<ResolvedEntry> {
-    let r = resolve_entry(plan, assets, &entry.asset_id)?;
+    let r = resolve_entry(plan, assets, entry)?;
     match verify_source(entry, &r.still_path) {
         Ok(()) => Some(r),
         Err(reason) => {
@@ -189,7 +187,9 @@ fn export_inner(
     }
     let by_id: HashMap<String, triptape_core::types::Asset> =
         assets.iter().map(|a| (a.id.clone(), a.clone())).collect();
-    let usable = plan.hero.len();
+    // Eligibility counts assets, not entries: a scene-split clip plays
+    // several windows but is still one usable asset.
+    let usable = distinct_assets(&plan.hero);
     let photos = assets.iter().filter(|a| a.kind != AssetKind::Video).count();
     let elig = plan_eligibility(usable, photos, plan.chapters.len());
 
@@ -549,6 +549,7 @@ mod tests {
         let still = |id: &str| ResolvedEntry {
             entry: PlanEntry {
                 asset_id: id.into(),
+                window: 0,
                 content_hash: None,
                 size_bytes: 1,
                 mtime: 0,
@@ -600,6 +601,7 @@ mod tests {
         let mut plan = empty_plan();
         plan.hero.push(PlanEntry {
             asset_id: "a0".into(),
+            window: 0,
             content_hash: None,
             size_bytes: 1,
             mtime: 0,
@@ -611,7 +613,7 @@ mod tests {
         asset.taken_at = Some(1791288000);
         let assets: HashMap<String, triptape_core::types::Asset> =
             [("a0".to_string(), asset)].into_iter().collect();
-        let r = resolve_entry(&plan, &assets, "a0").expect("resolves");
+        let r = resolve_entry(&plan, &assets, &plan.hero[0]).expect("resolves");
         assert_eq!(r.taken_at, Some(1791288000));
         assert_eq!(r.caption.as_deref(), Some("Overlook"));
     }
