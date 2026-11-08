@@ -169,6 +169,24 @@ pub struct EditedPlan {
     pub assets: Vec<Asset>,
 }
 
+/// Add `assets.<column>` with type `ddl` unless the table already has it
+/// (forward migration for DBs created before the column existed).
+fn add_column_if_missing(conn: &Connection, column: &str, ddl: &str) -> Result<(), String> {
+    let present = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name=?1",
+            [column],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())?
+        > 0;
+    if !present {
+        conn.execute(&format!("ALTER TABLE assets ADD COLUMN {column} {ddl}"), [])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 impl Db {
     /// Open (creating parent dirs) and apply the schema.
     pub fn open(path: &Path) -> Result<Self, String> {
@@ -187,45 +205,11 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-        // Migration for DBs created before capture timezones were stored.
-        let has_tz_offset = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='tz_offset'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(|e| e.to_string())?
-            > 0;
-        if !has_tz_offset {
-            conn.execute("ALTER TABLE assets ADD COLUMN tz_offset INTEGER", [])
-                .map_err(|e| e.to_string())?;
-        }
-        // Migration for DBs created before embedded user captions were read.
-        let has_caption = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='user_caption'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(|e| e.to_string())?
-            > 0;
-        if !has_caption {
-            conn.execute("ALTER TABLE assets ADD COLUMN user_caption TEXT", [])
-                .map_err(|e| e.to_string())?;
-        }
-        // Migration for DBs created before people counts were stored.
-        let has_people = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='people_count'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(|e| e.to_string())?
-            > 0;
-        if !has_people {
-            conn.execute("ALTER TABLE assets ADD COLUMN people_count INTEGER", [])
-                .map_err(|e| e.to_string())?;
-        }
+        // Migrations for DBs created before capture timezones, embedded
+        // user captions and people counts were stored.
+        add_column_if_missing(&conn, "tz_offset", "INTEGER")?;
+        add_column_if_missing(&conn, "user_caption", "TEXT")?;
+        add_column_if_missing(&conn, "people_count", "INTEGER")?;
         Ok(Self { conn })
     }
 
@@ -329,18 +313,6 @@ impl Db {
         self.conn
             .prepare_cached("UPDATE assets SET content_hash=?1 WHERE id=?2")
             .and_then(|mut st| st.execute(params![hash, asset_id]))
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    /// Record one asset's score without touching the rest of the row.
-    /// The ingest background task flushes these in batches after decoding
-    /// and thumbnail work that must never hold the Db lock.
-    pub fn update_asset_score(&self, asset_id: &str, score: &Score) -> Result<(), String> {
-        let json = serde_json::to_string(score).map_err(|e| e.to_string())?;
-        self.conn
-            .prepare_cached("UPDATE assets SET score_json=?1 WHERE id=?2")
-            .and_then(|mut st| st.execute(params![json, asset_id]))
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -956,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn update_asset_score_changes_only_the_score() {
+    fn update_asset_scoring_changes_only_the_score() {
         let db = mem();
         let p = db.create_project("trip", "/tmp/trip").unwrap();
         db.upsert_asset(&p.id, &asset("a1")).unwrap();
@@ -964,7 +936,7 @@ mod tests {
             total: 0.4,
             ..Default::default()
         };
-        db.update_asset_score("a1", &first).unwrap();
+        db.update_asset_scoring("a1", &first, None).unwrap();
         let after_first = db.list_assets(&p.id).unwrap();
         assert!((after_first[0].score.as_ref().unwrap().total - 0.4).abs() < 1e-6);
         // Every other column survives the column-only write.
@@ -976,7 +948,7 @@ mod tests {
             highlight: true,
             ..Default::default()
         };
-        db.update_asset_score("a1", &second).unwrap();
+        db.update_asset_scoring("a1", &second, None).unwrap();
         let after_second = db.list_assets(&p.id).unwrap();
         assert_eq!(after_second.len(), 1);
         assert!((after_second[0].score.as_ref().unwrap().total - 0.9).abs() < 1e-6);

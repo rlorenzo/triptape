@@ -9,7 +9,7 @@
 
 use crate::geo::haversine_m;
 use crate::hash::is_near_dupe;
-use crate::types::{Asset, Cluster, Score};
+use crate::types::{Asset, AssetKind, Cluster, Score};
 use std::collections::{HashMap, HashSet};
 
 /// A time gap this large always starts a new cluster (4 h).
@@ -267,6 +267,9 @@ fn same_moment(a: &Asset, b: &Asset) -> bool {
 /// with union-find; groups merge only when every cross pair is the same
 /// moment, so a whole group stays within the window and radius. The best
 /// shot is the highest `total` score (ties → first in story order).
+/// Videos never collapse: their pHash is only the poster frame, so two
+/// clips (or a clip and a photo) opening on the same view can still hold
+/// different footage.
 pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) -> Vec<DupeGroup> {
     let n = assets.len();
     let mut parent: Vec<usize> = (0..n).collect();
@@ -277,7 +280,10 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
         }
         x
     }
-    let phashes: Vec<Option<u64>> = assets.iter().map(|a| a.phash).collect();
+    let phashes: Vec<Option<u64>> = assets
+        .iter()
+        .map(|a| a.phash.filter(|_| a.kind != AssetKind::Video))
+        .collect();
     let mut members: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
     for i in 0..n {
         for j in (i + 1)..n {
@@ -343,7 +349,6 @@ pub fn suppressed_ids(groups: &[DupeGroup]) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::AssetKind;
 
     fn asset(id: &str, taken: Option<i64>, gps: Option<(f64, f64)>, phash: Option<u64>) -> Asset {
         let mut a = Asset::new(id, format!("/tmp/{id}.jpg").into(), AssetKind::Photo);
@@ -424,6 +429,23 @@ mod tests {
             .find(|x| x.members.contains(&"a".to_string()))
             .unwrap();
         assert_eq!(ab.best_id, "b");
+    }
+
+    #[test]
+    fn videos_never_collapse_as_near_dupes() {
+        // Same poster frame, same moment: distinct clips (and a clip vs. a
+        // photo) all stay, since the pHash only covers the first frame.
+        let video = |id: &str, t: i64| {
+            let mut a = asset(id, Some(t), None, Some(0b101));
+            a.kind = AssetKind::Video;
+            a
+        };
+        let a = vec![
+            video("v1", 1),
+            video("v2", 2),
+            asset("p", Some(3), None, Some(0b101)),
+        ];
+        assert_eq!(collapse_near_dupes(&a, &HashMap::new()).len(), 3);
     }
 
     #[test]

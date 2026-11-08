@@ -326,8 +326,7 @@ pub struct ExportSummary {
 pub fn fill_foreground_metadata(a: &mut Asset) {
     if a.kind == AssetKind::Video {
         let probe = metadata::probe_video("ffprobe", &a.path).ok();
-        a.user_caption = metadata::read_sidecar_caption(&a.path);
-        a.people_count = metadata::read_sidecar_people(&a.path);
+        (a.user_caption, a.people_count) = metadata::story_fields(&a.path, None);
         let Some(p) = probe else {
             a.taken_at = Some(a.mtime);
             a.time_guessed = true;
@@ -349,13 +348,7 @@ pub fn fill_foreground_metadata(a: &mut Asset) {
         a.taken_at = Some(ct.unix_secs);
         a.time_guessed = ct.time_guessed;
         a.tz_offset_secs = exif.tz_offset_secs;
-        a.user_caption = exif
-            .caption
-            .clone()
-            .or_else(|| metadata::read_sidecar_caption(&a.path));
-        a.people_count = exif
-            .people
-            .or_else(|| metadata::read_sidecar_people(&a.path));
+        (a.user_caption, a.people_count) = metadata::story_fields(&a.path, Some(&exif));
         a.gps = exif.gps;
         a.rotation_deg = exif
             .orientation

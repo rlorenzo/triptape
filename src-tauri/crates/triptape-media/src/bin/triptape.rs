@@ -221,9 +221,7 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         |(_, path, dur, _)| clip_analysis::analyze_clip(&ffmpeg, &ffprobe, path, *dur),
         |idx, analysis, _, _| {
             let (id, _, _, signals) = &videos[idx];
-            let mut s = score::score_video(analysis.quality, signals);
-            s.clip_window = analysis.window;
-            scores.insert(id.clone(), s);
+            scores.insert(id.clone(), analysis.score(signals));
         },
     );
 
@@ -382,7 +380,7 @@ fn fill_video(a: &mut Asset, probe: Option<&metadata::FfprobeOutput>) {
     let Some(p) = probe else {
         a.taken_at = Some(a.mtime);
         a.time_guessed = true;
-        fill_sidecar_story(a);
+        (a.user_caption, a.people_count) = metadata::story_fields(&a.path, None);
         return;
     };
     a.duration_secs = p.duration_secs();
@@ -395,13 +393,7 @@ fn fill_video(a: &mut Asset, probe: Option<&metadata::FfprobeOutput>) {
     let ct = metadata::resolve_capture_time(p.creation_time(), a.mtime);
     a.taken_at = Some(ct.unix_secs);
     a.time_guessed = ct.time_guessed;
-    fill_sidecar_story(a);
-}
-
-/// Video story fields from its XMP sidecar (user caption, people count).
-fn fill_sidecar_story(a: &mut Asset) {
-    a.user_caption = metadata::read_sidecar_caption(&a.path);
-    a.people_count = metadata::read_sidecar_people(&a.path);
+    (a.user_caption, a.people_count) = metadata::story_fields(&a.path, None);
 }
 
 /// Fill photo metadata from EXIF; dimensions + pHash from the decoded
@@ -412,13 +404,7 @@ fn fill_photo(a: &mut Asset, img: Option<&image::DynamicImage>) {
     a.taken_at = Some(ct.unix_secs);
     a.time_guessed = ct.time_guessed;
     a.tz_offset_secs = exif.tz_offset_secs;
-    a.user_caption = exif
-        .caption
-        .clone()
-        .or_else(|| metadata::read_sidecar_caption(&a.path));
-    a.people_count = exif
-        .people
-        .or_else(|| metadata::read_sidecar_people(&a.path));
+    (a.user_caption, a.people_count) = metadata::story_fields(&a.path, Some(&exif));
     a.gps = exif.gps;
     a.rotation_deg = exif
         .orientation
@@ -468,10 +454,7 @@ fn score_asset(
     if a.kind == AssetKind::Video {
         return (score::score_video(None, &signals), phash);
     }
-    let score = pixels
-        .and_then(|p| score::score_still_image(p, &signals))
-        .unwrap_or_else(|| score::fallback_score_with(&signals));
-    (score, phash)
+    (score::score_still_or_fallback(pixels, &signals), phash)
 }
 
 fn plan_cmd(flags: &HashMap<String, String>) {

@@ -206,14 +206,22 @@ fn signal_bonus(signals: &StorySignals, for_print: bool) -> (f32, Vec<String>) {
     (bonus, reasons)
 }
 
+/// Map raw technical quality (0..1) onto the squeezed
+/// `TECH_FLOOR..TECH_FLOOR + TECH_SPAN` band; see [`TECH_FLOOR`].
+pub fn squeeze_quality(quality: f32) -> f32 {
+    TECH_FLOOR + TECH_SPAN * quality.clamp(0.0, 1.0)
+}
+
 /// Highlight score: compressed technical quality plus story-signal
 /// bonuses, with reasons. See [`TECH_FLOOR`] for why quality is squeezed.
 pub fn highlight_score(base: &Score, signals: &StorySignals, for_print: bool) -> Score {
     let mut out = base.clone();
     let (bonus, reasons) = signal_bonus(signals, for_print);
     out.reasons.extend(reasons);
+    let quality = squeeze_quality(base.total);
     out.bonus = bonus;
-    out.total = (TECH_FLOOR + TECH_SPAN * base.total.clamp(0.0, 1.0) + bonus).clamp(0.0, 1.0);
+    out.quality = Some(quality);
+    out.total = (quality + bonus).clamp(0.0, 1.0);
     out.highlight = out.total >= HIGHLIGHT_THRESHOLD;
     out
 }
@@ -234,6 +242,7 @@ pub fn fallback_score_with(signals: &StorySignals) -> Score {
     let mut s = fallback_score();
     s.reasons = reasons;
     s.bonus = bonus;
+    s.quality = Some(s.total);
     s.total = (s.total + bonus).clamp(0.0, 1.0);
     s.highlight = bonus > 0.0 && s.total >= HIGHLIGHT_THRESHOLD;
     s
@@ -273,11 +282,16 @@ pub fn score_still_image(img: &image::DynamicImage, signals: &StorySignals) -> O
     Some(highlight_score(&base, signals, false))
 }
 
-/// Score a still from a file on disk (a photo, or a cached thumbnail of
-/// one). Returns `None` when the file cannot be decoded or carries no
-/// frame stats; callers apply [`fallback_score_with`].
-pub fn score_still_file(path: &std::path::Path, signals: &StorySignals) -> Option<Score> {
-    score_still_image(&image::open(path).ok()?, signals)
+/// Score a still from whatever pixels could be decoded for it (the photo
+/// or a thumbnail of it): [`score_still_image`] when `pixels` carry frame
+/// stats, else [`fallback_score_with`].
+pub fn score_still_or_fallback(
+    pixels: Option<&image::DynamicImage>,
+    signals: &StorySignals,
+) -> Score {
+    pixels
+        .and_then(|p| score_still_image(p, signals))
+        .unwrap_or_else(|| fallback_score_with(signals))
 }
 
 #[cfg(test)]
@@ -436,24 +450,28 @@ mod tests {
     }
 
     #[test]
-    fn still_file_scores_saved_image_and_rejects_garbage() {
-        let dir = tempfile::tempdir().unwrap();
-        let sharp_path = dir.path().join("sharp.png");
-        checkerboard(32).save(&sharp_path).unwrap();
-        let sharp = score_still_file(&sharp_path, &StorySignals::default()).unwrap();
-        assert!(sharp.total > 0.65, "{sharp:?}");
+    fn squeeze_quality_maps_into_the_tech_band() {
+        assert_eq!(squeeze_quality(0.0), TECH_FLOOR);
+        assert_eq!(squeeze_quality(1.0), TECH_FLOOR + TECH_SPAN);
+        assert_eq!(squeeze_quality(-1.0), TECH_FLOOR);
+        assert_eq!(squeeze_quality(2.0), TECH_FLOOR + TECH_SPAN);
+    }
 
-        let dark_path = dir.path().join("dark.png");
-        flat_dark(32).save(&dark_path).unwrap();
-        let dark = score_still_file(&dark_path, &StorySignals::default()).unwrap();
-        assert!(dark.total < sharp.total, "{dark:?} vs {sharp:?}");
-
-        assert!(
-            score_still_file(&dir.path().join("missing.png"), &StorySignals::default()).is_none()
+    #[test]
+    fn still_or_fallback_scores_pixels_and_falls_back_without_them() {
+        let people = StorySignals {
+            people_count: 2,
+            ..Default::default()
+        };
+        let sharp = score_still_or_fallback(Some(&checkerboard(32)), &people);
+        assert_eq!(
+            sharp,
+            score_still_image(&checkerboard(32), &people).unwrap()
         );
-        let junk = dir.path().join("junk.png");
-        std::fs::write(&junk, b"not an image").unwrap();
-        assert!(score_still_file(&junk, &StorySignals::default()).is_none());
+        assert_eq!(
+            score_still_or_fallback(None, &people),
+            fallback_score_with(&people)
+        );
     }
 
     #[test]

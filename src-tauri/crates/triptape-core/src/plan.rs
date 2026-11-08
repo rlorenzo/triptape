@@ -313,12 +313,12 @@ pub fn estimate_hero_secs<'e, 'c>(
     let n = segs.len();
     let mut overlap = 0.0;
     let mut breaks = 0usize;
+    // A cut into or out of a card, or between chapters, is a chapter break.
+    let is_break = |a: Seg, b: Seg| a == Seg::Card || b == Seg::Card || (a != Seg::Title && a != b);
     for i in 1..n {
-        let is_break = |a: Seg, b: Seg| {
-            let cut_card = |s: Seg| s == Seg::Card;
-            cut_card(a) || cut_card(b) || (a != Seg::Title && a != b)
-        };
-        overlap += if i == 1 || (i == n - 1 && n > 2) {
+        // The opening cut and (when there is a middle) the closing cut.
+        let bookend = i == 1 || (i == n - 1 && n > 2);
+        overlap += if bookend {
             EST_BOOKEND_OVERLAP_SECS
         } else if is_break(segs[i - 1].0, segs[i].0) {
             breaks += 1;
@@ -824,21 +824,9 @@ pub fn build_plan_with_length(
             places: chapters.iter().any(|c| c.place.is_some()),
         },
     };
-    let moment: HashMap<&str, (Option<i64>, Option<u64>)> = ordered
-        .iter()
-        .map(|a| (a.id.as_str(), (a.taken_at, a.phash)))
-        .collect();
-    let same_moment = |x: &str, y: &str| match (moment.get(x), moment.get(y)) {
-        (Some(&(tx, hx)), Some(&(ty, hy))) => match (tx, ty) {
-            (Some(tx), Some(ty)) => {
-                let dt = (tx - ty).abs();
-                dt <= SAME_MOMENT_BURST_SECS
-                    || (dt <= SAME_MOMENT_SECS
-                        && matches!((hx, hy), (Some(p), Some(q))
-                            if crate::hash::phash_distance(p, q) <= SAME_MOMENT_PHASH_DISTANCE))
-            }
-            _ => false,
-        },
+    let by_id: HashMap<&str, &Asset> = ordered.iter().map(|a| (a.id.as_str(), *a)).collect();
+    let similar = |x: &str, y: &str| match (by_id.get(x), by_id.get(y)) {
+        (Some(a), Some(b)) => same_moment(a, b),
         _ => false,
     };
     // Panoramas pan solo for longer than a plain still; the estimator
@@ -851,14 +839,7 @@ pub fn build_plan_with_length(
         })
         .collect();
     let pano_secs_of = |id: &str| pano_hold.get(id).copied();
-    let hero = select_hero_by_budget(
-        hero,
-        chapter_label,
-        score_of,
-        same_moment,
-        pano_secs_of,
-        budget,
-    );
+    let hero = select_hero_by_budget(hero, chapter_label, score_of, similar, pano_secs_of, budget);
 
     // Reel selects: trip highlights. Rank every asset trip-wide by score
     // (motion-capable assets get a small ranking bonus — a clip or Live
@@ -943,10 +924,29 @@ pub fn build_plan_with_length(
     }
 }
 
+/// Whether `a` and `b` show the same moment: a burst (within
+/// [`SAME_MOMENT_BURST_SECS`]), or close in time
+/// ([`SAME_MOMENT_SECS`]) with similar pixels.
+fn same_moment(a: &Asset, b: &Asset) -> bool {
+    let (Some(ta), Some(tb)) = (a.taken_at, b.taken_at) else {
+        return false;
+    };
+    let dt = (ta - tb).abs();
+    if dt <= SAME_MOMENT_BURST_SECS {
+        return true;
+    }
+    let (Some(p), Some(q)) = (a.phash, b.phash) else {
+        return false;
+    };
+    dt <= SAME_MOMENT_SECS && crate::hash::phash_distance(p, q) <= SAME_MOMENT_PHASH_DISTANCE
+}
+
 /// Story score per asset: technical quality made relative to the asset's
 /// chapter, plus its story bonuses.
 ///
-/// Quality is `total - bonus` (already squeezed by the scorer). Each asset's
+/// Quality is [`Score::tech_quality`] (already squeezed by the scorer, and
+/// kept apart from the clamped `total` so saturation can't make a bonus
+/// lower an asset's rank). Each asset's
 /// percentile within its chapter (mid-rank, so a lone asset sits at 0.5)
 /// is blended in at [`REL_QUALITY_WEIGHT`], so a chapter's sharpest frames
 /// are favoured over equal frames of a dull chapter without letting
@@ -963,19 +963,21 @@ fn relative_scores<'a>(
         };
         by_chapter.entry(chapter_of(&a.id)).or_default().push((
             a.id.as_str(),
-            s.total - s.bonus,
+            s.tech_quality(),
             s.bonus,
         ));
     }
     let mut out = HashMap::new();
     for members in by_chapter.values() {
         let n = members.len() as f32;
+        let mut sorted: Vec<f32> = members.iter().map(|m| m.1).collect();
+        sorted.sort_by(f32::total_cmp);
         for &(id, quality, bonus) in members {
-            let less = members.iter().filter(|m| m.1 < quality).count() as f32;
-            let same = members.iter().filter(|m| m.1 == quality).count() as f32;
-            let pct = (less + same / 2.0) / n;
+            let less = sorted.partition_point(|&q| q < quality);
+            let same = sorted.partition_point(|&q| q <= quality) - less;
+            let pct = (less as f32 + same as f32 / 2.0) / n;
             let relative = (1.0 - REL_QUALITY_WEIGHT) * quality
-                + REL_QUALITY_WEIGHT * (crate::score::TECH_FLOOR + crate::score::TECH_SPAN * pct);
+                + REL_QUALITY_WEIGHT * crate::score::squeeze_quality(pct);
             out.insert(id.to_string(), (relative + bonus).clamp(0.0, 1.0));
         }
     }
@@ -2371,10 +2373,64 @@ mod tests {
         with_people.insert("a1".into(), with_bonus(0.60, 0.10));
         let rel = relative_scores(&ordered, letter, &with_people);
         assert!(rel["a1"] > rel["a3"], "{rel:?}");
+        // Tied qualities share one mid-rank.
+        let mut tied = scores.clone();
+        tied.insert("a2".into(), with_bonus(0.60, 0.0));
+        let rel = relative_scores(&ordered, letter, &tied);
+        assert_eq!(rel["a1"], rel["a2"], "{rel:?}");
+        assert!(rel["a3"] > rel["a1"], "{rel:?}");
         // A lone asset sits mid-chapter and keeps its bonus.
         let lone = vec![&assets[0]];
         let rel = relative_scores(&lone, |_| "x", &scores);
         assert!((rel["a1"] - 0.60).abs() < 0.1 * REL_QUALITY_WEIGHT + 1e-6);
+    }
+
+    #[test]
+    fn saturated_total_does_not_let_a_caption_lower_the_rank() {
+        // Equal technical quality; the caption pushes `total` past 1. Ranking
+        // must read the stored quality, not `total - bonus`.
+        let assets = [
+            asset("plain", 100, AssetKind::Photo),
+            asset("captioned", 101, AssetKind::Photo),
+        ];
+        let score = |total: f32, bonus: f32| Score {
+            total,
+            bonus,
+            quality: Some(0.70),
+            ..Default::default()
+        };
+        let scores = HashMap::from([
+            ("plain".to_string(), score(0.98, 0.28)),
+            ("captioned".to_string(), score(1.0, 0.38)),
+        ]);
+        let ordered: Vec<&Asset> = assets.iter().collect();
+        let rel = relative_scores(&ordered, |_| "x", &scores);
+        assert!(rel["captioned"] > rel["plain"], "{rel:?}");
+        // Older scores without `quality` fall back to `total - bonus`.
+        assert!((with_bonus(0.6, 0.1).tech_quality() - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn same_moment_needs_a_burst_or_close_time_with_similar_pixels() {
+        let shot = |id: &str, taken: i64, phash: Option<u64>| {
+            let mut a = asset(id, taken, AssetKind::Photo);
+            a.phash = phash;
+            a
+        };
+        let base = shot("a", 1_000, Some(0));
+        // A burst counts even without pixels.
+        assert!(same_moment(
+            &base,
+            &shot("b", 1_000 + SAME_MOMENT_BURST_SECS, None)
+        ));
+        let later = 1_000 + SAME_MOMENT_SECS;
+        assert!(same_moment(&base, &shot("c", later, Some(0))));
+        assert!(!same_moment(&base, &shot("d", later, Some(u64::MAX))));
+        assert!(!same_moment(&base, &shot("e", later, None)));
+        assert!(!same_moment(&base, &shot("f", later + 1, Some(0))));
+        let mut undated = shot("g", 1_000, Some(0));
+        undated.taken_at = None;
+        assert!(!same_moment(&base, &undated));
     }
 
     #[test]

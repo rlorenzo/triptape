@@ -294,13 +294,16 @@ fn xmp_description(data: &[u8]) -> Option<String> {
         inner
     };
     let end = body.find('<')?;
-    let raw = body[..end]
-        .replace("&lt;", "<")
+    clean_caption(&xml_unescape(&body[..end]))
+}
+
+/// Decode the five predefined XML entities in element text.
+fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
-        .replace("&amp;", "&"); // Last, so `&amp;lt;` stays a literal `&lt;`.
-    clean_caption(&raw)
+        .replace("&amp;", "&") // Last, so `&amp;lt;` stays a literal `&lt;`.
 }
 
 /// Most people counted for one photo: a tagged crowd saturates the story
@@ -361,12 +364,7 @@ fn xmp_list_items(body: &str) -> Vec<String> {
         }
         let text = &rest[gt + 1..];
         let end = text.find('<').unwrap_or(text.len());
-        let item = text[..end]
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&amp;", "&");
+        let item = xml_unescape(&text[..end]);
         let item = item.trim();
         if !item.is_empty() {
             out.push(item.to_string());
@@ -424,30 +422,40 @@ pub fn xmp_people_count(data: &[u8]) -> Option<u32> {
         .map(|n| n.min(MAX_PEOPLE))
 }
 
-/// Read one value from an XMP sidecar next to `path` (`IMG_1.heic.xmp`,
-/// `IMG_1.xmp`, or `IMG_1.XMP`). `IMG_1.heic.xmp` names exactly this photo,
-/// so when it exists it is the answer even if `extract` finds nothing.
-/// `IMG_1.xmp` may belong to a same-stem sibling (RAW + HEIC), and its
-/// values must not land on this photo instead.
-fn read_sidecar<T>(path: &Path, extract: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
-    if let Ok(data) = read_prefix(&path.with_added_extension("xmp")) {
-        return extract(&data);
-    }
-    [path.with_extension("xmp"), path.with_extension("XMP")]
-        .iter()
-        .find_map(|c| extract(&read_prefix(c).ok()?))
-}
-
-/// Caption from an XMP sidecar next to `path`; see [`read_sidecar`] for
-/// which sidecar wins. Photos exports write one sidecar per photo and put
+/// User caption and people count from an XMP sidecar next to `path`
+/// (`IMG_1.heic.xmp`, `IMG_1.xmp`, or `IMG_1.XMP`), reading each sidecar
+/// at most once. `IMG_1.heic.xmp` names exactly this photo, so when it
+/// exists it is the answer even for fields it lacks. `IMG_1.xmp` may belong
+/// to a same-stem sibling (RAW + HEIC), and its values must not land on
+/// this photo instead. Photos exports write one sidecar per photo and put
 /// the user's caption inside; the image itself may carry none.
-pub fn read_sidecar_caption(path: &Path) -> Option<String> {
-    read_sidecar(path, xmp_description)
+pub fn read_sidecar_story(path: &Path) -> (Option<String>, Option<u32>) {
+    if let Ok(data) = read_prefix(&path.with_added_extension("xmp")) {
+        return (xmp_description(&data), xmp_people_count(&data));
+    }
+    let (mut caption, mut people) = (None, None);
+    for c in [path.with_extension("xmp"), path.with_extension("XMP")] {
+        if caption.is_some() && people.is_some() {
+            break;
+        }
+        let Ok(data) = read_prefix(&c) else { continue };
+        caption = caption.or_else(|| xmp_description(&data));
+        people = people.or_else(|| xmp_people_count(&data));
+    }
+    (caption, people)
 }
 
-/// People count from an XMP sidecar next to `path` (see [`xmp_people_count`]).
-pub fn read_sidecar_people(path: &Path) -> Option<u32> {
-    read_sidecar(path, xmp_people_count)
+/// An asset's story fields `(user caption, people count)`: in-file values
+/// from `exif` (photos) win and the XMP sidecar fills the rest. The sidecar
+/// is not read when `exif` already supplies both.
+pub fn story_fields(path: &Path, exif: Option<&ImageExif>) -> (Option<String>, Option<u32>) {
+    let caption = exif.and_then(|e| e.caption.clone());
+    let people = exif.and_then(|e| e.people);
+    if caption.is_some() && people.is_some() {
+        return (caption, people);
+    }
+    let (side_caption, side_people) = read_sidecar_story(path);
+    (caption.or(side_caption), people.or(side_people))
 }
 
 /// Upper bound on bytes buffered from one image for metadata parsing.
@@ -823,7 +831,7 @@ mod tests {
             );
             std::fs::write(dir.path().join(name), body).unwrap();
         };
-        let caption = |photo: &str| read_sidecar_caption(&dir.path().join(photo));
+        let caption = |photo: &str| read_sidecar_story(&dir.path().join(photo)).0;
 
         // Every supported sidecar naming.
         sidecar("IMG_1.xmp", "Replaced extension");
@@ -1247,7 +1255,7 @@ mod tests {
         write("IMG_1.heic.xmp", 3);
         write("IMG_1.xmp", 1);
         write("IMG_2.xmp", 2);
-        let people = |photo: &str| read_sidecar_people(&dir.path().join(photo));
+        let people = |photo: &str| read_sidecar_story(&dir.path().join(photo)).1;
         assert_eq!(people("IMG_1.heic"), Some(3), "exact sidecar wins");
         assert_eq!(people("IMG_2.heic"), Some(2));
         assert_eq!(people("IMG_3.heic"), None);
@@ -1258,5 +1266,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(people("IMG_2.heic"), None);
+    }
+
+    #[test]
+    fn story_fields_prefer_in_file_values_and_fill_from_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let photo = dir.path().join("IMG_1.heic");
+        std::fs::write(
+            dir.path().join("IMG_1.heic.xmp"),
+            "<x:xmpmeta><rdf:Description><dc:description>Sidecar words</dc:description>\
+             <Iptc4xmpExt:PersonInImage><rdf:Bag><rdf:li>Ann</rdf:li><rdf:li>Bo</rdf:li>\
+             </rdf:Bag></Iptc4xmpExt:PersonInImage></rdf:Description></x:xmpmeta>",
+        )
+        .unwrap();
+        // One sidecar read yields both fields.
+        assert_eq!(
+            read_sidecar_story(&photo),
+            (Some("Sidecar words".to_string()), Some(2))
+        );
+        assert_eq!(
+            story_fields(&photo, None),
+            (Some("Sidecar words".to_string()), Some(2))
+        );
+        // In-file values win; the sidecar fills only what is missing.
+        let exif = ImageExif {
+            caption: Some("In-file words".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            story_fields(&photo, Some(&exif)),
+            (Some("In-file words".to_string()), Some(2))
+        );
+        let full = ImageExif {
+            caption: Some("In-file words".into()),
+            people: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(
+            story_fields(&photo, Some(&full)),
+            (Some("In-file words".to_string()), Some(5))
+        );
+        assert_eq!(
+            story_fields(&dir.path().join("IMG_9.heic"), None),
+            (None, None)
+        );
     }
 }

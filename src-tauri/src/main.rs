@@ -109,19 +109,14 @@ fn score_asset_with_cache(cache_dir: &Path, a: &Asset) -> Scored {
         let analysis = a.duration_secs.map_or_else(Default::default, |d| {
             triptape_media::clip_analysis::analyze_clip("ffmpeg", "ffprobe", &a.path, d)
         });
-        let mut score = score::score_video(analysis.quality, &signals);
-        score.clip_window = analysis.window;
         return Scored {
-            score,
+            score: analysis.score(&signals),
             phash: thumb.as_ref().map(hash::average_hash_from_image),
         };
     }
     let pixels = thumb.or_else(|| hash::open_image(&a.path));
     Scored {
-        score: pixels
-            .as_ref()
-            .and_then(|p| score::score_still_image(p, &signals))
-            .unwrap_or_else(|| score::fallback_score_with(&signals)),
+        score: score::score_still_or_fallback(pixels.as_ref(), &signals),
         phash: pixels.as_ref().map(hash::average_hash_from_image),
     }
 }
@@ -313,10 +308,9 @@ fn background_hash_job(
                 .min(SCORE_WORKERS_MAX);
             score_assets_parallel(&cache_dir, &unscored, workers, |a, s, done, total| {
                 pending_scores.push((a.id.clone(), s.score, s.phash));
-                if pending_scores.len() >= SCORE_FLUSH_FILES
-                    && flush_scores(&mut pending_scores).is_ok()
-                {
-                    last_flush = std::time::Instant::now();
+                // A failed flush keeps its batch; the final flush retries it.
+                if pending_scores.len() >= SCORE_FLUSH_FILES {
+                    let _ = flush_scores(&mut pending_scores);
                 }
                 let candidate = (BACKGROUND_HASH_CEILING_PROGRESS
                     + (done as f32 / total as f32)
@@ -347,7 +341,7 @@ fn background_hash_job(
         // lock; the rebuild itself is pure. Inserting a newer plan only
         // adds a row, so Story edits (PlanEdits applied on read) survive
         // untouched.
-        let assets = lock()?.list_assets(project_id)?;
+        let mut assets = lock()?.list_assets(project_id)?;
         let clusters = cluster::cluster_assets(&assets);
         let cluster_of: HashMap<String, String> = clusters
             .iter()
@@ -362,12 +356,8 @@ fn background_hash_job(
         // Near-duplicates (same moment, similar pixels) stay in the library
         // but only the best shot of each stack enters the plan, as in the CLI.
         let suppressed = cluster::suppressed_ids(&cluster::collapse_near_dupes(&assets, &scores));
-        let plan_assets: Vec<Asset> = assets
-            .iter()
-            .filter(|a| !suppressed.contains(&a.id))
-            .cloned()
-            .collect();
-        let plan = planmod::build_plan(&plan_assets, &cluster_of, &scores);
+        assets.retain(|a| !suppressed.contains(&a.id));
+        let plan = planmod::build_plan(&assets, &cluster_of, &scores);
         let db = lock()?;
         db.insert_plan(project_id, &plan, "local")?;
         db.update_job(job_id, JobState::Done, 1.0, Some("done"), None)?;
