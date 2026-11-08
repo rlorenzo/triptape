@@ -42,12 +42,15 @@ pub fn day_key(taken_at: Option<i64>, tz_offset_secs: Option<i32>) -> String {
         .unwrap_or_else(|| "unknown-date".to_string())
 }
 
+/// Story-order sort key: capture time (unknown last), then id.
+pub fn story_key(a: &Asset) -> (i64, &str) {
+    (a.taken_at.unwrap_or(i64::MAX), &a.id)
+}
+
 /// Assets in story order: capture time (unknown last), then id.
 pub fn story_order(assets: &[Asset]) -> Vec<&Asset> {
     let mut ordered: Vec<&Asset> = assets.iter().collect();
-    ordered.sort_by(|a, b| {
-        (a.taken_at.unwrap_or(i64::MAX), &a.id).cmp(&(b.taken_at.unwrap_or(i64::MAX), &b.id))
-    });
+    ordered.sort_by(|a, b| story_key(a).cmp(&story_key(b)));
     ordered
 }
 

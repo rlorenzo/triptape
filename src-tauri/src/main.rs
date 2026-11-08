@@ -1115,6 +1115,27 @@ async fn set_asset_excluded(
     })
 }
 
+/// Pin a photo into the film ("Add to film"), or un-pin it. Film only; the
+/// plan puts it at its capture-time position and trades it for the weakest
+/// unpinned shot of its day to keep the length.
+#[tauri::command]
+async fn set_asset_included(
+    state: State<'_, AppState>,
+    project_id: String,
+    asset_id: String,
+    included: bool,
+) -> Result<StoryView, String> {
+    AppState::check_id(&asset_id)?;
+    state.require_project(&project_id)?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    if included {
+        StoryData::load(&db, &project_id)?.check_include(&asset_id)?;
+    }
+    save_edits(&db, &project_id, |edits| {
+        edits.set_included(asset_id, included)
+    })
+}
+
 #[tauri::command]
 async fn swap_asset(
     state: State<'_, AppState>,
@@ -1234,6 +1255,7 @@ fn main() {
             set_chapter_place,
             set_asset_caption,
             set_asset_excluded,
+            set_asset_included,
             swap_asset,
             get_thumbnail
         ])

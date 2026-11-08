@@ -198,6 +198,13 @@ impl Plan {
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(s)
     }
+
+    /// The chapter whose book flow holds `asset_id`.
+    pub fn chapter_of(&self, asset_id: &str) -> Option<&Chapter> {
+        self.chapters
+            .iter()
+            .find(|c| c.asset_ids.iter().any(|id| id == asset_id))
+    }
 }
 
 /// Per-signal quality score with human-readable reasons.

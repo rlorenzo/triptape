@@ -177,6 +177,8 @@ pub struct StoryView {
 /// Everything the Story editor reads for one project, loaded once.
 pub struct StoryData(EditedPlan);
 
+const NOT_IN_CHAPTER: &str = "asset is not in any chapter";
+
 impl StoryData {
     pub fn load(db: &Db, project_id: &str) -> Result<Self, String> {
         db.edited_plan(Some(project_id))?
@@ -253,16 +255,24 @@ impl StoryData {
         let chapter = self
             .0
             .base
-            .chapters
-            .iter()
-            .find(|c| c.asset_ids.iter().any(|id| id == asset_id))
-            .ok_or_else(|| "asset is not in any chapter".to_string())?;
+            .chapter_of(asset_id)
+            .ok_or_else(|| NOT_IN_CHAPTER.to_string())?;
         let entry = self.entry_builder();
         Ok(chapter
             .asset_ids
             .iter()
             .filter_map(|id| entry(id))
             .collect())
+    }
+
+    /// Only assets of a scan-time chapter can be pinned into the film
+    /// (the plan needs the chapter to trade a shot off against).
+    pub fn check_include(&self, asset_id: &str) -> Result<(), String> {
+        self.0
+            .base
+            .chapter_of(asset_id)
+            .map(|_| ())
+            .ok_or_else(|| NOT_IN_CHAPTER.to_string())
     }
 
     /// A swap replaces a current video/reel pick with a different asset of
@@ -567,6 +577,17 @@ mod tests {
             .collect();
         assert_eq!(ids, ["a", "b"]);
         assert!(data.alternatives("missing").is_err());
+    }
+
+    #[test]
+    fn story_include_requires_a_chapter_member() {
+        let (db, pid) = story_db(&["a", "b"]);
+        let data = StoryData::load(&db, &pid).unwrap();
+        assert!(data.check_include("b").is_ok());
+        assert_eq!(
+            data.check_include("missing").unwrap_err(),
+            "asset is not in any chapter"
+        );
     }
 
     #[test]
