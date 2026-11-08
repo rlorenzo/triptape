@@ -75,7 +75,8 @@ current state of each privacy control.
 - Windows: install Rust + the pinned static FFmpeg sidecar (see
   `scripts/fetch-ffmpeg`); PATH fallback is dev-only.
 - Thumbnails cache in the OS cache dir with no size cap yet. Export
-  intermediates stay in `.work` inside the export folder.
+  intermediates live in `.work` inside the export folder and are removed
+  when the export ends.
 
 ## Known blockers (Sprint 0)
 

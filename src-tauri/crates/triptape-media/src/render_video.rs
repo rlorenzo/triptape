@@ -396,7 +396,7 @@ fn render_card_png(
 }
 
 /// Render the hero film. `work_dir` holds intermediates (deleted by the
-/// caller on cancel); outputs land directly in their final paths.
+/// caller when the export ends); outputs land directly in their final paths.
 pub fn render_hero_video(
     caps: &Capabilities,
     plan: &Plan,
@@ -1228,7 +1228,7 @@ fn glide_variants(groups: &[Vec<&ResolvedEntry>]) -> Vec<usize> {
         .enumerate()
         .map(|(i, &h)| {
             if i > 0 && hashed[i - 1] == h {
-                (h + 1) % GLIDE_VARIANTS
+                (h + 1) % ffmpeg::GLIDE_VARIANTS
             } else {
                 h
             }
@@ -1236,12 +1236,9 @@ fn glide_variants(groups: &[Vec<&ResolvedEntry>]) -> Vec<usize> {
         .collect()
 }
 
-/// Number of glide variants ([`ffmpeg::glide`] cycles through four).
-const GLIDE_VARIANTS: usize = 4;
-
 fn stable_variant(asset_id: &str) -> usize {
     let h = blake3::hash(asset_id.as_bytes());
-    usize::from(h.as_bytes()[0]) % GLIDE_VARIANTS
+    usize::from(h.as_bytes()[0]) % ffmpeg::GLIDE_VARIANTS
 }
 
 /// Render, probe and (for short clips) freeze-pad one group. A failed render
@@ -1608,14 +1605,14 @@ pub(crate) fn silent_input(secs: f64) -> Vec<String> {
 /// blurred fill at 16:9, then a gentle Ken Burns move (≤1.05×) on the
 /// finished composite, varied by index. Zooming the raw photo instead
 /// both crops the subject and distorts non-16:9 sources.
-fn hold_graph(caps: &Capabilities, idx: usize, frames: u32, res: Resolution) -> String {
+fn hold_graph(caps: &Capabilities, variant: usize, frames: u32, res: Resolution) -> String {
     // Supersample the composite once, hold it, then glide over it. The fill
     // blur radius is in canvas pixels, so it scales with the resolution.
     let (sw, sh) = res.supersample();
     let (w, h) = res.dims();
     let composite = ffmpeg::fit_over_blur(caps, "[0:v]", sw, sh, "", 40 * res.scale());
     let hold = ffmpeg::hold_still(frames);
-    let glide = ffmpeg::glide(caps, frames, w, h, idx);
+    let glide = ffmpeg::glide(caps, frames, w, h, variant);
     format!("{composite},{hold},{glide},format=yuv420p[v]")
 }
 
@@ -1672,12 +1669,12 @@ fn cached_segment(
     let cached = caps.segment_cache.as_deref().map(|c| (c, key(c)));
     if let Some((c, key)) = &cached {
         if let Some(m) = c.fetch(key, &out) {
-            return Ok((out, m.secs, m.kind));
+            return Ok((out, m.secs, kind.into()));
         }
     }
     let secs = render(&out)?;
     if let Some((c, key)) = &cached {
-        c.store(key, &out, secs, kind);
+        c.store(key, &out, secs);
     }
     Ok((out, secs, kind.into()))
 }
@@ -1998,7 +1995,7 @@ fn compose_collage(
 }
 
 /// Filter graph of a panorama pan.
-fn pano_graph(dur: f64, aspect: f64, coverage: f64, idx: usize, res: Resolution) -> String {
+fn pano_graph(dur: f64, aspect: f64, coverage: f64, variant: usize, res: Resolution) -> String {
     let frames = (dur * 30.0).round() as u32;
     format!(
         "[0:v]{},format=yuv420p[v]",
@@ -2008,13 +2005,13 @@ fn pano_graph(dur: f64, aspect: f64, coverage: f64, idx: usize, res: Resolution)
             res.height(),
             aspect,
             coverage,
-            idx % 2 == 1
+            variant % 2 == 1
         )
     )
 }
 
 /// Panorama segment: pans across the whole image ([`ffmpeg::pano_pan`]);
-/// direction alternates with the segment index.
+/// direction alternates with the variant.
 #[allow(clippy::too_many_arguments)]
 fn render_pano_segment(
     caps: &Capabilities,
@@ -2022,11 +2019,11 @@ fn render_pano_segment(
     dur: f64,
     aspect: f64,
     coverage: f64,
-    idx: usize,
+    variant: usize,
     res: Resolution,
     out: &Path,
 ) -> Result<(), crate::MediaError> {
-    let graph = pano_graph(dur, aspect, coverage, idx, res);
+    let graph = pano_graph(dur, aspect, coverage, variant, res);
     render_graph_segment(caps, img, dur, graph, out)
 }
 
@@ -2035,12 +2032,12 @@ fn hold_args(
     caps: &Capabilities,
     img: &Path,
     dur: f64,
-    idx: usize,
+    variant: usize,
     res: Resolution,
     out: &Path,
 ) -> Vec<String> {
     let frames = (dur * 30.0).round() as u32;
-    graph_segment_args(img, dur, hold_graph(caps, idx, frames, res), out)
+    graph_segment_args(img, dur, hold_graph(caps, variant, frames, res), out)
 }
 
 /// Cache key of a still entry, before anything is decoded. The source's
@@ -2051,7 +2048,7 @@ fn still_key(
     cache: &SegmentCache,
     caps: &Capabilities,
     r: &ResolvedEntry,
-    idx: usize,
+    variant: usize,
     still_secs: f64,
     max_secs: f64,
     res: Resolution,
@@ -2063,13 +2060,14 @@ fn still_key(
         .num("max_secs", max_secs)
         .part("aspect", &format!("{:?}", r.aspect));
     let (input, output) = (Path::new("<IN>"), Path::new("<OUT>"));
-    k.args(&hold_args(caps, input, still_secs, idx, res, output));
+    k.args(&hold_args(caps, input, still_secs, variant, res, output));
+    // Any panorama aspect will do: its pan arguments fingerprint the pan code.
     let reference = 3.0;
     let dur = pano_motion(reference).hold_secs;
     k.args(&graph_segment_args(
         input,
         dur,
-        pano_graph(dur, reference, pano_coverage(reference, dur), idx, res),
+        pano_graph(dur, reference, pano_coverage(reference, dur), variant, res),
         output,
     ));
     k.finish()
@@ -2080,11 +2078,11 @@ fn render_hold_segment(
     caps: &Capabilities,
     img: &Path,
     dur: f64,
-    idx: usize,
+    variant: usize,
     res: Resolution,
     out: &Path,
 ) -> Result<(), crate::MediaError> {
-    caps.run(&hold_args(caps, img, dur, idx, res, out), out)
+    caps.run(&hold_args(caps, img, dur, variant, res, out), out)
 }
 
 /// Encode a one-image segment of `dur` seconds through `graph` (a

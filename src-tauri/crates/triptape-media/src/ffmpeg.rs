@@ -86,6 +86,9 @@ pub fn glide(caps: &Capabilities, frames: u32, w: u32, h: u32, variant: usize) -
     glide_depth(caps, frames, w, h, variant, GLIDE_DEPTH)
 }
 
+/// Distinct motions [`glide`] cycles through (by `variant`).
+pub const GLIDE_VARIANTS: usize = 4;
+
 /// Window divisor of the standard glide: the window shrinks to
 /// `(D-1)/D` of the frame, i.e. a 1.05x push at 21.
 pub const GLIDE_DEPTH: u32 = 21;
@@ -111,7 +114,7 @@ pub fn glide_depth(
     let p = format!("(min(in-1\\,{denom})/{denom})");
     // Window size as a fraction of the frame, and where its slack sits.
     let d1 = depth - 1;
-    let (size, slack) = match variant % 4 {
+    let (size, slack) = match variant % GLIDE_VARIANTS {
         0 => (format!("(1-{p}/{depth})"), "0.5".to_string()),
         1 => (format!("(({d1}+{p})/{depth})"), "0.5".to_string()),
         2 => (format!("({d1}/{depth})"), p),

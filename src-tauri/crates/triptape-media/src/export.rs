@@ -191,47 +191,41 @@ pub fn export_all(
     // The cache takes its lease before any segment is used and gives it back
     // however the export ends (the handle also releases on drop).
     let work = out_dir.join(".work");
-    let mut cache_note = None;
-    let cache: Option<std::sync::Arc<SegmentCache>> = opts.segment_cache.as_ref().and_then(|cfg| {
-        let version = crate::segment_cache::ffmpeg_version(&caps.ffmpeg_bin);
-        match SegmentCache::open(cfg, version, &work) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                cache_note = Some(format!("segment cache off ({}): {e}", cfg.dir.display()));
-                None
+    let (cache, cache_note) = match &opts.segment_cache {
+        None => (None, None),
+        Some(cfg) => {
+            let version = crate::segment_cache::ffmpeg_version(&caps.ffmpeg_bin);
+            match SegmentCache::open(cfg, version, &work) {
+                Ok(c) => (Some(c), None),
+                Err(e) => (
+                    None,
+                    Some(format!("segment cache off ({}): {e}", cfg.dir.display())),
+                ),
             }
         }
-    });
+    };
     caps.segment_cache = cache.clone();
     let mut out = export_inner(&caps, plan, assets, out_dir, opts);
-    if matches!(out, Err(crate::MediaError::Cancelled)) {
-        // Leave no intermediates behind; finished outputs and `.partial`
-        // siblings are already gone (a killed encode removes its own).
-        let _ = std::fs::remove_dir_all(&work);
+    // Leave no intermediates behind however the export ends (on cancel,
+    // finished outputs and `.partial` siblings are already gone). This must
+    // precede `cache.finish()`: `.work` holds hard links to cache entries, so
+    // while it exists eviction and `cache clear` cannot reclaim their bytes.
+    if let Err(e) = std::fs::remove_dir_all(&work) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            if let Ok(report) = out.as_mut() {
+                report.fallbacks.push(format!(
+                    "could not remove intermediates ({}): {e}; cached segments they share stay allocated",
+                    work.display()
+                ));
+            }
+        }
     }
     if let Some(cache) = cache {
         // Eviction runs only now: the lease is released first, so nothing
         // this export used is protected any longer than it is needed.
-        let stats = cache.stats();
         let evicted = cache.finish();
         if let Ok(report) = out.as_mut() {
-            if stats.hits + stats.misses > 0 {
-                report.segment_cache = Some(SegmentCacheReport {
-                    dir: cache.dir().to_string_lossy().into_owned(),
-                    reused: stats.hits,
-                    total: stats.hits + stats.misses,
-                    stored: stats.stored,
-                    skipped_low_disk: stats.skipped_low_disk,
-                    evicted: evicted.removed,
-                });
-            }
-            if stats.skipped_low_disk > 0 {
-                report.fallbacks.push(format!(
-                    "segment cache: {} segments not cached (under {} free)",
-                    stats.skipped_low_disk,
-                    crate::segment_cache::fmt_bytes(crate::segment_cache::LOW_DISK_BYTES)
-                ));
-            }
+            record_cache_use(&cache, evicted.removed, report);
         }
     }
     if let (Ok(report), Some(note)) = (out.as_mut(), cache_note) {
@@ -246,6 +240,30 @@ pub fn export_all(
         .map_err(|e| crate::MediaError::Io(e.to_string()))?;
     }
     out
+}
+
+/// Add how `cache` served this export to `report`: the reuse summary and,
+/// when the volume ran low, a fallback note.
+fn record_cache_use(cache: &SegmentCache, evicted: usize, report: &mut ExportReport) {
+    let stats = cache.stats();
+    let total = stats.hits + stats.misses;
+    if total > 0 {
+        report.segment_cache = Some(SegmentCacheReport {
+            dir: cache.dir().to_string_lossy().into_owned(),
+            reused: stats.hits,
+            total,
+            stored: stats.stored,
+            skipped_low_disk: stats.skipped_low_disk,
+            evicted,
+        });
+    }
+    if stats.skipped_low_disk > 0 {
+        report.fallbacks.push(format!(
+            "segment cache: {} segments not cached (under {} free)",
+            stats.skipped_low_disk,
+            crate::segment_cache::fmt_bytes(crate::segment_cache::LOW_DISK_BYTES)
+        ));
+    }
 }
 
 fn export_inner(
@@ -593,6 +611,32 @@ mod tests {
                 rationale: "r".into(),
             },
         }
+    }
+
+    #[test]
+    fn finished_export_removes_its_work_dir() {
+        // `.work` hard-links cache entries; left behind, it would pin their
+        // bytes past eviction and `cache clear`.
+        let t = tempfile::tempdir().unwrap();
+        let out = t.path().join("out");
+        let opts = ExportOptions {
+            preset: render_book::BookPreset::P1,
+            trip_name: "t".into(),
+            typst_bin: "typst".into(),
+            music_path: None,
+            keep_ambience: false,
+            only: "reels".into(),
+            resolution: Default::default(),
+            jobs: None,
+            progress: Default::default(),
+            segment_cache: Some(SegmentCacheConfig {
+                dir: t.path().join("cache"),
+                max_bytes: None,
+            }),
+        };
+        let report = export_all(&Default::default(), &empty_plan(), &[], &out, &opts).unwrap();
+        assert!(!out.join(".work").exists(), "{:?}", report.fallbacks);
+        assert!(out.join("export.json").exists());
     }
 
     #[test]

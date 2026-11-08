@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! <dir>/<kk>/<key>.mp4      the segment (kk = first two hex digits)
-//! <dir>/<kk>/<key>.json     sidecar: size, planned seconds, kind
+//! <dir>/<kk>/<key>.json     sidecar: size, planned seconds
 //! <dir>/leases/<id>.lease   one per running export (pid + start time)
 //! <dir>/.tmp-*              in-flight writes; never read
 //! ```
@@ -207,8 +207,6 @@ impl KeyBuilder {
 pub struct SegmentMeta {
     /// Seconds the renderer reported for the segment.
     pub secs: f64,
-    /// Timeline kind ("still", "clip", ...).
-    pub kind: String,
     /// Size of the `.mp4`, to reject a torn or swapped file cheaply.
     pub size: u64,
 }
@@ -362,7 +360,7 @@ impl SegmentCache {
     /// Cache the finished segment at `produced`. Best effort: a full disk or
     /// an I/O error is swallowed because the export itself already has its
     /// segment. Returns whether the entry was stored.
-    pub fn store(&self, key: &str, produced: &Path, secs: f64, kind: &str) -> bool {
+    pub fn store(&self, key: &str, produced: &Path, secs: f64) -> bool {
         if read_valid(&self.dir, key).is_some() {
             return true;
         }
@@ -376,21 +374,16 @@ impl SegmentCache {
         if size == 0 {
             return false;
         }
-        let ok = self.try_store(key, produced, secs, kind, size).is_ok();
+        let ok = self
+            .try_store(key, produced, &SegmentMeta { secs, size })
+            .is_ok();
         if ok {
             self.bump(|s| s.stored += 1);
         }
         ok
     }
 
-    fn try_store(
-        &self,
-        key: &str,
-        produced: &Path,
-        secs: f64,
-        kind: &str,
-        size: u64,
-    ) -> std::io::Result<()> {
+    fn try_store(&self, key: &str, produced: &Path, meta: &SegmentMeta) -> std::io::Result<()> {
         let mp4 = entry_path(&self.dir, key, "mp4");
         let json = entry_path(&self.dir, key, "json");
         std::fs::create_dir_all(mp4.parent().expect("entry has a parent"))?;
@@ -400,13 +393,8 @@ impl SegmentCache {
             place(produced, &tmp_mp4)?;
             // The data must be durable before the entry becomes visible.
             std::fs::File::open(&tmp_mp4)?.sync_all()?;
-            let meta = SegmentMeta {
-                secs,
-                kind: kind.to_string(),
-                size,
-            };
             let mut f = std::fs::File::create(&tmp_json)?;
-            f.write_all(&serde_json::to_vec(&meta).map_err(std::io::Error::other)?)?;
+            f.write_all(&serde_json::to_vec(meta).map_err(std::io::Error::other)?)?;
             f.sync_all()?;
             std::fs::rename(&tmp_mp4, &mp4)?;
             std::fs::rename(&tmp_json, &json)
@@ -427,28 +415,17 @@ impl SegmentCache {
     }
 
     /// End the export's claim on the cache: release the lease, then evict
-    /// down to the size cap (entries of other live exports stay).
+    /// least-recently-used entries down to the size cap (entries of other
+    /// live exports stay).
     pub fn finish(&self) -> EvictReport {
         self.release_lease();
-        self.evict()
+        evict_to(&self.dir, resolve_cap(self.max_bytes, &self.dir), now_ms())
     }
 
     fn release_lease(&self) {
         if let Some(p) = self.lease_path.lock().expect("lease lock").take() {
             let _ = std::fs::remove_file(p);
         }
-    }
-
-    /// Resolve the size cap now.
-    pub fn cap_bytes(&self) -> u64 {
-        resolve_cap(self.max_bytes, &self.dir)
-    }
-
-    /// Evict least-recently-used entries until the cache fits its cap. Never
-    /// removes entries a live export (including this one, while its lease is
-    /// held) has used.
-    pub fn evict(&self) -> EvictReport {
-        evict_to(&self.dir, Some(self.cap_bytes()), now_ms())
     }
 }
 
@@ -534,28 +511,11 @@ fn clone_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Free bytes on the volume holding `path` (or its nearest existing parent).
-pub fn free_bytes(path: &Path) -> Option<u64> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let mut p = path;
-        while !p.exists() {
-            p = p.parent()?;
-        }
-        let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
-        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-        // SAFETY: `c` is NUL-terminated and `st` is a valid out-pointer.
-        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-            return None;
-        }
-        Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        None
-    }
+/// Free bytes on the volume holding `path` (or its nearest existing parent,
+/// since the cache dir may not exist yet).
+fn free_bytes(path: &Path) -> Option<u64> {
+    let existing = path.ancestors().find(|p| p.exists())?;
+    triptape_core::jobs::free_bytes(existing)
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -575,13 +535,17 @@ fn pid_alive(pid: u32) -> bool {
 /// `<pid>-<timestamp>-<seq>.lease`, the only lease names [`SegmentCache::open`]
 /// makes.
 fn is_lease_name(name: &str) -> bool {
-    name.strip_suffix(".lease").is_some_and(|stem| {
-        let parts: Vec<&str> = stem.split('-').collect();
-        parts.len() == 3
-            && parts
-                .iter()
-                .all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
-    })
+    name.strip_suffix(".lease")
+        .is_some_and(|stem| is_digit_fields(stem, 3))
+}
+
+/// `s` is exactly `n` nonempty runs of ASCII digits joined by `-`.
+fn is_digit_fields(s: &str, n: usize) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == n
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
 }
 
 /// Leases of exports still running. With `sweep`, stale lease files are
@@ -634,12 +598,7 @@ fn is_hex(s: &str, n: usize) -> bool {
 /// `.tmp-<pid>-<seq>`, the only temp names [`SegmentCache::tmp_name`] makes.
 fn is_cache_tmp(name: &str) -> bool {
     name.strip_prefix(".tmp-")
-        .and_then(|r| r.split_once('-'))
-        .is_some_and(|(a, b)| {
-            [a, b]
-                .iter()
-                .all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
-        })
+        .is_some_and(|rest| is_digit_fields(rest, 2))
 }
 
 /// Complete entries. With `sweep`, also delete old temp files and orphans.
@@ -712,8 +671,8 @@ fn scan(dir: &Path, now: u64, sweep: bool) -> Vec<DiskEntry> {
 }
 
 /// Remove oldest-used unprotected entries until the total is at most `cap`
-/// (`None`: remove all unprotected entries).
-fn evict_to(dir: &Path, cap: Option<u64>, now: u64) -> EvictReport {
+/// (`0`: remove every unprotected entry).
+fn evict_to(dir: &Path, cap: u64, now: u64) -> EvictReport {
     let mut entries = scan(dir, now, true);
     let leases = live_leases(dir, now, true);
     let floor = leases.iter().map(|l| l.started_ms).min();
@@ -721,7 +680,7 @@ fn evict_to(dir: &Path, cap: Option<u64>, now: u64) -> EvictReport {
     entries.sort_by_key(|e| e.last_used_ms);
     let mut report = EvictReport::default();
     for e in entries {
-        if cap.is_some_and(|c| total <= c) {
+        if total <= cap {
             break;
         }
         if floor.is_some_and(|f| e.last_used_ms >= f) {
@@ -741,7 +700,7 @@ fn evict_to(dir: &Path, cap: Option<u64>, now: u64) -> EvictReport {
 
 /// `triptape cache clear`: remove every entry no live export has used.
 pub fn clear(dir: &Path) -> EvictReport {
-    evict_to(dir, None, now_ms())
+    evict_to(dir, 0, now_ms())
 }
 
 /// `triptape cache stats`. Read-only: no orphan or temp-file sweep.
@@ -873,10 +832,10 @@ mod tests {
         let dest = work.join("seg_000.mp4");
         assert!(c.fetch(&key, &dest).is_none());
         let made = produce(&work, "made.mp4", 1000);
-        assert!(c.store(&key, &made, 4.0, "still"));
+        assert!(c.store(&key, &made, 4.0));
         let c2 = open(&cdir, &work, None);
         let meta = c2.fetch(&key, &dest).expect("hit");
-        assert_eq!((meta.secs, meta.kind.as_str()), (4.0, "still"));
+        assert_eq!(meta.secs, 4.0);
         assert_eq!(std::fs::read(&dest).unwrap().len(), 1000);
         assert_eq!(c2.stats().hits, 1);
         assert_eq!(c.stats().misses, 1);
@@ -891,14 +850,13 @@ mod tests {
         let key = c.key("still").finish();
         let dest = work.join("seg.mp4");
         let made = produce(&work, "made.mp4", 500);
-        assert!(c.store(&key, &made, 4.0, "still"));
+        assert!(c.store(&key, &made, 4.0));
         // mp4 without sidecar (crash between renames).
         std::fs::remove_file(entry_path(&cdir, &key, "json")).unwrap();
         assert!(c.fetch(&key, &dest).is_none());
         // Sidecar present but file torn (size mismatch).
         let meta = SegmentMeta {
             secs: 4.0,
-            kind: "still".into(),
             size: 999,
         };
         std::fs::write(
@@ -918,8 +876,8 @@ mod tests {
         assert!(c.fetch(&key, &dest).is_none());
         // A store with a missing or empty source writes nothing.
         let key2 = c.key("other").finish();
-        assert!(!c.store(&key2, &work.join("nope.mp4"), 1.0, "still"));
-        assert!(!c.store(&key2, &produce(&work, "empty.mp4", 0), 1.0, "still"));
+        assert!(!c.store(&key2, &work.join("nope.mp4"), 1.0));
+        assert!(!c.store(&key2, &produce(&work, "empty.mp4", 0), 1.0));
         assert!(!entry_path(&cdir, &key2, "mp4").exists());
         // No temp debris from the failures.
         let debris = std::fs::read_dir(&cdir)
@@ -936,7 +894,7 @@ mod tests {
         let (cdir, work) = (t.path().join("c"), t.path().join("w"));
         let c = open(&cdir, &work, None);
         let key = c.key("still").finish();
-        assert!(c.store(&key, &produce(&work, "made.mp4", 4096), 4.0, "still"));
+        assert!(c.store(&key, &produce(&work, "made.mp4", 4096), 4.0));
         let dest = work.join("seg_001.mp4");
         assert!(c.fetch(&key, &dest).is_some());
         // A cleaner wipes the whole cache mid-export.
@@ -948,7 +906,7 @@ mod tests {
             use std::os::unix::fs::MetadataExt;
             let c = open(&t.path().join("c2"), &work, None);
             let k = c.key("x").finish();
-            c.store(&k, &dest, 1.0, "still");
+            c.store(&k, &dest, 1.0);
             let d2 = work.join("again.mp4");
             c.fetch(&k, &d2).unwrap();
             assert_eq!(
@@ -965,7 +923,7 @@ mod tests {
         let c = open(&cdir, &work, Some(2500));
         let keys: Vec<String> = (0..4).map(|i| c.key(&format!("k{i}")).finish()).collect();
         for (i, k) in keys.iter().enumerate() {
-            assert!(c.store(k, &produce(&work, &format!("m{i}.mp4"), 1000), 1.0, "still"));
+            assert!(c.store(k, &produce(&work, &format!("m{i}.mp4"), 1000), 1.0));
             // Oldest first: k0 oldest, k3 newest.
             set_age(&entry_path(&cdir, k, "mp4"), 1000 - 100 * i as u64);
         }
@@ -988,8 +946,8 @@ mod tests {
         let setup = open(&cdir, &work, None);
         let old = setup.key("old").finish();
         let used = setup.key("used").finish();
-        assert!(setup.store(&old, &produce(&work, "a.mp4", 1000), 1.0, "still"));
-        assert!(setup.store(&used, &produce(&work, "b.mp4", 1000), 1.0, "still"));
+        assert!(setup.store(&old, &produce(&work, "a.mp4", 1000), 1.0));
+        assert!(setup.store(&used, &produce(&work, "b.mp4", 1000), 1.0));
         setup.release_lease();
         set_age(&entry_path(&cdir, &old, "mp4"), 5000);
         set_age(&entry_path(&cdir, &used, "mp4"), 5000);
@@ -1002,18 +960,12 @@ mod tests {
         assert!(read_valid(&cdir, &used).is_some());
         assert!(read_valid(&cdir, &old).is_none());
         // Our own eviction is held off by the same lease.
-        assert_eq!(live.evict_to_zero().removed, 0);
+        assert_eq!(evict_to(&cdir, 0, now_ms()).removed, 0);
         // Once the export finishes the entry is evictable again.
         live.release_lease();
         assert_eq!(clear(&cdir).removed, 1);
         // And the export's materialized copy was unaffected throughout.
         assert!(work.join("seg.mp4").exists());
-    }
-
-    impl SegmentCache {
-        fn evict_to_zero(&self) -> EvictReport {
-            evict_to(&self.dir, Some(0), now_ms())
-        }
     }
 
     #[test]
@@ -1022,7 +974,7 @@ mod tests {
         let (cdir, work) = (t.path().join("c"), t.path().join("w"));
         let c = open(&cdir, &work, None);
         let k = c.key("a").finish();
-        assert!(c.store(&k, &produce(&work, "a.mp4", 1000), 1.0, "still"));
+        assert!(c.store(&k, &produce(&work, "a.mp4", 1000), 1.0));
         c.release_lease();
         // A lease left by a crashed export (pid that cannot exist).
         let stale = Lease {
@@ -1055,7 +1007,7 @@ mod tests {
         assert!(tmp.exists() && entry_path(&cdir, &k, "mp4").exists());
         set_age(&tmp, 7200);
         set_age(&entry_path(&cdir, &k, "mp4"), 7200);
-        evict_to(&cdir, None, now_ms());
+        evict_to(&cdir, 0, now_ms());
         assert!(!tmp.exists() && !entry_path(&cdir, &k, "mp4").exists());
     }
 
@@ -1102,6 +1054,40 @@ mod tests {
         assert_eq!(disk_stats(&cdir).live_leases, 1);
         drop(c);
         assert_eq!(disk_stats(&cdir).live_leases, 0);
+    }
+
+    #[test]
+    fn only_the_cache_own_names_are_recognized() {
+        assert!(is_lease_name("12-1700000000000-0.lease"));
+        for bad in [
+            "dead.lease",
+            "1-2.lease",
+            "1--2.lease",
+            "1-2-3.txt",
+            "a-2-3.lease",
+        ] {
+            assert!(!is_lease_name(bad), "{bad}");
+        }
+        assert!(is_cache_tmp(".tmp-12-3"));
+        for bad in [
+            ".tmp-notes.mp4",
+            ".tmp-1",
+            ".tmp-1-2-3",
+            ".tmp--2",
+            "tmp-1-2",
+        ] {
+            assert!(!is_cache_tmp(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn free_bytes_measures_a_cache_dir_that_does_not_exist_yet() {
+        let t = tempfile::tempdir().unwrap();
+        let missing = t.path().join("not").join("yet");
+        assert_eq!(
+            free_bytes(&missing).is_some(),
+            free_bytes(t.path()).is_some()
+        );
     }
 
     #[test]

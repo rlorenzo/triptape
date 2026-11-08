@@ -21,7 +21,7 @@ fn entry(dir: &std::path::Path, prefix: &str, bytes: usize) -> String {
     std::fs::write(sub.join(format!("{key}.mp4")), vec![1u8; bytes]).unwrap();
     std::fs::write(
         sub.join(format!("{key}.json")),
-        format!(r#"{{"secs":4.0,"kind":"still","size":{bytes}}}"#),
+        format!(r#"{{"secs":4.0,"size":{bytes}}}"#),
     )
     .unwrap();
     key
