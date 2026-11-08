@@ -351,10 +351,7 @@ fn background_hash_job(
         // untouched.
         let mut assets = lock()?.list_assets(project_id)?;
         let clusters = cluster::cluster_assets(&assets);
-        let cluster_of: HashMap<String, String> = clusters
-            .iter()
-            .flat_map(|c| c.asset_ids.iter().map(|id| (id.clone(), c.label.clone())))
-            .collect();
+        let cluster_of = cluster::chapter_labels(&clusters);
         // The plan reads the freshly persisted scores (already-scored
         // restores contribute theirs too), so hero trim/cap match CLI use.
         let scores: HashMap<String, Score> = assets

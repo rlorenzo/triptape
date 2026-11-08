@@ -339,6 +339,14 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
     out
 }
 
+/// Asset id -> its cluster's label: the chapter map plans are built from.
+pub fn chapter_labels(clusters: &[Cluster]) -> HashMap<String, String> {
+    clusters
+        .iter()
+        .flat_map(|c| c.asset_ids.iter().map(|id| (id.clone(), c.label.clone())))
+        .collect()
+}
+
 /// Ids of every near-dupe group member except the group's best shot: the
 /// assets to keep out of plans (they stay in the library).
 pub fn suppressed_ids(groups: &[DupeGroup]) -> HashSet<String> {
