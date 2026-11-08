@@ -79,8 +79,7 @@ const SCORE_FLUSH_FILES: usize = 25;
 /// (`triptape-media`'s `triptape` binary) constants.
 ///
 /// Videos use the fixed GPS-novelty proxy plus a best-window analysis.
-/// Stills and Live Photos score
-/// their still image, preferring the existing 320 px ffmpeg thumbnail
+/// Stills and Live Photos score their still image, preferring the existing 320 px ffmpeg thumbnail
 /// (same `source_cache_key` + `cache_path` convention as `get_thumbnail`,
 /// so scoring warms the Library thumbnail cache) and falling back to the
 /// source file when the thumbnail cannot be made or decoded; unscorable

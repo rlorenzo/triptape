@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use triptape_core::clip_window::{
     audio_rms_buckets, laplacian_variance, mean_abs_diff, mean_luma, pick_window, score_samples,
-    RawSample, MIN_ANALYZED_SECS, SAMPLE_SECS,
+    wants_window, RawSample, SAMPLE_SECS,
 };
 
 /// Analysis frame width in pixels.
@@ -52,18 +52,28 @@ fn measure(ffmpeg_bin: &str, path: &Path) -> Option<Vec<RawSample>> {
         "fps={},scale={FRAME_W}:{FRAME_H},format=gray",
         1.0 / SAMPLE_SECS
     );
-    let video = run_capture(
-        ffmpeg_bin,
-        &input_args(
-            path,
-            // Keyframes only: ~1 s apart on phone video, far cheaper than
-            // decoding every frame.
-            &["-skip_frame", "nokey"],
-            &[
-                "-an", "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
-            ],
-        ),
-    )?;
+    let rate = AUDIO_RATE.to_string();
+    let video_args = input_args(
+        path,
+        // Keyframes only: ~1 s apart on phone video, far cheaper than
+        // decoding every frame.
+        &["-skip_frame", "nokey"],
+        &[
+            "-an", "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+        ],
+    );
+    let audio_args = input_args(
+        path,
+        &[],
+        &["-vn", "-ac", "1", "-ar", &rate, "-f", "s16le", "pipe:1"],
+    );
+    // The two decodes are independent: run the audio one alongside.
+    let (video, audio) = std::thread::scope(|s| {
+        let audio = s.spawn(|| run_capture(ffmpeg_bin, &audio_args));
+        let video = run_capture(ffmpeg_bin, &video_args);
+        (video, audio.join().ok().flatten())
+    });
+    let video = video?;
     let frames: Vec<&[u8]> = video
         .as_chunks::<{ FRAME_W * FRAME_H }>()
         .0
@@ -73,25 +83,17 @@ fn measure(ffmpeg_bin: &str, path: &Path) -> Option<Vec<RawSample>> {
     if frames.is_empty() {
         return None;
     }
-    let rate = AUDIO_RATE.to_string();
-    let audio = run_capture(
-        ffmpeg_bin,
-        &input_args(
-            path,
-            &[],
-            &["-vn", "-ac", "1", "-ar", &rate, "-f", "s16le", "pipe:1"],
-        ),
-    )
-    .map(|pcm| {
-        let samples: Vec<i16> = pcm
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|b| i16::from_le_bytes(*b))
-            .collect();
-        audio_rms_buckets(&samples, AUDIO_RATE, SAMPLE_SECS)
-    })
-    .filter(|b| !b.is_empty());
+    let audio = audio
+        .map(|pcm| {
+            let samples: Vec<i16> = pcm
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i16::from_le_bytes(*b))
+                .collect();
+            audio_rms_buckets(&samples, AUDIO_RATE, SAMPLE_SECS)
+        })
+        .filter(|b| !b.is_empty());
     Some(
         frames
             .iter()
@@ -109,7 +111,7 @@ fn measure(ffmpeg_bin: &str, path: &Path) -> Option<Vec<RawSample>> {
 /// Best `(start, end)` playback window of a video clip, in seconds. `None`
 /// when the clip is short enough to play whole or analysis failed.
 pub fn best_clip_window(ffmpeg_bin: &str, path: &Path, duration_secs: f64) -> Option<(f64, f64)> {
-    if !duration_secs.is_finite() || duration_secs <= MIN_ANALYZED_SECS {
+    if !wants_window(duration_secs) {
         return None;
     }
     let raw = measure(ffmpeg_bin, path)?;

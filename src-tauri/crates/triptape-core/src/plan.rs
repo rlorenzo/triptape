@@ -6,6 +6,7 @@
 //! size, mtime, rendition) feeds the pre-render source-integrity check.
 //! Sec 5.4 degradation eligibility lives here too.
 
+use crate::clip_window::MAX_WINDOW_SECS;
 use crate::cluster::{gps_outliers, story_order};
 use crate::types::{Asset, AssetKind, Chapter, MusicPick, Plan, PlanEntry, Rendition, Score};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -260,6 +261,8 @@ pub fn build_plan_with_overrides(
 ) -> Plan {
     let ordered = story_order(assets);
     let score_of = |id: &str| scores.get(id).map_or(DEFAULT_SCORE, |s| s.total);
+    // Fresh scores win; a persisted one still carries the clip window.
+    let entry = |a: &Asset| plan_entry(a, scores.get(&a.id).or(a.score.as_ref()));
 
     // Hero: story order, one entry per identical content hash (pHash
     // near-dupe stacks are resolved upstream via cluster picks).
@@ -271,7 +274,7 @@ pub fn build_plan_with_overrides(
                 .as_deref()
                 .is_none_or(|h| seen_hash.insert(h))
         })
-        .map(|a| plan_entry(a, scores.get(&a.id).or(a.score.as_ref())))
+        .map(|a| entry(a))
         .collect();
     if hero.len() > HERO_TRIM_ABOVE {
         hero.retain(|e| score_of(&e.asset_id) >= HERO_MIN_SCORE);
@@ -343,7 +346,7 @@ pub fn build_plan_with_overrides(
         if !used_clusters.contains(label) && qualifies(a, reel_selects.len()) {
             used_clusters.insert(label);
             picked_ids.insert(&a.id);
-            reel_selects.push(plan_entry(a, scores.get(&a.id).or(a.score.as_ref())));
+            reel_selects.push(entry(a));
         }
     }
     // Pass 2: fill remaining slots with the next-best qualifying assets.
@@ -353,7 +356,7 @@ pub fn build_plan_with_overrides(
         }
         if !picked_ids.contains(a.id.as_str()) && qualifies(a, reel_selects.len()) {
             picked_ids.insert(&a.id);
-            reel_selects.push(plan_entry(a, scores.get(&a.id).or(a.score.as_ref())));
+            reel_selects.push(entry(a));
         }
     }
     let story_pos: HashMap<&str, usize> = ordered
@@ -482,9 +485,12 @@ fn plan_entry(a: &Asset, score: Option<&Score>) -> PlanEntry {
             }
         }
         AssetKind::Video => {
-            let (trim_start, trim_end) = score
-                .and_then(|s| s.clip_window)
-                .unwrap_or_else(|| (0.0, a.duration_secs.unwrap_or(5.0).clamp(1.0, 8.0)));
+            let (trim_start, trim_end) = score.and_then(|s| s.clip_window).unwrap_or_else(|| {
+                (
+                    0.0,
+                    a.duration_secs.unwrap_or(5.0).clamp(1.0, MAX_WINDOW_SECS),
+                )
+            });
             Rendition::Clip {
                 trim_start,
                 trim_end,

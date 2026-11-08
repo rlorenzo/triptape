@@ -237,6 +237,12 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         .map(String::as_str)
         .collect();
 
+    // Store scores (including clip windows) on the asset rows so later
+    // `Db::edited_plan` reloads see the same windows as this initial plan.
+    for a in &mut final_assets {
+        a.score = scores.get(&a.id).cloned();
+    }
+
     // Persist assets, clusters, and links in one transaction.
     let persisted = db.in_transaction(|db| {
         for a in &final_assets {

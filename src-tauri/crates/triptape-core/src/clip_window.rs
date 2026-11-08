@@ -9,8 +9,9 @@
 pub const SAMPLE_SECS: f64 = 1.0;
 /// Default length of the chosen window.
 pub const TARGET_WINDOW_SECS: f64 = 6.0;
-/// Hard ceiling on the window (the film's existing per-clip clamp).
+/// Hard ceiling on any clip trim (the film's per-clip clamp).
 pub const MAX_WINDOW_SECS: f64 = 8.0;
+const _: () = assert!(TARGET_WINDOW_SECS <= MAX_WINDOW_SECS);
 /// Clips at or under this length are kept whole.
 pub const MIN_ANALYZED_SECS: f64 = 2.0;
 /// Opening and closing margin a window never touches (camera raise/lower).
@@ -32,6 +33,10 @@ const STEADY_DIFF: f32 = 0.12;
 const STEADY_RANGE: f32 = 0.20;
 /// Mean luma deviation from mid-grey that is still considered well exposed.
 const EXPOSURE_TOLERANCE: f32 = 0.30;
+/// Exposure score lost at full black or full white.
+const EXPOSURE_MAX_PENALTY: f32 = 0.7;
+/// Steady-shot difference at which the subject-motion reward saturates.
+const MOTION_FULL_DIFF: f32 = 0.08;
 
 /// Raw per-sample measurements fed to [`score_samples`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -129,7 +134,7 @@ pub fn score_samples(raw: &[RawSample]) -> Vec<f32> {
         .enumerate()
         .map(|(i, r)| {
             let exposure = 1.0
-                - 0.7 * ((r.mean - 0.5).abs() - EXPOSURE_TOLERANCE).max(0.0)
+                - EXPOSURE_MAX_PENALTY * ((r.mean - 0.5).abs() - EXPOSURE_TOLERANCE).max(0.0)
                     / (0.5 - EXPOSURE_TOLERANCE);
             // The first sample has no predecessor: borrow the next one's diff.
             let diff = r.diff.or_else(|| raw.get(i + 1).and_then(|n| n.diff));
@@ -137,7 +142,7 @@ pub fn score_samples(raw: &[RawSample]) -> Vec<f32> {
                 Some(d) => (
                     1.0 - ((d - STEADY_DIFF) / STEADY_RANGE).clamp(0.0, 1.0),
                     if d <= STEADY_DIFF {
-                        (d / 0.08).min(1.0)
+                        (d / MOTION_FULL_DIFF).min(1.0)
                     } else {
                         0.0
                     },
@@ -156,9 +161,15 @@ pub fn score_samples(raw: &[RawSample]) -> Vec<f32> {
         .collect()
 }
 
-/// Window length for a clip: the target, never past the clip or the clamp.
+/// Window length for a clip: the target, never past the clip.
 pub fn window_len(duration: f64) -> f64 {
-    duration.min(TARGET_WINDOW_SECS).min(MAX_WINDOW_SECS)
+    duration.min(TARGET_WINDOW_SECS)
+}
+
+/// Whether a clip is long enough for a window to differ from playing it
+/// whole. Callers check this before paying for any decoding.
+pub fn wants_window(duration: f64) -> bool {
+    duration.is_finite() && duration > MIN_ANALYZED_SECS && duration - window_len(duration) >= 0.1
 }
 
 /// Pick the max-sum window of `window_len(duration)` over per-sample scores
@@ -167,13 +178,10 @@ pub fn window_len(duration: f64) -> f64 {
 /// seconds, or `None` when the clip should play whole (short, or no
 /// analysis available).
 pub fn pick_window(scores: &[f32], duration: f64) -> Option<(f64, f64)> {
-    if !duration.is_finite() || duration <= MIN_ANALYZED_SECS {
+    if !wants_window(duration) {
         return None;
     }
     let len = window_len(duration);
-    if duration - len < 0.1 {
-        return None; // the window would be the whole clip anyway
-    }
     let n = (len / SAMPLE_SECS).round() as usize;
     if n == 0 || scores.len() < n {
         return None;
@@ -300,6 +308,15 @@ mod tests {
         assert_eq!(pick_window(&[], 30.0), None);
         assert_eq!(pick_window(&[1.0; 3], 30.0), None, "too few samples");
         assert_eq!(pick_window(&[1.0; 30], f64::NAN), None);
+    }
+
+    #[test]
+    fn wants_window_only_for_clips_longer_than_the_window() {
+        assert!(!wants_window(1.5));
+        assert!(!wants_window(TARGET_WINDOW_SECS));
+        assert!(!wants_window(TARGET_WINDOW_SECS + 0.05));
+        assert!(wants_window(TARGET_WINDOW_SECS + 0.2));
+        assert!(!wants_window(f64::INFINITY));
     }
 
     #[test]
