@@ -2,7 +2,7 @@
 //!
 //! The bundled/static FFmpeg varies per machine (system FFmpeg 9.0.2 here:
 //! `libx264`, `xfade`, `perspective`, `tonemap`, `loudnorm` present;
-//! `zscale`/`drawtext`/`vidstab`/`libass` absent). Every renderer probes
+//! `zscale`/`drawtext`/`vidstab`/libass absent). Every renderer probes
 //! once at startup and picks fallback filters accordingly, so exports
 //! degrade instead of failing.
 
@@ -67,6 +67,74 @@ pub fn glide(caps: &Capabilities, frames: u32, w: u32, h: u32, variant: usize) -
     )
 }
 
+/// Supersampled short side of a panorama strip: the strip is scaled to
+/// this height (wide) or `PANO_SS * 16 / 9` width (tall) before panning.
+const PANO_SS: u32 = 1296;
+
+/// Smooth side-to-side (or top-to-bottom for tall images) pan over a whole
+/// panorama, no zoompan. The photo is scaled to fill the frame on its short
+/// side, so it covers the frame with no bars or blurred fill, then the same
+/// sub-pixel `perspective` window technique as [`glide`] slides across it
+/// with smoothstep easing and lanczos-downscales to `w`x`h`. `aspect` is
+/// the display width / height; `coverage` the fraction of the overflow to
+/// travel (see `triptape_core::plan::pano_motion`); `reverse` flips the
+/// direction. Without `perspective` it holds the centered crop instead.
+pub fn pano_pan(
+    caps: &Capabilities,
+    frames: u32,
+    w: u32,
+    h: u32,
+    aspect: f64,
+    coverage: f64,
+    reverse: bool,
+) -> String {
+    let frame = f64::from(w) / f64::from(h);
+    let tall = aspect < 1.0;
+    // Scale so the strip fills the frame on its short side.
+    let fill = if tall {
+        format!(
+            "scale={}:-2:flags=lanczos",
+            (f64::from(PANO_SS) * frame).round()
+        )
+    } else {
+        format!("scale=-2:{PANO_SS}:flags=lanczos")
+    };
+    if !caps.perspective {
+        let centered = if tall {
+            format!("crop=iw:trunc(iw*{h}/{w}/2)*2")
+        } else {
+            format!("crop=trunc(ih*{w}/{h}/2)*2:ih")
+        };
+        return format!("{fill},{centered},scale={w}:{h}:flags=lanczos,setsar=1");
+    }
+    // Visible window as a fraction of the strip along the pan axis.
+    let win = if tall { aspect / frame } else { frame / aspect }.clamp(0.01, 1.0);
+    let denom = frames.saturating_sub(1).max(1);
+    let p = format!("(min(in-1\\,{denom})/{denom})");
+    let eased = format!("({p}*{p}*(3-2*{p}))");
+    let eased = if reverse {
+        format!("(1-{eased})")
+    } else {
+        eased
+    };
+    // Where the window's leading edge sits within the slack, centered on
+    // 0.5 and narrowed by `coverage`.
+    let slack = format!("(0.5+({eased}-0.5)*{coverage:.4})");
+    let (x0, x1, y0, y1) = if tall {
+        let top = format!("H*(1-{win:.5})*{slack}");
+        let bottom = format!("H*((1-{win:.5})*{slack}+{win:.5})");
+        ("0".to_string(), "W".to_string(), top, bottom)
+    } else {
+        let left = format!("W*(1-{win:.5})*{slack}");
+        let right = format!("W*((1-{win:.5})*{slack}+{win:.5})");
+        (left, right, "0".to_string(), "H".to_string())
+    };
+    format!(
+        "{fill},setsar=1,{hold},perspective=x0='{x0}':y0='{y0}':x1='{x1}':y1='{y0}':x2='{x0}':y2='{y1}':x3='{x1}':y3='{y1}':interpolation=cubic:eval=frame,scale={w}:{h}:flags=lanczos,setsar=1",
+        hold = hold_still(frames),
+    )
+}
+
 /// Path as an owned FFmpeg CLI argument.
 pub fn path_arg(p: &Path) -> String {
     p.to_string_lossy().into_owned()
@@ -120,10 +188,10 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// Captions can only be burned in when libass (or the subtitles filter
-    /// chain) exists; otherwise renderers emit a sidecar SRT plus a note.
+    /// Captions burn in through libass's `subtitles` filter; without it
+    /// renderers emit a sidecar SRT plus a note.
     pub fn can_burn_captions(&self) -> bool {
-        self.libass && self.subtitles
+        self.subtitles
     }
 
     /// Full HDR->SDR chain needs zscale; otherwise tonemap alone is the
@@ -131,6 +199,43 @@ impl Capabilities {
     pub fn full_tonemap(&self) -> bool {
         self.tonemap && self.zscale
     }
+}
+
+/// Escape `v` as a filter option value, then as a filtergraph element, so it
+/// survives both parsing levels (ffmpeg-filters "Notes on filtergraph
+/// escaping"): level one escapes backslash, quote and colon; level two
+/// backslash, quote, comma, semicolon and brackets.
+fn escape_filter_value(v: &str) -> String {
+    backslash_escape(
+        &backslash_escape(v, &['\\', '\'', ':']),
+        &['\\', '\'', ',', ';', '[', ']'],
+    )
+}
+
+/// Prefix every char of `v` found in `special` with a backslash.
+fn backslash_escape(v: &str, special: &[char]) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        if special.contains(&c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `subtitles` filter burning the SRT at `srt` into a 1920x1080 frame: white
+/// text, dark outline, bottom-centre and lifted clear of the 1200x200
+/// lower-third. SRT is scaled against libass's 288-line default play
+/// resolution (1080/288 = 3.75 px per unit). Paths with spaces, colons,
+/// commas or apostrophes are escaped for both parsing levels.
+pub fn subtitles_filter(srt: &Path) -> String {
+    let style = "FontName=Helvetica,FontSize=11,PrimaryColour=&H00FFFFFF,OutlineColour=&H80000000,BorderStyle=1,Outline=1.2,Shadow=0.5,Alignment=2,MarginV=60";
+    format!(
+        "subtitles=filename={}:force_style={}",
+        escape_filter_value(&path_arg(srt)),
+        escape_filter_value(style)
+    )
 }
 
 fn flag_present(output: &str, name: &str) -> bool {
@@ -169,7 +274,9 @@ pub fn probe_capabilities(ffmpeg_bin: &str, ffprobe_bin: &str) -> Capabilities {
         crop: filter("crop"),
         gblur: filter("gblur"),
         drawtext: filter("drawtext"),
-        libass: filter("libass"),
+        // ffmpeg has no filter called `libass`; the library surfaces as the
+        // `subtitles` and `ass` filters.
+        libass: filter("subtitles") || filter("ass"),
         vidstabdetect: filter("vidstabdetect"),
         vidstabtransform: filter("vidstabtransform"),
         subtitles: filter("subtitles"),
@@ -496,10 +603,45 @@ pub struct ProbeInfo {
     pub height: u32,
     pub fps: f64,
     pub has_video: bool,
+    /// True when at least one *usable* audio stream exists (see
+    /// [`is_unusable_audio_codec`]); apac-only files count as silent.
     pub has_audio: bool,
+    /// Position among the file's audio streams of the one to use
+    /// (`-map 0:a:N`): the first stream we can decode and mux.
+    pub audio_index: usize,
     pub audio_rate: u32,
     pub audio_channels: u32,
     pub color_transfer: String,
+}
+
+/// Audio codecs ffmpeg cannot decode or the MP4 muxer cannot take. iPhone 16
+/// clips carry a spatial `apple_apac` track beside the regular AAC one;
+/// mapping it makes the encode fail ("Invalid argument" opening the output).
+pub fn is_unusable_audio_codec(codec: &str) -> bool {
+    matches!(codec, "" | "none" | "unknown" | "apple_apac")
+}
+
+impl ProbeInfo {
+    /// Input specifier for the usable audio stream of input 0, e.g. `0:a:0`.
+    pub fn audio_spec(&self) -> String {
+        format!("0:a:{}", self.audio_index)
+    }
+}
+
+/// Audio specifier for input 0: the probed usable stream, or the first audio
+/// stream when the probe failed.
+pub fn audio_spec(probe: Option<&ProbeInfo>) -> String {
+    probe.map_or_else(|| "0:a:0".to_string(), ProbeInfo::audio_spec)
+}
+
+/// `-map` value for a source's audio: the first usable stream, `None` when the
+/// probe finds no usable audio (e.g. `apple_apac` only), and the optional
+/// first stream when the probe itself fails.
+pub fn audio_map(ffprobe_bin: &str, path: &Path) -> Option<String> {
+    match ffprobe_file(ffprobe_bin, path) {
+        Ok(info) => info.has_audio.then(|| info.audio_spec()),
+        Err(_) => Some("0:a:0?".to_string()),
+    }
 }
 
 /// Probe one media file; errors when ffprobe fails or finds no streams.
@@ -524,6 +666,11 @@ pub fn ffprobe_file(ffprobe_bin: &str, path: &Path) -> Result<ProbeInfo, super::
     }
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(super::MediaError::Json)?;
+    parse_probe(&v, path)
+}
+
+/// Fold `ffprobe -show_streams -show_format -of json` output into [`ProbeInfo`].
+fn parse_probe(v: &serde_json::Value, path: &Path) -> Result<ProbeInfo, super::MediaError> {
     let mut info = ProbeInfo::default();
     if let Some(d) = v
         .pointer("/format/duration")
@@ -532,6 +679,7 @@ pub fn ffprobe_file(ffprobe_bin: &str, path: &Path) -> Result<ProbeInfo, super::
     {
         info.duration_secs = d;
     }
+    let mut audio_seen = 0usize;
     for s in v
         .pointer("/streams")
         .and_then(|s| s.as_array())
@@ -555,7 +703,14 @@ pub fn ffprobe_file(ffprobe_bin: &str, path: &Path) -> Result<ProbeInfo, super::
                     .to_string();
             }
             Some("audio") => {
+                let pos = audio_seen;
+                audio_seen += 1;
+                let codec = s.get("codec_name").and_then(|c| c.as_str()).unwrap_or("");
+                if info.has_audio || is_unusable_audio_codec(codec) {
+                    continue;
+                }
                 info.has_audio = true;
+                info.audio_index = pos;
                 info.audio_rate = s
                     .get("sample_rate")
                     .and_then(|r| r.as_str())
@@ -786,6 +941,136 @@ mod tests {
             hold_still(1),
             "loop=loop=0:size=1:start=0,settb=1/30,setpts=N,fps=30"
         );
+    }
+
+    fn probe_json(streams: &str) -> serde_json::Value {
+        serde_json::from_str(&format!(
+            r#"{{"format":{{"duration":"2.0"}},"streams":[{streams}]}}"#
+        ))
+        .unwrap()
+    }
+
+    const VIDEO: &str = r#"{"codec_type":"video","codec_name":"hevc","width":1920,"height":1080,"avg_frame_rate":"30/1"}"#;
+    const AAC: &str =
+        r#"{"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":1}"#;
+    const APAC: &str =
+        r#"{"codec_type":"audio","codec_name":"apple_apac","sample_rate":"48000","channels":4}"#;
+    const DATA: &str = r#"{"codec_type":"data","codec_name":"none"}"#;
+
+    /// iPhone 16 layout: hevc, aac, apple_apac, data tracks.
+    #[test]
+    fn probe_picks_first_usable_audio_stream() {
+        let v = probe_json(&format!("{VIDEO},{AAC},{APAC},{DATA}"));
+        let info = parse_probe(&v, Path::new("x.mov")).unwrap();
+        assert!(info.has_audio);
+        assert_eq!(info.audio_spec(), "0:a:0");
+        assert_eq!(info.audio_channels, 1);
+        // apac listed first: skip it, map the aac that follows.
+        let v = probe_json(&format!("{VIDEO},{APAC},{AAC}"));
+        let info = parse_probe(&v, Path::new("x.mov")).unwrap();
+        assert_eq!(info.audio_spec(), "0:a:1");
+        assert_eq!(info.audio_rate, 48000);
+    }
+
+    #[test]
+    fn audio_spec_defaults_to_first_stream_without_probe() {
+        assert_eq!(audio_spec(None), "0:a:0");
+        let v = probe_json(&format!("{VIDEO},{APAC},{AAC}"));
+        let info = parse_probe(&v, Path::new("x.mov")).unwrap();
+        assert_eq!(audio_spec(Some(&info)), "0:a:1");
+    }
+
+    #[test]
+    fn apac_only_clip_counts_as_silent() {
+        let v = probe_json(&format!("{VIDEO},{APAC},{DATA}"));
+        let info = parse_probe(&v, Path::new("x.mov")).unwrap();
+        assert!(!info.has_audio);
+    }
+
+    #[test]
+    fn libass_is_detected_by_its_filters() {
+        let full = " .. ass  V->V  Render ASS subtitles using the libass library.\n .. subtitles V->V Render text subtitles.\n";
+        assert!(flag_present(full, "subtitles") && flag_present(full, "ass"));
+        let plain = " ..C scale V->V Scale.\n T.. drawtext V->V Draw text.\n";
+        assert!(!flag_present(plain, "subtitles") && !flag_present(plain, "ass"));
+    }
+
+    #[test]
+    fn subtitles_filter_escapes_awkward_paths() {
+        let f = subtitles_filter(Path::new(
+            "/Movies/Japan to Singapore 2026/it's: a,b[1].srt",
+        ));
+        assert!(
+            f.starts_with(
+                r"subtitles=filename=/Movies/Japan to Singapore 2026/it\\\'s\\: a\,b\[1\].srt:force_style="
+            ),
+            "{f}"
+        );
+        // Style commas are escaped for the filtergraph level.
+        assert!(f.contains(r"FontName=Helvetica\,FontSize=11"), "{f}");
+    }
+
+    /// Burn an SRT through an awkward path with a libass ffmpeg and check
+    /// pixels change at the bottom of the frame. Skips without libass.
+    #[test]
+    fn subtitles_burn_in_through_awkward_path() {
+        let full = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg";
+        let bin = if Path::new(full).exists() {
+            full
+        } else {
+            "ffmpeg"
+        };
+        let caps = probe_capabilities(bin, "ffprobe");
+        if !caps.can_burn_captions() {
+            eprintln!("no libass ffmpeg; skipping caption burn-in test");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("Japan to Singapore 2026 it's: [a],b");
+        std::fs::create_dir_all(&dir).unwrap();
+        let srt = dir.join("film.srt");
+        std::fs::write(
+            &srt,
+            "1\n00:00:00,000 --> 00:00:02,000\nGolden Gate at sunset\n",
+        )
+        .unwrap();
+        let run = |vf: &str| {
+            let out = Command::new(bin)
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=1920x1080:r=30:d=1",
+                ])
+                .args([
+                    "-vf",
+                    vf,
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "gray",
+                    "-",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        let bright = |px: &[u8]| px.iter().filter(|&&p| p > 128).count();
+        let burned = run(&subtitles_filter(&srt));
+        assert_eq!(burned.len(), 1920 * 1080);
+        assert!(bright(&burned) > 500, "text pixels expected");
+        // Text sits in the bottom half, above the lower-third band.
+        assert_eq!(bright(&burned[..1920 * 540]), 0);
+        assert_eq!(bright(&run("null")), 0);
     }
 
     #[test]

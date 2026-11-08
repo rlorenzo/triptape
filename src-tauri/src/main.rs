@@ -107,7 +107,7 @@ fn score_asset_with_cache(cache_dir: &Path, a: &Asset) -> Scored {
     if a.kind == AssetKind::Video {
         // Any failure keeps the start-of-clip trim and a neutral quality.
         let analysis = a.duration_secs.map_or_else(Default::default, |d| {
-            triptape_media::clip_analysis::analyze_clip("ffmpeg", &a.path, d)
+            triptape_media::clip_analysis::analyze_clip("ffmpeg", "ffprobe", &a.path, d)
         });
         let mut score = score::score_video(analysis.quality, &signals);
         score.clip_window = analysis.window;

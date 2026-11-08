@@ -47,7 +47,7 @@ fn input_args(path: &Path, pre: &[&str], tail: &[&str]) -> Vec<String> {
 }
 
 /// Raw per-sample measurements for a clip, or `None` when no frames decode.
-fn measure(ffmpeg_bin: &str, path: &Path) -> Option<Vec<RawSample>> {
+fn measure(ffmpeg_bin: &str, audio_map: Option<&str>, path: &Path) -> Option<Vec<RawSample>> {
     let vf = format!(
         "fps={},scale={FRAME_W}:{FRAME_H},format=gray",
         1.0 / SAMPLE_SECS
@@ -62,14 +62,20 @@ fn measure(ffmpeg_bin: &str, path: &Path) -> Option<Vec<RawSample>> {
             "-an", "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
         ],
     );
-    let audio_args = input_args(
-        path,
-        &[],
-        &["-vn", "-ac", "1", "-ar", &rate, "-f", "s16le", "pipe:1"],
-    );
+    // One explicit, probed stream: ffmpeg's best-stream pick can land on the
+    // undecodable spatial `apple_apac` track. No usable audio: video only.
+    let audio_args = audio_map.map(|a| {
+        input_args(
+            path,
+            &[],
+            &[
+                "-vn", "-map", a, "-ac", "1", "-ar", &rate, "-f", "s16le", "pipe:1",
+            ],
+        )
+    });
     // The two decodes are independent: run the audio one alongside.
     let (video, audio) = std::thread::scope(|s| {
-        let audio = s.spawn(|| run_capture(ffmpeg_bin, &audio_args));
+        let audio = s.spawn(|| run_capture(ffmpeg_bin, audio_args.as_ref()?));
         let video = run_capture(ffmpeg_bin, &video_args);
         (video, audio.join().ok().flatten())
     });
@@ -122,11 +128,17 @@ pub struct ClipAnalysis {
 /// Analyse a clip once: best playback window plus the quality of what plays.
 /// Clips at or under [`MIN_ANALYZED_SECS`] are not decoded and yield the
 /// default (no window, no quality).
-pub fn analyze_clip(ffmpeg_bin: &str, path: &Path, duration_secs: f64) -> ClipAnalysis {
+pub fn analyze_clip(
+    ffmpeg_bin: &str,
+    ffprobe_bin: &str,
+    path: &Path,
+    duration_secs: f64,
+) -> ClipAnalysis {
     if !duration_secs.is_finite() || duration_secs <= MIN_ANALYZED_SECS {
         return ClipAnalysis::default();
     }
-    let Some(raw) = measure(ffmpeg_bin, path) else {
+    let audio = crate::ffmpeg::audio_map(ffprobe_bin, path);
+    let Some(raw) = measure(ffmpeg_bin, audio.as_deref(), path) else {
         return ClipAnalysis::default();
     };
     let scores = score_samples(&raw);
@@ -139,11 +151,16 @@ pub fn analyze_clip(ffmpeg_bin: &str, path: &Path, duration_secs: f64) -> ClipAn
 
 /// Best `(start, end)` playback window of a video clip, in seconds. `None`
 /// when the clip is short enough to play whole or analysis failed.
-pub fn best_clip_window(ffmpeg_bin: &str, path: &Path, duration_secs: f64) -> Option<(f64, f64)> {
+pub fn best_clip_window(
+    ffmpeg_bin: &str,
+    ffprobe_bin: &str,
+    path: &Path,
+    duration_secs: f64,
+) -> Option<(f64, f64)> {
     if !wants_window(duration_secs) {
         return None;
     }
-    analyze_clip(ffmpeg_bin, path, duration_secs).window
+    analyze_clip(ffmpeg_bin, ffprobe_bin, path, duration_secs).window
 }
 
 #[cfg(test)]
@@ -153,22 +170,34 @@ mod tests {
     #[test]
     fn missing_ffmpeg_or_file_yields_no_window() {
         let p = Path::new("/nonexistent/clip.mov");
-        assert_eq!(best_clip_window("ffmpeg-does-not-exist", p, 30.0), None);
-        assert_eq!(best_clip_window("ffmpeg", p, 30.0), None);
+        assert_eq!(
+            best_clip_window("ffmpeg-does-not-exist", "ffprobe", p, 30.0),
+            None
+        );
+        assert_eq!(best_clip_window("ffmpeg", "ffprobe", p, 30.0), None);
     }
 
     #[test]
     fn unanalysable_clips_report_no_window_and_no_quality() {
         let p = Path::new("/nonexistent/clip.mov");
-        assert_eq!(analyze_clip("ffmpeg", p, 30.0), ClipAnalysis::default());
-        assert_eq!(analyze_clip("ffmpeg", p, 1.5), ClipAnalysis::default());
-        assert_eq!(analyze_clip("ffmpeg", p, f64::NAN), ClipAnalysis::default());
+        assert_eq!(
+            analyze_clip("ffmpeg", "ffprobe", p, 30.0),
+            ClipAnalysis::default()
+        );
+        assert_eq!(
+            analyze_clip("ffmpeg", "ffprobe", p, 1.5),
+            ClipAnalysis::default()
+        );
+        assert_eq!(
+            analyze_clip("ffmpeg", "ffprobe", p, f64::NAN),
+            ClipAnalysis::default()
+        );
     }
 
     #[test]
     fn short_clips_skip_analysis() {
         let p = Path::new("/nonexistent/clip.mov");
-        assert_eq!(best_clip_window("ffmpeg", p, 1.5), None);
-        assert_eq!(best_clip_window("ffmpeg", p, f64::NAN), None);
+        assert_eq!(best_clip_window("ffmpeg", "ffprobe", p, 1.5), None);
+        assert_eq!(best_clip_window("ffmpeg", "ffprobe", p, f64::NAN), None);
     }
 }

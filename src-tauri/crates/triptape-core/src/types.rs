@@ -77,6 +77,20 @@ pub struct Asset {
 }
 
 impl Asset {
+    /// Width / height as displayed (EXIF rotation applied); `None` when
+    /// the size is unknown.
+    pub fn display_aspect(&self) -> Option<f64> {
+        let (w, h) = (f64::from(self.width?), f64::from(self.height?));
+        if w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        Some(if matches!(self.rotation_deg, 90 | 270) {
+            h / w
+        } else {
+            w / h
+        })
+    }
+
     pub fn new(id: impl Into<String>, path: PathBuf, kind: AssetKind) -> Self {
         Self {
             id: id.into(),
