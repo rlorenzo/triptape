@@ -16,7 +16,9 @@ use triptape_core::{
     hash, jobs, livephoto, metadata, plan as planmod, privacy, proxies, scan, score,
     types::*,
 };
-use triptape_media::{export::export_all, export::ExportOptions, ffmpeg, render_book::BookPreset};
+use triptape_media::{
+    clip_analysis, export::export_all, export::ExportOptions, ffmpeg, render_book::BookPreset,
+};
 
 fn parse_args() -> (String, HashMap<String, String>) {
     let mut it = std::env::args().skip(1);
@@ -195,6 +197,24 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         );
         final_assets.push(a);
     }
+
+    // Best playback window per video, analysed in parallel (ffmpeg-bound).
+    let videos: Vec<(String, PathBuf, f64)> = final_assets
+        .iter()
+        .filter(|a| a.kind == AssetKind::Video)
+        .filter_map(|a| Some((a.id.clone(), a.path.clone(), a.duration_secs?)))
+        .collect();
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().min(4));
+    triptape_core::parallel::for_each_parallel(
+        &videos,
+        workers,
+        |(_, path, dur)| clip_analysis::best_clip_window(&ffmpeg, path, *dur),
+        |idx, window, _, _| {
+            if let Some(s) = scores.get_mut(&videos[idx].0) {
+                s.clip_window = window;
+            }
+        },
+    );
 
     // Capture timezones: assets without an EXIF offset inherit the
     // nearest dated neighbor's, so day grouping and displayed times are

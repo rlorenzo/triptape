@@ -215,7 +215,7 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
             if picks.iter().any(|e| e.asset_id == *to) {
                 picks.retain(|e| e.asset_id != *from);
             } else if let Some(entry) = picks.iter_mut().find(|e| e.asset_id == *from) {
-                *entry = plan_entry(asset);
+                *entry = plan_entry(asset, asset.score.as_ref());
             }
         }
     }
@@ -271,7 +271,7 @@ pub fn build_plan_with_overrides(
                 .as_deref()
                 .is_none_or(|h| seen_hash.insert(h))
         })
-        .map(|a| plan_entry(a))
+        .map(|a| plan_entry(a, scores.get(&a.id).or(a.score.as_ref())))
         .collect();
     if hero.len() > HERO_TRIM_ABOVE {
         hero.retain(|e| score_of(&e.asset_id) >= HERO_MIN_SCORE);
@@ -343,7 +343,7 @@ pub fn build_plan_with_overrides(
         if !used_clusters.contains(label) && qualifies(a, reel_selects.len()) {
             used_clusters.insert(label);
             picked_ids.insert(&a.id);
-            reel_selects.push(plan_entry(a));
+            reel_selects.push(plan_entry(a, scores.get(&a.id).or(a.score.as_ref())));
         }
     }
     // Pass 2: fill remaining slots with the next-best qualifying assets.
@@ -353,7 +353,7 @@ pub fn build_plan_with_overrides(
         }
         if !picked_ids.contains(a.id.as_str()) && qualifies(a, reel_selects.len()) {
             picked_ids.insert(&a.id);
-            reel_selects.push(plan_entry(a));
+            reel_selects.push(plan_entry(a, scores.get(&a.id).or(a.score.as_ref())));
         }
     }
     let story_pos: HashMap<&str, usize> = ordered
@@ -466,7 +466,9 @@ fn human_chapter_title(label: &str) -> String {
         .map_or_else(|_| label.to_string(), |d| d.format(DAY_FORMAT).to_string())
 }
 
-fn plan_entry(a: &Asset) -> PlanEntry {
+/// Plan entry for one asset. Videos play the best window picked at ingest
+/// (`score.clip_window`) and fall back to the start of the clip.
+fn plan_entry(a: &Asset, score: Option<&Score>) -> PlanEntry {
     let rendition = match a.kind {
         AssetKind::LivePhoto => {
             if a.companion_path.is_some() {
@@ -479,10 +481,15 @@ fn plan_entry(a: &Asset) -> PlanEntry {
                 Rendition::Still
             }
         }
-        AssetKind::Video => Rendition::Clip {
-            trim_start: 0.0,
-            trim_end: a.duration_secs.unwrap_or(5.0).clamp(1.0, 8.0),
-        },
+        AssetKind::Video => {
+            let (trim_start, trim_end) = score
+                .and_then(|s| s.clip_window)
+                .unwrap_or_else(|| (0.0, a.duration_secs.unwrap_or(5.0).clamp(1.0, 8.0)));
+            Rendition::Clip {
+                trim_start,
+                trim_end,
+            }
+        }
         AssetKind::Photo => Rendition::Still,
     };
     PlanEntry {
@@ -636,6 +643,49 @@ mod tests {
                 (id.to_string(), s)
             })
             .collect()
+    }
+
+    #[test]
+    fn video_entry_uses_best_window_else_start_of_clip() {
+        let mut v = asset("v", 1, AssetKind::Video);
+        v.duration_secs = Some(40.0);
+        let trim = |v: &Asset, scores: &HashMap<String, Score>| match &build_plan(
+            std::slice::from_ref(v),
+            &HashMap::new(),
+            scores,
+        )
+        .hero[0]
+            .rendition
+        {
+            Rendition::Clip {
+                trim_start,
+                trim_end,
+            } => (*trim_start, *trim_end),
+            other => panic!("not a clip: {other:?}"),
+        };
+        assert_eq!(trim(&v, &HashMap::new()), (0.0, 8.0));
+        let mut scores = scored(&["v"]);
+        assert_eq!(trim(&v, &scores), (0.0, 8.0));
+        scores.get_mut("v").unwrap().clip_window = Some((12.5, 18.5));
+        assert_eq!(trim(&v, &scores), (12.5, 18.5));
+        // A persisted score on the asset applies when no map entry exists.
+        v.score = scores.remove("v");
+        assert_eq!(trim(&v, &HashMap::new()), (12.5, 18.5));
+        // Live Photo motion is never windowed.
+        let mut lp = asset("l", 2, AssetKind::LivePhoto);
+        lp.companion_path = Some(PathBuf::from("/t/l.mov"));
+        lp.duration_secs = Some(3.0);
+        let s = Score {
+            clip_window: Some((1.0, 2.0)),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_entry(&lp, Some(&s)).rendition,
+            Rendition::Motion {
+                trim_start: 0.0,
+                trim_end: 3.0
+            }
+        );
     }
 
     #[test]
@@ -846,7 +896,7 @@ mod tests {
             .map(|id| (id.to_string(), "2024-05-01".to_string()))
             .collect();
         let mut base = build_plan(&assets, &co, &scored(&["a", "b", "x", "y"]));
-        base.hero = vec![plan_entry(&assets[0]), plan_entry(&assets[1])];
+        base.hero = vec![plan_entry(&assets[0], None), plan_entry(&assets[1], None)];
         let mut edits = PlanEdits::default();
         edits.swap("a".into(), "x".into()); // [x, b]
         edits.swap("b".into(), "a".into()); // [x, a]
@@ -868,7 +918,7 @@ mod tests {
             .map(|id| (id.to_string(), "2024-05-01".to_string()))
             .collect();
         let mut base = build_plan(&assets, &co, &scored(&["a", "z", "c", "d"]));
-        base.hero = vec![plan_entry(&assets[1])]; // only "z" is picked
+        base.hero = vec![plan_entry(&assets[1], None)]; // only "z" is picked
         let edits = PlanEdits {
             swaps: vec![("z".into(), "c".into()), ("c".into(), "d".into())],
             ..Default::default()
@@ -890,7 +940,7 @@ mod tests {
             .map(|id| (id.to_string(), "2024-05-01".to_string()))
             .collect();
         let mut base = build_plan(&assets, &co, &scored(&["a", "b", "c", "keep"]));
-        base.hero = vec![plan_entry(&assets[0]), plan_entry(&assets[3])];
+        base.hero = vec![plan_entry(&assets[0], None), plan_entry(&assets[3], None)];
         base.reel_selects = base.hero.clone();
         let picks = |edits: &PlanEdits| {
             let out = apply_edits(&base, &assets, edits);

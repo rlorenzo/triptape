@@ -1,5 +1,6 @@
 //! triptape-media: FFmpeg/ffprobe orchestration and render-plan execution.
 
+pub mod clip_analysis;
 pub mod export;
 pub mod ffmpeg;
 pub mod map;
