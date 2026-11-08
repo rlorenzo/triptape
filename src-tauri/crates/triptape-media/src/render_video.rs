@@ -1379,52 +1379,61 @@ fn render_entry_segment(
             let has_audio = probe.as_ref().is_none_or(|i| i.has_audio);
             // Upscaled first so the push-in samples, not smears.
             let (pw, ph) = res.clip_prescale();
-            // Lanczos where the source is smaller than the pre-scale (the
-            // upscale must not smear); the default filter for downscales,
-            // where lanczos only costs time.
             // Framing follows the displayed (autorotated) aspect.
             let display = probe.as_ref().map(ffmpeg::ProbeInfo::display_dims);
             let framing = display.map_or(ClipFraming::Cover, |(w, h)| {
                 clip_framing(f64::from(w) / f64::from(h.max(1)))
             });
+            // Lanczos where the source is smaller than the pre-scale (the
+            // upscale must not smear); the default filter for downscales,
+            // where lanczos only costs time.
             let upscaling = display.is_some_and(|(w, h)| match framing {
                 ClipFraming::Cover => w < pw || h < ph,
                 ClipFraming::Contain => w < pw && h < ph,
             });
-            let flags = if upscaling { ":flags=lanczos" } else { "" };
-            let tonemap = probe
-                .as_ref()
-                .and_then(|i| ffmpeg::tonemap_chain(caps, &i.color_transfer));
-            if tonemap.is_some() {
-                let transfer = probe.as_ref().map_or("", |i| i.color_transfer.as_str());
-                fallbacks.push(format!("{} HDR tone-mapped ({transfer})", r.entry.asset_id));
-            }
-            let mut vf = match framing {
+            let tonemap = probe.as_ref().and_then(|i| {
+                let chain = ffmpeg::tonemap_chain(caps, &i.color_transfer)?;
+                fallbacks.push(format!(
+                    "{} HDR tone-mapped ({})",
+                    r.entry.asset_id, i.color_transfer
+                ));
+                Some(chain)
+            });
+            // Normalized to 30 fps before any per-frame work: 60 fps
+            // sources would otherwise composite twice the frames, and the
+            // glide's progress counts frames.
+            let mut vf = String::from("fps=30,");
+            match framing {
                 ClipFraming::Cover => {
-                    let mut vf = format!(
+                    let flags = if upscaling { ":flags=lanczos" } else { "" };
+                    vf.push_str(&format!(
                         "scale={pw}:{ph}:force_original_aspect_ratio=increase{flags},crop={pw}:{ph},setsar=1"
-                    );
+                    ));
                     if let Some(chain) = &tonemap {
                         vf.push(',');
                         vf.push_str(chain);
                     }
-                    vf
                 }
-                ClipFraming::Contain => {
-                    ffmpeg::video_contain_over_blur(caps, pw, ph, upscaling, tonemap.as_deref())
-                }
-            };
-            // Slow glide push-in on clips (1.0 -> 1.05), matching the
-            // stills' Ken Burns drift so cuts don't sit static. Normalized
-            // to 30 fps first: the glide's progress counts frames.
+                ClipFraming::Contain => vf.push_str(&ffmpeg::video_contain_over_blur(
+                    caps,
+                    pw,
+                    ph,
+                    upscaling,
+                    tonemap.as_deref(),
+                )),
+            }
+            // Slow glide push-in on clips (1.0 -> 1.05, gentler when the
+            // clip is shown whole), matching the stills' Ken Burns drift
+            // so cuts don't sit static.
             let frames = (len * 30.0).round().max(1.0) as u32;
-            let depth = match framing {
-                ClipFraming::Cover => ffmpeg::GLIDE_DEPTH,
-                ClipFraming::Contain => ffmpeg::GLIDE_DEPTH_GENTLE,
-            };
-            vf.push_str(&format!(
-                ",fps=30,{}",
-                ffmpeg::glide_depth(caps, frames, res.width(), res.height(), 0, depth)
+            vf.push(',');
+            vf.push_str(&ffmpeg::glide_depth(
+                caps,
+                frames,
+                res.width(),
+                res.height(),
+                0,
+                framing.glide_depth(),
             ));
             vf.push_str(",format=yuv420p");
             let mut args: Vec<String> = vec![
@@ -1479,6 +1488,17 @@ enum ClipFraming {
     Cover,
     /// Whole frame, centred over a blurred copy of itself.
     Contain,
+}
+
+impl ClipFraming {
+    /// Glide window divisor: contained clips keep the whole subject on
+    /// screen, so they push in more gently.
+    fn glide_depth(self) -> u32 {
+        match self {
+            Self::Cover => ffmpeg::GLIDE_DEPTH,
+            Self::Contain => ffmpeg::GLIDE_DEPTH_GENTLE,
+        }
+    }
 }
 
 /// Framing for a clip of displayed aspect `aspect` (width / height, after
@@ -1544,7 +1564,8 @@ fn collage_eligible(e: &ResolvedEntry) -> bool {
     matches!(e.entry.rendition, Rendition::Still) && !e.aspect.is_some_and(is_panorama)
 }
 
-/// Under this width / height a photo counts as a portrait for layout.
+/// Under this width / height a photo counts as a portrait, which the
+/// collage layout never puts in a stacked (half-height) cell.
 const PORTRAIT_BELOW: f64 = 0.95;
 /// Most of a photo a collage cell may crop away before the photo is
 /// shown whole over its own blurred fill instead. Faces survive because
@@ -1575,6 +1596,7 @@ struct CollageCell {
 /// (1 whole, 2 stacked) its column holds, left to right.
 fn column_shapes(n: usize) -> &'static [&'static [usize]] {
     match n {
+        1 => &[&[1]],
         2 => &[&[1, 1]],
         3 => &[&[1, 1, 1], &[1, 2], &[2, 1]],
         4 => &[&[1, 1, 1, 1], &[2, 2], &[1, 1, 2], &[2, 1, 1], &[1, 2, 1]],
@@ -1654,6 +1676,30 @@ fn build_columns(
     cells
 }
 
+/// Ideal width of each column of `shape` filled by `order`: the width at
+/// which its cells match their photos' mean aspect. `None` when a portrait
+/// would land in a stacked (short) cell.
+fn ideal_column_widths(
+    order: &[usize],
+    shape: &[usize],
+    aspects: &[f64],
+    h: u32,
+) -> Option<Vec<f64>> {
+    let mut at = 0;
+    shape
+        .iter()
+        .map(|&count| {
+            let members = &order[at..at + count];
+            at += count;
+            if count > 1 && members.iter().any(|&m| aspects[m] < PORTRAIT_BELOW) {
+                return None;
+            }
+            let mean = members.iter().map(|&m| aspects[m]).sum::<f64>() / count as f64;
+            Some(mean * f64::from(h) / count as f64)
+        })
+        .collect()
+}
+
 /// Lay out a collage by photo shape (`aspects` are width / height in
 /// member order). Every column arrangement (a row of full-height cells,
 /// some columns split in two) of every ordering is scored by how much of
@@ -1663,62 +1709,39 @@ fn build_columns(
 /// Cells tile the canvas exactly.
 fn collage_layout(aspects: &[f64], w: u32, h: u32) -> Vec<CollageCell> {
     let n = aspects.len().min(MAX_COLLAGE);
-    if n == 0 {
-        return vec![];
-    }
-    if n == 1 {
-        return vec![CollageCell {
-            member: 0,
-            x: 0,
-            y: 0,
-            w,
-            h,
-        }];
-    }
     let total_area = f64::from(w) * f64::from(h);
-    let score = |cells: &[CollageCell], order: &[usize]| {
-        let fit: f64 = cells
+    let fit = |cells: &[CollageCell]| -> f64 {
+        cells
             .iter()
             .map(|c| {
                 let ca = f64::from(c.w) / f64::from(c.h);
                 cell_penalty(aspects[c.member], ca) * f64::from(c.w) * f64::from(c.h) / total_area
             })
-            .sum();
+            .sum()
+    };
+    let mut best: Option<(f64, Vec<CollageCell>)> = None;
+    for order in permutations(n) {
         let inversions = (0..n)
             .flat_map(|i| (i + 1..n).map(move |j| (i, j)))
             .filter(|&(i, j)| order[i] > order[j])
             .count();
-        fit + REORDER_PENALTY * inversions as f64
-    };
-    let mut best: Option<(f64, Vec<CollageCell>)> = None;
-    for order in permutations(n) {
+        let reorder = REORDER_PENALTY * inversions as f64;
         for shape in column_shapes(n) {
-            let mut at = 0;
-            let mut ideal = vec![];
-            let mut ok = true;
-            for &count in *shape {
-                let members = &order[at..at + count];
-                at += count;
-                if count > 1 && members.iter().any(|&m| aspects[m] < PORTRAIT_BELOW) {
-                    ok = false;
-                    break;
-                }
-                let mean = members.iter().map(|&m| aspects[m]).sum::<f64>() / count as f64;
-                ideal.push(mean * f64::from(h) / count as f64);
-            }
-            if !ok {
+            let Some(ideal) = ideal_column_widths(&order, shape, aspects, h) else {
                 continue;
-            }
+            };
+            // Candidate widths: each column's ideal (floored so no column
+            // collapses below half the mean), a sqrt-damped blend, and
+            // equal columns.
             let mean_ideal = ideal.iter().sum::<f64>() / ideal.len() as f64;
-            let floor = |v: f64| v.max(0.5 * mean_ideal);
-            let sets: [Vec<f64>; 3] = [
-                ideal.iter().map(|&v| floor(v)).collect(),
-                ideal.iter().map(|&v| floor(v).sqrt()).collect(),
-                vec![1.0; ideal.len()],
-            ];
+            let floored: Vec<f64> = ideal.iter().map(|&v| v.max(0.5 * mean_ideal)).collect();
+            let damped = floored.iter().map(|v| v.sqrt()).collect();
+            let sets = [floored, damped, vec![1.0; ideal.len()]];
             for weights in &sets {
                 let cells = build_columns(&order, shape, weights, w, h);
-                let sc = score(&cells, &order);
+                let sc = fit(&cells) + reorder;
+                // Strictly better only, so earlier (closer to capture
+                // order) candidates win ties despite float noise.
                 if best.as_ref().is_none_or(|(b, _)| sc < *b - 1e-9) {
                     best = Some((sc, cells));
                 }
@@ -2203,15 +2226,32 @@ mod tests {
             }
         }
         // Mixed fours keep portraits tall too, with landscapes stacked.
-        let cells = collage_layout(&[L, P, P, L], 3840, 2160);
+        let mixed = [L, P, P, L];
+        let cells = collage_layout(&mixed, 3840, 2160);
         assert!(cells
             .iter()
-            .filter(|c| [P].contains(&[L, P, P, L][c.member]))
+            .filter(|c| mixed[c.member] == P)
             .all(|c| c.h == 2160));
         assert!(cells.iter().any(|c| c.h == 1080));
         // Three portraits: three equal columns.
         let cols = collage_layout(&[0.7, 0.75, 0.8], 2880, 1620);
         assert!(cols.iter().all(|c| c.h == 1620 && c.w == 960));
+    }
+
+    #[test]
+    fn degenerate_collages_fill_the_canvas() {
+        assert!(collage_layout(&[], 2880, 1620).is_empty());
+        let one = collage_layout(&[0.75], 2880, 1620);
+        assert_eq!(
+            one,
+            vec![CollageCell {
+                member: 0,
+                x: 0,
+                y: 0,
+                w: 2880,
+                h: 1620
+            }]
+        );
     }
 
     #[test]
@@ -2598,40 +2638,27 @@ mod tests {
                 .unwrap();
             assert!(st.success());
         };
-        let flat = temp.path().join("flat.mp4");
-        let flat_s = flat.to_string_lossy().into_owned();
-        run(&[
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=s=640x360:r=30:d=2",
-            "-pix_fmt",
-            "yuv420p",
-            &flat_s,
-        ]);
-        let rotated = temp.path().join("rotated.mp4");
-        let rotated_s = rotated.to_string_lossy().into_owned();
+        let path = |name: &str| temp.path().join(name).to_string_lossy().into_owned();
+        let testsrc = |size: &str, name: &str| {
+            let out = path(name);
+            let src = format!("testsrc2=s={size}:r=30:d=2");
+            run(&["-f", "lavfi", "-i", &src, "-pix_fmt", "yuv420p", &out]);
+            out
+        };
+        let flat = testsrc("640x360", "flat.mp4");
+        let rotated = path("rotated.mp4");
         run(&[
             "-display_rotation",
             "90",
             "-i",
-            &flat_s,
+            &flat,
             "-c",
             "copy",
-            &rotated_s,
+            &rotated,
         ]);
-        let native = temp.path().join("native.mp4");
-        let native_s = native.to_string_lossy().into_owned();
-        run(&[
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=s=358x638:r=30:d=2",
-            "-pix_fmt",
-            "yuv420p",
-            &native_s,
-        ]);
+        let native = testsrc("358x638", "native.mp4");
         for (name, src) in [("rotated", rotated), ("native", native)] {
+            let src = PathBuf::from(src);
             let probe = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &src).unwrap();
             let (dw, dh) = probe.display_dims();
             assert!(dh > dw, "{name}: displayed {dw}x{dh} should be portrait");

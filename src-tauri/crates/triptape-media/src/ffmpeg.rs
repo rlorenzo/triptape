@@ -44,8 +44,10 @@ pub fn fit_over_blur(
 /// cover-fill of itself. The frame is first fitted to `w`x`h` (`lanczos`
 /// when upscaling), then `tonemap` (an HDR chain) runs on that fitted
 /// frame, converted to 8-bit before the overlay; the fill is built from a
-/// 1/8 copy and scaled back up, so the blur costs almost nothing per
-/// frame even at 4K.
+/// 1/8 copy and scaled back up (bilinear: it holds no detail), so the
+/// blur stays cheap per frame even at 4K. Kept apart from
+/// [`fit_over_blur`], which builds a full-size blur once for a still and
+/// labels its input for multi-input graphs.
 pub fn video_contain_over_blur(
     caps: &Capabilities,
     w: u32,
@@ -58,7 +60,7 @@ pub fn video_contain_over_blur(
     let flags = if lanczos { ":flags=lanczos" } else { "" };
     let tone = tonemap.map_or(String::new(), |t| format!(",{t},format=yuv420p"));
     format!(
-        "scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2{flags}{tone},split[a][b];[a]scale={sw}:{sh}:force_original_aspect_ratio=increase,crop={sw}:{sh}{blur},scale={w}:{h}:flags=bicubic[bg];[bg][b]overlay=(W-w)/2:(H-h)/2,setsar=1"
+        "scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2{flags}{tone},split[a][b];[a]scale={sw}:{sh}:force_original_aspect_ratio=increase,crop={sw}:{sh}{blur},scale={w}:{h}:flags=bilinear[bg];[bg][b]overlay=(W-w)/2:(H-h)/2,setsar=1"
     )
 }
 
@@ -108,11 +110,12 @@ pub fn glide_depth(
     // Frame progress 0..=1; perspective's `in` counts from 1.
     let p = format!("(min(in-1\\,{denom})/{denom})");
     // Window size as a fraction of the frame, and where its slack sits.
+    let d1 = depth - 1;
     let (size, slack) = match variant % 4 {
         0 => (format!("(1-{p}/{depth})"), "0.5".to_string()),
-        1 => (format!("(({}+{p})/{depth})", depth - 1), "0.5".to_string()),
-        2 => (format!("({}/{depth})", depth - 1), p),
-        _ => (format!("({}/{depth})", depth - 1), format!("(1-{p})")),
+        1 => (format!("(({d1}+{p})/{depth})"), "0.5".to_string()),
+        2 => (format!("({d1}/{depth})"), p),
+        _ => (format!("({d1}/{depth})"), format!("(1-{p})")),
     };
     let left = format!("W*(1-{size})*{slack}");
     let right = format!("W*((1-{size})*{slack}+{size})");
