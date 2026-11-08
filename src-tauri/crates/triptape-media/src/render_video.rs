@@ -585,6 +585,7 @@ pub fn render_hero_video(
     // sequential. Both paths go through `render_group`, and results are
     // folded back in group order, so the segment list, timeline and
     // fallbacks do not depend on the worker count.
+    let variants = glide_variants(&groups);
     let progress = caps.progress.clone();
     let jobs = if opts.short_mode {
         1
@@ -627,7 +628,16 @@ pub fn render_hero_video(
                 cap: fair_share(budget, groups.len() - idx),
                 budget,
             };
-            let out = render_group(&job_caps, &present, idx, still_secs, limits, opts, work_dir)?;
+            let out = render_group(
+                &job_caps,
+                &present,
+                idx,
+                variants[idx],
+                still_secs,
+                limits,
+                opts,
+                work_dir,
+            )?;
             if let Some(seg) = &out.seg {
                 budget -= seg.2;
             }
@@ -652,6 +662,7 @@ pub fn render_hero_video(
                     &job_caps,
                     &plans[idx].0,
                     idx,
+                    variants[idx],
                     still_secs,
                     SegmentLimits::NONE,
                     opts,
@@ -1193,12 +1204,54 @@ impl SegmentLimits {
     };
 }
 
+/// Motion variant (glide direction, pan direction) of each group, from a
+/// stable hash of its lead asset id rather than its position, so adding or
+/// removing a shot leaves every other segment's picture, and so its cache
+/// key, unchanged.
+///
+/// Neighbours should differ, so a group whose hashed variant equals the
+/// previous group's hashed variant takes the next one. The comparison is
+/// against the previous group's *hashed* value, not its final one: a
+/// comparison with the final value would chain through the whole film and
+/// make every later segment depend on position again. The cost: a group's
+/// variant depends on its immediate neighbour, so inserting or removing a
+/// shot can change the shot after it, and a rotated group can occasionally
+/// land on the same variant as a neighbour that was itself rotated (about
+/// 1 in 16 neighbours instead of 1 in 4, versus never with position).
+fn glide_variants(groups: &[Vec<&ResolvedEntry>]) -> Vec<usize> {
+    let hashed: Vec<usize> = groups
+        .iter()
+        .map(|g| g.first().map_or(0, |r| stable_variant(&r.entry.asset_id)))
+        .collect();
+    hashed
+        .iter()
+        .enumerate()
+        .map(|(i, &h)| {
+            if i > 0 && hashed[i - 1] == h {
+                (h + 1) % GLIDE_VARIANTS
+            } else {
+                h
+            }
+        })
+        .collect()
+}
+
+/// Number of glide variants ([`ffmpeg::glide`] cycles through four).
+const GLIDE_VARIANTS: usize = 4;
+
+fn stable_variant(asset_id: &str) -> usize {
+    let h = blake3::hash(asset_id.as_bytes());
+    usize::from(h.as_bytes()[0]) % GLIDE_VARIANTS
+}
+
 /// Render, probe and (for short clips) freeze-pad one group. A failed render
 /// is a fallback note, not an error: only a cancel comes back as `Err`.
+#[allow(clippy::too_many_arguments)]
 fn render_group(
     caps: &Capabilities,
     present: &[&ResolvedEntry],
     idx: usize,
+    variant: usize,
     still_secs: f64,
     limits: SegmentLimits,
     opts: &VideoOptions,
@@ -1211,6 +1264,7 @@ fn render_group(
             caps,
             r,
             idx,
+            variant,
             still_secs,
             limits.cap,
             opts.resolution,
@@ -1218,7 +1272,15 @@ fn render_group(
             &mut fallbacks,
         )
     } else {
-        render_collage_segment(caps, present, idx, still_secs, opts.resolution, work_dir)
+        render_collage_segment(
+            caps,
+            present,
+            idx,
+            variant,
+            still_secs,
+            opts.resolution,
+            work_dir,
+        )
     };
     let (seg_path, dur, kind) = match rendered {
         Ok(v) => v,
@@ -1331,6 +1393,7 @@ fn render_entry_segment(
     caps: &Capabilities,
     r: &ResolvedEntry,
     idx: usize,
+    variant: usize,
     still_secs: f64,
     max_secs: f64,
     res: Resolution,
@@ -1340,7 +1403,7 @@ fn render_entry_segment(
     match &r.entry.rendition {
         Rendition::Still => {
             let out = work_dir.join(format!("seg_{idx:03}.mp4"));
-            let key = |c: &SegmentCache| still_key(c, caps, r, idx, still_secs, max_secs, res);
+            let key = |c: &SegmentCache| still_key(c, caps, r, variant, still_secs, max_secs, res);
             cached_segment(caps, key, out, "still", |out| {
                 // Decode first: looping a raw HEIC fails on tmap/Dolby Vision items.
                 let png = ffmpeg::decode_still_to_png(&caps.ffmpeg_bin, &r.still_path)?;
@@ -1356,10 +1419,10 @@ fn render_entry_segment(
                     let dur = motion.hold_secs.min(max_secs.max(still_secs));
                     // Travel less when shortened so the pan keeps its speed bound.
                     let coverage = pano_coverage(aspect, dur);
-                    render_pano_segment(caps, &png.path, dur, aspect, coverage, idx, res, out)?;
+                    render_pano_segment(caps, &png.path, dur, aspect, coverage, variant, res, out)?;
                     dur
                 } else {
-                    render_hold_segment(caps, &png.path, still_secs, idx, res, out)?;
+                    render_hold_segment(caps, &png.path, still_secs, variant, res, out)?;
                     still_secs
                 };
                 Ok(dur)
@@ -1563,6 +1626,7 @@ fn render_collage_segment(
     caps: &Capabilities,
     members: &[&ResolvedEntry],
     idx: usize,
+    variant: usize,
     still_secs: f64,
     res: Resolution,
     work_dir: &Path,
@@ -1581,7 +1645,7 @@ fn render_collage_segment(
             caps,
             Path::new("<IN>"),
             dur,
-            idx,
+            variant,
             res,
             Path::new("<OUT>"),
         ));
@@ -1590,7 +1654,7 @@ fn render_collage_segment(
     cached_segment(caps, key, out, "still", |out| {
         let canvas = work_dir.join(format!("collage_{idx:03}.png"));
         compose_collage(&caps.ffmpeg_bin, members, res, &canvas)?;
-        render_hold_segment(caps, &canvas, dur, idx, res, out)?;
+        render_hold_segment(caps, &canvas, dur, variant, res, out)?;
         Ok(dur)
     })
 }
@@ -2781,6 +2845,7 @@ mod tests {
                 &caps,
                 &r,
                 0,
+                0,
                 3.0,
                 10.0,
                 Resolution::Hd1080,
@@ -2839,6 +2904,7 @@ mod tests {
             &caps,
             &r,
             0,
+            0,
             3.0,
             10.0,
             Resolution::Hd1080,
@@ -2876,6 +2942,7 @@ mod tests {
         let (out, _, _) = render_entry_segment(
             &caps,
             &r,
+            0,
             0,
             3.0,
             10.0,
@@ -3573,7 +3640,7 @@ mod tests {
             let r = still(name);
             time(label, &mut || {
                 let (o, d, _) =
-                    render_entry_segment(&caps, &r, 0, 4.0, 99.0, res, &work, &mut fb).unwrap();
+                    render_entry_segment(&caps, &r, 0, 0, 4.0, 99.0, res, &work, &mut fb).unwrap();
                 eprintln!("  {label} dur {d:.2}s -> {}", o.display());
                 std::fs::copy(&o, work.join(format!("{label}.mp4"))).unwrap();
             });
@@ -3583,7 +3650,7 @@ mod tests {
             .to_vec();
         let refs: Vec<&ResolvedEntry> = members.iter().collect();
         time("collage4", &mut || {
-            let (o, _, _) = render_collage_segment(&caps, &refs, 1, 4.0, res, &work).unwrap();
+            let (o, _, _) = render_collage_segment(&caps, &refs, 1, 1, 4.0, res, &work).unwrap();
             std::fs::copy(&o, work.join("collage.mp4")).unwrap();
         });
         for (label, name, end) in [
@@ -3594,7 +3661,7 @@ mod tests {
             let r = clip_entry(label, dir.join(name), end);
             time(label, &mut || {
                 let (o, d, _) =
-                    render_entry_segment(&caps, &r, 2, 4.0, 99.0, res, &work, &mut fb).unwrap();
+                    render_entry_segment(&caps, &r, 2, 2, 4.0, 99.0, res, &work, &mut fb).unwrap();
                 eprintln!("  {label} dur {d:.2}s");
                 std::fs::copy(&o, work.join(format!("{label}.mp4"))).unwrap();
             });
@@ -3721,6 +3788,78 @@ mod tests {
         assert_eq!((third.hits, third.misses), (1, 1), "{third:?}");
     }
 
+    /// Inserting a shot must not change the recipe (so the cache key) of
+    /// any still segment except possibly the one right after it.
+    #[test]
+    fn inserting_a_shot_leaves_other_still_keys_unchanged() {
+        use crate::segment_cache::{SegmentCache, SegmentCacheConfig};
+        let caps = Capabilities {
+            gblur: true,
+            perspective: true,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = SegmentCacheConfig {
+            dir: dir.path().join("c"),
+            max_bytes: None,
+        };
+        let cache = SegmentCache::open(&cfg, "ffmpeg test".into(), &dir.path().join("w")).unwrap();
+        let mk = |id: &str| {
+            let p = dir.path().join(format!("{id}.png"));
+            std::fs::write(&p, id).unwrap();
+            let mut e = card_entry(id, &p);
+            e.entry.asset_id = id.into();
+            e.aspect = Some(1.5);
+            e
+        };
+        let ids: Vec<String> = (0..40).map(|i| format!("asset-{i}")).collect();
+        let keys = |entries: &[ResolvedEntry]| -> Vec<(String, String)> {
+            let groups: Vec<Vec<&ResolvedEntry>> = entries.iter().map(|e| vec![e]).collect();
+            let variants = glide_variants(&groups);
+            entries
+                .iter()
+                .zip(variants)
+                .map(|(e, v)| {
+                    let k = still_key(&cache, &caps, e, v, 4.0, f64::INFINITY, Resolution::Hd1080);
+                    (e.entry.asset_id.clone(), k)
+                })
+                .collect()
+        };
+        let base: Vec<ResolvedEntry> = ids.iter().map(|i| mk(i)).collect();
+        let before: HashMap<String, String> = keys(&base).into_iter().collect();
+        for k in [0, 1, 7, 20, 39, 40] {
+            let mut with = base.clone();
+            with.insert(k, mk("inserted"));
+            let after = keys(&with);
+            let changed: Vec<&str> = after
+                .iter()
+                .filter(|(id, key)| before.get(id).is_some_and(|b| b != key))
+                .map(|(id, _)| id.as_str())
+                .collect();
+            assert!(changed.len() <= 1, "insert at {k} changed {changed:?}");
+            if let Some(c) = changed.first() {
+                let pos = with.iter().position(|e| e.entry.asset_id == *c).unwrap();
+                assert_eq!(pos, k + 1, "only the shot after the insert may change");
+            }
+        }
+    }
+
+    /// Neighbouring groups with the same hash take different variants.
+    #[test]
+    fn glide_variants_separate_equal_neighbours() {
+        let mk = |id: &str| {
+            let mut e = card_entry(id, Path::new("x.png"));
+            e.entry.asset_id = id.into();
+            e
+        };
+        let a = mk("same");
+        let b = mk("same");
+        let groups = vec![vec![&a], vec![&b]];
+        let v = glide_variants(&groups);
+        assert_ne!(v[0], v[1]);
+        assert_eq!(v[0], stable_variant("same"));
+    }
+
     /// A trimmed clip is cached on its full recipe: the same trim hits from
     /// another work dir, a different trim misses.
     #[test]
@@ -3758,6 +3897,7 @@ mod tests {
             let (out, secs, kind) = render_entry_segment(
                 &caps,
                 &r,
+                1,
                 1,
                 1.0,
                 f64::INFINITY,
@@ -3962,7 +4102,7 @@ mod tests {
             let r = clip_entry(name, dir.join(name), 3.0);
             let t = std::time::Instant::now();
             let (o, _, _) =
-                render_entry_segment(&caps, &r, i, 4.0, 99.0, res, &work, &mut fb).unwrap();
+                render_entry_segment(&caps, &r, i, i, 4.0, 99.0, res, &work, &mut fb).unwrap();
             eprintln!("VIS {name}: {:.2}s", t.elapsed().as_secs_f64());
             std::fs::copy(&o, dir.join(format!("vis_{}_{name}.mp4", res.label()))).unwrap();
         }
@@ -3970,7 +4110,7 @@ mod tests {
             .map(|n| card_entry(n, &dir.join(n)))
             .to_vec();
         let refs: Vec<&ResolvedEntry> = members.iter().collect();
-        let (o, _, _) = render_collage_segment(&caps, &refs, 9, 4.0, res, &work).unwrap();
+        let (o, _, _) = render_collage_segment(&caps, &refs, 9, 1, 4.0, res, &work).unwrap();
         std::fs::copy(&o, dir.join(format!("vis_{}_collage.mp4", res.label()))).unwrap();
         let (w, h) = res.dims();
         let card = dir.join(format!("map_{}.png", res.label()));

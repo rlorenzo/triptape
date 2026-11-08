@@ -57,7 +57,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// not show: the collage layout, cover-crop and blur code, or the Ken Burns
 /// parameter maths that lives outside the filter strings. Argument changes
 /// are already in every key.
-pub const SEGMENT_CACHE_VERSION: u32 = 1;
+pub const SEGMENT_CACHE_VERSION: u32 = 2;
 
 /// Skip new entries when the cache volume has less than this free.
 pub const LOW_DISK_BYTES: u64 = 5 << 30;
