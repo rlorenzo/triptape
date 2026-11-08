@@ -228,6 +228,11 @@ pub struct Score {
     /// `None` on older scores; see [`Score::tech_quality`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality: Option<f32>,
+    /// Raw Hasler-Susstrunk colourfulness of a still (about 0 for grey,
+    /// 80+ for vivid). `None` on older scores and for video. Ranked within
+    /// the chapter by the plan, never compared across chapters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colourfulness: Option<f32>,
     /// Whether this asset is a story highlight.
     pub highlight: bool,
     /// One short string per contributing signal.
