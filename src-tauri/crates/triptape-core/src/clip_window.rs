@@ -217,14 +217,8 @@ pub fn pick_window(scores: &[f32], duration: f64) -> Option<(f64, f64)> {
         let start = ((duration - len) / 2.0).max(0.0);
         return Some((start, start + len));
     }
-    let mut best = (first, f32::NEG_INFINITY);
-    for s in first..=last {
-        let sum: f32 = scores[s..s + n].iter().sum();
-        if sum > best.1 {
-            best = (s, sum);
-        }
-    }
-    let start = best.0 as f64 * SAMPLE_SECS;
+    let (s, _) = best_run(scores, n, first, last)?;
+    let start = s as f64 * SAMPLE_SECS;
     Some((start, start + len))
 }
 
@@ -239,14 +233,6 @@ pub fn scene_cuts(diffs: &[Option<f32>]) -> Vec<usize> {
             here >= SCENE_CUT_DIFF && here >= SCENE_CUT_SPIKE * d(i - 1).max(d(i + 1))
         })
         .collect()
-}
-
-fn span(scores: &[f32], start: f64, end: f64) -> ClipSpan {
-    ClipSpan {
-        start,
-        end,
-        quality: window_quality(scores, Some((start, end))).unwrap_or(0.0),
-    }
 }
 
 /// Best window of `n` samples starting within `[first, last]` (sample
@@ -272,7 +258,11 @@ fn best_run(scores: &[f32], n: usize, first: usize, last: usize) -> Option<(usiz
 pub fn pick_windows(scores: &[f32], cuts: &[usize], duration: f64) -> Vec<ClipSpan> {
     let single = || {
         pick_window(scores, duration)
-            .map(|(a, b)| span(scores, a, b))
+            .map(|(start, end)| ClipSpan {
+                start,
+                end,
+                quality: window_quality(scores, Some((start, end))).unwrap_or(0.0),
+            })
             .into_iter()
             .collect::<Vec<_>>()
     };
@@ -290,7 +280,7 @@ pub fn pick_windows(scores: &[f32], cuts: &[usize], duration: f64) -> Vec<ClipSp
         return single();
     }
     starts.insert(0, 0);
-    let mut found: Vec<(f32, ClipSpan)> = vec![];
+    let mut found: Vec<ClipSpan> = vec![];
     for (i, &a) in starts.iter().enumerate() {
         // Stay inside the scene: it starts at the first post-cut sample and
         // ends at the last pre-cut one (the cut falls somewhere after it).
@@ -309,23 +299,29 @@ pub fn pick_windows(scores: &[f32], cuts: &[usize], duration: f64) -> Vec<ClipSp
         }
         let first = (lo / SAMPLE_SECS).ceil() as usize;
         let last = ((hi - n as f64 * SAMPLE_SECS) / SAMPLE_SECS).floor() as usize;
-        if last < first {
-            continue;
-        }
-        if let Some((s, mean)) = best_run(scores, n, first, last) {
+        // The run's mean is exactly `window_quality` over the same samples.
+        if let Some((s, quality)) = best_run(scores, n, first, last) {
             let start = s as f64 * SAMPLE_SECS;
-            found.push((mean, span(scores, start, start + n as f64 * SAMPLE_SECS)));
+            found.push(ClipSpan {
+                start,
+                end: start + n as f64 * SAMPLE_SECS,
+                quality,
+            });
         }
     }
-    let Some(top) = found.iter().map(|f| f.0).max_by(f32::total_cmp) else {
+    let Some(top) = found.iter().map(|w| w.quality).max_by(f32::total_cmp) else {
         return single();
     };
-    found.retain(|f| f.0 >= WINDOW_QUALITY_BAR * top);
+    found.retain(|w| w.quality >= WINDOW_QUALITY_BAR * top);
     // Best first (earliest on ties), keep the cap, then back to time order.
-    found.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.start.total_cmp(&b.1.start)));
+    found.sort_by(|a, b| {
+        b.quality
+            .total_cmp(&a.quality)
+            .then(a.start.total_cmp(&b.start))
+    });
     found.truncate(MAX_CLIP_WINDOWS);
-    found.sort_by(|a, b| a.1.start.total_cmp(&b.1.start));
-    found.into_iter().map(|f| f.1).collect()
+    found.sort_by(|a, b| a.start.total_cmp(&b.start));
+    found
 }
 
 /// Mean per-sample score over the part of the clip that will play: the

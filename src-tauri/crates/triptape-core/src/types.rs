@@ -169,7 +169,7 @@ pub struct PlanEntry {
     /// Which playback window of the asset this entry plays: an index into
     /// `Score::clip_windows`. Always 0 except for the sibling entries of a
     /// long multi-scene clip. `(asset_id, window)` identifies an entry.
-    #[serde(default, skip_serializing_if = "is_zero_window")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub window: u32,
     pub content_hash: Option<String>,
     pub size_bytes: u64,
@@ -274,6 +274,20 @@ pub struct ClipSpan {
     pub quality: f32,
 }
 
+impl ClipSpan {
+    /// The best of `windows` (highest quality, earliest on ties) and its
+    /// index.
+    pub fn best(windows: &[ClipSpan]) -> Option<(usize, ClipSpan)> {
+        let mut best: Option<(usize, ClipSpan)> = None;
+        for (i, w) in windows.iter().enumerate() {
+            if best.is_none_or(|(_, b)| w.quality > b.quality) {
+                best = Some((i, *w));
+            }
+        }
+        best
+    }
+}
+
 /// Accepts the current window list or the old single `(start, end)` pair.
 fn deserialize_clip_windows<'de, D: serde::Deserializer<'de>>(
     de: D,
@@ -301,13 +315,7 @@ impl Score {
     /// The clip's best window (highest quality, earliest on ties) and its
     /// index in [`Score::clip_windows`].
     pub fn best_clip_window(&self) -> Option<(usize, ClipSpan)> {
-        let mut best: Option<(usize, ClipSpan)> = None;
-        for (i, w) in self.clip_windows.iter().enumerate() {
-            if best.is_none_or(|(_, b)| w.quality > b.quality) {
-                best = Some((i, *w));
-            }
-        }
-        best
+        ClipSpan::best(&self.clip_windows)
     }
 
     /// Technical quality without story bonuses: the stored `quality`, or
@@ -317,12 +325,8 @@ impl Score {
     }
 }
 
-fn is_zero_window(v: &u32) -> bool {
-    *v == 0
-}
-
-fn is_zero(v: &f32) -> bool {
-    *v == 0.0
+fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 /// Durable job state machine.
@@ -370,6 +374,18 @@ mod tests {
             }]
         );
         assert_eq!(s.best_clip_window().map(|b| b.0), Some(0));
+    }
+
+    #[test]
+    fn best_window_is_highest_quality_and_earliest_on_ties() {
+        let w = |start, quality| ClipSpan {
+            start,
+            end: start + 6.0,
+            quality,
+        };
+        assert_eq!(ClipSpan::best(&[]), None);
+        let ws = [w(0.0, 0.5), w(20.0, 0.9), w(40.0, 0.9)];
+        assert_eq!(ClipSpan::best(&ws), Some((1, ws[1])));
     }
 
     #[test]

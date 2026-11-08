@@ -9,7 +9,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use triptape_core::clip_window::{
     audio_rms_buckets, laplacian_variance, mean_abs_diff, mean_luma, pick_windows, scene_cuts,
-    score_samples, RawSample, MIN_ANALYZED_SECS, MULTI_WINDOW_MIN_SECS, SAMPLE_SECS,
+    score_samples, window_quality, RawSample, MIN_ANALYZED_SECS, MULTI_WINDOW_MIN_SECS,
+    SAMPLE_SECS,
 };
 use triptape_core::score;
 use triptape_core::types::ClipSpan;
@@ -168,14 +169,9 @@ pub fn analyze_clip(
     }
     let scores = score_samples(&raw);
     let windows = pick_windows(&scores, &cuts, duration_secs);
-    let best = windows.iter().max_by(|a, b| {
-        a.quality
-            .total_cmp(&b.quality)
-            .then(b.start.total_cmp(&a.start))
-    });
-    let quality = match best {
-        Some(w) => Some(w.quality),
-        None => triptape_core::clip_window::window_quality(&scores, None),
+    let quality = match ClipSpan::best(&windows) {
+        Some((_, w)) => Some(w.quality),
+        None => window_quality(&scores, None),
     };
     ClipAnalysis { windows, quality }
 }

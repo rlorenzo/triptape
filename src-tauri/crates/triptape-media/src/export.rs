@@ -69,16 +69,15 @@ fn resolve_entry(
 ) -> Option<ResolvedEntry> {
     let asset_id = entry.asset_id.as_str();
     let a = assets.get(asset_id)?;
-    // The caller's entry, not a lookup by asset id: sibling windows of one
-    // clip share the id but not the trim.
-    let entry = entry.clone();
     let (still_path, motion_path) = match a.kind {
         AssetKind::Photo => (a.path.clone(), None),
         AssetKind::Video => (a.path.clone(), Some(a.path.clone())),
         AssetKind::LivePhoto => (a.path.clone(), a.companion_path.clone()),
     };
     Some(ResolvedEntry {
-        entry,
+        // The caller's entry, not a lookup by asset id: sibling windows of
+        // one clip share the id but not the trim.
+        entry: entry.clone(),
         still_path,
         motion_path,
         caption: plan.captions.get(asset_id).cloned(),
@@ -188,7 +187,14 @@ fn export_inner(
     }
     let by_id: HashMap<String, triptape_core::types::Asset> =
         assets.iter().map(|a| (a.id.clone(), a.clone())).collect();
-    let usable = plan.hero.len();
+    // Eligibility counts assets, not entries: a scene-split clip plays
+    // several windows but is still one usable asset.
+    let usable = plan
+        .hero
+        .iter()
+        .map(|e| e.asset_id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
     let photos = assets.iter().filter(|a| a.kind != AssetKind::Video).count();
     let elig = plan_eligibility(usable, photos, plan.chapters.len());
 

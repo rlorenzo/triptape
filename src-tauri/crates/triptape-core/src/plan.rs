@@ -858,6 +858,10 @@ pub fn build_plan_with_overrides(
     build_plan_with_length(assets, cluster_of, scores, overrides, FilmLength::Auto)
 }
 
+/// Weight of a window's own quality when ranking sibling windows of a clip.
+/// Small: it only breaks ties between windows of one clip.
+const WINDOW_TIEBREAK: f32 = 0.01;
+
 /// [`build_plan_with_overrides`] with a chosen hero film length.
 pub fn build_plan_with_length(
     assets: &[Asset],
@@ -873,10 +877,6 @@ pub fn build_plan_with_length(
     // the neutral default.
     let story_scores = relative_scores(&ordered, chapter_label, scores);
     let score_of = |id: &str| story_scores.get(id).copied().unwrap_or(DEFAULT_SCORE);
-    // Fresh scores win; a persisted one still carries the clip windows.
-    fn score_for_asset<'s>(scores: &'s HashMap<String, Score>, a: &'s Asset) -> Option<&'s Score> {
-        scores.get(&a.id).or(a.score.as_ref())
-    }
     let entry = |a: &Asset| plan_entry(a, score_for_asset(scores, a));
     let local_date = |a: &Asset| crate::metadata::local_date(a.taken_at?, a.tz_offset_secs);
 
@@ -959,7 +959,13 @@ pub fn build_plan_with_length(
             entries
         })
         .collect();
-    if hero.len() > HERO_TRIM_ABOVE {
+    // The threshold counts assets: a clip's extra windows are not extra assets.
+    let hero_assets = hero
+        .iter()
+        .map(|e| e.asset_id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    if hero_assets > HERO_TRIM_ABOVE {
         hero.retain(|e| score_of(&e.asset_id) >= HERO_MIN_SCORE);
     }
     let target_secs = match length {
@@ -1013,7 +1019,11 @@ pub fn build_plan_with_length(
             .map_or(0.0, |w| WINDOW_TIEBREAK * w.quality);
         score_of(&e.asset_id) + bonus
     };
-    let mut hero = select_hero_by_budget(
+    // Place windows before selection: the estimate groups stills into
+    // collages by playback order, and selection keeps candidate order, so
+    // every budget check sees the order that will be rendered.
+    place_sibling_windows(&mut hero, &by_id, chapter_label);
+    let hero = select_hero_by_budget(
         hero,
         chapter_label,
         entry_score,
@@ -1021,7 +1031,6 @@ pub fn build_plan_with_length(
         pano_secs_of,
         budget,
     );
-    place_sibling_windows(&mut hero, &by_id, chapter_label);
 
     // Reel selects: trip highlights. Rank every asset trip-wide by score
     // (motion-capable assets get a small ranking bonus — a clip or Live
@@ -1096,10 +1105,6 @@ pub fn build_plan_with_length(
     }
 }
 
-/// Weight of a window's own quality when ranking sibling windows of a clip.
-/// Small: it only breaks ties between windows of one clip.
-const WINDOW_TIEBREAK: f32 = 0.01;
-
 /// Move each further window of a clip to where it was captured: the clip's
 /// capture time plus the window's start, within its chapter, so photos taken
 /// while the clip ran play between its windows instead of the windows
@@ -1119,11 +1124,15 @@ fn place_sibling_windows<'a>(
         let taken = by_id.get(e.asset_id.as_str())?.taken_at?;
         Some(taken as f64 + start)
     };
-    let (siblings, mut kept): (Vec<PlanEntry>, Vec<PlanEntry>) = std::mem::take(hero)
-        .into_iter()
-        .partition(|e| e.window > 0 && moment(e).is_some());
-    for e in siblings {
-        let at = moment(&e).unwrap_or(f64::MAX);
+    let mut kept = Vec::with_capacity(hero.len());
+    let mut siblings = vec![];
+    for e in std::mem::take(hero) {
+        match moment(&e).filter(|_| e.window > 0) {
+            Some(at) => siblings.push((at, e)),
+            None => kept.push(e),
+        }
+    }
+    for (at, e) in siblings {
         let chapter = chapter_of(&e.asset_id);
         let in_chapter = |k: &PlanEntry| chapter_of(&k.asset_id) == chapter;
         let after_sibling = kept
@@ -1274,6 +1283,12 @@ fn human_chapter_title(label: &str) -> String {
         .map_or_else(|_| label.to_string(), |d| d.format(DAY_FORMAT).to_string())
 }
 
+/// An asset's score: the fresh one when scoring just ran, else the persisted
+/// one (which still carries the clip windows).
+fn score_for_asset<'s>(scores: &'s HashMap<String, Score>, a: &'s Asset) -> Option<&'s Score> {
+    scores.get(&a.id).or(a.score.as_ref())
+}
+
 /// Plan entry for one asset. Videos play the best window picked at ingest
 /// (`score.clip_windows`) and fall back to the start of the clip. This is
 /// the asset's single entry: reels, swap-ins and pins use it, so only the
@@ -1292,23 +1307,16 @@ fn plan_entry(a: &Asset, score: Option<&Score>) -> PlanEntry {
                 Rendition::Still
             }
         }
-        AssetKind::Video => {
-            let best = score.and_then(Score::best_clip_window);
-            window = best.map_or(0, |(i, _)| i as u32);
-            let (trim_start, trim_end) = best.map_or_else(
-                || {
-                    (
-                        0.0,
-                        a.duration_secs.unwrap_or(5.0).clamp(1.0, MAX_WINDOW_SECS),
-                    )
-                },
-                |(_, w)| (w.start, w.end),
-            );
-            Rendition::Clip {
-                trim_start,
-                trim_end,
+        AssetKind::Video => match score.and_then(Score::best_clip_window) {
+            Some((i, w)) => {
+                window = i as u32;
+                clip_rendition(&w)
             }
-        }
+            None => Rendition::Clip {
+                trim_start: 0.0,
+                trim_end: a.duration_secs.unwrap_or(5.0).clamp(1.0, MAX_WINDOW_SECS),
+            },
+        },
         AssetKind::Photo => Rendition::Still,
     };
     PlanEntry {
@@ -1334,13 +1342,17 @@ fn plan_entries(a: &Asset, score: Option<&Score>) -> Vec<PlanEntry> {
         .enumerate()
         .map(|(i, w)| PlanEntry {
             window: i as u32,
-            rendition: Rendition::Clip {
-                trim_start: w.start,
-                trim_end: w.end,
-            },
+            rendition: clip_rendition(w),
             ..primary.clone()
         })
         .collect()
+}
+
+fn clip_rendition(w: &crate::types::ClipSpan) -> Rendition {
+    Rendition::Clip {
+        trim_start: w.start,
+        trim_end: w.end,
+    }
 }
 
 // -- Sec 5.4 degradation eligibility ---------------------------------------
@@ -3256,6 +3268,24 @@ mod tests {
     }
 
     #[test]
+    fn sibling_windows_without_a_capture_time_stay_put() {
+        let (mut assets, _) = clip_fixture([0.9, 0.8, 0.7], &[20, 40]);
+        assets[0].taken_at = None;
+        let by_id: HashMap<&str, &Asset> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
+        let v = plan_entries(&assets[0], assets[0].score.as_ref());
+        let p = |id: &str| plan_entry(by_id[id], None);
+        let mut hero = vec![v[0].clone(), v[1].clone(), p("p0"), v[2].clone(), p("p1")];
+        let keys = |h: &[PlanEntry]| {
+            h.iter()
+                .map(|e| (e.asset_id.clone(), e.window))
+                .collect::<Vec<_>>()
+        };
+        let before = keys(&hero);
+        place_sibling_windows(&mut hero, &by_id, |_| "c");
+        assert_eq!(keys(&hero), before);
+    }
+
+    #[test]
     fn tight_budget_prefers_one_window_per_clip_and_the_best_one() {
         // Window 1 is the clip's best; two 6 s clips fit, three do not.
         let cands = vec![
@@ -3300,6 +3330,24 @@ mod tests {
         let (assets, _) = clip_fixture([0.9, 0.8, 0.7], &[20, 40, 100]);
         let co = one_chapter(&assets);
         for secs in [30.0, 45.0, 90.0] {
+            let plan =
+                build_plan_with_length(&assets, &co, &HashMap::new(), &[], FilmLength::Secs(secs));
+            let est = hero_secs(&plan, &co);
+            assert!(
+                est <= secs * (1.0 + LENGTH_OVERSHOOT) || plan.hero.len() == 1,
+                "{secs}: {est}"
+            );
+        }
+    }
+
+    #[test]
+    fn placed_windows_do_not_split_collages_past_the_ceiling() {
+        // Photo runs between every window: placement breaks what would be
+        // one collage after an adjacent run of windows into solo segments,
+        // so the budget must be checked against the placed order.
+        let (assets, _) = clip_fixture([0.9, 0.8, 0.7], &[16, 18, 20, 36, 38, 40, 56, 57, 58]);
+        let co = one_chapter(&assets);
+        for secs in (20..=120).map(f64::from) {
             let plan =
                 build_plan_with_length(&assets, &co, &HashMap::new(), &[], FilmLength::Secs(secs));
             let est = hero_secs(&plan, &co);
