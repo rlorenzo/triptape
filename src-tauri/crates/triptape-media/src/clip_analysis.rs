@@ -8,9 +8,8 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 use triptape_core::clip_window::{
-    audio_rms_buckets, laplacian_variance, mean_abs_diff, mean_luma, pick_windows, scene_cuts,
-    score_samples, window_quality, RawSample, MIN_ANALYZED_SECS, MULTI_WINDOW_MIN_SECS,
-    SAMPLE_SECS,
+    audio_rms_buckets, laplacian_variance, mean_abs_diff, mean_luma, pick_windows, score_samples,
+    split_scenes, window_quality, RawSample, MIN_ANALYZED_SECS, SAMPLE_SECS,
 };
 use triptape_core::score;
 use triptape_core::types::ClipSpan;
@@ -156,17 +155,7 @@ pub fn analyze_clip(
         return ClipAnalysis::default();
     };
     // Scene cuts come from the differences already measured: no extra decode.
-    let cuts = if duration_secs > MULTI_WINDOW_MIN_SECS {
-        let diffs: Vec<Option<f32>> = raw.iter().map(|r| r.diff).collect();
-        scene_cuts(&diffs)
-    } else {
-        vec![]
-    };
-    // A cut is not shake: its spike must not mark down the first shot of
-    // the new scene (the scorer borrows the next sample's difference).
-    for &c in &cuts {
-        raw[c].diff = None;
-    }
+    let cuts = split_scenes(&mut raw, duration_secs);
     let scores = score_samples(&raw);
     let windows = pick_windows(&scores, &cuts, duration_secs);
     let quality = match ClipSpan::best(&windows) {

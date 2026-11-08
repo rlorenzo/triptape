@@ -235,6 +235,23 @@ pub fn scene_cuts(diffs: &[Option<f32>]) -> Vec<usize> {
         .collect()
 }
 
+/// Scene cuts of a clip, ready for [`pick_windows`]: empty for clips of
+/// [`MULTI_WINDOW_MIN_SECS`] or less. Each cut's difference is cleared in
+/// `raw`, because a cut is not shake: its spike must not mark down the first
+/// shot of the new scene (the scorer borrows the next sample's difference).
+/// Call before [`score_samples`].
+pub fn split_scenes(raw: &mut [RawSample], duration: f64) -> Vec<usize> {
+    if duration <= MULTI_WINDOW_MIN_SECS {
+        return vec![];
+    }
+    let diffs: Vec<Option<f32>> = raw.iter().map(|r| r.diff).collect();
+    let cuts = scene_cuts(&diffs);
+    for &c in &cuts {
+        raw[c].diff = None;
+    }
+    cuts
+}
+
 /// Best window of `n` samples starting within `[first, last]` (sample
 /// indices), earliest on ties, with its mean score.
 fn best_run(scores: &[f32], n: usize, first: usize, last: usize) -> Option<(usize, f32)> {
@@ -253,8 +270,10 @@ fn best_run(scores: &[f32], n: usize, first: usize, last: usize) -> Option<(usiz
 /// most, never overlapping, at most [`MAX_CLIP_WINDOWS`], each scoring
 /// within [`WINDOW_QUALITY_BAR`] of the clip's best. `cuts` are scene-start
 /// sample indices from [`scene_cuts`]. Clips of [`MULTI_WINDOW_MIN_SECS`] or
-/// less, and clips without cuts, get exactly [`pick_window`]'s single
-/// window. Empty when the clip should play whole.
+/// less, clips without cuts, and clips where no scene has room for a
+/// [`MIN_SCENE_WINDOW_SECS`] window (a fast-cut montage) get exactly
+/// [`pick_window`]'s single window, which may span cuts as it did before
+/// scene splitting. Empty when the clip should play whole.
 pub fn pick_windows(scores: &[f32], cuts: &[usize], duration: f64) -> Vec<ClipSpan> {
     let single = || {
         pick_window(scores, duration)
@@ -309,6 +328,8 @@ pub fn pick_windows(scores: &[f32], cuts: &[usize], duration: f64) -> Vec<ClipSp
             });
         }
     }
+    // No scene has room for a window: every shot is too short to stand alone,
+    // so play the clip's best stretch across them, as clips without cuts do.
     let Some(top) = found.iter().map(|w| w.quality).max_by(f32::total_cmp) else {
         return single();
     };
@@ -512,6 +533,27 @@ mod tests {
         assert!(scene_cuts(&pan).is_empty());
     }
 
+    #[test]
+    fn split_scenes_clears_cut_spikes_and_skips_short_clips() {
+        let raw = |n: usize| -> Vec<RawSample> {
+            diffs(n, &[(15, 0.5)])
+                .into_iter()
+                .map(|diff| RawSample {
+                    diff,
+                    ..sample(0.5, None)
+                })
+                .collect()
+        };
+        let mut long = raw(40);
+        assert_eq!(split_scenes(&mut long, 40.0), vec![15]);
+        assert_eq!(long[15].diff, None);
+        assert_eq!(long[14].diff, Some(0.03));
+        // At or under the threshold: no cuts, measurements untouched.
+        let mut short = raw(20);
+        assert!(split_scenes(&mut short, MULTI_WINDOW_MIN_SECS).is_empty());
+        assert_eq!(short[15].diff, Some(0.5));
+    }
+
     /// A 60 s clip: three 20 s scenes, each with a good 6 s stretch.
     fn three_scenes(peaks: [f32; 3]) -> (Vec<f32>, Vec<usize>) {
         let mut s = vec![0.2; 60];
@@ -589,6 +631,15 @@ mod tests {
         let old = pick_window(&s, 60.0).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!((one[0].start, one[0].end), old);
+    }
+
+    #[test]
+    fn montage_without_room_in_any_scene_falls_back_to_the_single_pick() {
+        // 3 s shots: no scene fits a MIN_SCENE_WINDOW_SECS window.
+        let s = vec![0.5; 24];
+        let w = pick_windows(&s, &[3, 6, 9, 12, 15, 18, 21], 24.0);
+        assert_eq!(w.len(), 1);
+        assert_eq!((w[0].start, w[0].end), pick_window(&s, 24.0).unwrap());
     }
 
     #[test]

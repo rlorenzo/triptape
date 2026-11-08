@@ -8,7 +8,9 @@
 
 use crate::clip_window::MAX_WINDOW_SECS;
 use crate::cluster::{gps_outliers, story_key, story_order};
-use crate::types::{Asset, AssetKind, Chapter, MusicPick, Plan, PlanEntry, Rendition, Score};
+use crate::types::{
+    distinct_assets, Asset, AssetKind, Chapter, MusicPick, Plan, PlanEntry, Rendition, Score,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
@@ -960,12 +962,7 @@ pub fn build_plan_with_length(
         })
         .collect();
     // The threshold counts assets: a clip's extra windows are not extra assets.
-    let hero_assets = hero
-        .iter()
-        .map(|e| e.asset_id.as_str())
-        .collect::<HashSet<_>>()
-        .len();
-    if hero_assets > HERO_TRIM_ABOVE {
+    if distinct_assets(&hero) > HERO_TRIM_ABOVE {
         hero.retain(|e| score_of(&e.asset_id) >= HERO_MIN_SCORE);
     }
     let target_secs = match length {
@@ -1203,7 +1200,7 @@ fn relative_scores<'a>(
 ) -> HashMap<String, f32> {
     let mut by_chapter: HashMap<&str, Vec<ChapterMember>> = HashMap::new();
     for a in ordered {
-        let Some(s) = scores.get(&a.id).or(a.score.as_ref()) else {
+        let Some(s) = score_for_asset(scores, a) else {
             continue;
         };
         by_chapter
@@ -3325,13 +3322,13 @@ mod tests {
         assert_eq!(run(60.0).len(), 3);
     }
 
-    #[test]
-    fn extra_windows_do_not_overrun_the_film_length() {
-        let (assets, _) = clip_fixture([0.9, 0.8, 0.7], &[20, 40, 100]);
-        let co = one_chapter(&assets);
-        for secs in [30.0, 45.0, 90.0] {
+    /// Every film length in `lengths` keeps the estimate within the
+    /// overshoot, unless the film is down to one entry.
+    fn assert_fits_length(assets: &[Asset], lengths: impl IntoIterator<Item = f64>) {
+        let co = one_chapter(assets);
+        for secs in lengths {
             let plan =
-                build_plan_with_length(&assets, &co, &HashMap::new(), &[], FilmLength::Secs(secs));
+                build_plan_with_length(assets, &co, &HashMap::new(), &[], FilmLength::Secs(secs));
             let est = hero_secs(&plan, &co);
             assert!(
                 est <= secs * (1.0 + LENGTH_OVERSHOOT) || plan.hero.len() == 1,
@@ -3341,21 +3338,18 @@ mod tests {
     }
 
     #[test]
+    fn extra_windows_do_not_overrun_the_film_length() {
+        let (assets, _) = clip_fixture([0.9, 0.8, 0.7], &[20, 40, 100]);
+        assert_fits_length(&assets, [30.0, 45.0, 90.0]);
+    }
+
+    #[test]
     fn placed_windows_do_not_split_collages_past_the_ceiling() {
         // Photo runs between every window: placement breaks what would be
         // one collage after an adjacent run of windows into solo segments,
         // so the budget must be checked against the placed order.
         let (assets, _) = clip_fixture([0.9, 0.8, 0.7], &[16, 18, 20, 36, 38, 40, 56, 57, 58]);
-        let co = one_chapter(&assets);
-        for secs in (20..=120).map(f64::from) {
-            let plan =
-                build_plan_with_length(&assets, &co, &HashMap::new(), &[], FilmLength::Secs(secs));
-            let est = hero_secs(&plan, &co);
-            assert!(
-                est <= secs * (1.0 + LENGTH_OVERSHOOT) || plan.hero.len() == 1,
-                "{secs}: {est}"
-            );
-        }
+        assert_fits_length(&assets, (20..=120).map(f64::from));
     }
 
     #[test]

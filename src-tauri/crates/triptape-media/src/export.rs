@@ -13,7 +13,7 @@ use crate::resolution::Resolution;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{check_source_integrity, plan_eligibility, Integrity};
-use triptape_core::types::{AssetKind, Plan, PlanEntry, Rendition};
+use triptape_core::types::{distinct_assets, AssetKind, Plan, PlanEntry, Rendition};
 
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
@@ -189,12 +189,7 @@ fn export_inner(
         assets.iter().map(|a| (a.id.clone(), a.clone())).collect();
     // Eligibility counts assets, not entries: a scene-split clip plays
     // several windows but is still one usable asset.
-    let usable = plan
-        .hero
-        .iter()
-        .map(|e| e.asset_id.as_str())
-        .collect::<HashSet<_>>()
-        .len();
+    let usable = distinct_assets(&plan.hero);
     let photos = assets.iter().filter(|a| a.kind != AssetKind::Video).count();
     let elig = plan_eligibility(usable, photos, plan.chapters.len());
 

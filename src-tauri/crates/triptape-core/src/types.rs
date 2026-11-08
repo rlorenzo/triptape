@@ -201,6 +201,16 @@ impl PlanEntry {
     }
 }
 
+/// How many distinct assets `entries` show: sibling windows of one clip
+/// count once.
+pub fn distinct_assets(entries: &[PlanEntry]) -> usize {
+    entries
+        .iter()
+        .map(|e| e.asset_id.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
 impl Plan {
     pub const SCHEMA_VERSION: u32 = 1;
 
