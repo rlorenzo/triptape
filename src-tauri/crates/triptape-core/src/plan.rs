@@ -241,13 +241,16 @@ pub fn parse_film_length(spec: &str) -> Result<FilmLength, String> {
 }
 
 /// Which fixed cards the renderer will add around the hero entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HeroCards {
     /// Opening and closing route maps (the plan has a GPS route).
     pub route: bool,
     /// Chapter stops the closing map travels between; fewer than two keep
     /// the static closing card (see [`crate::route_stops::closing_map_secs`]).
     pub route_stops: usize,
+    /// Closing map length when the journey's own schedule sets it (an
+    /// itinerary recap); `None` derives it from `route_stops`.
+    pub route_secs: Option<f64>,
     /// Closing places card (some chapter has a named place).
     pub places: bool,
 }
@@ -332,7 +335,9 @@ pub fn estimate_hero_secs<'e, 'c>(
     if cards.route {
         segs.push((
             Seg::Card,
-            crate::route_stops::closing_map_secs(cards.route_stops),
+            cards
+                .route_secs
+                .unwrap_or_else(|| crate::route_stops::closing_map_secs(cards.route_stops)),
         ));
     }
     if cards.places {
@@ -1004,6 +1009,7 @@ pub fn build_plan_with_length(
             route_stops: crate::route_stops::animated_stop_count(
                 &crate::route_stops::chapter_route_stops(&chapters, assets, &map_polyline),
             ),
+            route_secs: None,
             places: chapters.iter().any(|c| c.place.is_some()),
         },
     };
@@ -2307,6 +2313,7 @@ mod tests {
             HeroCards {
                 route: !plan.map_polyline.is_empty(),
                 route_stops: 0,
+                route_secs: None,
                 places: plan.chapters.iter().any(|c| c.place.is_some()),
             },
         )
@@ -2575,6 +2582,7 @@ mod tests {
         let cards = HeroCards {
             route: true,
             route_stops: 0,
+            route_secs: None,
             places: true,
         };
         assert!(
@@ -2584,6 +2592,7 @@ mod tests {
         let bare = HeroCards {
             route: false,
             route_stops: 0,
+            route_secs: None,
             places: false,
         };
         // 2.5 + 7 + 4 + 6 + 2.5 + 4 = 26 s; cuts 0.7 + 0.54 + 0.8 + 0.54 +
@@ -2596,6 +2605,7 @@ mod tests {
         let bare = HeroCards {
             route: false,
             route_stops: 0,
+            route_secs: None,
             places: false,
         };
         let est = |ids: &[&str], caps: &[(&str, &str)]| {
@@ -2699,6 +2709,7 @@ mod tests {
         let bare = HeroCards {
             route: false,
             route_stops: 0,
+            route_secs: None,
             places: false,
         };
         assert!(
@@ -2801,6 +2812,7 @@ mod tests {
     const NO_CARDS: HeroCards = HeroCards {
         route: false,
         route_stops: 0,
+        route_secs: None,
         places: false,
     };
 
@@ -3261,6 +3273,7 @@ mod tests {
             HeroCards {
                 route: true,
                 route_stops: 0,
+                route_secs: None,
                 places: true,
             },
         );
