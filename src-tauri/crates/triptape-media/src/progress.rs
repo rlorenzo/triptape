@@ -52,8 +52,8 @@ impl ProgressEvent {
         let (lo, hi) = match (self.keepsake(), name) {
             ("video", "segment") => (0.0, 0.70),
             ("video", "overlay") => (0.70, 0.75),
-            ("video", n) if n.starts_with("assembling") => (0.75, 0.90),
-            ("video", _) => (0.90, 1.0),
+            // One fused encode (transitions, music, captions) is the tail.
+            ("video", _) => (0.75, 1.0),
             ("book", "page") => (0.0, 0.90),
             ("book", _) => (0.90, 1.0),
             _ => (0.0, 1.0),
@@ -61,8 +61,8 @@ impl ProgressEvent {
         Some(lo + (hi - lo) * within.clamp(0.0, 1.0))
     }
 
-    /// `video: segment 17/152 (11%)`, `video: final pass 42%`, or
-    /// `video: assembling transitions…` when no fraction is known.
+    /// `video: segment 17/152 (11%)`, `video: assembling film 42%`, or
+    /// `video: assembling film…` when no fraction is known.
     pub fn text(&self) -> String {
         match self {
             Self::Counted {
@@ -455,19 +455,19 @@ mod tests {
         );
         let step = ProgressEvent::Step {
             keepsake: "video",
-            label: "assembling transitions",
+            label: "assembling film",
             fraction: None,
         };
         assert_eq!(
             format_line(&step, 3.0, None),
-            "video: assembling transitions… · elapsed 3s"
+            "video: assembling film… · elapsed 3s"
         );
         let with = ProgressEvent::Step {
             keepsake: "video",
-            label: "assembling transitions",
+            label: "assembling film",
             fraction: Some(0.426),
         };
-        assert!(format_line(&with, 3.0, None).contains("assembling transitions 42%"));
+        assert!(format_line(&with, 3.0, None).contains("assembling film 42%"));
     }
 
     #[test]
@@ -505,14 +505,11 @@ mod tests {
             fraction,
         };
         near(
-            step("assembling transitions", Some(0.5)).keepsake_fraction(),
-            0.825,
+            step("assembling film", Some(0.5)).keepsake_fraction(),
+            0.875,
         );
-        near(
-            step("final pass (music)", Some(1.5)).keepsake_fraction(),
-            1.0,
-        );
-        assert_eq!(step("final pass", None).keepsake_fraction(), None);
+        near(step("assembling film", Some(1.5)).keepsake_fraction(), 1.0);
+        assert_eq!(step("assembling film", None).keepsake_fraction(), None);
         let page = ProgressEvent::Counted {
             keepsake: "book",
             unit: "page",
@@ -541,7 +538,7 @@ mod tests {
         c.report_at(
             &ProgressEvent::Step {
                 keepsake: "video",
-                label: "assembling transitions",
+                label: "assembling film",
                 fraction: None,
             },
             t0 + Duration::from_secs(3),
@@ -585,7 +582,7 @@ mod tests {
         let t0 = Instant::now();
         let step = |f| ProgressEvent::Step {
             keepsake: "video",
-            label: "final pass",
+            label: "assembling film",
             fraction: f,
         };
         c.report_at(&step(None), t0);
