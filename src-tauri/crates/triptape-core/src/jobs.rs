@@ -112,22 +112,40 @@ pub fn required_free_bytes(estimate_bytes: u64) -> u64 {
 
 /// Free bytes available on the filesystem containing `path`.
 ///
-/// Uses `df -P -k` on unix and `GetDiskFreeSpaceExW` on Windows. `None` when
-/// unknowable, so the caller can warn instead of block.
+/// `None` when unknowable, so the caller can warn instead of block.
 pub fn free_bytes(path: &Path) -> Option<u64> {
+    disk_space(path).map(|d| d.free)
+}
+
+/// Free and total bytes of a filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskSpace {
+    /// Bytes available to this user.
+    pub free: u64,
+    /// Size of the volume; `None` when the platform will not say.
+    pub total: Option<u64>,
+}
+
+/// Free and total bytes of the filesystem containing `path`.
+///
+/// Uses `df -P -k` on unix and `GetDiskFreeSpaceExW` on Windows. `None` when
+/// unknowable.
+pub fn disk_space(path: &Path) -> Option<DiskSpace> {
     #[cfg(unix)]
     {
         let out = std::process::Command::new("df")
-            .args(["-P", "-k", &path.to_string_lossy()])
+            .args(["-P", "-k"])
+            .arg(path)
             .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
+            .ok()
+            .filter(|o| o.status.success())?;
         let text = String::from_utf8_lossy(&out.stdout);
-        let line = text.lines().nth(1)?;
-        let avail_kb: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
-        Some(avail_kb * 1024)
+        let cols: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
+        let kb = |i: usize| cols.get(i)?.parse::<u64>().ok().map(|k| k * 1024);
+        Some(DiskSpace {
+            free: kb(3)?,
+            total: kb(1),
+        })
     }
     #[cfg(windows)]
     {
@@ -142,18 +160,16 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
             ) -> i32;
         }
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        let mut free = 0u64;
-        // SAFETY: `wide` is NUL-terminated and outlives the call, `free` is a
-        // valid out pointer, and the API accepts null for the other two.
+        let (mut free, mut total) = (0u64, 0u64);
+        // SAFETY: `wide` is NUL-terminated and outlives the call, `free` and
+        // `total` are valid out pointers, and the API accepts null for the last.
         let ok = unsafe {
-            GetDiskFreeSpaceExW(
-                wide.as_ptr(),
-                &mut free,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
+            GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, std::ptr::null_mut())
         };
-        (ok != 0).then_some(free)
+        (ok != 0).then_some(DiskSpace {
+            free,
+            total: Some(total),
+        })
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -246,6 +262,15 @@ mod tests {
         let done = finalize_checkpoint(dir.path(), "seg001.mp4").unwrap();
         assert_eq!(std::fs::read(done).unwrap(), b"bytes");
         assert!(finalize_checkpoint(dir.path(), "missing.mp4").is_err());
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn disk_space_reports_free_within_total() {
+        let t = tempfile::tempdir().unwrap();
+        let d = disk_space(t.path()).expect("disk space of a temp dir");
+        let total = d.total.expect("total size");
+        assert!(total > 0 && d.free <= total, "{d:?}");
     }
 
     #[test]
