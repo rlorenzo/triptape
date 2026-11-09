@@ -852,59 +852,16 @@ pub fn render_hero_video(
         .collect();
     let offsets = xfade_offsets_var(&durations, &cut_overlaps);
 
-    // 5. Single-pass assembly: every xfade/acrossfade in one filter
-    // graph, encoded once. The old pairwise chain re-encoded the whole
-    // accumulated film at every cut, so the first segments went through
-    // dozens of lossy generations and came out soft. The intermediate
-    // encode is near-lossless (CRF 12); the final music pass is the only
-    // other generation.
-    let acc = work_dir.join("chain_final.mp4");
+    // 5. One encode: every xfade (and, with --keep-ambience, acrossfade) in
+    // a single filter graph feeds the caption burn and the music mix, and
+    // x264 runs exactly once at final quality. The old pairwise chain
+    // re-encoded the whole accumulated film at every cut (soft output); the
+    // later two-pass layout (near-lossless intermediate, then final encode)
+    // paid for a full extra decode+encode of the film. The music bed is the
+    // PRIMARY audio (looped, trimmed, faded in/out); film audio is muted, or
+    // kept at 0.12 ducked under the music with --keep-ambience. Loudnorm
+    // lands on the mix, never on raw clip noise.
     let total = durations.iter().sum::<f64>() - cut_overlaps.iter().sum::<f64>();
-    progress.check_cancelled()?;
-    progress.step("video", "assembling transitions", Some(0.0));
-    {
-        let mut args: Vec<String> = vec!["-y".into()];
-        for (_, p, _, _) in &segs {
-            args.extend(["-i".into(), s(p)]);
-        }
-        let mut graph = String::new();
-        let (mut vl, mut al) = ("[0:v]".to_string(), "[0:a]".to_string());
-        for i in 1..segs.len() {
-            let t = transitions[i].unwrap_or(Transition::Fade);
-            let ov = cut_overlaps[i - 1];
-            let offset = offsets[i - 1].max(0.0);
-            let (nv, na) = if i == segs.len() - 1 {
-                ("[v]".to_string(), "[a]".to_string())
-            } else {
-                (format!("[v{i}]"), format!("[a{i}]"))
-            };
-            graph.push_str(&format!(
-                "{vl}[{i}:v]xfade=transition={}:duration={ov:.3}:offset={offset:.3}{nv};{al}[{i}:a]acrossfade=d={ov:.3}:c1=tri:c2=tri{na};",
-                t.xfade_name(),
-            ));
-            vl = nv;
-            al = na;
-        }
-        graph.pop();
-        args.extend([
-            "-filter_complex".into(),
-            graph,
-            "-map".into(),
-            "[v]".into(),
-            "-map".into(),
-            "[a]".into(),
-        ]);
-        args.extend(ffmpeg::x264_aac("veryfast", 12));
-        args.push(s(&acc));
-        caps.run_progress(&args, &acc, total, &|f| {
-            progress.step("video", "assembling transitions", Some(f));
-        })?;
-    }
-
-    // 6. Final pass: the music bed is the PRIMARY audio (looped, trimmed to
-    // the film, faded in/out); the original film audio is muted, or kept at
-    // 0.12 ducked under the music with --keep-ambience. Loudnorm lands on
-    // the mix, never on raw clip noise.
     let norm = if caps.loudnorm {
         ffmpeg::LOUDNORM
     } else {
@@ -924,9 +881,9 @@ pub fn render_hero_video(
         &playlist.iter().map(|t| t.duration_secs).collect::<Vec<_>>(),
         total,
     );
-    // Captions: the sidecar SRT is always written; with libass the final
-    // pass also burns it into the picture. Segment 0 starts at 0; every
-    // later segment starts at its xfade cut.
+    // Captions: the sidecar SRT is always written; with libass the encode
+    // also burns it into the picture. Segment 0 starts at 0; every later
+    // segment starts at its xfade cut.
     let starts: Vec<f64> = std::iter::once(0.0)
         .chain(offsets.iter().copied())
         .collect();
@@ -940,48 +897,91 @@ pub fn render_hero_video(
     };
     let burn_srt =
         (srt_count > 0 && caps.can_burn_captions()).then(|| ffmpeg::subtitles_filter(&srt_path));
-    // Input 0 is the film; the bed placements follow as inputs 1..
-    let bed_graph = crate::music::bed_filter(&bed_plan, &playlist, 1, total);
-    let audio_graph = if opts.keep_ambience {
-        format!(
-            "[0:a]volume=0.12,aresample=48000,aformat=channel_layouts=stereo[film];{bed_graph};[mbed][film]sidechaincompress=threshold=0.02:ratio=8:attack=200:release=800[duck];[film][duck]amix=inputs=2:duration=first:dropout_transition=0,{norm}[aout]"
-        )
-    } else {
-        // Muted film audio: the music bed alone is the soundtrack.
-        format!("{bed_graph};[mbed]{norm}[aout]")
-    };
-    let (audio_graph, video_map) = match burn_srt {
-        Some(sub) => (
-            format!("[0:v]{sub}[vsub];{audio_graph}"),
-            "[vsub]".to_string(),
-        ),
-        None => (audio_graph, "0:v".to_string()),
-    };
-    let mut final_args: Vec<String> = vec!["-y".into(), "-i".into(), s(&acc)];
-    for m in crate::music::bed_inputs(&bed_plan, &playlist) {
-        final_args.extend(["-i".into(), s(m)]);
-    }
-    final_args.extend([
-        "-filter_complex".into(),
-        audio_graph,
-        "-map".into(),
-        video_map,
-        "-map".into(),
-        "[aout]".into(),
-    ]);
-    final_args.extend(ffmpeg::x264_aac("medium", 19));
-    final_args.extend(opts.resolution.x264_level_args());
-    final_args.extend(["-r".into(), "30".into(), s(out_mp4)]);
     progress.check_cancelled()?;
-    let final_label = "final pass (music, captions, encode)";
-    progress.step("video", final_label, Some(0.0));
-    let on_final = |f: f64| progress.step("video", final_label, Some(f));
-    match caps.run_progress(&final_args, out_mp4, total, &on_final) {
-        Ok(()) => {}
-        Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
-        // Music bed is mandatory: a failed mix fails the film (the old
-        // film-audio-only path is exactly the raw-clip-noise bug).
-        Err(e) => return Err(crate::MediaError::Ffmpeg(format!("music mix failed: {e}"))),
+    let label = "assembling film (transitions, music, captions, encode)";
+    progress.step("video", label, Some(0.0));
+    {
+        let n = segs.len();
+        let mut args: Vec<String> = vec!["-y".into()];
+        for (_, p, _, _) in &segs {
+            args.extend(["-i".into(), s(p)]);
+        }
+        for m in crate::music::bed_inputs(&bed_plan, &playlist) {
+            args.extend(["-i".into(), s(m)]);
+        }
+        let mut graph = String::new();
+        let (mut vl, mut al) = ("[0:v]".to_string(), "[0:a]".to_string());
+        for i in 1..n {
+            let t = transitions[i].unwrap_or(Transition::Fade);
+            let ov = cut_overlaps[i - 1];
+            let offset = offsets[i - 1].max(0.0);
+            let last = i == n - 1;
+            let nv = if last {
+                "[v]".to_string()
+            } else {
+                format!("[v{i}]")
+            };
+            graph.push_str(&format!(
+                "{vl}[{i}:v]xfade=transition={}:duration={ov:.3}:offset={offset:.3}{nv};",
+                t.xfade_name(),
+            ));
+            vl = nv;
+            if opts.keep_ambience {
+                let na = if last {
+                    "[a]".to_string()
+                } else {
+                    format!("[a{i}]")
+                };
+                graph.push_str(&format!(
+                    "{al}[{i}:a]acrossfade=d={ov:.3}:c1=tri:c2=tri{na};"
+                ));
+                al = na;
+            }
+        }
+        // Single segment: no cut, the lone stream passes straight through.
+        let film_v = if n > 1 { "[v]" } else { "[0:v]" };
+        let film_a = if n > 1 { "[a]" } else { "[0:a]" };
+        let bed_graph = crate::music::bed_filter(&bed_plan, &playlist, n, total);
+        let audio_graph = if opts.keep_ambience {
+            format!(
+                "{film_a}volume=0.12,aresample=48000,aformat=channel_layouts=stereo[film];{bed_graph};[mbed][film]sidechaincompress=threshold=0.02:ratio=8:attack=200:release=800[duck];[film][duck]amix=inputs=2:duration=first:dropout_transition=0,{norm}[aout]"
+            )
+        } else {
+            // Muted film audio: the music bed alone is the soundtrack.
+            format!("{bed_graph};[mbed]{norm}[aout]")
+        };
+        let video_map = match &burn_srt {
+            Some(sub) => {
+                graph.push_str(&format!("{film_v}{sub}[vsub];"));
+                "[vsub]".to_string()
+            }
+            None if n > 1 => "[v]".to_string(),
+            None => "0:v".to_string(),
+        };
+        graph.push_str(&audio_graph);
+        args.extend([
+            "-filter_complex".into(),
+            graph,
+            "-map".into(),
+            video_map,
+            "-map".into(),
+            "[aout]".into(),
+        ]);
+        args.extend(ffmpeg::x264_aac("medium", 19));
+        args.extend(opts.resolution.x264_level_args());
+        args.extend(["-r".into(), "30".into(), s(out_mp4)]);
+        let on_progress = |f: f64| progress.step("video", label, Some(f));
+        match caps.run_progress(&args, out_mp4, total, &on_progress) {
+            Ok(()) => {}
+            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
+            // Music bed is mandatory: a failed mix fails the film (the old
+            // film-audio-only path is exactly the raw-clip-noise bug).
+            Err(e) => {
+                return Err(crate::MediaError::Ffmpeg(format!(
+                    "film assembly failed: {e}"
+                )))
+            }
+        }
     }
 
     // 7. Verify + EDL + sidecar SRT.
