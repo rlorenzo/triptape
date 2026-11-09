@@ -64,6 +64,11 @@ pub struct ItinLeg {
     /// dates do not say.
     #[serde(default)]
     pub dates: Option<String>,
+    /// An explicit `[lat, lon]` path for the leg (e.g. a cruise traced from
+    /// the line's own itinerary map); drawn as given instead of a routed or
+    /// generated path. Must have two or more points.
+    #[serde(default)]
+    pub path: Option<Vec<[f64; 2]>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -181,6 +186,18 @@ impl Itinerary {
             }
             if let Some(d) = &leg.dates {
                 parse_range(d)?;
+            }
+            if let Some(p) = &leg.path {
+                if p.len() < 2
+                    || p.iter().any(|q| {
+                        !(-90.0..=90.0).contains(&q[0]) || !(-180.0..=180.0).contains(&q[1])
+                    })
+                {
+                    return Err(format!(
+                        "leg {:?} -> {:?} has an invalid path",
+                        leg.from, leg.to
+                    ));
+                }
             }
             at = &leg.to;
         }

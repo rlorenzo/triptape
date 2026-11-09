@@ -112,6 +112,73 @@ pub fn land_fraction(gps: (f64, f64)) -> f32 {
     top * (1.0 - tr) + bottom * tr
 }
 
+/// The land grid blurred (two passes of a 1-4-6-4-1 kernel in each axis,
+/// sigma about 1.4 cells) into bytes, built on first use: 26 MB. Bilinear
+/// lookups into it give coastlines without the raw grid's stair-steps when
+/// zoomed in.
+fn blurred_grid() -> &'static [u8] {
+    static BLURRED: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    BLURRED.get_or_init(|| {
+        let (w, h) = (GRID_W as usize, GRID_H as usize);
+        let mut cur: Vec<u8> = (0..w * h)
+            .map(|i| {
+                if LAND_GRID[i / 8] >> (i % 8) & 1 == 1 {
+                    255
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let mut tmp = vec![0u8; w * h];
+        const K: [u32; 5] = [1, 4, 6, 4, 1];
+        for _ in 0..2 {
+            // Horizontal (wraps at the antimeridian).
+            for y in 0..h {
+                let row = &cur[y * w..(y + 1) * w];
+                for x in 0..w {
+                    let mut acc = 0;
+                    for (k, wgt) in K.iter().enumerate() {
+                        acc += wgt * u32::from(row[(x + w + k - 2) % w]);
+                    }
+                    tmp[y * w + x] = (acc / 16) as u8;
+                }
+            }
+            // Vertical (clamped at the poles).
+            for y in 0..h {
+                for x in 0..w {
+                    let mut acc = 0;
+                    for (k, wgt) in K.iter().enumerate() {
+                        let yy = (y + k).saturating_sub(2).min(h - 1);
+                        acc += wgt * u32::from(tmp[yy * w + x]);
+                    }
+                    cur[y * w + x] = (acc / 16) as u8;
+                }
+            }
+        }
+        cur
+    })
+}
+
+/// [`land_fraction`] from the blurred grid: smoother shorelines, 0.5 still
+/// the coast. Builds a 26 MB table on first call.
+pub fn land_fraction_smooth(gps: (f64, f64)) -> f32 {
+    let grid = blurred_grid();
+    let fc = (gps.1 + 180.0) * CELLS_PER_DEG as f64 - 0.5;
+    let fr = (gps.0 + 90.0) * CELLS_PER_DEG as f64 - 0.5;
+    let (c0, r0) = (fc.floor(), fr.floor());
+    let (tc, tr) = ((fc - c0) as f32, (fr - r0) as f32);
+    let cell = |r: i64, c: i64| -> f32 {
+        if !(0..GRID_H).contains(&r) {
+            return 0.0;
+        }
+        f32::from(grid[(r * GRID_W + c.rem_euclid(GRID_W)) as usize]) / 255.0
+    };
+    let (r0, c0) = (r0 as i64, c0 as i64);
+    let top = cell(r0, c0) * (1.0 - tc) + cell(r0, c0 + 1) * tc;
+    let bottom = cell(r0 + 1, c0) * (1.0 - tc) + cell(r0 + 1, c0 + 1) * tc;
+    top * (1.0 - tr) + bottom * tr
+}
+
 /// The name for `gps`: a nearby attraction beats the generic city.
 /// `None` when nothing is close enough to name honestly (open water,
 /// remote areas). This is the only place-name source in the app, backed
@@ -323,6 +390,30 @@ mod tests {
         let _ = land_fraction((-90.0, 0.0));
         let _ = land_fraction((90.0, 179.99));
         let _ = land_fraction((10.0, 540.0));
+    }
+
+    #[test]
+    fn smooth_fraction_agrees_with_the_raw_grid_away_from_coasts() {
+        assert!(land_fraction_smooth((36.0, 138.0)) > 0.95);
+        assert!(land_fraction_smooth((20.0, -150.0)) < 0.05);
+        // Across a coastline it rises smoothly (small steps), unlike the raw grid.
+        let steps: Vec<f32> = (0..80)
+            .map(|i| land_fraction_smooth((35.0, 139.0 + f64::from(i) * 0.01)))
+            .collect();
+        let max_jump = steps
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
+        let raw: Vec<f32> = (0..80)
+            .map(|i| land_fraction((35.0, 139.0 + f64::from(i) * 0.01)))
+            .collect();
+        let raw_jump = raw
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
+        assert!(max_jump <= raw_jump + 1e-6, "{max_jump} vs {raw_jump}");
+        let _ = land_fraction_smooth((10.0, 540.0));
+        let _ = land_fraction_smooth((-90.0, 0.0));
     }
 
     #[test]

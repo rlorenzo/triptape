@@ -146,7 +146,12 @@ impl Journey {
                 itin.stop(&leg.from).expect("validated chain"),
                 itin.stop(&leg.to).expect("validated chain"),
             );
+            let explicit: Option<Vec<(f64, f64)>> = leg
+                .path
+                .as_ref()
+                .map(|p| p.iter().map(|q| (q[0], q[1])).collect());
             let path = match leg.mode {
+                _ if explicit.is_some() => explicit.unwrap_or_default(),
                 LegMode::Flight => great_circle(from.pos(), to.pos()),
                 LegMode::Ground => vec![from.pos(), to.pos()],
                 LegMode::Ship if leg.is_loop => loop_path(from.pos()),
@@ -481,6 +486,28 @@ mod tests {
         assert_eq!(s.total_secs, s.pull_back_at + PULL_BACK_SECS);
         assert_eq!(s.leg_secs[0], FLIGHT_SECS);
         assert_eq!(s.leg_secs[9], LOOP_SECS);
+    }
+
+    #[test]
+    fn an_explicit_leg_path_is_used_as_given() {
+        let json = JSON.replacen(
+            "\"loop\": true,",
+            "\"loop\": true, \"path\": [[1.265, 103.864], [2.7, 105.3], [1.265, 103.864]],",
+            1,
+        );
+        let j = Journey::build(&Itinerary::from_json(&json).unwrap(), &[]);
+        // Used as given (longitudes continue the journey's unwrapped run).
+        let p = &j.legs[9].path;
+        assert_eq!(p.len(), 3);
+        assert!((p[1].0 - 2.7).abs() < 1e-9 && (p[1].1 + 360.0 - 105.3).abs() < 1e-6);
+        assert!((p[0].0 - p[2].0).abs() < 0.01 && (p[0].1 - p[2].1).abs() < 0.01);
+        // A path with one point is rejected.
+        let bad = JSON.replacen(
+            "\"loop\": true,",
+            "\"loop\": true, \"path\": [[1.0, 2.0]],",
+            1,
+        );
+        assert!(Itinerary::from_json(&bad).is_err());
     }
 
     #[test]

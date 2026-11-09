@@ -16,8 +16,8 @@
 use crate::ffmpeg::Capabilities;
 use crate::resolution::Resolution;
 use crate::routeanim::{
-    blend_px, blend_shape, composite, encode, frame_count, label_doc, RecapReport, CORE, FPS, GLOW,
-    PIN_END, PIN_RING, PIN_START, PIN_STOP,
+    blend_px, blend_shape, composite, encode, frame_count, label_doc_sized, RecapReport, CORE, FPS,
+    GLOW, PIN_END, PIN_RING, PIN_START, PIN_STOP,
 };
 use crate::MediaError;
 use image::{Rgb, RgbImage, RgbaImage};
@@ -257,8 +257,11 @@ struct Scene<'a> {
     tags: Vec<Option<Sprite>>,
     /// Nodes with labels in journey order, for the recency rule.
     labelled: Vec<usize>,
-    /// Labelled nodes that stay on the final overview.
-    major: Vec<usize>,
+    /// Smaller label sprites for the final overview, where every city is
+    /// named, and each one's offset from its pin (placed once, at the
+    /// overview camera, so the cluster in Asia does not collide).
+    overview_labels: Vec<Option<Sprite>>,
+    overview_offsets: Vec<Option<(f64, f64)>>,
     glow_mask: Vec<u8>,
     core_mask: Vec<u8>,
     /// Per row: touched pixel span in the masks.
@@ -282,6 +285,13 @@ impl Scene<'_> {
         let cells_per_px = 20.0 / cam.s;
         // A floor on the blend zone rounds the grid's stair-steps into smooth shores.
         let soft = (0.5 * cells_per_px).clamp(0.3, 0.5);
+        // Zoomed in (cells wider than a pixel), the blurred grid rounds off
+        // the raw grid's stair-steps; zoomed out the raw one is sharper.
+        let fraction: fn(LatLon) -> f32 = if cells_per_px < 0.7 {
+            triptape_core::geo::land_fraction_smooth
+        } else {
+            triptape_core::geo::land_fraction
+        };
         let threads = std::thread::available_parallelism()
             .map_or(4, |n| n.get())
             .min(16);
@@ -295,7 +305,7 @@ impl Scene<'_> {
                         let lat = cam.cy - ((y as f64 + 0.5) - f64::from(h) / 2.0) / cam.s;
                         for x in 0..w as usize {
                             let lon = cam.cx + ((x as f64 + 0.5) - f64::from(w) / 2.0) / cam.s;
-                            let f = f64::from(triptape_core::geo::land_fraction((lat, lon)));
+                            let f = f64::from(fraction((lat, lon)));
                             let t = ((f - (0.5 - soft)) / (2.0 * soft)).clamp(0.0, 1.0);
                             let a = t * t * (3.0 - 2.0 * t);
                             if a > 0.0 {
@@ -559,19 +569,41 @@ impl Scene<'_> {
     fn draw_labels(&self, img: &mut RgbImage, cam: Cam, t: f64) {
         let size = (self.w, self.h);
         let k = self.k;
-        let reached: Vec<usize> = self
-            .labelled
-            .iter()
-            .copied()
-            .filter(|&n| t >= self.sched.arrive[n])
-            .collect();
+        // At the pull-back the working labels crossfade into the overview
+        // set, where every city is named.
         let pull = ease(((t - self.sched.pull_back_at) / 0.6).clamp(0.0, 1.0));
         for (j, &n) in self.labelled.iter().enumerate() {
+            let arrive = self.sched.arrive[n];
+            let fade_in = ((t - arrive) / triptape_core_label_fade()).clamp(0.0, 1.0);
+            if fade_in <= 0.0 {
+                continue;
+            }
+            let c = cam.to_screen(self.journey.nodes[n].pos, size);
+            if let (Some(Sprite(sprite)), Some(off)) =
+                (&self.overview_labels[n], self.overview_offsets[n])
+            {
+                let alpha = fade_in * pull;
+                if alpha > 0.0 && on_screen(c, size, 300.0 * k) {
+                    let at = ((c.0 + off.0).round() as i32, (c.1 + off.1).round() as i32);
+                    // A nudged label is tied to its own pin by a short leader.
+                    let (lw, lh) = (f64::from(sprite.width()), f64::from(sprite.height()));
+                    let (x0, y0) = (f64::from(at.0), f64::from(at.1));
+                    let edge = (c.0.clamp(x0, x0 + lw), c.1.clamp(y0, y0 + lh));
+                    let len = ((edge.0 - c.0).powi(2) + (edge.1 - c.1).powi(2)).sqrt();
+                    if len > 12.0 * k {
+                        let steps = (len / (0.7 * k)).ceil() as u32;
+                        for i in 0..=steps {
+                            let u = f64::from(i) / f64::from(steps);
+                            let p = (c.0 + (edge.0 - c.0) * u, c.1 + (edge.1 - c.1) * u);
+                            blend_shape(img, p, 0.9 * k, None, CORE, 0.8 * alpha);
+                        }
+                    }
+                    composite(img, sprite, at, alpha);
+                }
+            }
             let Some(Sprite(sprite)) = &self.labels[n] else {
                 continue;
             };
-            let arrive = self.sched.arrive[n];
-            let fade_in = ((t - arrive) / triptape_core_label_fade()).clamp(0.0, 1.0);
             // Older labels fade once LABELS_KEPT later stops have been reached.
             let stale_at = self
                 .labelled
@@ -580,14 +612,10 @@ impl Scene<'_> {
             let recency = stale_at.map_or(1.0, |s| {
                 1.0 - ((t - s) / LABEL_FADE_OUT_SECS).clamp(0.0, 1.0)
             });
-            let mut alpha = fade_in * recency;
-            if self.major.contains(&n) {
-                alpha = alpha.max(fade_in * pull);
-            }
-            if alpha <= 0.0 || reached.is_empty() {
+            let alpha = fade_in * recency * (1.0 - pull);
+            if alpha <= 0.0 {
                 continue;
             }
-            let c = cam.to_screen(self.journey.nodes[n].pos, size);
             let (lw, lh) = (f64::from(sprite.width()), f64::from(sprite.height()));
             let gap = 14.0 * k;
             if !on_screen(c, size, lw + gap) {
@@ -794,15 +822,19 @@ fn build_scene<'a>(
     let cams = plan_camera(journey, &sched, &geoms, frames, f64::from(w) / f64::from(h));
 
     std::fs::create_dir_all(work_dir).map_err(|e| MediaError::Io(e.to_string()))?;
-    let mut sprite = |tag: String, text: &str| -> Option<Sprite> {
+    let mut sprite = |tag: String, text: &str, size_pt: f64| -> Option<Sprite> {
         let png = work_dir.join(format!("journey_{tag}.png"));
-        let made =
-            crate::titlecard::render_text_png(typst_bin, &label_doc(text), &png, 72 * k as u32)
-                .and_then(|()| {
-                    image::open(&png)
-                        .map(|im| im.to_rgba8())
-                        .map_err(|e| MediaError::Io(format!("read label: {e}")))
-                });
+        let made = crate::titlecard::render_text_png(
+            typst_bin,
+            &label_doc_sized(text, size_pt),
+            &png,
+            72 * k as u32,
+        )
+        .and_then(|()| {
+            image::open(&png)
+                .map(|im| im.to_rgba8())
+                .map_err(|e| MediaError::Io(format!("read label: {e}")))
+        });
         let _ = std::fs::remove_file(&png);
         match made {
             Ok(img) => Some(Sprite(img)),
@@ -819,7 +851,17 @@ fn build_scene<'a>(
         .map(|(i, n)| {
             n.label
                 .as_deref()
-                .and_then(|t| sprite(format!("n{i:02}"), t))
+                .and_then(|t| sprite(format!("n{i:02}"), t, 30.0))
+        })
+        .collect();
+    let overview_labels: Vec<Option<Sprite>> = journey
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            n.label
+                .as_deref()
+                .and_then(|t| sprite(format!("o{i:02}"), t, 22.0))
         })
         .collect();
     let tags: Vec<Option<Sprite>> = journey
@@ -829,26 +871,36 @@ fn build_scene<'a>(
         .map(|(i, l)| {
             l.boarding_tag
                 .as_deref()
-                .and_then(|t| sprite(format!("t{i:02}"), t))
+                .and_then(|t| sprite(format!("t{i:02}"), t, 30.0))
         })
         .collect();
     let labelled: Vec<usize> = (0..journey.nodes.len())
         .filter(|&i| journey.nodes[i].label.is_some())
         .collect();
-    // The overview keeps the opening city, the first stop after a flight
-    // and the last labelled stop.
-    let mut major: Vec<usize> = vec![];
-    if let Some(&first) = labelled.first() {
-        major.push(first);
-    }
-    if let Some(i) = journey.legs.iter().position(|l| l.mode == LegMode::Flight) {
-        if journey.nodes[i + 1].label.is_some() {
-            major.push(i + 1);
-        }
-    }
-    if let Some(&last) = labelled.last() {
-        major.push(last);
-    }
+    // Place every overview label once, at the final camera, so the cities
+    // clustered in Asia are nudged apart rather than dropped.
+    let overview_offsets: Vec<Option<(f64, f64)>> = {
+        let (lat, lon, view) = *cams.last().expect("frames");
+        let cam = Cam {
+            cx: lon,
+            cy: lat,
+            s: f64::from(w) / view,
+        };
+        let anchors: Vec<(f64, f64)> = journey
+            .nodes
+            .iter()
+            .map(|n| cam.to_screen(n.pos, (w, h)))
+            .collect();
+        let sizes: Vec<Option<(u32, u32)>> = overview_labels
+            .iter()
+            .map(|l| l.as_ref().map(|Sprite(i)| (i.width(), i.height())))
+            .collect();
+        crate::routeanim::place_labels(&anchors, &sizes, (w, h), 10.0 * k)
+            .into_iter()
+            .zip(&anchors)
+            .map(|(p, a)| p.map(|p| (f64::from(p.0) - a.0, f64::from(p.1) - a.1)))
+            .collect()
+    };
     Ok(Scene {
         journey,
         sched,
@@ -860,7 +912,8 @@ fn build_scene<'a>(
         labels,
         tags,
         labelled,
-        major,
+        overview_labels,
+        overview_offsets,
         glow_mask: vec![0; (w * h) as usize],
         core_mask: vec![0; (w * h) as usize],
         spans: vec![(i32::MAX, i32::MIN); h as usize],
@@ -1033,7 +1086,8 @@ mod tests {
             .all(|n| !n.contains("Carnival") && !n.contains("Disney")));
         assert_eq!(notes.iter().filter(|n| n.contains("Boarded")).count(), 2);
         assert_eq!(s.labelled, vec![0, 1, 3, 4]);
-        assert!(s.major.contains(&0) && s.major.contains(&1) && s.major.contains(&4));
+        // Typst is absent, so no overview sprite exists to place.
+        assert!(s.overview_offsets.iter().all(Option::is_none));
     }
 
     #[test]

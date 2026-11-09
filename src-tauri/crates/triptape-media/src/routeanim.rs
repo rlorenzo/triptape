@@ -281,9 +281,16 @@ pub(crate) fn place_labels(
             });
             !placed.iter().any(hits) && !pin_hit
         };
-        let pick = candidates
+        // Nearest to its own pin first, so a nudged label stays beside its dot.
+        let near = |(x, y): (f64, f64)| {
+            let (ex, ey) = (ax.clamp(x, x + lw), ay.clamp(y, y + lh));
+            (ex - ax).hypot(ey - ay)
+        };
+        let mut ranked: Vec<(f64, f64)> = candidates.iter().map(|&c| clamp(c)).collect();
+        ranked.sort_by(|&p, &q| near(p).total_cmp(&near(q)));
+        let pick = ranked
             .iter()
-            .map(|&c| clamp(c))
+            .copied()
             .find(|&c| free(c))
             .unwrap_or_else(|| clamp(candidates[0]));
         placed.push((pick.0, pick.1, pick.0 + lw, pick.1 + lh));
@@ -619,11 +626,21 @@ pub(crate) fn composite(img: &mut RgbImage, sprite: &RgbaImage, pos: (i32, i32),
 
 /// Typst source for a transparent stop-label pill (sized to its text).
 pub(crate) fn label_doc(text: &str) -> String {
+    label_doc_sized(text, 30.0)
+}
+
+/// [`label_doc`] at another text size (points at 1080p); the pill's padding
+/// scales with it.
+pub(crate) fn label_doc_sized(text: &str, size_pt: f64) -> String {
     format!(
         r##"#set page(width: auto, height: auto, margin: 0pt, fill: none)
-#set text(font: {fonts}, fill: white, size: 30pt, weight: "bold")
-#box(fill: rgb(13, 20, 32, 225), inset: (x: 16pt, y: 9pt), radius: 9pt, stroke: 1.5pt + rgb("#f5b242"), "{text}")"##,
+#set text(font: {fonts}, fill: white, size: {size}pt, weight: "bold")
+#box(fill: rgb(13, 20, 32, 225), inset: (x: {ix}pt, y: {iy}pt), radius: {r}pt, stroke: 1.5pt + rgb("#f5b242"), "{text}")"##,
         fonts = crate::titlecard::FONT_STACK,
+        size = size_pt,
+        ix = size_pt * 0.53,
+        iy = size_pt * 0.3,
+        r = size_pt * 0.3,
         text = crate::titlecard::esc(text),
     )
 }
