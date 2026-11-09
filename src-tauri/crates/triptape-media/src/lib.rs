@@ -10,6 +10,8 @@ pub mod render_book;
 pub mod render_reels;
 pub mod render_video;
 pub mod resolution;
+pub mod routeanim;
+pub mod routetravel;
 pub mod segment_cache;
 pub mod titlecard;
 

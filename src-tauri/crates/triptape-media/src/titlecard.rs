@@ -55,7 +55,7 @@ pub fn render_text_png(
 }
 
 /// Escape a string for use inside a Typst `"..."` literal.
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 

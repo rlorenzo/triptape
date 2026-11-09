@@ -3,10 +3,10 @@
 //!
 //! ```sh
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m]
-//! triptape plan --db trip.db --out plan.json [--home LAT,LON]
+//! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
-//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--resolution 4k|1080p] [--jobs N] [--quiet]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--itinerary itinerary.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE]
 //! triptape cache stats|clear [--segment-cache DIR]
 //! ```
@@ -500,13 +500,24 @@ fn score_asset(
     (score::score_still_or_fallback(pixels, &signals), phash)
 }
 
+/// `--itinerary <json>`: the owner's itinerary, which relabels chapters
+/// (city, or the ship when on board) and drives the closing map.
+fn load_itinerary(flags: &HashMap<String, String>) -> Option<triptape_core::itinerary::Itinerary> {
+    let path = flags.get("itinerary")?;
+    Some(
+        triptape_core::itinerary::Itinerary::load(std::path::Path::new(path))
+            .unwrap_or_else(|e| die("itinerary", e)),
+    )
+}
+
 fn plan_cmd(flags: &HashMap<String, String>) {
     let db_path = need(flags, "db");
     let out = PathBuf::from(flag_or(flags, "out", "plan.json"));
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
     // Default (no --project): latest plan in the db, for single-project DBs.
+    let itinerary = load_itinerary(flags);
     let mut p = db
-        .edited_plan(flags.get("project").map(String::as_str))
+        .edited_plan_with(flags.get("project").map(String::as_str), itinerary.as_ref())
         .unwrap_or_else(|e| die("plan", e))
         .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"))
         .edited;
@@ -549,13 +560,14 @@ fn export_cmd(flags: &HashMap<String, String>) {
     }
 
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
+    let itinerary = load_itinerary(flags);
     let EditedPlan {
         project_id,
         edited: mut plan,
         assets,
         ..
     } = db
-        .edited_plan(flags.get("project").map(String::as_str))
+        .edited_plan_with(flags.get("project").map(String::as_str), itinerary.as_ref())
         .unwrap_or_else(|e| die("plan", e))
         .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
     // Rendered maps get the same home fuzzing as `plan` JSON (Sec 14).
@@ -635,6 +647,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             jobs,
             progress,
             segment_cache,
+            itinerary,
         },
     );
     console.finish();

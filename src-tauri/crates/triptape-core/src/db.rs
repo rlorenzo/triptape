@@ -760,12 +760,25 @@ impl Db {
     /// is what every keepsake renders. The stored plan stays pristine, so
     /// edits can be undone and carry over to newer plans of the project.
     pub fn edited_plan(&self, project_id: Option<&str>) -> Result<Option<EditedPlan>, String> {
+        self.edited_plan_with(project_id, None)
+    }
+
+    /// [`Self::edited_plan`] under the owner's itinerary: chapters take the
+    /// itinerary's city (or ship) labels and the route follows it, then the
+    /// Story-editor edits are applied on top, so a user rename still wins.
+    pub fn edited_plan_with(
+        &self,
+        project_id: Option<&str>,
+        itinerary: Option<&crate::itinerary::Itinerary>,
+    ) -> Result<Option<EditedPlan>, String> {
         let Some((project_id, base)) = self.latest_plan_with_project(project_id)? else {
             return Ok(None);
         };
         let edits = self.get_plan_edits(&project_id)?;
         let assets = self.list_assets(&project_id)?;
-        let edited = crate::plan::apply_edits(&base, &assets, &edits);
+        let relabelled = itinerary.map(|i| crate::itinerary::apply_itinerary(&base, &assets, i));
+        let edited =
+            crate::plan::apply_edits(relabelled.as_ref().unwrap_or(&base), &assets, &edits);
         Ok(Some(EditedPlan {
             project_id,
             base,
