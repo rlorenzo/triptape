@@ -46,12 +46,12 @@ pub const LABEL_FADE_SECS: f64 = 0.25;
 /// Shortest a leg may take when the budget is very tight.
 const MIN_LEG_SECS: f64 = 0.4;
 
-const GLOW: Rgb<u8> = Rgb([146, 102, 30]);
-const CORE: Rgb<u8> = Rgb([245, 178, 66]);
-const PIN_RING: Rgb<u8> = Rgb([255, 255, 255]);
-const PIN_STOP: Rgb<u8> = Rgb([94, 234, 212]);
-const PIN_START: Rgb<u8> = Rgb([52, 199, 123]);
-const PIN_END: Rgb<u8> = Rgb([235, 87, 87]);
+pub(crate) const GLOW: Rgb<u8> = Rgb([146, 102, 30]);
+pub(crate) const CORE: Rgb<u8> = Rgb([245, 178, 66]);
+pub(crate) const PIN_RING: Rgb<u8> = Rgb([255, 255, 255]);
+pub(crate) const PIN_STOP: Rgb<u8> = Rgb([94, 234, 212]);
+pub(crate) const PIN_START: Rgb<u8> = Rgb([52, 199, 123]);
+pub(crate) const PIN_END: Rgb<u8> = Rgb([235, 87, 87]);
 
 /// Cubic ease-in-out on `0..=1`: slow out of a stop, slow into the next.
 pub fn ease_in_out(u: f64) -> f64 {
@@ -73,7 +73,7 @@ pub(crate) struct Stop {
     pub sea_after: Option<String>,
 }
 
-fn dist(a: (f64, f64), b: (f64, f64)) -> f64 {
+pub(crate) fn dist(a: (f64, f64), b: (f64, f64)) -> f64 {
     ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
 }
 
@@ -293,7 +293,7 @@ pub(crate) fn place_labels(
 }
 
 /// Blend `col` into one pixel with `alpha` coverage.
-fn blend_px(img: &mut RgbImage, x: i32, y: i32, col: Rgb<u8>, alpha: f64) {
+pub(crate) fn blend_px(img: &mut RgbImage, x: i32, y: i32, col: Rgb<u8>, alpha: f64) {
     if alpha <= 0.0 || x < 0 || y < 0 || x as u32 >= img.width() || y as u32 >= img.height() {
         return;
     }
@@ -305,7 +305,7 @@ fn blend_px(img: &mut RgbImage, x: i32, y: i32, col: Rgb<u8>, alpha: f64) {
 }
 
 /// Anti-aliased disc (`ring_width` of `None`) or ring centred on `c`.
-fn blend_shape(
+pub(crate) fn blend_shape(
     img: &mut RgbImage,
     c: (f64, f64),
     r: f64,
@@ -328,7 +328,7 @@ fn blend_shape(
     }
 }
 
-fn point_seg_dist(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+pub(crate) fn point_seg_dist(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let len2 = dx * dx + dy * dy;
     let t = if len2 <= f64::EPSILON {
@@ -578,7 +578,7 @@ fn draw_ship(img: &mut RgbImage, c: (f64, f64), k: f64, alpha: f64) {
 }
 
 /// Fill a convex polygon (winding in either direction).
-fn fill_convex(img: &mut RgbImage, pts: &[(f64, f64)], col: Rgb<u8>, alpha: f64) {
+pub(crate) fn fill_convex(img: &mut RgbImage, pts: &[(f64, f64)], col: Rgb<u8>, alpha: f64) {
     let (mut x0, mut x1, mut y0, mut y1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
     for p in pts {
         x0 = x0.min(p.0);
@@ -602,7 +602,7 @@ fn fill_convex(img: &mut RgbImage, pts: &[(f64, f64)], col: Rgb<u8>, alpha: f64)
 }
 
 /// Alpha-composite `sprite` onto `img` at `pos`, scaled by `opacity`.
-fn composite(img: &mut RgbImage, sprite: &RgbaImage, pos: (i32, i32), opacity: f64) {
+pub(crate) fn composite(img: &mut RgbImage, sprite: &RgbaImage, pos: (i32, i32), opacity: f64) {
     for (sx, sy, px) in sprite.enumerate_pixels() {
         let a = f64::from(px.0[3]) / 255.0 * opacity;
         if a > 0.0 {
@@ -618,7 +618,7 @@ fn composite(img: &mut RgbImage, sprite: &RgbaImage, pos: (i32, i32), opacity: f
 }
 
 /// Typst source for a transparent stop-label pill (sized to its text).
-fn label_doc(text: &str) -> String {
+pub(crate) fn label_doc(text: &str) -> String {
     format!(
         r##"#set page(width: auto, height: auto, margin: 0pt, fill: none)
 #set text(font: {fonts}, fill: white, size: 30pt, weight: "bold")
@@ -774,7 +774,7 @@ fn build_animator(
 
 /// Pipe `frames` raw RGB frames from `frame_at` into ffmpeg and write
 /// `out_mp4` atomically (partial file, then rename).
-fn encode(
+pub(crate) fn encode(
     caps: &Capabilities,
     (w, h): (u32, u32),
     frames: u32,

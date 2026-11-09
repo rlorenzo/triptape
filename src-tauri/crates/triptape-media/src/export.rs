@@ -36,6 +36,10 @@ pub struct ExportOptions {
     pub progress: Progress,
     /// Reuse rendered hero segments across exports; `None` renders all.
     pub segment_cache: Option<SegmentCacheConfig>,
+    /// The owner's itinerary: the closing map travels it, and chapters were
+    /// relabelled with it before the plan got here (see
+    /// `Db::edited_plan_with`).
+    pub itinerary: Option<triptape_core::itinerary::Itinerary>,
 }
 
 /// How the segment cache served one export.
@@ -360,11 +364,19 @@ fn export_inner(
                 typst_bin: opts.typst_bin.clone(),
                 resolution: opts.resolution,
                 jobs: opts.jobs,
-                route_stops: triptape_core::route_stops::chapter_route_stops(
-                    &plan.chapters,
-                    assets,
-                    &plan.map_polyline,
-                ),
+                journey: opts
+                    .itinerary
+                    .as_ref()
+                    .map(|i| triptape_core::journey::Journey::build(i, assets)),
+                route_stops: if opts.itinerary.is_some() {
+                    vec![]
+                } else {
+                    triptape_core::route_stops::chapter_route_stops(
+                        &plan.chapters,
+                        assets,
+                        &plan.map_polyline,
+                    )
+                },
                 ..Default::default()
             },
         ) {
@@ -639,6 +651,7 @@ mod tests {
                 dir: t.path().join("cache"),
                 max_bytes: None,
             }),
+            itinerary: None,
         };
         let report = export_all(&Default::default(), &empty_plan(), &[], &out, &opts).unwrap();
         assert!(!out.join(".work").exists(), "{:?}", report.fallbacks);

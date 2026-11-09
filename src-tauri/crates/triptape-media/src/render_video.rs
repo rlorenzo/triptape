@@ -277,6 +277,10 @@ pub struct VideoOptions {
     /// Chapter stops the closing map travels between (indices into the
     /// plan's `map_polyline`). Fewer than two keep the static closing card.
     pub route_stops: Vec<triptape_core::route_stops::RouteStop>,
+    /// The owner's itinerary as a journey: when set, the closing map travels
+    /// it (flights, ships, camera) instead of the photo-derived stops, and
+    /// ship names stay off the places card.
+    pub journey: Option<triptape_core::journey::Journey>,
 }
 
 impl Default for VideoOptions {
@@ -294,6 +298,7 @@ impl Default for VideoOptions {
             resolution: Resolution::default(),
             jobs: None,
             route_stops: vec![],
+            journey: None,
         }
     }
 }
@@ -351,13 +356,20 @@ fn closing_map_secs(route_stops: usize, map_secs: f64) -> f64 {
     }
 }
 
+/// Seconds the closing map segment will run for these options.
+fn closing_map_len(opts: &VideoOptions) -> f64 {
+    match &opts.journey {
+        Some(j) => j.duration_secs(),
+        None => closing_map_secs(
+            triptape_core::route_stops::animated_stop_count(&opts.route_stops),
+            opts.map_secs,
+        ),
+    }
+}
+
 /// Seconds the closing cards add, reserved up front in short mode.
-fn closing_secs(has_route: bool, route_stops: usize, has_places: bool, map_secs: f64) -> f64 {
-    let map = if has_route {
-        closing_map_secs(route_stops, map_secs)
-    } else {
-        0.0
-    };
+fn closing_secs(has_route: bool, closing_map: f64, has_places: bool) -> f64 {
+    let map = if has_route { closing_map } else { 0.0 };
     map + if has_places { CREDITS_SECS } else { 0.0 }
 }
 
@@ -592,7 +604,9 @@ pub fn render_hero_video(
 
     let mut places: Vec<String> = vec![];
     for c in &plan.chapters {
-        if let Some(p) = &c.place {
+        // A ship is where we slept, not a place we went.
+        let is_ship = |p: &String| opts.journey.as_ref().is_some_and(|j| j.ships().contains(p));
+        if let Some(p) = c.place.as_ref().filter(|p| !is_ship(p)) {
             if !places.contains(p) {
                 places.push(p.clone());
             }
@@ -607,12 +621,7 @@ pub fn render_hero_video(
         let has_route = map_card.is_some() && !plan.map_polyline.is_empty();
         SHORT_FILM_SECS
             - segs.iter().map(|s| s.2).sum::<f64>()
-            - closing_secs(
-                has_route,
-                triptape_core::route_stops::animated_stop_count(&opts.route_stops),
-                !places.is_empty(),
-                opts.map_secs,
-            )
+            - closing_secs(has_route, closing_map_len(opts), !places.is_empty())
     } else {
         f64::INFINITY
     };
@@ -776,15 +785,25 @@ pub fn render_hero_video(
         if !plan.map_polyline.is_empty() {
             let close_mp4 = work_dir.join("seg_closing.mp4");
             // Animated travel recap; the static pull-out card is the fallback.
-            let animated = crate::routeanim::render_route_recap(
-                caps,
-                &plan.map_polyline,
-                &opts.route_stops,
-                opts.resolution,
-                &opts.typst_bin,
-                work_dir,
-                &close_mp4,
-            );
+            let animated = match &opts.journey {
+                Some(journey) => crate::routetravel::render_journey_recap(
+                    caps,
+                    journey,
+                    opts.resolution,
+                    &opts.typst_bin,
+                    work_dir,
+                    &close_mp4,
+                ),
+                None => crate::routeanim::render_route_recap(
+                    caps,
+                    &plan.map_polyline,
+                    &opts.route_stops,
+                    opts.resolution,
+                    &opts.typst_bin,
+                    work_dir,
+                    &close_mp4,
+                ),
+            };
             let animated = match animated {
                 Ok(rep) => {
                     fallbacks.extend(rep.notes);
@@ -792,7 +811,9 @@ pub fn render_hero_video(
                 }
                 Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
                 Err(e) => {
-                    if triptape_core::route_stops::animated_stop_count(&opts.route_stops) >= 2 {
+                    if opts.journey.is_some()
+                        || triptape_core::route_stops::animated_stop_count(&opts.route_stops) >= 2
+                    {
                         fallbacks.push(format!("route animation failed, static closing map: {e}"));
                     }
                     None
@@ -2416,21 +2437,25 @@ mod tests {
                 HeroCards {
                     route: true,
                     route_stops: 0,
+                    route_secs: None,
                     places: true,
                 },
                 HeroCards {
                     route: false,
                     route_stops: 0,
+                    route_secs: None,
                     places: false,
                 },
                 HeroCards {
                     route: true,
                     route_stops: 0,
+                    route_secs: None,
                     places: false,
                 },
                 HeroCards {
                     route: true,
                     route_stops: 6,
+                    route_secs: None,
                     places: true,
                 },
             ] {
@@ -3322,13 +3347,28 @@ mod tests {
 
     #[test]
     fn closing_secs_counts_only_cards_that_render() {
-        assert_eq!(closing_secs(true, 0, true, 3.0), 9.0);
-        assert_eq!(closing_secs(true, 1, false, 3.0), 4.5);
-        assert_eq!(closing_secs(false, 5, true, 3.0), CREDITS_SECS);
-        assert_eq!(closing_secs(false, 0, false, 3.0), 0.0);
+        assert_eq!(closing_secs(true, 4.5, true), 9.0);
+        assert_eq!(closing_secs(true, 4.5, false), 4.5);
+        assert_eq!(closing_secs(false, 4.5, true), CREDITS_SECS);
+        assert_eq!(closing_secs(false, 4.5, false), 0.0);
         // Two or more stops: the animated recap's budget replaces the card.
-        assert_eq!(closing_secs(true, 6, false, 3.0), 8.4);
-        assert_eq!(closing_secs(true, 40, true, 3.0), 14.0 + CREDITS_SECS);
+        let stops = |n| {
+            let opts = VideoOptions {
+                route_stops: (0..n)
+                    .map(|i| triptape_core::route_stops::RouteStop {
+                        route_index: i,
+                        label: None,
+                        at_sea: false,
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            closing_map_len(&opts)
+        };
+        assert_eq!(stops(6), 8.4);
+        assert_eq!(stops(40), 14.0);
+        // An itinerary journey sets its own length.
+        assert_eq!(stops(0), 4.5);
     }
 
     #[test]

@@ -271,7 +271,7 @@ fn paint_land(img: &mut RgbImage, fit: &RouteFit) {
     let (lat0, _) = fit.unproject(0.0, 0.0);
     let (lat1, _) = fit.unproject(0.0, 1.0);
     let cells_per_px = (lat0 - lat1).abs() * 20.0;
-    let soft = (0.35 * cells_per_px).clamp(0.03, 0.5);
+    let soft = (0.35 * cells_per_px).clamp(0.3, 0.5);
     let gap = fit.gap_columns();
     const OFFS: [f64; 2] = [0.25, 0.75];
     for y in 0..h {
