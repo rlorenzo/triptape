@@ -145,7 +145,19 @@ impl Journey {
             pin: true,
         });
         let mut prev_ship: Option<&str> = None;
-        for leg in &itin.legs {
+        // Traced paths by leg, so a smoothed leg can borrow the neighbouring
+        // leg's adjacent point and leave a stop with the tangent it arrived on.
+        let traced: Vec<Option<Vec<(f64, f64)>>> = itin
+            .legs
+            .iter()
+            .map(|l| {
+                l.path
+                    .as_ref()
+                    .filter(|_| l.mode != LegMode::Flight && !l.is_loop)
+                    .map(|p| p.iter().map(|q| (q[0], q[1])).collect())
+            })
+            .collect();
+        for (li, leg) in itin.legs.iter().enumerate() {
             let (from, to) = (
                 itin.stop(&leg.from).expect("validated chain"),
                 itin.stop(&leg.to).expect("validated chain"),
@@ -158,7 +170,23 @@ impl Journey {
                 // A traced path is smoothed through its points (flights keep
                 // their exact arc).
                 _ if explicit.is_some() && leg.mode != LegMode::Flight => {
-                    catmull_rom(&explicit.unwrap_or_default(), 10)
+                    let own = explicit.unwrap_or_default();
+                    let before = li
+                        .checked_sub(1)
+                        .and_then(|j| traced[j].as_ref())
+                        .filter(|t| t.len() >= 2)
+                        .map(|t| t[t.len() - 2]);
+                    let after = traced
+                        .get(li + 1)
+                        .and_then(Option::as_ref)
+                        .filter(|t| t.len() >= 2)
+                        .map(|t| t[1]);
+                    catmull_rom_through(
+                        &own,
+                        10,
+                        before.filter(|_| !leg.is_loop),
+                        after.filter(|_| !leg.is_loop),
+                    )
                 }
                 _ if explicit.is_some() => explicit.unwrap_or_default(),
                 LegMode::Flight => great_circle(from.pos(), to.pos()),
@@ -248,14 +276,33 @@ fn sea_fixes(
 /// Uniform Catmull-Rom spline through `pts` (`per_seg` points per span),
 /// keeping the first and last points exactly.
 pub fn catmull_rom(pts: &[(f64, f64)], per_seg: usize) -> Vec<(f64, f64)> {
-    if pts.len() < 3 {
+    catmull_rom_through(pts, per_seg, None, None)
+}
+
+/// [`catmull_rom`] where the path continues from `before` into its first
+/// point and on to `after` past its last, so the tangents at both ends match
+/// the neighbouring legs instead of kinking at the stop.
+pub fn catmull_rom_through(
+    pts: &[(f64, f64)],
+    per_seg: usize,
+    before: Option<(f64, f64)>,
+    after: Option<(f64, f64)>,
+) -> Vec<(f64, f64)> {
+    if pts.len() < 3 && before.is_none() && after.is_none() {
         return pts.to_vec();
     }
     let mut out = vec![pts[0]];
     for i in 0..pts.len() - 1 {
         let (p1, p2) = (pts[i], pts[i + 1]);
-        let p0 = if i == 0 { p1 } else { pts[i - 1] };
-        let p3 = pts.get(i + 2).copied().unwrap_or(p2);
+        let p0 = if i == 0 {
+            before.unwrap_or(p1)
+        } else {
+            pts[i - 1]
+        };
+        let p3 = pts
+            .get(i + 2)
+            .copied()
+            .unwrap_or_else(|| after.unwrap_or(p2));
         for k in 1..=per_seg {
             let t = k as f64 / per_seg as f64;
             let (t2, t3) = (t * t, t * t * t);
@@ -546,6 +593,36 @@ mod tests {
         );
         assert!(Itinerary::from_json(&bad).is_err());
     }
+
+    #[test]
+    fn traced_legs_leave_a_stop_on_the_tangent_they_arrived_on() {
+        // Jeju: arrive heading west-north-west, leave south-south-west.
+        let it = Itinerary::from_json(JSON_TWO_TRACED).unwrap();
+        let j = Journey::build(&it, &[]);
+        let (a, b) = (&j.legs[1].path, &j.legs[2].path);
+        let (p, n) = (a[a.len() - 2], a[a.len() - 1]);
+        let (m, q) = (b[0], b[1]);
+        assert_eq!(n, m);
+        let ang = |u: (f64, f64), v: (f64, f64)| (v.0 - u.0).atan2(v.1 - u.1).to_degrees();
+        let turn = (ang(p, n) - ang(m, q) + 540.0).rem_euclid(360.0) - 180.0;
+        let turn = turn.abs();
+        assert!(turn < 15.0, "tangent kink of {turn} degrees at the stop");
+    }
+
+    const JSON_TWO_TRACED: &str = r#"{
+      "stops": [
+        { "id": "a", "label": "A", "lat": 35.0, "lon": 139.0, "depart": "2026-10-03", "kind": "home" },
+        { "id": "b", "label": "B", "lat": 34.0, "lon": 135.0, "arrive": "2026-10-04", "depart": "2026-10-04" },
+        { "id": "c", "label": "C", "lat": 33.2, "lon": 126.5, "arrive": "2026-10-05", "depart": "2026-10-05", "kind": "port" },
+        { "id": "d", "label": "D", "lat": 25.1, "lon": 121.7, "arrive": "2026-10-06", "depart": "2026-10-06", "kind": "port" }
+      ],
+      "legs": [
+        { "from": "a", "to": "b", "mode": "flight" },
+        { "from": "b", "to": "c", "mode": "ship", "ship": "S", "path": [[34.0, 135.0], [33.4, 128.8], [33.17, 126.65], [33.2, 126.5]] },
+        { "from": "c", "to": "d", "mode": "ship", "ship": "S", "path": [[33.2, 126.5], [33.1, 126.2], [31.2, 125.1], [25.1, 121.7]] },
+        { "from": "d", "to": "d", "mode": "ship", "ship": "T", "loop": true }
+      ]
+    }"#;
 
     #[test]
     fn catmull_rom_passes_through_its_points_and_keeps_the_ends() {
