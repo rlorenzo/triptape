@@ -28,9 +28,10 @@ use triptape_core::journey::{Journey, Schedule};
 /// Camera width (degrees of longitude across the frame) per phase.
 const FLIGHT_VIEW_DEG: f64 = 80.0;
 const PORT_VIEW_DEG: f64 = 24.0;
-const LOOP_VIEW_DEG: f64 = 9.0;
+/// The loop fills this share of the frame height.
+const LOOP_FILL: f64 = 0.45;
 /// Camera and zoom smoothing (seconds, Gaussian sigma).
-const CAMERA_SIGMA_SECS: f64 = 0.45;
+const CAMERA_SIGMA_SECS: f64 = 0.3;
 /// Boarding tag on screen: fade in, hold, fade out.
 const TAG_SECS: f64 = 2.2;
 const TAG_FADE_SECS: f64 = 0.3;
@@ -125,7 +126,6 @@ fn view_for_leg(journey: &Journey, leg: usize) -> f64 {
     let l = &journey.legs[leg];
     match (l.mode, l.is_loop) {
         (LegMode::Flight, _) => FLIGHT_VIEW_DEG,
-        (LegMode::Ship, true) => LOOP_VIEW_DEG,
         _ => PORT_VIEW_DEG,
     }
 }
@@ -202,15 +202,33 @@ fn plan_camera(
         .max(30.0);
     let whole_center = ((lat_min + lat_max) / 2.0, (lon_min + lon_max) / 2.0);
     let legs = journey.legs.len();
+    // A loop is framed whole: its bounding box fills LOOP_FILL of the frame
+    // height, with the port it leaves from at the bottom of it.
+    let loop_frame = |leg: usize| -> ((f64, f64), f64) {
+        let g = &geoms[leg];
+        let (mut a, mut b, mut c, mut d) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+        for p in &g.pts {
+            a = a.min(p.0);
+            b = b.max(p.0);
+            c = c.min(p.1);
+            d = d.max(p.1);
+        }
+        let view = ((b - a) / LOOP_FILL * aspect).max((d - c) * 1.6).max(4.0);
+        (((a + b) / 2.0, (c + d) / 2.0), view)
+    };
     let (mut lat, mut lon, mut logw) = (vec![], vec![], vec![]);
     for f in 0..frames {
         let t = f64::from(f) / f64::from(FPS);
         let pose = pose_at(sched, legs, t);
         let (pos, view) = match pose {
+            Pose::Moving { leg, .. } if journey.legs[leg].is_loop => loop_frame(leg),
             Pose::Moving { leg, u } => {
                 let g = &geoms[leg];
                 (g.at(u * g.len()), view_for_leg(journey, leg))
             }
+            // Parked before a loop, or holding on one after it.
+            Pose::Parked(n) if n < legs && journey.legs[n].is_loop => loop_frame(n),
+            Pose::Parked(n) if n > 0 && journey.legs[n - 1].is_loop => loop_frame(n - 1),
             Pose::Parked(n) => (
                 journey.nodes[n].pos,
                 if n < legs {
@@ -262,6 +280,8 @@ struct Scene<'a> {
     /// overview camera, so the cluster in Asia does not collide).
     overview_labels: Vec<Option<Sprite>>,
     overview_offsets: Vec<Option<(f64, f64)>>,
+    /// (glow, core) line colours per leg: each ship gets its own.
+    leg_colors: Vec<(Rgb<u8>, Rgb<u8>)>,
     glow_mask: Vec<u8>,
     core_mask: Vec<u8>,
     /// Per row: touched pixel span in the masks.
@@ -284,7 +304,7 @@ impl Scene<'_> {
         let mut img = RgbImage::from_pixel(w, h, WATER);
         let cells_per_px = 20.0 / cam.s;
         // A floor on the blend zone rounds the grid's stair-steps into smooth shores.
-        let soft = (0.5 * cells_per_px).clamp(0.3, 0.5);
+        let soft = (0.5 * cells_per_px).clamp(0.12, 0.5);
         // Zoomed in (cells wider than a pixel), the blurred grid rounds off
         // the raw grid's stair-steps; zoomed out the raw one is sharper.
         let fraction: fn(LatLon) -> f32 = if cells_per_px < 0.7 {
@@ -428,7 +448,7 @@ impl Scene<'_> {
     }
 
     /// Blend the stamped masks into `img` and clear them.
-    fn flush_route(&mut self, img: &mut RgbImage) {
+    fn flush_route(&mut self, img: &mut RgbImage, glow: Rgb<u8>, core: Rgb<u8>) {
         for y in 0..self.h as usize {
             let (x0, x1) = self.spans[y];
             if x0 > x1 {
@@ -440,9 +460,9 @@ impl Scene<'_> {
                 if g == 0 {
                     continue;
                 }
-                blend_px(img, x, y as i32, GLOW, f64::from(g) / 255.0);
+                blend_px(img, x, y as i32, glow, f64::from(g) / 255.0);
                 if c > 0 {
-                    blend_px(img, x, y as i32, CORE, f64::from(c) / 255.0);
+                    blend_px(img, x, y as i32, core, f64::from(c) / 255.0);
                 }
                 self.glow_mask[idx] = 0;
                 self.core_mask[idx] = 0;
@@ -472,6 +492,8 @@ impl Scene<'_> {
                 .map(|&p| cam.to_screen(p, size))
                 .collect();
             self.stamp_polyline(&pts, self.journey.legs[i].mode == LegMode::Ship);
+            let (g, c) = self.leg_colors[i];
+            self.flush_route(&mut img, g, c);
         }
         if let Pose::Moving { leg, u } = pose {
             let g = &self.geoms[leg];
@@ -481,8 +503,9 @@ impl Scene<'_> {
                 .map(|&p| cam.to_screen(p, size))
                 .collect();
             self.stamp_polyline(&pts, self.journey.legs[leg].mode == LegMode::Ship);
+            let (g, c) = self.leg_colors[leg];
+            self.flush_route(&mut img, g, c);
         }
-        self.flush_route(&mut img);
 
         // Pins of the stops reached.
         let last = self.journey.nodes.len() - 1;
@@ -504,8 +527,8 @@ impl Scene<'_> {
             }
         }
 
-        self.draw_labels(&mut img, cam, t);
-        self.draw_tags(&mut img, cam, t);
+        let taken = self.draw_labels(&mut img, cam, t);
+        self.draw_tags(&mut img, cam, t, &taken);
 
         // The dot and its vehicle.
         let (pos, heading_to, mode) = match pose {
@@ -541,10 +564,14 @@ impl Scene<'_> {
                 draw_plane(&mut img, dot, heading, k);
             }
             Some(LegMode::Ship) => {
-                blend_shape(&mut img, dot, 16.0 * k, None, CORE, 0.28);
+                let core = match pose {
+                    Pose::Moving { leg, .. } => self.leg_colors[leg].1,
+                    Pose::Parked(_) => CORE,
+                };
+                blend_shape(&mut img, dot, 16.0 * k, None, core, 0.28);
                 blend_shape(&mut img, dot, 9.0 * k, None, PIN_RING, 1.0);
-                blend_shape(&mut img, dot, 6.0 * k, None, CORE, 1.0);
-                draw_ship_icon(&mut img, (dot.0, dot.1 - 18.0 * k), k);
+                blend_shape(&mut img, dot, 6.0 * k, None, core, 1.0);
+                draw_ship_icon(&mut img, (dot.0, dot.1 - 18.0 * k), k, core);
             }
             _ => {
                 blend_shape(&mut img, dot, 16.0 * k, None, CORE, 0.28);
@@ -566,7 +593,8 @@ impl Scene<'_> {
         }
     }
 
-    fn draw_labels(&self, img: &mut RgbImage, cam: Cam, t: f64) {
+    fn draw_labels(&self, img: &mut RgbImage, cam: Cam, t: f64) -> Vec<(f64, f64, f64, f64)> {
+        let mut rects: Vec<(f64, f64, f64, f64)> = vec![];
         let size = (self.w, self.h);
         let k = self.k;
         // At the pull-back the working labels crossfade into the overview
@@ -599,6 +627,7 @@ impl Scene<'_> {
                         }
                     }
                     composite(img, sprite, at, alpha);
+                    rects.push((x0, y0, x0 + lw, y0 + lh));
                 }
             }
             let Some(Sprite(sprite)) = &self.labels[n] else {
@@ -630,10 +659,12 @@ impl Scene<'_> {
             let mut y = if above { c.1 - gap - lh } else { c.1 + gap };
             y = y.clamp(gap, f64::from(self.h) - lh - gap);
             composite(img, sprite, (x.round() as i32, y.round() as i32), alpha);
+            rects.push((x, y, x + lw, y + lh));
         }
+        rects
     }
 
-    fn draw_tags(&self, img: &mut RgbImage, cam: Cam, t: f64) {
+    fn draw_tags(&self, img: &mut RgbImage, cam: Cam, t: f64, taken: &[(f64, f64, f64, f64)]) {
         let size = (self.w, self.h);
         let k = self.k;
         for (i, tag) in self.tags.iter().enumerate() {
@@ -646,12 +677,39 @@ impl Scene<'_> {
             let alpha = (local / TAG_FADE_SECS)
                 .clamp(0.0, 1.0)
                 .min(((TAG_SECS - local) / TAG_FADE_SECS).clamp(0.0, 1.0));
-            // Runs out to the east from just above the stop it leaves (stop
-            // labels sit right and below/above alternately, ports lie west).
-            let c = cam.to_screen(self.journey.nodes[i].pos, size);
+            // Sits beside the outgoing leg (a little way along it), up and
+            // right of the path when there is room, never on a city label.
+            let g = &self.geoms[i];
+            let c = cam.to_screen(g.at(0.3 * g.len()), size);
             let (lw, lh) = (f64::from(sprite.width()), f64::from(sprite.height()));
-            let x = (c.0 - 12.0 * k).clamp(14.0 * k, f64::from(self.w) - lw - 14.0 * k);
-            let y = (c.1 - 24.0 * k - lh).clamp(14.0 * k, f64::from(self.h) - lh - 14.0 * k);
+            let (gap, m) = (16.0 * k, 14.0 * k);
+            let overlaps = |x: f64, y: f64| {
+                taken.iter().any(|r| {
+                    x < r.2 + 4.0 * k
+                        && r.0 < x + lw + 4.0 * k
+                        && y < r.3 + 4.0 * k
+                        && r.1 < y + lh + 4.0 * k
+                })
+            };
+            let candidates = [
+                (c.0 + gap, c.1 - gap - lh),
+                (c.0 + gap, c.1 + gap),
+                (c.0 - gap - lw, c.1 - gap - lh),
+                (c.0 - gap - lw, c.1 + gap),
+                (c.0 + 3.0 * gap, c.1 - 3.0 * gap - lh),
+                (c.0 + 3.0 * gap, c.1 + 3.0 * gap),
+            ];
+            let clamp = |(x, y): (f64, f64)| {
+                (
+                    x.clamp(m, (f64::from(self.w) - lw - m).max(m)),
+                    y.clamp(m, (f64::from(self.h) - lh - m).max(m)),
+                )
+            };
+            let (x, y) = candidates
+                .iter()
+                .map(|&p| clamp(p))
+                .find(|&(x, y)| !overlaps(x, y))
+                .unwrap_or_else(|| clamp(candidates[0]));
             composite(img, sprite, (x.round() as i32, y.round() as i32), alpha);
         }
     }
@@ -749,7 +807,7 @@ fn draw_plane(img: &mut RgbImage, c: (f64, f64), heading: f64, k: f64) {
 }
 
 /// A small ship (hull and sail) centred on `c`.
-fn draw_ship_icon(img: &mut RgbImage, c: (f64, f64), k: f64) {
+fn draw_ship_icon(img: &mut RgbImage, c: (f64, f64), k: f64, sail: Rgb<u8>) {
     let at = |pts: &[(f64, f64)]| -> Vec<(f64, f64)> {
         pts.iter()
             .map(|&(x, y)| (c.0 + x * k, c.1 + y * k))
@@ -770,7 +828,7 @@ fn draw_ship_icon(img: &mut RgbImage, c: (f64, f64), k: f64) {
     fill_poly(
         img,
         &at(&[(-1.0, -1.0), (-1.0, -14.0), (8.0, -1.0)]),
-        CORE,
+        sail,
         1.0,
     );
 }
@@ -901,6 +959,23 @@ fn build_scene<'a>(
             .map(|(p, a)| p.map(|p| (f64::from(p.0) - a.0, f64::from(p.1) - a.1)))
             .collect()
     };
+    // Each ship's legs get their own colour; flights and ground hops stay amber.
+    let ships = journey.ships();
+    let palette: [(Rgb<u8>, Rgb<u8>); 3] = [
+        (GLOW, CORE),
+        (Rgb([34, 104, 156]), Rgb([125, 211, 252])),
+        (Rgb([26, 112, 98]), Rgb([110, 231, 183])),
+    ];
+    let leg_colors: Vec<(Rgb<u8>, Rgb<u8>)> = journey
+        .legs
+        .iter()
+        .map(|l| {
+            l.ship
+                .as_ref()
+                .and_then(|s| ships.iter().position(|x| x == s))
+                .map_or(palette[0], |i| palette[i % palette.len()])
+        })
+        .collect();
     Ok(Scene {
         journey,
         sched,
@@ -914,6 +989,7 @@ fn build_scene<'a>(
         labelled,
         overview_labels,
         overview_offsets,
+        leg_colors,
         glow_mask: vec![0; (w * h) as usize],
         core_mask: vec![0; (w * h) as usize],
         spans: vec![(i32::MAX, i32::MIN); h as usize],

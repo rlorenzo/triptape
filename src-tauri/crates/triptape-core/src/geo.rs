@@ -112,8 +112,8 @@ pub fn land_fraction(gps: (f64, f64)) -> f32 {
     top * (1.0 - tr) + bottom * tr
 }
 
-/// The land grid blurred (two passes of a 1-4-6-4-1 kernel in each axis,
-/// sigma about 1.4 cells) into bytes, built on first use: 26 MB. Bilinear
+/// The land grid blurred (one pass of a 1-4-6-4-1 kernel in each axis,
+/// sigma about 1 cell) into bytes, built on first use: 26 MB. Bilinear
 /// lookups into it give coastlines without the raw grid's stair-steps when
 /// zoomed in.
 fn blurred_grid() -> &'static [u8] {
@@ -131,7 +131,9 @@ fn blurred_grid() -> &'static [u8] {
             .collect();
         let mut tmp = vec![0u8; w * h];
         const K: [u32; 5] = [1, 4, 6, 4, 1];
-        for _ in 0..2 {
+        // One pass: sigma about one cell, enough to smooth stair-steps
+        // without melting small islands.
+        for _ in 0..1 {
             // Horizontal (wraps at the antimeridian).
             for y in 0..h {
                 let row = &cur[y * w..(y + 1) * w];

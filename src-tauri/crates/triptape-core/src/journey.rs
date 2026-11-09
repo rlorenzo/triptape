@@ -19,10 +19,12 @@ pub const END_TAIL_SECS: f64 = 0.5;
 /// Final pull-back to the whole route.
 pub const PULL_BACK_SECS: f64 = 1.6;
 /// Leg durations.
-pub const FLIGHT_SECS: f64 = 2.2;
+pub const FLIGHT_SECS: f64 = 2.0;
 pub const GROUND_SECS: f64 = 0.35;
-pub const SHIP_LEG_SECS: f64 = 0.7;
-pub const LOOP_SECS: f64 = 1.6;
+pub const SHIP_LEG_SECS: f64 = 0.6;
+/// A round-trip cruise's loop, and the hold on it once drawn.
+pub const LOOP_SECS: f64 = 2.4;
+pub const LOOP_HOLD_SECS: f64 = 0.8;
 
 /// A stop on the journey.
 #[derive(Debug, Clone, PartialEq)]
@@ -105,7 +107,9 @@ impl Journey {
 
     /// Pause at node `i` (not the first or last): labelled stops only.
     fn pause_at(&self, i: usize) -> f64 {
-        if self.nodes[i].label.is_some() {
+        if i > 0 && self.legs[i - 1].is_loop {
+            LOOP_HOLD_SECS
+        } else if self.nodes[i].label.is_some() {
             NODE_PAUSE_SECS
         } else {
             0.0
@@ -151,6 +155,11 @@ impl Journey {
                 .as_ref()
                 .map(|p| p.iter().map(|q| (q[0], q[1])).collect());
             let path = match leg.mode {
+                // A traced path is smoothed through its points (flights keep
+                // their exact arc).
+                _ if explicit.is_some() && leg.mode != LegMode::Flight => {
+                    catmull_rom(&explicit.unwrap_or_default(), 10)
+                }
                 _ if explicit.is_some() => explicit.unwrap_or_default(),
                 LegMode::Flight => great_circle(from.pos(), to.pos()),
                 LegMode::Ground => vec![from.pos(), to.pos()],
@@ -234,6 +243,32 @@ fn sea_fixes(
         .collect();
     fixes.sort_by_key(|f| f.0);
     fixes.into_iter().map(|f| f.1).collect()
+}
+
+/// Uniform Catmull-Rom spline through `pts` (`per_seg` points per span),
+/// keeping the first and last points exactly.
+pub fn catmull_rom(pts: &[(f64, f64)], per_seg: usize) -> Vec<(f64, f64)> {
+    if pts.len() < 3 {
+        return pts.to_vec();
+    }
+    let mut out = vec![pts[0]];
+    for i in 0..pts.len() - 1 {
+        let (p1, p2) = (pts[i], pts[i + 1]);
+        let p0 = if i == 0 { p1 } else { pts[i - 1] };
+        let p3 = pts.get(i + 2).copied().unwrap_or(p2);
+        for k in 1..=per_seg {
+            let t = k as f64 / per_seg as f64;
+            let (t2, t3) = (t * t, t * t * t);
+            let f = |a: f64, b: f64, c: f64, d: f64| {
+                0.5 * (2.0 * b
+                    + (c - a) * t
+                    + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2
+                    + (3.0 * b - a - 3.0 * c + d) * t3)
+            };
+            out.push((f(p0.0, p1.0, p2.0, p3.0), f(p0.1, p1.1, p2.1, p3.1)));
+        }
+    }
+    out
 }
 
 /// Great-circle arc from `a` to `b`, a point about every degree, with
@@ -480,7 +515,8 @@ mod tests {
         // Labelled stops pause; the terminal and the loop's return do not.
         assert!((s.depart[1] - s.arrive[1] - NODE_PAUSE_SECS).abs() < 1e-9);
         assert_eq!(s.depart[2] - s.arrive[2], 0.0);
-        assert_eq!(s.depart[10] - s.arrive[10], 0.0);
+        // After the loop the camera holds on it for a moment.
+        assert!((s.depart[10] - s.arrive[10] - LOOP_HOLD_SECS).abs() < 1e-9);
         assert!(s.arrive.windows(2).all(|w| w[1] > w[0]));
         assert_eq!(s.pull_back_at, s.arrive[11] + END_TAIL_SECS);
         assert_eq!(s.total_secs, s.pull_back_at + PULL_BACK_SECS);
@@ -498,9 +534,10 @@ mod tests {
         let j = Journey::build(&Itinerary::from_json(&json).unwrap(), &[]);
         // Used as given (longitudes continue the journey's unwrapped run).
         let p = &j.legs[9].path;
-        assert_eq!(p.len(), 3);
-        assert!((p[1].0 - 2.7).abs() < 1e-9 && (p[1].1 + 360.0 - 105.3).abs() < 1e-6);
-        assert!((p[0].0 - p[2].0).abs() < 0.01 && (p[0].1 - p[2].1).abs() < 0.01);
+        // Smoothed through its three points: 2 spans x 10 samples + the start.
+        assert_eq!(p.len(), 21);
+        assert!((p[10].0 - 2.7).abs() < 1e-9 && (p[10].1 + 360.0 - 105.3).abs() < 1e-6);
+        assert!((p[0].0 - p[20].0).abs() < 0.01 && (p[0].1 - p[20].1).abs() < 0.01);
         // A path with one point is rejected.
         let bad = JSON.replacen(
             "\"loop\": true,",
@@ -508,6 +545,21 @@ mod tests {
             1,
         );
         assert!(Itinerary::from_json(&bad).is_err());
+    }
+
+    #[test]
+    fn catmull_rom_passes_through_its_points_and_keeps_the_ends() {
+        let pts = [(0.0, 0.0), (1.0, 2.0), (0.0, 4.0), (-1.0, 2.0)];
+        let s = catmull_rom(&pts, 8);
+        assert_eq!(s.len(), 1 + 3 * 8);
+        assert_eq!(s[0], pts[0]);
+        assert_eq!(*s.last().unwrap(), pts[3]);
+        for (i, p) in pts.iter().enumerate().skip(1) {
+            let q = s[i * 8];
+            assert!((q.0 - p.0).abs() < 1e-9 && (q.1 - p.1).abs() < 1e-9);
+        }
+        // Rounder than the polyline: the middle sample leaves the chord.
+        assert!(catmull_rom(&pts[..2], 4).len() == 2);
     }
 
     #[test]
