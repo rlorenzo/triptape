@@ -262,7 +262,7 @@ fn record_cache_use(cache: &SegmentCache, evicted: usize, report: &mut ExportRep
     }
     if stats.skipped_low_disk > 0 {
         report.fallbacks.push(format!(
-            "segment cache: {} segments not cached (the disk's free-space floor would not hold)",
+            "segment cache: {} segments not cached (storing them would drop free space below the floor)",
             stats.skipped_low_disk
         ));
     }

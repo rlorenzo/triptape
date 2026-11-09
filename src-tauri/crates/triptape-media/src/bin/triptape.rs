@@ -739,6 +739,7 @@ fn cache_cmd(sub: &str, flags: &HashMap<String, String>) {
                 cache_min_free_flag(flags),
                 disk,
             );
+            let free = disk.map(|d| d.free);
             let size = segment_cache::fmt_bytes;
             println!("segment cache: {}", dir.display());
             println!(
@@ -752,17 +753,11 @@ fn cache_cmd(sub: &str, flags: &HashMap<String, String>) {
                 size(policy.max_bytes),
                 size(policy.floor_bytes)
             );
-            match disk {
-                Some(d) => println!(
-                    "disk free: {}  headroom: {} (room to grow before the limit or the floor)",
-                    size(d.free),
-                    size(policy.headroom(st.bytes, Some(d.free)))
-                ),
-                None => println!(
-                    "disk free: unknown  headroom: {} (limit only)",
-                    size(policy.headroom(st.bytes, None))
-                ),
-            }
+            println!(
+                "disk free: {}  headroom: {} (room to grow before the limit or the floor)",
+                free.map_or_else(|| "unknown".into(), size),
+                size(policy.headroom(st.bytes, free))
+            );
         }
         "clear" => {
             let r = segment_cache::clear(&dir);

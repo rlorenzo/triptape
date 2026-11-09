@@ -86,7 +86,7 @@ fn unknown_cache_command_fails() {
 }
 
 #[test]
-fn stats_reports_the_given_cap_and_rejects_a_bad_one() {
+fn stats_reports_the_given_limit_and_rejects_a_bad_one() {
     let t = tempfile::tempdir().unwrap();
     let dir = t.path().to_str().unwrap();
     let (ok, out) = triptape(&[
@@ -98,7 +98,7 @@ fn stats_reports_the_given_cap_and_rejects_a_bad_one() {
         "1MB",
     ]);
     assert!(ok);
-    assert!(out.contains("cap: 1.0 MB"), "{out}");
+    assert!(out.contains("limit: 1.0 MB"), "{out}");
     let (ok, _) = triptape(&[
         "cache",
         "stats",

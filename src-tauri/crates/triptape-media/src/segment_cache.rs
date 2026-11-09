@@ -61,10 +61,10 @@ pub const SEGMENT_CACHE_VERSION: u32 = 2;
 
 /// Default size limit of the cache.
 pub const DEFAULT_CAP_BYTES: u64 = 20 << 30;
-/// Default free-space floor: the smaller of this and [`FLOOR_FRACTION_PCT`]
-/// percent of the volume.
+/// Default free-space floor: the smaller of this and
+/// [`FLOOR_FRACTION_PCT`] percent of the volume.
 pub const DEFAULT_MIN_FREE_BYTES: u64 = 10 << 30;
-pub const FLOOR_FRACTION_PCT: u64 = 5;
+const FLOOR_FRACTION_PCT: u64 = 5;
 /// A lease this old is dead whatever its pid says (pid reuse guard).
 const LEASE_MAX_AGE: Duration = Duration::from_secs(3 * 24 * 3600);
 /// In-flight and orphaned files younger than this may belong to a live write.
@@ -90,8 +90,10 @@ pub struct SegmentCacheConfig {
     /// Free-space floor. `None`: min([`DEFAULT_MIN_FREE_BYTES`], 5% of the
     /// volume's total size).
     pub min_free_bytes: Option<u64>,
-    /// Where disk numbers come from; `None` asks the OS. Tests inject fakes.
-    pub disk_probe: Option<DiskProbe>,
+    /// Fixed disk numbers instead of asking the OS, so tests do not
+    /// depend on the machine's real disk.
+    #[cfg(test)]
+    pub(crate) fake_disk: Option<Disk>,
 }
 
 impl SegmentCacheConfig {
@@ -101,59 +103,31 @@ impl SegmentCacheConfig {
             dir,
             max_bytes: None,
             min_free_bytes: None,
-            disk_probe: None,
+            #[cfg(test)]
+            fake_disk: None,
         }
     }
 
-    /// A config on a pretend volume with ample free space, so tests do not
-    /// depend on the machine's real disk.
+    /// A config on a pretend volume with ample free space.
     #[cfg(test)]
     pub(crate) fn roomy(dir: PathBuf) -> Self {
         Self {
-            disk_probe: Some(DiskProbe::fixed(1 << 40, 2 << 40)),
+            fake_disk: Some(fixed_disk(1 << 40, 2 << 40)),
             ..Self::new(dir)
         }
     }
 }
 
-/// Free and total bytes of the volume holding a path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Disk {
-    pub free: u64,
-    /// `None` when the platform will not say; the floor is then the flat
-    /// [`DEFAULT_MIN_FREE_BYTES`].
-    pub total: Option<u64>,
-}
+/// Free and total bytes of the volume holding a path. With no total the
+/// floor is the flat [`DEFAULT_MIN_FREE_BYTES`].
+pub use triptape_core::jobs::DiskSpace as Disk;
 
-/// Source of [`Disk`] numbers, injectable for tests.
-#[derive(Clone)]
-pub struct DiskProbe(Arc<ProbeFn>);
-
-type ProbeFn = dyn Fn(&Path) -> Option<Disk> + Send + Sync;
-
-impl DiskProbe {
-    pub fn new(f: impl Fn(&Path) -> Option<Disk> + Send + Sync + 'static) -> Self {
-        Self(Arc::new(f))
-    }
-
-    /// Always the same numbers.
-    pub fn fixed(free: u64, total: u64) -> Self {
-        Self::new(move |_| {
-            Some(Disk {
-                free,
-                total: Some(total),
-            })
-        })
-    }
-
-    fn probe(&self, path: &Path) -> Option<Disk> {
-        (self.0)(path)
-    }
-}
-
-impl std::fmt::Debug for DiskProbe {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("DiskProbe")
+/// A volume with `free` of `total` bytes left.
+#[cfg(test)]
+pub(crate) fn fixed_disk(free: u64, total: u64) -> Disk {
+    Disk {
+        free,
+        total: Some(total),
     }
 }
 
@@ -168,12 +142,11 @@ pub struct Policy {
 
 impl Policy {
     pub fn resolve(max: Option<u64>, min_free: Option<u64>, disk: Option<Disk>) -> Self {
-        let floor = min_free.unwrap_or_else(|| {
-            disk.and_then(|d| d.total)
-                .map_or(DEFAULT_MIN_FREE_BYTES, |t| {
-                    DEFAULT_MIN_FREE_BYTES.min(t / 100 * FLOOR_FRACTION_PCT)
-                })
-        });
+        let default_floor = match disk.and_then(|d| d.total) {
+            Some(total) => DEFAULT_MIN_FREE_BYTES.min(total / 100 * FLOOR_FRACTION_PCT),
+            None => DEFAULT_MIN_FREE_BYTES,
+        };
+        let floor = min_free.unwrap_or(default_floor);
         Self {
             max_bytes: max.unwrap_or(DEFAULT_CAP_BYTES),
             floor_bytes: floor,
@@ -193,27 +166,7 @@ impl Policy {
 /// Free and total bytes on the volume holding `path` (or its nearest
 /// existing parent, since the cache dir may not exist yet).
 pub fn disk_space(path: &Path) -> Option<Disk> {
-    let existing = path.ancestors().find(|p| p.exists())?;
-    #[cfg(unix)]
-    {
-        let out = std::process::Command::new("df")
-            .args(["-P", "-k"])
-            .arg(existing)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let cols: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
-        let kb = |i: usize| cols.get(i)?.parse::<u64>().ok().map(|k| k * 1024);
-        Some(Disk {
-            free: kb(3)?,
-            total: kb(1),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        triptape_core::jobs::free_bytes(existing).map(|free| Disk { free, total: None })
-    }
+    triptape_core::jobs::disk_space(path.ancestors().find(|p| p.exists())?)
 }
 
 /// Parse `500MB`, `20GB`, `1.5G`, `1024` (bytes). Decimal-free suffix units
@@ -399,9 +352,10 @@ pub struct SegmentCache {
     dir: PathBuf,
     max_bytes: Option<u64>,
     min_free_bytes: Option<u64>,
-    disk: Option<DiskProbe>,
+    #[cfg(test)]
+    fake_disk: Option<Disk>,
     /// Bytes in the cache: counted at open, grown by each store.
-    cache_bytes: std::sync::atomic::AtomicU64,
+    cache_bytes: AtomicU64,
     ffmpeg_version: String,
     work_dir: PathBuf,
     lease_path: Mutex<Option<PathBuf>>,
@@ -433,8 +387,9 @@ impl SegmentCache {
             dir: cfg.dir.clone(),
             max_bytes: cfg.max_bytes,
             min_free_bytes: cfg.min_free_bytes,
-            disk: cfg.disk_probe.clone(),
-            cache_bytes: std::sync::atomic::AtomicU64::new(disk_stats(&cfg.dir).bytes),
+            #[cfg(test)]
+            fake_disk: cfg.fake_disk,
+            cache_bytes: AtomicU64::new(disk_stats(&cfg.dir).bytes),
             ffmpeg_version,
             work_dir: work_dir.to_path_buf(),
             lease_path: Mutex::new(None),
@@ -623,10 +578,11 @@ impl SegmentCache {
     }
 
     fn disk_now(&self) -> Option<Disk> {
-        match &self.disk {
-            Some(p) => p.probe(&self.dir),
-            None => disk_space(&self.dir),
+        #[cfg(test)]
+        if self.fake_disk.is_some() {
+            return self.fake_disk;
         }
+        disk_space(&self.dir)
     }
 
     /// The size limit and free-space floor in force.
@@ -642,12 +598,8 @@ impl SegmentCache {
         self.release_lease();
         let disk = self.disk_now();
         let policy = self.policy(disk);
-        evict_with(
-            &self.dir,
-            policy.max_bytes,
-            disk.map(|d| (d.free, policy.floor_bytes)),
-            now_ms(),
-        )
+        let below_floor = disk.map_or(0, |d| policy.floor_bytes.saturating_sub(d.free));
+        evict_to(&self.dir, policy.max_bytes, below_floor, now_ms())
     }
 
     fn release_lease(&self) {
@@ -873,25 +825,17 @@ fn scan(dir: &Path, now: u64, sweep: bool) -> Vec<DiskEntry> {
 }
 
 /// Remove oldest-used unprotected entries until the total is at most `cap`
-/// (`0`: remove every unprotected entry).
-fn evict_to(dir: &Path, cap: u64, now: u64) -> EvictReport {
-    evict_with(dir, cap, None, now)
-}
-
-/// [`evict_to`] that also keeps going until free space is at least the floor
-/// in `free_floor = (free now, floor)`, counting each removed entry's bytes
-/// as freed.
-fn evict_with(dir: &Path, cap: u64, free_floor: Option<(u64, u64)>, now: u64) -> EvictReport {
+/// (`0`: remove every unprotected entry) and at least `need_freed` bytes
+/// have gone (to bring the volume back up to its free-space floor).
+fn evict_to(dir: &Path, cap: u64, need_freed: u64, now: u64) -> EvictReport {
     let mut entries = scan(dir, now, true);
     let leases = live_leases(dir, now, true);
     let floor = leases.iter().map(|l| l.started_ms).min();
     let mut total: u64 = entries.iter().map(|e| e.size).sum();
     entries.sort_by_key(|e| e.last_used_ms);
     let mut report = EvictReport::default();
-    let mut free = free_floor.map(|(f, _)| f);
-    let need_free = free_floor.map_or(0, |(_, fl)| fl);
     for e in entries {
-        if total <= cap && free.is_none_or(|f| f >= need_free) {
+        if total <= cap && report.freed >= need_freed {
             break;
         }
         if floor.is_some_and(|f| e.last_used_ms >= f) {
@@ -904,7 +848,6 @@ fn evict_with(dir: &Path, cap: u64, free_floor: Option<(u64, u64)>, now: u64) ->
             report.removed += 1;
             report.freed += e.size;
             total = total.saturating_sub(e.size);
-            free = free.map(|f| f.saturating_add(e.size));
         }
     }
     report
@@ -912,7 +855,7 @@ fn evict_with(dir: &Path, cap: u64, free_floor: Option<(u64, u64)>, now: u64) ->
 
 /// `triptape cache clear`: remove every entry no live export has used.
 pub fn clear(dir: &Path) -> EvictReport {
-    evict_to(dir, 0, now_ms())
+    evict_to(dir, 0, 0, now_ms())
 }
 
 /// `triptape cache stats`. Read-only: no orphan or temp-file sweep.
@@ -1214,7 +1157,7 @@ mod tests {
         assert!(read_valid(&cdir, &used).is_some());
         assert!(read_valid(&cdir, &old).is_none());
         // Our own eviction is held off by the same lease.
-        assert_eq!(evict_to(&cdir, 0, now_ms()).removed, 0);
+        assert_eq!(evict_to(&cdir, 0, 0, now_ms()).removed, 0);
         // Once the export finishes the entry is evictable again.
         live.release_lease();
         assert_eq!(clear(&cdir).removed, 1);
@@ -1261,7 +1204,7 @@ mod tests {
         assert!(tmp.exists() && entry_path(&cdir, &k, "mp4").exists());
         set_age(&tmp, 7200);
         set_age(&entry_path(&cdir, &k, "mp4"), 7200);
-        evict_to(&cdir, 0, now_ms());
+        evict_to(&cdir, 0, 0, now_ms());
         assert!(!tmp.exists() && !entry_path(&cdir, &k, "mp4").exists());
     }
 
@@ -1360,24 +1303,19 @@ mod tests {
         dir: &Path,
         max: Option<u64>,
         min_free: Option<u64>,
-        disk: DiskProbe,
+        disk: Disk,
     ) -> SegmentCacheConfig {
         SegmentCacheConfig {
             max_bytes: max,
             min_free_bytes: min_free,
-            disk_probe: Some(disk),
+            fake_disk: Some(disk),
             ..SegmentCacheConfig::new(dir.to_path_buf())
         }
     }
 
     #[test]
     fn floor_defaults_to_the_smaller_of_10gb_and_5_percent() {
-        let d = |free, total| {
-            Some(Disk {
-                free,
-                total: Some(total),
-            })
-        };
+        let d = |free, total| Some(fixed_disk(free, total));
         // 460 GB disk: 5% = 23 GB, so the 10 GB cap wins.
         assert_eq!(
             Policy::resolve(None, None, d(17 * GB, 460 * GB)).floor_bytes,
@@ -1389,16 +1327,12 @@ mod tests {
             5 * GB
         );
         // Unknown total: flat 10 GB.
+        let no_total = Disk {
+            free: GB,
+            total: None,
+        };
         assert_eq!(
-            Policy::resolve(
-                None,
-                None,
-                Some(Disk {
-                    free: GB,
-                    total: None
-                })
-            )
-            .floor_bytes,
+            Policy::resolve(None, None, Some(no_total)).floor_bytes,
             10 * GB
         );
         assert_eq!(Policy::resolve(None, None, None).floor_bytes, 10 * GB);
@@ -1419,7 +1353,8 @@ mod tests {
         };
         // Plenty of disk: the limit decides.
         assert_eq!(p.headroom(5 * GB, Some(100 * GB)), 15 * GB);
-        // 17 GB free, 7 GB above the floor: the floor decides.
+        // 17 GB free, 7 GB above the floor: the floor decides (the old
+        // 10%-of-free-space rule would have allowed only 1.7 GB).
         assert_eq!(p.headroom(0, Some(17 * GB)), 7 * GB);
         // Below the floor: none.
         assert_eq!(p.headroom(0, Some(4 * GB)), 0);
@@ -1428,32 +1363,10 @@ mod tests {
     }
 
     #[test]
-    fn small_free_space_no_longer_shrinks_the_limit() {
-        // The old rule gave 10% of 17 GB = 1.7 GB; now 7 GB above the floor
-        // can be used, up to the 20 GB limit.
-        let p = Policy::resolve(
-            None,
-            None,
-            Some(Disk {
-                free: 17 * GB,
-                total: Some(460 * GB),
-            }),
-        );
-        assert_eq!(p.headroom(0, Some(17 * GB)), 7 * GB);
-    }
-
-    #[test]
     fn eviction_restores_the_free_space_floor() {
         let t = tempfile::tempdir().unwrap();
         let (cdir, work) = (t.path().join("c"), t.path().join("w"));
-        let probe = DiskProbe::fixed(1 << 40, 2 << 40);
-        std::fs::create_dir_all(&work).unwrap();
-        let c = SegmentCache::open(
-            &cfg_disk(&cdir, Some(1 << 30), None, probe),
-            "v".into(),
-            &work,
-        )
-        .unwrap();
+        let c = open(&cdir, &work, Some(GB));
         let keys: Vec<String> = (0..4).map(|i| c.key(&format!("k{i}")).finish()).collect();
         for (i, k) in keys.iter().enumerate() {
             assert!(c.store(k, &produce(&work, &format!("m{i}.mp4"), 1000), 1.0));
@@ -1461,8 +1374,7 @@ mod tests {
         }
         // Within the limit, but free space is 2500 bytes under the floor:
         // the three oldest entries (3000 bytes) go, in LRU order.
-        let (free, floor) = (7500u64, 10_000u64);
-        let r = evict_with(&cdir, 1 << 30, Some((free, floor)), now_ms());
+        let r = evict_to(&cdir, GB, 2500, now_ms());
         assert_eq!(r.removed, 3, "{r:?}");
         let alive: Vec<bool> = keys
             .iter()
@@ -1478,27 +1390,16 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
         // 100 MB disk, floor = min(10 GB, 5%) = 5 MB, 10 KB free above it.
         let mb = 1 << 20;
-        let probe = DiskProbe::fixed(5 * mb + 10_000, 100 * mb);
-        let open = |max| {
-            SegmentCache::open(
-                &cfg_disk(&cdir, max, None, probe.clone()),
-                "v".into(),
-                &work,
-            )
-            .unwrap()
+        let disk = fixed_disk(5 * mb + 10_000, 100 * mb);
+        let open = |min_free| {
+            SegmentCache::open(&cfg_disk(&cdir, None, min_free, disk), "v".into(), &work).unwrap()
         };
-        let c = open(Some(20 * GB));
+        let c = open(None);
         let k = c.key("a").finish();
         assert!(c.store(&k, &produce(&work, "a.mp4", 1000), 1.0));
         assert_eq!(c.finish().removed, 0, "limit and floor both hold");
         // Floor raised above free space: everything evictable goes.
-        let c = SegmentCache::open(
-            &cfg_disk(&cdir, None, Some(6 * mb), probe.clone()),
-            "v".into(),
-            &work,
-        )
-        .unwrap();
-        assert_eq!(c.finish().removed, 1);
+        assert_eq!(open(Some(6 * mb)).finish().removed, 1);
     }
 
     #[test]
@@ -1507,9 +1408,8 @@ mod tests {
         let (cdir, work) = (t.path().join("c"), t.path().join("w"));
         std::fs::create_dir_all(&work).unwrap();
         // free 10_500, floor 10_000: room for 500 bytes beyond the floor.
-        let probe = DiskProbe::fixed(10_500, 1_000_000);
         let c = SegmentCache::open(
-            &cfg_disk(&cdir, None, Some(10_000), probe),
+            &cfg_disk(&cdir, None, Some(10_000), fixed_disk(10_500, 1_000_000)),
             "v".into(),
             &work,
         )
@@ -1524,15 +1424,5 @@ mod tests {
         assert!(!c.store(&big, &produce(&work, "b.mp4", 2000), 1.0));
         assert_eq!(c.stats().skipped_low_disk, 1);
         assert!(read_valid(&cdir, &big).is_none());
-    }
-
-    #[test]
-    fn floor_does_not_block_a_roomy_disk() {
-        let t = tempfile::tempdir().unwrap();
-        let (cdir, work) = (t.path().join("c"), t.path().join("w"));
-        let c = open(&cdir, &work, None);
-        let k = c.key("x").finish();
-        assert!(c.store(&k, &produce(&work, "x.mp4", 1000), 1.0));
-        assert_eq!(c.finish().removed, 0);
     }
 }
