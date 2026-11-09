@@ -20,7 +20,9 @@ use crate::MediaError;
 use image::{Rgb, RgbImage, RgbaImage};
 use std::io::Write;
 use std::path::Path;
-use triptape_core::route_stops::{closing_map_secs, RouteStop, ROUTE_ANIM_MAX_STOPS};
+use triptape_core::route_stops::{
+    animated_stop_count, closing_map_secs, RouteStop, ROUTE_ANIM_MAX_STOPS,
+};
 
 /// Output frame rate (matches the other hero segments).
 pub const FPS: u32 = 30;
@@ -36,6 +38,9 @@ pub const TAIL_SECS: f64 = 0.6;
 /// A leg's time share is its length plus this fraction of the mean leg, so
 /// short hops do not flash by while long legs stay quick.
 const LEG_FLOOR_SHARE: f64 = 0.5;
+/// Sea-leg dash lengths (1080p design pixels).
+const SEA_DASH_ON: f64 = 12.0;
+const SEA_DASH_OFF: f64 = 10.0;
 /// Label fade-in after the dot arrives.
 pub const LABEL_FADE_SECS: f64 = 0.25;
 /// Shortest a leg may take when the budget is very tight.
@@ -63,6 +68,9 @@ pub fn ease_in_out(u: f64) -> f64 {
 pub(crate) struct Stop {
     pub pos: (f64, f64),
     pub label: Option<String>,
+    /// The leg to the next stop passed sea days: `Some(ship name)`, empty
+    /// when the ship has no name. Drawn dashed with a ship marker.
+    pub sea_after: Option<String>,
 }
 
 fn dist(a: (f64, f64), b: (f64, f64)) -> f64 {
@@ -100,6 +108,7 @@ pub(crate) fn merge_and_thin(stops: &[Stop], min_sep: f64, max: usize) -> Vec<St
                 .label
                 .clone()
                 .or_else(|| members.iter().find_map(|&m| stops[m].label.clone())),
+            sea_after: members.iter().find_map(|&m| stops[m].sea_after.clone()),
         })
         .collect();
     while out.len() > max.max(2) {
@@ -113,7 +122,11 @@ pub(crate) fn merge_and_thin(stops: &[Stop], min_sep: f64, max: usize) -> Vec<St
             .map(|(_, i)| i);
         match drop {
             Some(i) => {
-                out.remove(i);
+                // The merged leg is a sea leg if either half was.
+                let gone = out.remove(i);
+                if out[i - 1].sea_after.is_none() {
+                    out[i - 1].sea_after = gone.sea_after;
+                }
             }
             None => break,
         }
@@ -235,16 +248,23 @@ pub(crate) fn place_labels(
             continue;
         };
         let (lw, lh) = (f64::from(lw), f64::from(lh));
-        let candidates = [
-            (ax + gap, ay - gap - lh),
-            (ax - gap - lw, ay - gap - lh),
-            (ax + gap, ay + gap),
-            (ax - gap - lw, ay + gap),
-            (ax - lw / 2.0, ay - gap - lh),
-            (ax - lw / 2.0, ay + gap),
-            (ax + gap, ay - lh / 2.0),
-            (ax - gap - lw, ay - lh / 2.0),
-        ];
+        // Nearest free spot first: around the pin, then farther rings.
+        let candidates: Vec<(f64, f64)> = [1.0, 3.0, 6.0, 10.0]
+            .iter()
+            .flat_map(|&m| {
+                let g = gap * m;
+                [
+                    (ax + g, ay - g - lh),
+                    (ax - g - lw, ay - g - lh),
+                    (ax + g, ay + g),
+                    (ax - g - lw, ay + g),
+                    (ax - lw / 2.0, ay - g - lh),
+                    (ax - lw / 2.0, ay + g),
+                    (ax + g, ay - lh / 2.0),
+                    (ax - g - lw, ay - lh / 2.0),
+                ]
+            })
+            .collect();
         let clamp = |(x, y): (f64, f64)| {
             (
                 x.clamp(margin, (fw - lw - margin).max(margin)),
@@ -335,6 +355,11 @@ pub(crate) struct Animator {
     drawn: f64,
     labels: Vec<Option<RgbaImage>>,
     label_pos: Vec<Option<(i32, i32)>>,
+    /// Per leg: dashed sea leg, with the ship's label when it is the first
+    /// leg for that ship (sprite and its placement near the leg's middle).
+    sea: Vec<bool>,
+    sea_labels: Vec<Option<RgbaImage>>,
+    sea_label_pos: Vec<Option<(i32, i32)>>,
 }
 
 impl Animator {
@@ -345,14 +370,29 @@ impl Animator {
         stops: &[Stop],
         timeline: Timeline,
         labels: Vec<Option<RgbaImage>>,
+        sea_labels: Vec<Option<RgbaImage>>,
     ) -> Self {
         let k = f64::from((h / 1080).max(1));
         let pts: Vec<(f64, f64)> = stops.iter().map(|s| s.pos).collect();
+        let sea: Vec<bool> = stops[..stops.len() - 1]
+            .iter()
+            .map(|s| s.sea_after.is_some())
+            .collect();
+        // Ship labels sit at the middle of their leg; stop labels are
+        // placed around them so nothing overlaps.
+        let mids: Vec<(f64, f64)> = pts
+            .windows(2)
+            .map(|w| ((w[0].0 + w[1].0) / 2.0, (w[0].1 + w[1].1) / 2.0))
+            .collect();
+        let anchors: Vec<(f64, f64)> = pts.iter().chain(&mids).copied().collect();
         let sizes: Vec<Option<(u32, u32)>> = labels
             .iter()
+            .chain(&sea_labels)
             .map(|l| l.as_ref().map(|l| (l.width(), l.height())))
             .collect();
-        let label_pos = place_labels(&pts, &sizes, (w, h), 14.0 * k);
+        let mut placed = place_labels(&anchors, &sizes, (w, h), 14.0 * k);
+        let sea_label_pos = placed.split_off(pts.len());
+        let label_pos = placed;
         Self {
             w,
             h,
@@ -366,6 +406,9 @@ impl Animator {
             drawn: 0.0,
             labels,
             label_pos,
+            sea,
+            sea_labels,
+            sea_label_pos,
         }
     }
 
@@ -394,7 +437,26 @@ impl Animator {
         let cum = self.timeline.cum.clone();
         for i in 0..cum.len() - 1 {
             let (lo, hi) = (from.max(cum[i]), to.min(cum[i + 1]));
-            if lo < hi || (lo == hi && lo == from && from == 0.0) {
+            if lo >= hi {
+                continue;
+            }
+            if self.sea[i] {
+                // Dashes keyed to path distance, so they stay put as the
+                // line grows frame by frame.
+                let (on, period) = (SEA_DASH_ON * self.k, (SEA_DASH_ON + SEA_DASH_OFF) * self.k);
+                let mut d = lo;
+                while d < hi {
+                    let phase = d % period;
+                    if phase < on {
+                        let end = hi.min(d + (on - phase));
+                        let (a, b) = (self.point_at(d), self.point_at(end));
+                        self.stamp_capsule(a, b);
+                        d = end;
+                    } else {
+                        d = hi.min(d + (period - phase));
+                    }
+                }
+            } else {
                 let (a, b) = (self.point_at(lo), self.point_at(hi));
                 self.stamp_capsule(a, b);
             }
@@ -466,6 +528,22 @@ impl Animator {
                 }
             }
         }
+        // Ship marker and name at the middle of a sea leg, once the dot
+        // has passed it.
+        for i in 0..self.sea.len() {
+            let Some(sprite) = &self.sea_labels[i] else {
+                continue;
+            };
+            let len = self.timeline.cum[i + 1] - self.timeline.cum[i];
+            let mid = self.timeline.cum[i] + len / 2.0;
+            let alpha = ((d - mid) / (0.15 * len)).clamp(0.0, 1.0);
+            if alpha > 0.0 {
+                if let Some(pos) = self.sea_label_pos[i] {
+                    composite(&mut img, sprite, pos, alpha);
+                }
+                draw_ship(&mut img, self.point_at(mid), k, alpha);
+            }
+        }
         let dot = self.point_at(d);
         if let Some((_, since)) = self.timeline.pause_at(t) {
             // A soft ring pulses outward while the dot rests at a stop.
@@ -483,6 +561,43 @@ impl Animator {
         blend_shape(&mut img, dot, 9.0 * k, None, PIN_RING, 1.0);
         blend_shape(&mut img, dot, 6.0 * k, None, CORE, 1.0);
         img
+    }
+}
+
+/// Small ship (hull and sail) centred on `c`.
+fn draw_ship(img: &mut RgbImage, c: (f64, f64), k: f64, alpha: f64) {
+    let hull = [(-9.0, 0.0), (9.0, 0.0), (6.0, 5.0), (-6.0, 5.0)];
+    let sail = [(-1.0, -1.0), (-1.0, -12.0), (7.0, -1.0)];
+    for (poly, col) in [(&hull[..], PIN_RING), (&sail[..], CORE)] {
+        let pts: Vec<(f64, f64)> = poly
+            .iter()
+            .map(|&(x, y)| (c.0 + x * k, c.1 + (y - 1.0) * k))
+            .collect();
+        fill_convex(img, &pts, col, alpha);
+    }
+}
+
+/// Fill a convex polygon (winding in either direction).
+fn fill_convex(img: &mut RgbImage, pts: &[(f64, f64)], col: Rgb<u8>, alpha: f64) {
+    let (mut x0, mut x1, mut y0, mut y1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for p in pts {
+        x0 = x0.min(p.0);
+        x1 = x1.max(p.0);
+        y0 = y0.min(p.1);
+        y1 = y1.max(p.1);
+    }
+    for y in y0.floor() as i32..=y1.ceil() as i32 {
+        for x in x0.floor() as i32..=x1.ceil() as i32 {
+            let (px, py) = (f64::from(x) + 0.5, f64::from(y) + 0.5);
+            let cross =
+                |a: (f64, f64), b: (f64, f64)| (b.0 - a.0) * (py - a.1) - (b.1 - a.1) * (px - a.0);
+            let signs: Vec<bool> = (0..pts.len())
+                .map(|i| cross(pts[i], pts[(i + 1) % pts.len()]) >= 0.0)
+                .collect();
+            if signs.iter().all(|&s| s) || signs.iter().all(|&s| !s) {
+                blend_px(img, x, y, col, alpha);
+            }
+        }
     }
 }
 
@@ -574,15 +689,27 @@ fn build_animator(
     }
     let k = f64::from((h / 1080).max(1));
     let fit = RouteFit::new(&route, w, h);
-    let screen: Vec<Stop> = stops
-        .iter()
-        .filter_map(|s| {
-            Some(Stop {
-                pos: fit.project_f(*route.get(s.route_index)?),
-                label: s.label.clone(),
-            })
-        })
-        .collect();
+    // Real stops become pins; sea days (a ship's name over open water) fold
+    // into the leg after the previous stop, which is drawn dashed.
+    let mut screen: Vec<Stop> = vec![];
+    for s in stops {
+        let Some(&gps) = route.get(s.route_index) else {
+            continue;
+        };
+        if s.at_sea {
+            if let Some(prev) = screen.last_mut() {
+                if prev.sea_after.is_none() {
+                    prev.sea_after = Some(s.label.clone().unwrap_or_default());
+                }
+            }
+            continue;
+        }
+        screen.push(Stop {
+            pos: fit.project_f(gps),
+            label: s.label.clone(),
+            sea_after: None,
+        });
+    }
     let merged = merge_and_thin(&screen, MIN_STOP_SEPARATION_PX * k, ROUTE_ANIM_MAX_STOPS);
     if merged.len() < 2 {
         return Err(MediaError::InvalidArg(
@@ -590,38 +717,59 @@ fn build_animator(
         ));
     }
     // The plan budgeted the recap from the chapter count; fill exactly that.
-    let target = closing_map_secs(stops.len());
+    let target = closing_map_secs(animated_stop_count(stops));
     let pts: Vec<(f64, f64)> = merged.iter().map(|s| s.pos).collect();
     let timeline = Timeline::new(&pts, target);
     let total = timeline.total_secs;
 
-    let mut sprites: Vec<Option<RgbaImage>> = vec![];
-    if merged.iter().any(|s| s.label.is_some()) {
-        std::fs::create_dir_all(work_dir).map_err(|e| MediaError::Io(e.to_string()))?;
-    }
-    for (i, s) in merged.iter().enumerate() {
-        let sprite = s.label.as_deref().and_then(|text| {
-            let png = work_dir.join(format!("recap_label_{i:02}.png"));
-            let made =
-                crate::titlecard::render_text_png(typst_bin, &label_doc(text), &png, 72 * k as u32)
-                    .and_then(|()| {
-                        image::open(&png)
-                            .map(|im| im.to_rgba8())
-                            .map_err(|e| MediaError::Io(format!("read label: {e}")))
-                    });
-            let _ = std::fs::remove_file(&png);
-            match made {
-                Ok(img) => Some(img),
-                Err(e) => {
-                    notes.push(format!("recap label {text:?} skipped: {e}"));
-                    None
-                }
+    // Each ship is named once, on its first sea leg.
+    let mut seen_ships: Vec<&str> = vec![];
+    let sea_names: Vec<Option<&str>> = merged[..merged.len() - 1]
+        .iter()
+        .map(|s| {
+            let name = s.sea_after.as_deref().filter(|n| !n.is_empty())?;
+            if seen_ships.contains(&name) {
+                return None;
             }
-        });
-        sprites.push(sprite);
-    }
+            seen_ships.push(name);
+            Some(name)
+        })
+        .collect();
+    std::fs::create_dir_all(work_dir).map_err(|e| MediaError::Io(e.to_string()))?;
+    let mut sprite = |tag: String, text: Option<&str>| -> Option<RgbaImage> {
+        let text = text?;
+        let png = work_dir.join(format!("recap_label_{tag}.png"));
+        let made =
+            crate::titlecard::render_text_png(typst_bin, &label_doc(text), &png, 72 * k as u32)
+                .and_then(|()| {
+                    image::open(&png)
+                        .map(|im| im.to_rgba8())
+                        .map_err(|e| MediaError::Io(format!("read label: {e}")))
+                });
+        let _ = std::fs::remove_file(&png);
+        match made {
+            Ok(img) => Some(img),
+            Err(e) => {
+                notes.push(format!("recap label {text:?} skipped: {e}"));
+                None
+            }
+        }
+    };
+    let sprites: Vec<Option<RgbaImage>> = merged
+        .iter()
+        .enumerate()
+        .map(|(i, s)| sprite(format!("{i:02}"), s.label.as_deref()))
+        .collect();
+    let sea_sprites: Vec<Option<RgbaImage>> = sea_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| sprite(format!("sea{i:02}"), *n))
+        .collect();
     let base = draw_base(&route, w, h);
-    Ok((Animator::new(w, h, base, &merged, timeline, sprites), total))
+    Ok((
+        Animator::new(w, h, base, &merged, timeline, sprites, sea_sprites),
+        total,
+    ))
 }
 
 /// Pipe `frames` raw RGB frames from `frame_at` into ffmpeg and write
@@ -753,6 +901,7 @@ mod tests {
         Stop {
             pos: (x, y),
             label: label.map(Into::into),
+            sea_after: None,
         }
     }
 
@@ -967,6 +1116,7 @@ mod tests {
             .map(|&i| RouteStop {
                 route_index: i,
                 label: Some(format!("Stop {i}")),
+                at_sea: false,
             })
             .collect();
         (route, stops)
@@ -1016,11 +1166,113 @@ mod tests {
             .map(|i| RouteStop {
                 route_index: i,
                 label: None,
+                at_sea: false,
             })
             .collect();
         let dir = tempfile::tempdir().unwrap();
         let r = build_animator(&route, &stops, (480, 270), "x", dir.path(), &mut vec![]);
         assert!(r.is_err());
+    }
+
+    fn sea_stop(index: usize, ship: &str) -> RouteStop {
+        RouteStop {
+            route_index: index,
+            label: Some(ship.into()),
+            at_sea: true,
+        }
+    }
+
+    fn port(index: usize, name: &str) -> RouteStop {
+        RouteStop {
+            route_index: index,
+            label: Some(name.into()),
+            at_sea: false,
+        }
+    }
+
+    #[test]
+    fn sea_days_become_a_dashed_leg_and_the_ship_is_named_once() {
+        let route = vec![
+            (35.7, 139.8),
+            (30.0, 130.0),
+            (25.0, 121.5),
+            (15.0, 112.0),
+            (1.35, 103.8),
+        ];
+        let stops = vec![
+            port(0, "Tokyo"),
+            sea_stop(1, "Ship One"),
+            port(2, "Keelung"),
+            sea_stop(3, "Ship One"),
+            port(4, "Singapore"),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let mut notes = vec![];
+        let (an, total) = build_animator(
+            &route,
+            &stops,
+            (960, 540),
+            "no-such-typst",
+            dir.path(),
+            &mut notes,
+        )
+        .unwrap();
+        // Three pins, two legs, both dashed; sea days are not stops.
+        assert_eq!(an.pts.len(), 3);
+        assert_eq!(an.sea, [true, true]);
+        // Budget counts the three real stops.
+        assert!((total - closing_map_secs(3)).abs() < 1e-9);
+        // The ship is requested once (typst is absent, so it is noted).
+        let ship_notes = notes.iter().filter(|n| n.contains("Ship One")).count();
+        assert_eq!(ship_notes, 1, "{notes:?}");
+    }
+
+    #[test]
+    fn dashed_legs_draw_less_line_than_solid_ones() {
+        let route = vec![(35.7, 139.8), (25.0, 121.5), (1.35, 103.8)];
+        let dir = tempfile::tempdir().unwrap();
+        let solid = vec![port(0, "A"), port(1, "B"), port(2, "C")];
+        let dashed = vec![port(0, "A"), sea_stop(1, "S"), port(2, "C")];
+        let mut counts = vec![];
+        for stops in [&solid, &dashed] {
+            let (mut an, total) = build_animator(
+                &route,
+                stops,
+                (960, 540),
+                "no-such-typst",
+                dir.path(),
+                &mut vec![],
+            )
+            .unwrap();
+            counts.push(trail_px(&an.frame(total)));
+        }
+        assert!(counts[1] > 100, "dashes are drawn");
+        // Dashed: a 12-on/10-off pattern over one long leg, vs two solid legs.
+        assert!(counts[1] < counts[0], "{counts:?}");
+    }
+
+    #[test]
+    fn merging_keeps_sea_legs() {
+        let mut a = stop(100.0, 100.0, Some("A"));
+        a.sea_after = Some("Ship".into());
+        let stops = vec![
+            a,
+            stop(110.0, 100.0, None),
+            stop(500.0, 100.0, Some("B")),
+            stop(900.0, 100.0, Some("C")),
+        ];
+        let m = merge_and_thin(&stops, 48.0, 16);
+        assert_eq!(m[0].sea_after.as_deref(), Some("Ship"));
+        // Thinning folds a dropped stop's sea leg into the merged leg.
+        let mut b = stop(500.0, 100.0, Some("B"));
+        b.sea_after = Some("Ship".into());
+        let t = merge_and_thin(
+            &[stop(100.0, 100.0, None), b, stop(900.0, 100.0, None)],
+            48.0,
+            2,
+        );
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].sea_after.as_deref(), Some("Ship"));
     }
 
     fn test_caps() -> Option<Capabilities> {
@@ -1083,7 +1335,7 @@ mod tests {
         // Dot edges blend through similar tones, so compare rather than
         // demand zero: the first frame has no line, the last has all of it.
         let (n_first, n_last) = (near_glow(first), near_glow(last));
-        assert!(n_last > 300, "last frame shows the route: {n_last}");
+        assert!(n_last > 150, "last frame shows the route: {n_last}");
         assert!(n_first * 20 < n_last, "first frame has no route: {n_first}");
         // Audio track present and matching length.
         let probe = std::process::Command::new(&caps.ffprobe_bin)

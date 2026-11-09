@@ -91,6 +91,27 @@ pub fn is_land(gps: (f64, f64)) -> bool {
     false
 }
 
+/// Land fraction around `gps` by bilinear blend of the four nearest raw
+/// grid cells (no coastal buffer, unlike [`is_land`]): 0.0 open water to
+/// 1.0 inland, with the coastline at 0.5. For drawing smooth shorelines.
+pub fn land_fraction(gps: (f64, f64)) -> f32 {
+    let fc = (gps.1 + 180.0) * CELLS_PER_DEG as f64 - 0.5;
+    let fr = (gps.0 + 90.0) * CELLS_PER_DEG as f64 - 0.5;
+    let (c0, r0) = (fc.floor(), fr.floor());
+    let (tc, tr) = ((fc - c0) as f32, (fr - r0) as f32);
+    let cell = |r: i64, c: i64| -> f32 {
+        if !(0..GRID_H).contains(&r) {
+            return 0.0;
+        }
+        let idx = (r * GRID_W + c.rem_euclid(GRID_W)) as usize;
+        f32::from(LAND_GRID[idx / 8] >> (idx % 8) & 1)
+    };
+    let (r0, c0) = (r0 as i64, c0 as i64);
+    let top = cell(r0, c0) * (1.0 - tc) + cell(r0, c0 + 1) * tc;
+    let bottom = cell(r0 + 1, c0) * (1.0 - tc) + cell(r0 + 1, c0 + 1) * tc;
+    top * (1.0 - tr) + bottom * tr
+}
+
 /// The name for `gps`: a nearby attraction beats the generic city.
 /// `None` when nothing is close enough to name honestly (open water,
 /// remote areas). This is the only place-name source in the app, backed
@@ -283,6 +304,25 @@ mod tests {
         assert!(!is_land((16.564, 111.011)));
         // Singapore harbor counts as landfall.
         assert!(is_land((1.264, 103.840)));
+    }
+
+    #[test]
+    fn land_fraction_is_smooth_and_has_no_coastal_buffer() {
+        // Inland Honshu is land, mid-Pacific is water, the coast in between.
+        assert_eq!(land_fraction((36.0, 138.0)), 1.0);
+        assert_eq!(land_fraction((20.0, -150.0)), 0.0);
+        // The buffered test calls 8 km offshore "land"; the raw fraction
+        // does not, and it varies continuously across a coast.
+        let mut vals = vec![];
+        for i in 0..40 {
+            vals.push(land_fraction((35.0, 139.0 + f64::from(i) * 0.02)));
+        }
+        assert!(vals.iter().all(|v| (0.0..=1.0).contains(v)));
+        assert!(vals.iter().any(|v| *v > 0.0 && *v < 1.0), "has a coast");
+        // Edges stay in bounds, including across the antimeridian.
+        let _ = land_fraction((-90.0, 0.0));
+        let _ = land_fraction((90.0, 179.99));
+        let _ = land_fraction((10.0, 540.0));
     }
 
     #[test]

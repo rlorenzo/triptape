@@ -33,6 +33,16 @@ pub struct RouteStop {
     pub route_index: usize,
     /// The chapter's place (including user place overrides), if it has one.
     pub label: Option<String>,
+    /// The chapter has a place name only from a user override (a ship's
+    /// name for days at sea): GPS could not name where it is. The recap
+    /// draws these as a dashed sea leg, not a stop.
+    pub at_sea: bool,
+}
+
+/// Number of real stops (not sea days) the recap pauses at; the duration
+/// budget is built from this.
+pub fn animated_stop_count(stops: &[RouteStop]) -> usize {
+    stops.iter().filter(|s| !s.at_sea).count()
 }
 
 /// Length of the animated closing map for `stop_count` chapter stops.
@@ -74,6 +84,7 @@ pub fn chapter_route_stops(
         };
         let route_index = nearest_index(route, center);
         let label = ch.place.clone();
+        let at_sea = label.is_some() && crate::geo::place_name(center).is_none();
         match out.last_mut() {
             // Same point, or the same named place again (days in one port).
             Some(prev)
@@ -83,7 +94,11 @@ pub fn chapter_route_stops(
                     prev.label = label;
                 }
             }
-            _ => out.push(RouteStop { route_index, label }),
+            _ => out.push(RouteStop {
+                route_index,
+                label,
+                at_sea,
+            }),
         }
     }
     out
@@ -157,15 +172,18 @@ mod tests {
             vec![
                 RouteStop {
                     route_index: 0,
-                    label: Some("Kyoto".into())
+                    label: Some("Kyoto".into()),
+                    at_sea: false
                 },
                 RouteStop {
                     route_index: 1,
-                    label: None
+                    label: None,
+                    at_sea: false
                 },
                 RouteStop {
                     route_index: 2,
-                    label: Some("Singapore".into())
+                    label: Some("Singapore".into()),
+                    at_sea: false
                 },
             ]
         );
@@ -185,5 +203,27 @@ mod tests {
         ];
         assert_eq!(chapter_route_stops(&port, &assets, &route).len(), 2);
         assert!(chapter_route_stops(&chapters, &assets, &[]).is_empty());
+    }
+
+    #[test]
+    fn override_named_chapters_in_open_water_are_sea_days() {
+        // A ship's name over open water: GPS cannot name it, so it is not a stop.
+        let route = vec![(35.6, 139.7), (20.0, -150.0), (1.35, 103.8)];
+        let assets = vec![
+            asset("a", Some((35.6, 139.7))),
+            asset("b", Some((20.0, -150.0))),
+            asset("c", Some((1.35, 103.8))),
+        ];
+        let chapters = vec![
+            chapter(Some("Tokyo"), &["a"]),
+            chapter(Some("Carnival Luminosa"), &["b"]),
+            chapter(Some("Singapore"), &["c"]),
+        ];
+        let stops = chapter_route_stops(&chapters, &assets, &route);
+        assert_eq!(
+            stops.iter().map(|s| s.at_sea).collect::<Vec<_>>(),
+            [false, true, false]
+        );
+        assert_eq!(animated_stop_count(&stops), 2);
     }
 }

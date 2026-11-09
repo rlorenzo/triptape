@@ -12,7 +12,6 @@
 use crate::resolution::Resolution;
 use image::{Rgb, RgbImage};
 use std::path::Path;
-use triptape_core::geo::is_land;
 
 /// Flat water and land tones for the route card.
 pub(crate) const WATER: Rgb<u8> = Rgb([17, 27, 43]);
@@ -92,7 +91,11 @@ pub(crate) fn draw_base(route: &[(f64, f64)], w: u32, h: u32) -> RgbImage {
     let k = (h / 1080).max(1);
     let mut img = RgbImage::from_pixel(w, h, WATER);
     if !route.is_empty() {
-        paint_land(&mut img, &RouteFit::new(route, w, h), k);
+        let fit = RouteFit::new(route, w, h);
+        paint_land(&mut img, &fit);
+        if let Some(cols) = fit.gap_columns() {
+            draw_axis_break(&mut img, cols, k);
+        }
     }
     // Graticule: faint grid so the card reads as a map, not a black card.
     let grid = Rgb([31, 44, 63]);
@@ -136,6 +139,62 @@ pub(crate) struct RouteFit {
     span_lon: f64,
     w: f64,
     h: f64,
+    /// Broken longitude axis: an empty ocean gap squeezed out of the map.
+    gap: Option<LonGap>,
+}
+
+/// An empty longitude stretch `[lo, hi]` (degrees, unwrapped) between route
+/// points, drawn only [`GAP_SQUEEZE_DEG`] wide. A trip that crosses the
+/// Pacific once would otherwise spend most of the frame on open water and
+/// crush the actual destinations into a corner.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LonGap {
+    lo: f64,
+    hi: f64,
+}
+
+/// Width the squeezed gap is drawn at.
+const GAP_SQUEEZE_DEG: f64 = 10.0;
+/// A gap is squeezed only when at least this wide and this share of the
+/// route's longitude span.
+const MIN_GAP_DEG: f64 = 40.0;
+const MIN_GAP_SHARE: f64 = 0.4;
+
+impl LonGap {
+    /// Widest empty stretch between consecutive sorted route longitudes,
+    /// when it is big enough to squeeze.
+    fn find(route: &[(f64, f64)]) -> Option<Self> {
+        let mut lons: Vec<f64> = route.iter().map(|p| p.1).collect();
+        lons.sort_by(f64::total_cmp);
+        let span = lons.last()? - lons.first()?;
+        lons.windows(2)
+            .map(|w| (w[1] - w[0], w[0], w[1]))
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .filter(|(g, _, _)| *g >= MIN_GAP_DEG && *g >= MIN_GAP_SHARE * span)
+            .map(|(_, lo, hi)| Self { lo, hi })
+    }
+
+    fn warp(self, lon: f64) -> f64 {
+        let width = self.hi - self.lo;
+        if lon <= self.lo {
+            lon
+        } else if lon >= self.hi {
+            lon - width + GAP_SQUEEZE_DEG
+        } else {
+            self.lo + (lon - self.lo) * GAP_SQUEEZE_DEG / width
+        }
+    }
+
+    fn unwarp(self, lon: f64) -> f64 {
+        let width = self.hi - self.lo;
+        if lon <= self.lo {
+            lon
+        } else if lon >= self.lo + GAP_SQUEEZE_DEG {
+            lon + width - GAP_SQUEEZE_DEG
+        } else {
+            self.lo + (lon - self.lo) * width / GAP_SQUEEZE_DEG
+        }
+    }
 }
 
 impl RouteFit {
@@ -145,7 +204,9 @@ impl RouteFit {
     pub(crate) fn new(route: &[(f64, f64)], w: u32, h: u32) -> Self {
         let (mut min_lat, mut max_lat) = (f64::INFINITY, f64::NEG_INFINITY);
         let (mut min_lon, mut max_lon) = (f64::INFINITY, f64::NEG_INFINITY);
+        let gap = LonGap::find(route);
         for &(lat, lon) in route {
+            let lon = gap.map_or(lon, |g| g.warp(lon));
             min_lat = min_lat.min(lat);
             max_lat = max_lat.max(lat);
             min_lon = min_lon.min(lon);
@@ -158,7 +219,16 @@ impl RouteFit {
             span_lon: (max_lon - min_lon).max(Self::MIN_SPAN_DEG),
             w: f64::from(w),
             h: f64::from(h),
+            gap,
         }
+    }
+
+    /// Pixel columns `[x0, x1]` of the squeezed gap, when the axis is broken.
+    pub(crate) fn gap_columns(&self) -> Option<(f64, f64)> {
+        let g = self.gap?;
+        let (x0, _) = self.project_f((self.min_lat, g.lo));
+        let (x1, _) = self.project_f((self.min_lat, g.hi));
+        Some((x0, x1))
     }
 
     fn project(&self, gps: (f64, f64)) -> (i32, i32) {
@@ -168,6 +238,7 @@ impl RouteFit {
 
     /// [`Self::project`] without the pixel rounding, for sub-pixel motion.
     pub(crate) fn project_f(&self, (lat, lon): (f64, f64)) -> (f64, f64) {
+        let lon = self.gap.map_or(lon, |g| g.warp(lon));
         let fx = (lon - self.min_lon) / self.span_lon;
         let fy = 1.0 - (lat - self.min_lat) / self.span_lat;
         let inner = 1.0 - 2.0 * Self::PAD;
@@ -182,27 +253,65 @@ impl RouteFit {
         let inner = 1.0 - 2.0 * Self::PAD;
         let fx = (x / self.w - Self::PAD) / inner;
         let fy = (y / self.h - Self::PAD) / inner;
+        let lon = self.min_lon + fx * self.span_lon;
         (
             self.min_lat + (1.0 - fy) * self.span_lat,
-            self.min_lon + fx * self.span_lon,
+            self.gap.map_or(lon, |g| g.unwarp(lon)),
         )
     }
 }
 
-/// Paint landmasses from the bundled land grid in small blocks, so the
-/// card reads as a map of the region.
-fn paint_land(img: &mut RgbImage, fit: &RouteFit, k: u32) {
-    let step = 4 * k;
-    let (w, plot_h) = (fit.w as u32, fit.h as u32);
-    for by in (0..plot_h).step_by(step as usize) {
-        for bx in (0..w).step_by(step as usize) {
-            let center = fit.unproject(f64::from(bx + step / 2), f64::from(by + step / 2));
-            if !is_land(center) {
+/// Paint landmasses from the bundled land grid: the raw 0.05° cells,
+/// bilinearly blended and thresholded at the coastline, anti-aliased by 2x2
+/// supersampling, so shores are smooth at any zoom. Land inside a squeezed
+/// longitude gap is left as water.
+fn paint_land(img: &mut RgbImage, fit: &RouteFit) {
+    let (w, h) = (fit.w as u32, fit.h as u32);
+    // Cells per pixel: how wide the shoreline's blend zone is in pixels.
+    let (lat0, _) = fit.unproject(0.0, 0.0);
+    let (lat1, _) = fit.unproject(0.0, 1.0);
+    let cells_per_px = (lat0 - lat1).abs() * 20.0;
+    let soft = (0.35 * cells_per_px).clamp(0.03, 0.5);
+    let gap = fit.gap_columns();
+    const OFFS: [f64; 2] = [0.25, 0.75];
+    for y in 0..h {
+        for x in 0..w {
+            if gap.is_some_and(|(g0, g1)| f64::from(x) >= g0 && f64::from(x) <= g1) {
                 continue;
             }
-            for y in by..(by + step).min(plot_h) {
-                for x in bx..(bx + step).min(w) {
-                    img.put_pixel(x, y, LAND);
+            let mut cover = 0.0;
+            for oy in OFFS {
+                for ox in OFFS {
+                    let gps = fit.unproject(f64::from(x) + ox, f64::from(y) + oy);
+                    let f = f64::from(triptape_core::geo::land_fraction(gps));
+                    let t = ((f - (0.5 - soft)) / (2.0 * soft)).clamp(0.0, 1.0);
+                    cover += t * t * (3.0 - 2.0 * t);
+                }
+            }
+            let a = cover / 4.0;
+            if a > 0.0 {
+                let px = img.get_pixel_mut(x, y);
+                for c in 0..3 {
+                    px.0[c] =
+                        (f64::from(px.0[c]) * (1.0 - a) + f64::from(LAND.0[c]) * a).round() as u8;
+                }
+            }
+        }
+    }
+}
+
+/// Two slanted rules at the edges of a squeezed longitude gap, the usual
+/// sign of a broken axis.
+fn draw_axis_break(img: &mut RgbImage, (x0, x1): (f64, f64), k: u32) {
+    let col = Rgb([96, 116, 146]);
+    let h = img.height();
+    for edge in [x0, x1] {
+        for y in 0..h {
+            let cx = edge + (f64::from(y) - f64::from(h) / 2.0) * 0.12;
+            for dx in 0..(2 * k) {
+                let x = (cx + f64::from(dx)) as i64;
+                if (0..i64::from(img.width())).contains(&x) && (y / (6 * k)).is_multiple_of(2) {
+                    img.put_pixel(x as u32, y, col);
                 }
             }
         }
@@ -314,6 +423,45 @@ mod tests {
     }
 
     #[test]
+    fn long_empty_ocean_gaps_are_squeezed_out_of_the_axis() {
+        // Los Angeles then Asia (unwrapped, as the card does): 100+ degrees
+        // of Pacific between the route's points.
+        let route =
+            unwrap_longitudes(&[(33.9, -118.4), (35.6, 139.7), (22.3, 114.0), (1.35, 103.8)]);
+        let fit = RouteFit::new(&route, 1920, 1080);
+        let (g0, g1) = fit.gap_columns().expect("gap squeezed");
+        assert!(g1 > g0 && g1 - g0 < 0.35 * 1920.0, "{g0}..{g1}");
+        // Asia now fills a good share of the frame: Tokyo to Singapore.
+        let (tx, _) = fit.project_f(route[1]);
+        let (sx, _) = fit.project_f(route[3]);
+        assert!((tx - sx).abs() > 0.3 * 1920.0, "{tx} {sx}");
+        // Both sides still round-trip through the warp.
+        for gps in [route[0], route[1], route[3]] {
+            let (x, y) = fit.project_f(gps);
+            let (lat, lon) = fit.unproject(x, y);
+            assert!((lat - gps.0).abs() < 0.01 && (lon - gps.1).abs() < 0.01);
+        }
+        // A compact trip has no gap.
+        let japan = RouteFit::new(&[(35.0, 139.0), (34.0, 135.0), (33.0, 130.0)], 1920, 1080);
+        assert!(japan.gap_columns().is_none());
+    }
+
+    #[test]
+    fn shorelines_are_antialiased_not_blocky() {
+        // Tokyo Bay area at 1080p: coast pixels take blended tones.
+        let route = vec![(35.0, 139.0), (36.0, 140.0)];
+        let img = draw_route_card(&route, &[], 960, 540);
+        let blended = img
+            .pixels()
+            .filter(|p| **p != WATER && **p != LAND && p.0[2] > 43 && p.0[2] < 92)
+            .count();
+        assert!(
+            blended > 200,
+            "coastline should carry blended pixels: {blended}"
+        );
+    }
+
+    #[test]
     fn card_shows_landmass_not_black_card() {
         // Tokyo -> Singapore: Japan, Taiwan, and SE-Asia landmasses must
         // be visible against the water, not a plain dark card.
@@ -404,7 +552,9 @@ mod tests {
             "attribution strip still painted"
         );
         // Water or land, not an overlay: the bottom row is map-toned.
-        assert!([WATER, LAND].contains(img.get_pixel(10, 199)));
+        // (shorelines are anti-aliased, so any blend of the two tones).
+        let p = img.get_pixel(10, 199).0;
+        assert!((0..3).all(|c| p[c] >= WATER.0[c] && p[c] <= LAND.0[c]));
         // Empty route still yields a valid card.
         let empty = draw_route_card(&[], &[], 320, 200);
         assert_eq!((empty.width(), empty.height()), (320, 200));

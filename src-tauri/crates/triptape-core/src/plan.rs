@@ -1001,8 +1001,9 @@ pub fn build_plan_with_length(
         },
         cards: HeroCards {
             route: !map_polyline.is_empty(),
-            route_stops: crate::route_stops::chapter_route_stops(&chapters, assets, &map_polyline)
-                .len(),
+            route_stops: crate::route_stops::animated_stop_count(
+                &crate::route_stops::chapter_route_stops(&chapters, assets, &map_polyline),
+            ),
             places: chapters.iter().any(|c| c.place.is_some()),
         },
     };

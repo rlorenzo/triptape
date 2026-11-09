@@ -609,7 +609,7 @@ pub fn render_hero_video(
             - segs.iter().map(|s| s.2).sum::<f64>()
             - closing_secs(
                 has_route,
-                opts.route_stops.len(),
+                triptape_core::route_stops::animated_stop_count(&opts.route_stops),
                 !places.is_empty(),
                 opts.map_secs,
             )
@@ -792,7 +792,7 @@ pub fn render_hero_video(
                 }
                 Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
                 Err(e) => {
-                    if opts.route_stops.len() >= 2 {
+                    if triptape_core::route_stops::animated_stop_count(&opts.route_stops) >= 2 {
                         fallbacks.push(format!("route animation failed, static closing map: {e}"));
                     }
                     None
