@@ -15,6 +15,7 @@ pub mod parallel;
 pub mod plan;
 pub mod privacy;
 pub mod proxies;
+pub mod route_stops;
 pub mod scan;
 pub mod score;
 pub mod types;

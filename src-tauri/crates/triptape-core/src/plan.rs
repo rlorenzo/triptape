@@ -87,8 +87,6 @@ const EST_STILL_SECS: f64 = 4.0;
 const EST_TITLE_SECS: f64 = 2.5;
 /// Opening route map hold (only with a GPS route).
 const EST_MAP_SECS: f64 = 3.0;
-/// Closing route map hold: the opening map plus 1.5 s (GPS route only).
-const EST_CLOSING_MAP_SECS: f64 = 4.5;
 /// Closing places card hold (only when a chapter has a named place).
 const EST_PLACES_SECS: f64 = 4.5;
 /// Overlap of the first cut (circleopen) and the last (circleclose).
@@ -247,6 +245,9 @@ pub fn parse_film_length(spec: &str) -> Result<FilmLength, String> {
 pub struct HeroCards {
     /// Opening and closing route maps (the plan has a GPS route).
     pub route: bool,
+    /// Chapter stops the closing map travels between; fewer than two keep
+    /// the static closing card (see [`crate::route_stops::closing_map_secs`]).
+    pub route_stops: usize,
     /// Closing places card (some chapter has a named place).
     pub places: bool,
 }
@@ -329,7 +330,10 @@ pub fn estimate_hero_secs<'e, 'c>(
         return segs.iter().map(|s| s.1).sum();
     }
     if cards.route {
-        segs.push((Seg::Card, EST_CLOSING_MAP_SECS));
+        segs.push((
+            Seg::Card,
+            crate::route_stops::closing_map_secs(cards.route_stops),
+        ));
     }
     if cards.places {
         segs.push((Seg::Card, EST_PLACES_SECS));
@@ -997,6 +1001,8 @@ pub fn build_plan_with_length(
         },
         cards: HeroCards {
             route: !map_polyline.is_empty(),
+            route_stops: crate::route_stops::chapter_route_stops(&chapters, assets, &map_polyline)
+                .len(),
             places: chapters.iter().any(|c| c.place.is_some()),
         },
     };
@@ -1273,6 +1279,12 @@ fn motion_picks<'a, 'c>(
 /// A raw mean breaks at the antimeridian and is dragged by outliers. The
 /// search is quadratic, so large chapters use an even sample of their fixes.
 fn chapter_place(gps: &[(f64, f64)]) -> Option<String> {
+    crate::geo::place_name(medoid(gps)?)
+}
+
+/// Geographic medoid of `gps`: the fix minimizing total distance to the
+/// others. Large sets use an even sample of their fixes.
+pub(crate) fn medoid(gps: &[(f64, f64)]) -> Option<(f64, f64)> {
     let step = gps.len().div_ceil(MEDOID_MAX_FIXES).max(1);
     let sample: Vec<(f64, f64)> = gps.iter().copied().step_by(step).collect();
     let (_, medoid) = sample
@@ -1282,7 +1294,7 @@ fn chapter_place(gps: &[(f64, f64)]) -> Option<String> {
             (total, p)
         })
         .min_by(|a, b| a.0.total_cmp(&b.0))?;
-    crate::geo::place_name(medoid)
+    Some(medoid)
 }
 
 /// Display title for a cluster label: `2026-10-12 · place 21` (or a bare
@@ -2293,6 +2305,7 @@ mod tests {
             |id| has_caption(plan.captions.get(id).map(String::as_str)),
             HeroCards {
                 route: !plan.map_polyline.is_empty(),
+                route_stops: 0,
                 places: plan.chapters.iter().any(|c| c.place.is_some()),
             },
         )
@@ -2560,6 +2573,7 @@ mod tests {
         // plain 0.54 x2, hero->closing break 0.5, closing 0.7 = 4.82 s.
         let cards = HeroCards {
             route: true,
+            route_stops: 0,
             places: true,
         };
         assert!(
@@ -2568,6 +2582,7 @@ mod tests {
         // Without a route or places only the title card remains.
         let bare = HeroCards {
             route: false,
+            route_stops: 0,
             places: false,
         };
         // 2.5 + 7 + 4 + 6 + 2.5 + 4 = 26 s; cuts 0.7 + 0.54 + 0.8 + 0.54 +
@@ -2579,6 +2594,7 @@ mod tests {
     fn captioned_stills_play_solo_in_the_estimate() {
         let bare = HeroCards {
             route: false,
+            route_stops: 0,
             places: false,
         };
         let est = |ids: &[&str], caps: &[(&str, &str)]| {
@@ -2681,6 +2697,7 @@ mod tests {
         // plus title 2.5 = 19.5 + ... cuts 0.7 + 0.54 + 0.7 = 1.94 s.
         let bare = HeroCards {
             route: false,
+            route_stops: 0,
             places: false,
         };
         assert!(
@@ -2782,6 +2799,7 @@ mod tests {
 
     const NO_CARDS: HeroCards = HeroCards {
         route: false,
+        route_stops: 0,
         places: false,
     };
 
@@ -3241,6 +3259,7 @@ mod tests {
             |_| false,
             HeroCards {
                 route: true,
+                route_stops: 0,
                 places: true,
             },
         );
