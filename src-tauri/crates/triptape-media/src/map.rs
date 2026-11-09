@@ -40,28 +40,11 @@ pub fn draw_route_card(
     // Strokes, pins and land blocks are drawn in 1080p pixels; larger cards
     // (4K) multiply them so the card looks the same, just sharper.
     let k = (h / 1080).max(1) as i32;
-    let mut img = RgbImage::from_pixel(w, h, WATER);
     // Unwrap longitudes first: Los Angeles -> Tokyo crosses the Pacific
     // (102° of span). Raw min/max spans 258° the long way round and
     // crushes the trip into a corner of a half-planet map.
     let route = &unwrap_longitudes(route);
-    if !route.is_empty() {
-        paint_land(&mut img, &RouteFit::new(route, w, h), k as u32);
-    }
-    // Graticule: faint grid so the card reads as a map, not a black card.
-    let grid = Rgb([31, 44, 63]);
-    for gx in 1..8 {
-        let x = w * gx / 8;
-        for y in 0..h {
-            img.put_pixel(x, y, grid);
-        }
-    }
-    for gy in 1..6 {
-        let y = h * gy / 6;
-        for x in 0..w {
-            img.put_pixel(x, y, grid);
-        }
-    }
+    let mut img = draw_base(route, w, h);
     if route.is_empty() {
         return img;
     }
@@ -102,9 +85,35 @@ pub fn draw_route_card(
     img
 }
 
+/// Water, land and graticule for a route whose longitudes are already
+/// unwrapped: the part of the card that never changes, shared by the static
+/// card and the animated recap (which paints the route over it per frame).
+pub(crate) fn draw_base(route: &[(f64, f64)], w: u32, h: u32) -> RgbImage {
+    let k = (h / 1080).max(1);
+    let mut img = RgbImage::from_pixel(w, h, WATER);
+    if !route.is_empty() {
+        paint_land(&mut img, &RouteFit::new(route, w, h), k);
+    }
+    // Graticule: faint grid so the card reads as a map, not a black card.
+    let grid = Rgb([31, 44, 63]);
+    for gx in 1..8 {
+        let x = w * gx / 8;
+        for y in 0..h {
+            img.put_pixel(x, y, grid);
+        }
+    }
+    for gy in 1..6 {
+        let y = h * gy / 6;
+        for x in 0..w {
+            img.put_pixel(x, y, grid);
+        }
+    }
+    img
+}
+
 /// Shift longitudes by ±360° so consecutive points never jump more
 /// than 180°, keeping antimeridian-crossing routes continuous.
-fn unwrap_longitudes(route: &[(f64, f64)]) -> Vec<(f64, f64)> {
+pub(crate) fn unwrap_longitudes(route: &[(f64, f64)]) -> Vec<(f64, f64)> {
     let mut out: Vec<(f64, f64)> = Vec::with_capacity(route.len());
     for &(lat, lon) in route {
         let lon = match out.last() {
@@ -120,7 +129,7 @@ fn unwrap_longitudes(route: &[(f64, f64)]) -> Vec<(f64, f64)> {
 /// 8% padding (fine for a trip-scale card). Single-point routes collapse
 /// to a pin card. Route, pins, and land all share this one mapping, so
 /// they cannot drift apart.
-struct RouteFit {
+pub(crate) struct RouteFit {
     min_lat: f64,
     min_lon: f64,
     span_lat: f64,
@@ -133,7 +142,7 @@ impl RouteFit {
     const PAD: f64 = 0.08;
     const MIN_SPAN_DEG: f64 = 0.02;
 
-    fn new(route: &[(f64, f64)], w: u32, h: u32) -> Self {
+    pub(crate) fn new(route: &[(f64, f64)], w: u32, h: u32) -> Self {
         let (mut min_lat, mut max_lat) = (f64::INFINITY, f64::NEG_INFINITY);
         let (mut min_lon, mut max_lon) = (f64::INFINITY, f64::NEG_INFINITY);
         for &(lat, lon) in route {
@@ -152,13 +161,19 @@ impl RouteFit {
         }
     }
 
-    fn project(&self, (lat, lon): (f64, f64)) -> (i32, i32) {
+    fn project(&self, gps: (f64, f64)) -> (i32, i32) {
+        let (x, y) = self.project_f(gps);
+        (x as i32, y as i32)
+    }
+
+    /// [`Self::project`] without the pixel rounding, for sub-pixel motion.
+    pub(crate) fn project_f(&self, (lat, lon): (f64, f64)) -> (f64, f64) {
         let fx = (lon - self.min_lon) / self.span_lon;
         let fy = 1.0 - (lat - self.min_lat) / self.span_lat;
         let inner = 1.0 - 2.0 * Self::PAD;
         (
-            ((Self::PAD + fx * inner) * self.w) as i32,
-            ((Self::PAD + fy * inner) * self.h) as i32,
+            (Self::PAD + fx * inner) * self.w,
+            (Self::PAD + fy * inner) * self.h,
         )
     }
 

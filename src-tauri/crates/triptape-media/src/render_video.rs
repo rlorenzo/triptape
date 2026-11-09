@@ -274,6 +274,9 @@ pub struct VideoOptions {
     /// Segments rendered at once; `None` picks [`default_jobs`]. Short mode
     /// always renders sequentially (its budget couples the segments).
     pub jobs: Option<usize>,
+    /// Chapter stops the closing map travels between (indices into the
+    /// plan's `map_polyline`). Fewer than two keep the static closing card.
+    pub route_stops: Vec<triptape_core::route_stops::RouteStop>,
 }
 
 impl Default for VideoOptions {
@@ -290,6 +293,7 @@ impl Default for VideoOptions {
             typst_bin: "typst".into(),
             resolution: Resolution::default(),
             jobs: None,
+            route_stops: vec![],
         }
     }
 }
@@ -337,10 +341,20 @@ const CREDITS_SECS: f64 = 4.5;
 /// Closing map recap runs this much longer than the opening map.
 const CLOSING_MAP_EXTRA_SECS: f64 = 1.5;
 
-/// Seconds the closing cards add, reserved up front in short mode.
-fn closing_secs(has_route: bool, has_places: bool, map_secs: f64) -> f64 {
-    let map = if has_route {
+/// Seconds the closing map runs: the animated recap's budgeted length when
+/// there are stops to travel between, else the static card's hold.
+fn closing_map_secs(route_stops: usize, map_secs: f64) -> f64 {
+    if route_stops >= 2 {
+        triptape_core::route_stops::closing_map_secs(route_stops)
+    } else {
         map_secs + CLOSING_MAP_EXTRA_SECS
+    }
+}
+
+/// Seconds the closing cards add, reserved up front in short mode.
+fn closing_secs(has_route: bool, route_stops: usize, has_places: bool, map_secs: f64) -> f64 {
+    let map = if has_route {
+        closing_map_secs(route_stops, map_secs)
     } else {
         0.0
     };
@@ -593,7 +607,12 @@ pub fn render_hero_video(
         let has_route = map_card.is_some() && !plan.map_polyline.is_empty();
         SHORT_FILM_SECS
             - segs.iter().map(|s| s.2).sum::<f64>()
-            - closing_secs(has_route, !places.is_empty(), opts.map_secs)
+            - closing_secs(
+                has_route,
+                opts.route_stops.len(),
+                !places.is_empty(),
+                opts.map_secs,
+            )
     } else {
         f64::INFINITY
     };
@@ -756,8 +775,37 @@ pub fn render_hero_video(
     if let Some(card) = map_card {
         if !plan.map_polyline.is_empty() {
             let close_mp4 = work_dir.join("seg_closing.mp4");
-            let dur = opts.map_secs + CLOSING_MAP_EXTRA_SECS;
-            match crate::map::render_map_push_in(caps, card, &close_mp4, dur, 1, opts.resolution) {
+            // Animated travel recap; the static pull-out card is the fallback.
+            let animated = crate::routeanim::render_route_recap(
+                caps,
+                &plan.map_polyline,
+                &opts.route_stops,
+                opts.resolution,
+                &opts.typst_bin,
+                work_dir,
+                &close_mp4,
+            );
+            let animated = match animated {
+                Ok(rep) => {
+                    fallbacks.extend(rep.notes);
+                    Some(rep.secs)
+                }
+                Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
+                Err(e) => {
+                    if opts.route_stops.len() >= 2 {
+                        fallbacks.push(format!("route animation failed, static closing map: {e}"));
+                    }
+                    None
+                }
+            };
+            let dur = animated.unwrap_or(opts.map_secs + CLOSING_MAP_EXTRA_SECS);
+            let rendered = match animated {
+                Some(_) => Ok(()),
+                None => {
+                    crate::map::render_map_push_in(caps, card, &close_mp4, dur, 1, opts.resolution)
+                }
+            };
+            match rendered {
                 Ok(()) => segs.push((card_entry("closing", card), close_mp4, dur, "still".into())),
                 Err(e) => fallbacks.push(format!("closing map skipped: {e}")),
             }
@@ -2367,15 +2415,23 @@ mod tests {
             for cards in [
                 HeroCards {
                     route: true,
+                    route_stops: 0,
                     places: true,
                 },
                 HeroCards {
                     route: false,
+                    route_stops: 0,
                     places: false,
                 },
                 HeroCards {
                     route: true,
+                    route_stops: 0,
                     places: false,
+                },
+                HeroCards {
+                    route: true,
+                    route_stops: 6,
+                    places: true,
                 },
             ] {
                 // -- renderer replay: groups of consecutive same-chapter stills.
@@ -2429,7 +2485,7 @@ mod tests {
                 if cards.route {
                     segs.push((
                         "closing".into(),
-                        opts.map_secs + CLOSING_MAP_EXTRA_SECS,
+                        closing_map_secs(cards.route_stops, opts.map_secs),
                         "still",
                     ));
                 }
@@ -3266,10 +3322,13 @@ mod tests {
 
     #[test]
     fn closing_secs_counts_only_cards_that_render() {
-        assert_eq!(closing_secs(true, true, 3.0), 9.0);
-        assert_eq!(closing_secs(true, false, 3.0), 4.5);
-        assert_eq!(closing_secs(false, true, 3.0), CREDITS_SECS);
-        assert_eq!(closing_secs(false, false, 3.0), 0.0);
+        assert_eq!(closing_secs(true, 0, true, 3.0), 9.0);
+        assert_eq!(closing_secs(true, 1, false, 3.0), 4.5);
+        assert_eq!(closing_secs(false, 5, true, 3.0), CREDITS_SECS);
+        assert_eq!(closing_secs(false, 0, false, 3.0), 0.0);
+        // Two or more stops: the animated recap's budget replaces the card.
+        assert_eq!(closing_secs(true, 6, false, 3.0), 8.4);
+        assert_eq!(closing_secs(true, 40, true, 3.0), 14.0 + CREDITS_SECS);
     }
 
     #[test]

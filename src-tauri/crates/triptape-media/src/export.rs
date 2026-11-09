@@ -360,6 +360,11 @@ fn export_inner(
                 typst_bin: opts.typst_bin.clone(),
                 resolution: opts.resolution,
                 jobs: opts.jobs,
+                route_stops: triptape_core::route_stops::chapter_route_stops(
+                    &plan.chapters,
+                    assets,
+                    &plan.map_polyline,
+                ),
                 ..Default::default()
             },
         ) {
