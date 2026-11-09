@@ -109,3 +109,25 @@ fn stats_reports_the_given_cap_and_rejects_a_bad_one() {
     ]);
     assert!(!ok);
 }
+
+#[test]
+fn stats_shows_limit_floor_free_space_and_headroom() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().to_str().unwrap();
+    entry(t.path(), "dd44", 2048);
+    let (ok, out) = triptape(&[
+        "cache",
+        "stats",
+        "--segment-cache",
+        dir,
+        "--segment-cache-max",
+        "4GB",
+        "--segment-cache-min-free",
+        "1GB",
+    ]);
+    assert!(ok);
+    assert!(out.contains("limit: 4.0 GB"), "{out}");
+    assert!(out.contains("free-space floor: 1.0 GB"), "{out}");
+    assert!(out.contains("disk free:"), "{out}");
+    assert!(out.contains("headroom:"), "{out}");
+}

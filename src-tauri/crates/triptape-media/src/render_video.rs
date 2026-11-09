@@ -4002,10 +4002,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let (plan, entries) = parallel_fixture(dir.path());
-        let cfg = SegmentCacheConfig {
-            dir: dir.path().join("cache"),
-            max_bytes: None,
-        };
+        let cfg = SegmentCacheConfig::roomy(dir.path().join("cache"));
         let run = |name: &str, entries: &[ResolvedEntry]| {
             let work = dir.path().join(name).join(".work");
             let cache = SegmentCache::open(&cfg, "ffmpeg test".into(), &work).unwrap();
@@ -4052,10 +4049,7 @@ mod tests {
             ..Default::default()
         };
         let dir = tempfile::tempdir().unwrap();
-        let cfg = SegmentCacheConfig {
-            dir: dir.path().join("c"),
-            max_bytes: None,
-        };
+        let cfg = SegmentCacheConfig::roomy(dir.path().join("c"));
         let cache = SegmentCache::open(&cfg, "ffmpeg test".into(), &dir.path().join("w")).unwrap();
         let mk = |id: &str| {
             let p = dir.path().join(format!("{id}.png"));
@@ -4129,10 +4123,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let (plan, entries) = parallel_fixture(dir.path());
-        let cfg = SegmentCacheConfig {
-            dir: dir.path().join("cache"),
-            max_bytes: None,
-        };
+        let cfg = SegmentCacheConfig::roomy(dir.path().join("cache"));
         let run = |name: &str| {
             let work = dir.path().join(name).join(".work");
             let cache = SegmentCache::open(&cfg, "ffmpeg test".into(), &work).unwrap();
@@ -4195,10 +4186,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(made.success());
-        let cfg = SegmentCacheConfig {
-            dir: dir.path().join("cache"),
-            max_bytes: None,
-        };
+        let cfg = SegmentCacheConfig::roomy(dir.path().join("cache"));
         let work = dir.path().join("w");
         std::fs::create_dir_all(&work).unwrap();
         let cache = SegmentCache::open(&cfg, "ffmpeg test".into(), &work).unwrap();
@@ -4262,10 +4250,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(made.success());
-        let cfg = SegmentCacheConfig {
-            dir: dir.path().join("cache"),
-            max_bytes: None,
-        };
+        let cfg = SegmentCacheConfig::roomy(dir.path().join("cache"));
         let render = |work_name: &str, end: f64| {
             let work = dir.path().join(work_name);
             std::fs::create_dir_all(&work).unwrap();

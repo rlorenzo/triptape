@@ -54,7 +54,7 @@ pub struct SegmentCacheReport {
     /// Lower-third overlays taken from the cache / asked of it.
     pub overlays_reused: usize,
     pub overlays_total: usize,
-    /// Fresh segments left out because the volume was low on space.
+    /// Fresh segments left out because they would break the free-space floor.
     pub skipped_low_disk: usize,
     /// Old entries removed to stay within the size cap.
     pub evicted: usize,
@@ -262,9 +262,8 @@ fn record_cache_use(cache: &SegmentCache, evicted: usize, report: &mut ExportRep
     }
     if stats.skipped_low_disk > 0 {
         report.fallbacks.push(format!(
-            "segment cache: {} segments not cached (under {} free)",
-            stats.skipped_low_disk,
-            crate::segment_cache::fmt_bytes(crate::segment_cache::LOW_DISK_BYTES)
+            "segment cache: {} segments not cached (the disk's free-space floor would not hold)",
+            stats.skipped_low_disk
         ));
     }
 }
@@ -647,10 +646,7 @@ mod tests {
             resolution: Default::default(),
             jobs: None,
             progress: Default::default(),
-            segment_cache: Some(SegmentCacheConfig {
-                dir: t.path().join("cache"),
-                max_bytes: None,
-            }),
+            segment_cache: Some(SegmentCacheConfig::roomy(t.path().join("cache"))),
             itinerary: None,
         };
         let report = export_all(&Default::default(), &empty_plan(), &[], &out, &opts).unwrap();

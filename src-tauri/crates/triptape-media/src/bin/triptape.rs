@@ -7,7 +7,7 @@
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--itinerary itinerary.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
-//!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE]
+//!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
 //! triptape cache stats|clear [--segment-cache DIR]
 //! ```
 
@@ -696,7 +696,12 @@ fn segment_cache_config(flags: &HashMap<String, String>) -> Option<SegmentCacheC
     if dir.is_none() {
         eprintln!("segment cache off: no cache directory on this platform");
     }
-    dir.map(|dir| SegmentCacheConfig { dir, max_bytes })
+    let min_free_bytes = cache_min_free_flag(flags);
+    dir.map(|dir| SegmentCacheConfig {
+        max_bytes,
+        min_free_bytes,
+        ..SegmentCacheConfig::new(dir)
+    })
 }
 
 /// `--segment-cache DIR`, else the platform default.
@@ -714,6 +719,13 @@ fn cache_max_flag(flags: &HashMap<String, String>) -> Option<u64> {
         .map(|v| segment_cache::parse_size(v).unwrap_or_else(|e| die("segment-cache-max", e)))
 }
 
+/// `--segment-cache-min-free SIZE`, when given.
+fn cache_min_free_flag(flags: &HashMap<String, String>) -> Option<u64> {
+    flags
+        .get("segment-cache-min-free")
+        .map(|v| segment_cache::parse_size(v).unwrap_or_else(|e| die("segment-cache-min-free", e)))
+}
+
 /// `cache stats` / `cache clear`.
 fn cache_cmd(sub: &str, flags: &HashMap<String, String>) {
     let dir = cache_dir_flag(flags)
@@ -721,15 +733,36 @@ fn cache_cmd(sub: &str, flags: &HashMap<String, String>) {
     match sub {
         "stats" => {
             let st = segment_cache::disk_stats(&dir);
-            let cap = segment_cache::resolve_cap(cache_max_flag(flags), &dir);
+            let disk = segment_cache::disk_space(&dir);
+            let policy = segment_cache::Policy::resolve(
+                cache_max_flag(flags),
+                cache_min_free_flag(flags),
+                disk,
+            );
+            let size = segment_cache::fmt_bytes;
             println!("segment cache: {}", dir.display());
             println!(
-                "entries: {}  size: {}  cap: {}  exports running: {}",
+                "entries: {}  size: {}  exports running: {}",
                 st.entries,
-                segment_cache::fmt_bytes(st.bytes),
-                segment_cache::fmt_bytes(cap),
+                size(st.bytes),
                 st.live_leases
             );
+            println!(
+                "limit: {}  free-space floor: {}",
+                size(policy.max_bytes),
+                size(policy.floor_bytes)
+            );
+            match disk {
+                Some(d) => println!(
+                    "disk free: {}  headroom: {} (room to grow before the limit or the floor)",
+                    size(d.free),
+                    size(policy.headroom(st.bytes, Some(d.free)))
+                ),
+                None => println!(
+                    "disk free: unknown  headroom: {} (limit only)",
+                    size(policy.headroom(st.bytes, None))
+                ),
+            }
         }
         "clear" => {
             let r = segment_cache::clear(&dir);
