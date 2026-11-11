@@ -91,6 +91,96 @@ pub fn is_land(gps: (f64, f64)) -> bool {
     false
 }
 
+/// Land fraction around `gps` by bilinear blend of the four nearest raw
+/// grid cells (no coastal buffer, unlike [`is_land`]): 0.0 open water to
+/// 1.0 inland, with the coastline at 0.5. For drawing smooth shorelines.
+pub fn land_fraction(gps: (f64, f64)) -> f32 {
+    let fc = (gps.1 + 180.0) * CELLS_PER_DEG as f64 - 0.5;
+    let fr = (gps.0 + 90.0) * CELLS_PER_DEG as f64 - 0.5;
+    let (c0, r0) = (fc.floor(), fr.floor());
+    let (tc, tr) = ((fc - c0) as f32, (fr - r0) as f32);
+    let cell = |r: i64, c: i64| -> f32 {
+        if !(0..GRID_H).contains(&r) {
+            return 0.0;
+        }
+        let idx = (r * GRID_W + c.rem_euclid(GRID_W)) as usize;
+        f32::from(LAND_GRID[idx / 8] >> (idx % 8) & 1)
+    };
+    let (r0, c0) = (r0 as i64, c0 as i64);
+    let top = cell(r0, c0) * (1.0 - tc) + cell(r0, c0 + 1) * tc;
+    let bottom = cell(r0 + 1, c0) * (1.0 - tc) + cell(r0 + 1, c0 + 1) * tc;
+    top * (1.0 - tr) + bottom * tr
+}
+
+/// The land grid blurred (one pass of a 1-4-6-4-1 kernel in each axis,
+/// sigma about 1 cell) into bytes, built on first use: 26 MB. Bilinear
+/// lookups into it give coastlines without the raw grid's stair-steps when
+/// zoomed in.
+fn blurred_grid() -> &'static [u8] {
+    static BLURRED: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    BLURRED.get_or_init(|| {
+        let (w, h) = (GRID_W as usize, GRID_H as usize);
+        let mut cur: Vec<u8> = (0..w * h)
+            .map(|i| {
+                if LAND_GRID[i / 8] >> (i % 8) & 1 == 1 {
+                    255
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let mut tmp = vec![0u8; w * h];
+        const K: [u32; 5] = [1, 4, 6, 4, 1];
+        // One pass: sigma about one cell, enough to smooth stair-steps
+        // without melting small islands.
+        for _ in 0..1 {
+            // Horizontal (wraps at the antimeridian).
+            for y in 0..h {
+                let row = &cur[y * w..(y + 1) * w];
+                for x in 0..w {
+                    let mut acc = 0;
+                    for (k, wgt) in K.iter().enumerate() {
+                        acc += wgt * u32::from(row[(x + w + k - 2) % w]);
+                    }
+                    tmp[y * w + x] = (acc / 16) as u8;
+                }
+            }
+            // Vertical (clamped at the poles).
+            for y in 0..h {
+                for x in 0..w {
+                    let mut acc = 0;
+                    for (k, wgt) in K.iter().enumerate() {
+                        let yy = (y + k).saturating_sub(2).min(h - 1);
+                        acc += wgt * u32::from(tmp[yy * w + x]);
+                    }
+                    cur[y * w + x] = (acc / 16) as u8;
+                }
+            }
+        }
+        cur
+    })
+}
+
+/// [`land_fraction`] from the blurred grid: smoother shorelines, 0.5 still
+/// the coast. Builds a 26 MB table on first call.
+pub fn land_fraction_smooth(gps: (f64, f64)) -> f32 {
+    let grid = blurred_grid();
+    let fc = (gps.1 + 180.0) * CELLS_PER_DEG as f64 - 0.5;
+    let fr = (gps.0 + 90.0) * CELLS_PER_DEG as f64 - 0.5;
+    let (c0, r0) = (fc.floor(), fr.floor());
+    let (tc, tr) = ((fc - c0) as f32, (fr - r0) as f32);
+    let cell = |r: i64, c: i64| -> f32 {
+        if !(0..GRID_H).contains(&r) {
+            return 0.0;
+        }
+        f32::from(grid[(r * GRID_W + c.rem_euclid(GRID_W)) as usize]) / 255.0
+    };
+    let (r0, c0) = (r0 as i64, c0 as i64);
+    let top = cell(r0, c0) * (1.0 - tc) + cell(r0, c0 + 1) * tc;
+    let bottom = cell(r0 + 1, c0) * (1.0 - tc) + cell(r0 + 1, c0 + 1) * tc;
+    top * (1.0 - tr) + bottom * tr
+}
+
 /// The name for `gps`: a nearby attraction beats the generic city.
 /// `None` when nothing is close enough to name honestly (open water,
 /// remote areas). This is the only place-name source in the app, backed
@@ -283,6 +373,49 @@ mod tests {
         assert!(!is_land((16.564, 111.011)));
         // Singapore harbor counts as landfall.
         assert!(is_land((1.264, 103.840)));
+    }
+
+    #[test]
+    fn land_fraction_is_smooth_and_has_no_coastal_buffer() {
+        // Inland Honshu is land, mid-Pacific is water, the coast in between.
+        assert_eq!(land_fraction((36.0, 138.0)), 1.0);
+        assert_eq!(land_fraction((20.0, -150.0)), 0.0);
+        // The buffered test calls 8 km offshore "land"; the raw fraction
+        // does not, and it varies continuously across a coast.
+        let mut vals = vec![];
+        for i in 0..40 {
+            vals.push(land_fraction((35.0, 139.0 + f64::from(i) * 0.02)));
+        }
+        assert!(vals.iter().all(|v| (0.0..=1.0).contains(v)));
+        assert!(vals.iter().any(|v| *v > 0.0 && *v < 1.0), "has a coast");
+        // Edges stay in bounds, including across the antimeridian.
+        let _ = land_fraction((-90.0, 0.0));
+        let _ = land_fraction((90.0, 179.99));
+        let _ = land_fraction((10.0, 540.0));
+    }
+
+    #[test]
+    fn smooth_fraction_agrees_with_the_raw_grid_away_from_coasts() {
+        assert!(land_fraction_smooth((36.0, 138.0)) > 0.95);
+        assert!(land_fraction_smooth((20.0, -150.0)) < 0.05);
+        // Across a coastline it rises smoothly (small steps), unlike the raw grid.
+        let steps: Vec<f32> = (0..80)
+            .map(|i| land_fraction_smooth((35.0, 139.0 + f64::from(i) * 0.01)))
+            .collect();
+        let max_jump = steps
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
+        let raw: Vec<f32> = (0..80)
+            .map(|i| land_fraction((35.0, 139.0 + f64::from(i) * 0.01)))
+            .collect();
+        let raw_jump = raw
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
+        assert!(max_jump <= raw_jump + 1e-6, "{max_jump} vs {raw_jump}");
+        let _ = land_fraction_smooth((10.0, 540.0));
+        let _ = land_fraction_smooth((-90.0, 0.0));
     }
 
     #[test]

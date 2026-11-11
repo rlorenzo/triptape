@@ -86,6 +86,9 @@ pub fn glide(caps: &Capabilities, frames: u32, w: u32, h: u32, variant: usize) -
     glide_depth(caps, frames, w, h, variant, GLIDE_DEPTH)
 }
 
+/// Distinct motions [`glide`] cycles through (by `variant`).
+pub const GLIDE_VARIANTS: usize = 4;
+
 /// Window divisor of the standard glide: the window shrinks to
 /// `(D-1)/D` of the frame, i.e. a 1.05x push at 21.
 pub const GLIDE_DEPTH: u32 = 21;
@@ -111,7 +114,7 @@ pub fn glide_depth(
     let p = format!("(min(in-1\\,{denom})/{denom})");
     // Window size as a fraction of the frame, and where its slack sits.
     let d1 = depth - 1;
-    let (size, slack) = match variant % 4 {
+    let (size, slack) = match variant % GLIDE_VARIANTS {
         0 => (format!("(1-{p}/{depth})"), "0.5".to_string()),
         1 => (format!("(({d1}+{p})/{depth})"), "0.5".to_string()),
         2 => (format!("({d1}/{depth})"), p),
@@ -228,6 +231,8 @@ pub struct Capabilities {
     pub threads: Option<usize>,
     /// Cancel flag and progress sink; every [`Capabilities::run`] polls it.
     pub progress: crate::progress::Progress,
+    /// Hero-segment render cache for the running export (`None`: off).
+    pub segment_cache: Option<std::sync::Arc<crate::segment_cache::SegmentCache>>,
 }
 
 impl Capabilities {
@@ -328,7 +333,7 @@ pub fn probe_capabilities(ffmpeg_bin: &str, ffprobe_bin: &str) -> Capabilities {
     }
 }
 
-fn run_capture(bin: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn run_capture(bin: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(bin).args(args).output().ok()?;
     if out.status.success() {
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -1261,7 +1266,14 @@ mod tests {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().join("Japan to Singapore 2026 it's: [a],b");
+        // Windows forbids ':' in a file name; there the drive letter's colon
+        // (`C:\...`) still has to survive the filter escaping.
+        let name = if cfg!(windows) {
+            "Japan to Singapore 2026 it's [a],b"
+        } else {
+            "Japan to Singapore 2026 it's: [a],b"
+        };
+        let dir = temp.path().join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let srt = dir.join("film.srt");
         std::fs::write(

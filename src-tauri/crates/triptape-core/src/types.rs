@@ -166,6 +166,11 @@ pub struct MusicPick {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanEntry {
     pub asset_id: String,
+    /// Which playback window of the asset this entry plays: an index into
+    /// `Score::clip_windows`. Always 0 except for the sibling entries of a
+    /// long multi-scene clip. `(asset_id, window)` identifies an entry.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub window: u32,
     pub content_hash: Option<String>,
     pub size_bytes: u64,
     pub mtime: i64,
@@ -186,6 +191,24 @@ pub struct Plan {
     /// Route polyline (lat, lon) with day markers.
     pub map_polyline: Vec<(f64, f64)>,
     pub music: MusicPick,
+}
+
+impl PlanEntry {
+    /// Stable identity within a plan list: the asset and which of its
+    /// windows this entry plays.
+    pub fn key(&self) -> (&str, u32) {
+        (&self.asset_id, self.window)
+    }
+}
+
+/// How many distinct assets `entries` show: sibling windows of one clip
+/// count once.
+pub fn distinct_assets(entries: &[PlanEntry]) -> usize {
+    entries
+        .iter()
+        .map(|e| e.asset_id.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
 }
 
 impl Plan {
@@ -228,17 +251,83 @@ pub struct Score {
     /// `None` on older scores; see [`Score::tech_quality`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality: Option<f32>,
+    /// Raw Hasler-Susstrunk colourfulness of a still (about 0 for grey,
+    /// 80+ for vivid). `None` on older scores and for video. Ranked within
+    /// the chapter by the plan, never compared across chapters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colourfulness: Option<f32>,
     /// Whether this asset is a story highlight.
     pub highlight: bool,
     /// One short string per contributing signal.
     pub reasons: Vec<String>,
-    /// Best `(start, end)` window in seconds for a long video clip, picked
-    /// at ingest. `None` keeps the start-of-clip trim.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clip_window: Option<(f64, f64)>,
+    /// Playback windows picked at ingest for a long video clip, in time
+    /// order: one per scene for long multi-scene clips, otherwise a single
+    /// best window. Empty keeps the start-of-clip trim. Scores saved before
+    /// scene splitting stored one `clip_window` pair; it still loads here.
+    #[serde(
+        default,
+        alias = "clip_window",
+        deserialize_with = "deserialize_clip_windows",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub clip_windows: Vec<ClipSpan>,
+}
+
+/// One playback window of a video clip, in seconds from the clip start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClipSpan {
+    pub start: f64,
+    pub end: f64,
+    /// Mean sample score (0..1) over the window; ranks sibling windows.
+    /// 0 for windows converted from the old single-window format.
+    #[serde(default)]
+    pub quality: f32,
+}
+
+impl ClipSpan {
+    /// The best of `windows` (highest quality, earliest on ties) and its
+    /// index.
+    pub fn best(windows: &[ClipSpan]) -> Option<(usize, ClipSpan)> {
+        let mut best: Option<(usize, ClipSpan)> = None;
+        for (i, w) in windows.iter().enumerate() {
+            if best.is_none_or(|(_, b)| w.quality > b.quality) {
+                best = Some((i, *w));
+            }
+        }
+        best
+    }
+}
+
+/// Accepts the current window list or the old single `(start, end)` pair.
+fn deserialize_clip_windows<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<Vec<ClipSpan>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Many(Vec<ClipSpan>),
+        One(Option<(f64, f64)>),
+    }
+    Ok(match Stored::deserialize(de)? {
+        Stored::Many(v) => v,
+        Stored::One(w) => w
+            .map(|(start, end)| ClipSpan {
+                start,
+                end,
+                quality: 0.0,
+            })
+            .into_iter()
+            .collect(),
+    })
 }
 
 impl Score {
+    /// The clip's best window (highest quality, earliest on ties) and its
+    /// index in [`Score::clip_windows`].
+    pub fn best_clip_window(&self) -> Option<(usize, ClipSpan)> {
+        ClipSpan::best(&self.clip_windows)
+    }
+
     /// Technical quality without story bonuses: the stored `quality`, or
     /// `total - bonus` for scores saved before it existed.
     pub fn tech_quality(&self) -> f32 {
@@ -246,8 +335,8 @@ impl Score {
     }
 }
 
-fn is_zero(v: &f32) -> bool {
-    *v == 0.0
+fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 /// Durable job state machine.
@@ -275,4 +364,74 @@ pub struct Job {
     pub current_step: Option<String>,
     pub temp_dir: Option<String>,
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_single_clip_window_loads_as_one_window() {
+        let old = r#"{"sharpness":0.8,"exposure":0.9,"blur":0.1,"total":0.7,
+            "highlight":false,"reasons":[],"clip_window":[4.5,10.5]}"#;
+        let s: Score = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            s.clip_windows,
+            vec![ClipSpan {
+                start: 4.5,
+                end: 10.5,
+                quality: 0.0
+            }]
+        );
+        assert_eq!(s.best_clip_window().map(|b| b.0), Some(0));
+    }
+
+    #[test]
+    fn best_window_is_highest_quality_and_earliest_on_ties() {
+        let w = |start, quality| ClipSpan {
+            start,
+            end: start + 6.0,
+            quality,
+        };
+        assert_eq!(ClipSpan::best(&[]), None);
+        let ws = [w(0.0, 0.5), w(20.0, 0.9), w(40.0, 0.9)];
+        assert_eq!(ClipSpan::best(&ws), Some((1, ws[1])));
+    }
+
+    #[test]
+    fn scores_without_a_window_and_new_lists_round_trip() {
+        let none = r#"{"sharpness":0.8,"exposure":0.9,"blur":0.1,"total":0.7,
+            "highlight":false,"reasons":[]}"#;
+        assert!(serde_json::from_str::<Score>(none)
+            .unwrap()
+            .clip_windows
+            .is_empty());
+        let s = Score {
+            clip_windows: vec![
+                ClipSpan {
+                    start: 1.0,
+                    end: 7.0,
+                    quality: 0.4,
+                },
+                ClipSpan {
+                    start: 30.0,
+                    end: 36.0,
+                    quality: 0.8,
+                },
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("clip_windows"));
+        let back: Score = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.best_clip_window().map(|b| b.0), Some(1));
+        // `null` (the old Option written without skip) is also fine.
+        let null = r#"{"sharpness":0,"exposure":0,"blur":0,"total":0,
+            "highlight":false,"reasons":[],"clip_window":null}"#;
+        assert!(serde_json::from_str::<Score>(null)
+            .unwrap()
+            .clip_windows
+            .is_empty());
+    }
 }

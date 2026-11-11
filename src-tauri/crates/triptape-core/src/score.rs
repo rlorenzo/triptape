@@ -62,6 +62,37 @@ pub fn frame_stats(gray: &[u8], width: u32, height: u32) -> Option<FrameStats> {
     })
 }
 
+/// Colourfulness above this adds nothing in the chapter ranking, so
+/// garish or oversaturated frames tie with merely vivid ones. "Extremely
+/// colourful" on the Hasler-Susstrunk scale.
+pub const COLOUR_CAP: f32 = 80.0;
+
+/// Hasler-Susstrunk colourfulness of interleaved 8-bit RGB pixels:
+/// `sqrt(σrg² + σyb²) + 0.3·sqrt(μrg² + μyb²)` with `rg = R - G` and
+/// `yb = 0.5(R + G) - B`. About 0 for grey, 15 slightly, 33 averagely,
+/// 59 highly colourful. `None` for an empty buffer.
+pub fn colourfulness(rgb: &[u8]) -> Option<f32> {
+    let n = rgb.len() / 3;
+    if n == 0 {
+        return None;
+    }
+    let (mut srg, mut syb, mut srg2, mut syb2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for px in rgb.as_chunks::<3>().0 {
+        let (r, g, b) = (px[0] as f64, px[1] as f64, px[2] as f64);
+        let rg = r - g;
+        let yb = 0.5 * (r + g) - b;
+        srg += rg;
+        syb += yb;
+        srg2 += rg * rg;
+        syb2 += yb * yb;
+    }
+    let n = n as f64;
+    let (mrg, myb) = (srg / n, syb / n);
+    let var_rg = (srg2 / n - mrg * mrg).max(0.0);
+    let var_yb = (syb2 / n - myb * myb).max(0.0);
+    Some(((var_rg + var_yb).sqrt() + 0.3 * (mrg * mrg + myb * myb).sqrt()) as f32)
+}
+
 /// Score one still frame. Pure math over stats — unit-testable.
 pub fn score_still(stats: &FrameStats) -> Score {
     let mut reasons = vec![];
@@ -278,7 +309,12 @@ pub fn score_video(window_quality: Option<f32>, signals: &StorySignals) -> Score
 pub fn score_still_image(img: &image::DynamicImage, signals: &StorySignals) -> Option<Score> {
     let gray = img.to_luma8();
     let stats = frame_stats(gray.as_raw(), gray.width(), gray.height())?;
-    let base = score_still(&stats);
+    let mut base = score_still(&stats);
+    // Borrow the pixels when already RGB8 rather than copying the frame.
+    base.colourfulness = match img.as_rgb8() {
+        Some(rgb) => colourfulness(rgb.as_raw()),
+        None => colourfulness(img.to_rgb8().as_raw()),
+    };
     Some(highlight_score(&base, signals, false))
 }
 
@@ -304,6 +340,67 @@ mod tests {
             variance: var,
             edge_energy: edge,
         }
+    }
+
+    fn solid(rgb: [u8; 3]) -> Vec<u8> {
+        rgb.iter().copied().cycle().take(3 * 64).collect()
+    }
+
+    #[test]
+    fn grey_is_not_colourful() {
+        assert!(colourfulness(&solid([128, 128, 128])).unwrap() < 1e-3);
+        let ramp: Vec<u8> = (0..=255u8).flat_map(|v| [v, v, v]).collect();
+        assert!(colourfulness(&ramp).unwrap() < 1e-3);
+        assert_eq!(colourfulness(&[]), None);
+    }
+
+    #[test]
+    fn saturated_mix_is_very_colourful() {
+        let mut px = vec![];
+        for c in [[255u8, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]] {
+            px.extend(solid(c));
+        }
+        assert!(colourfulness(&px).unwrap() > COLOUR_CAP);
+        // A flat colour cast still counts, through the mean term.
+        let cast = colourfulness(&solid([200, 120, 60])).unwrap();
+        assert!(cast > 20.0, "cast={cast}");
+    }
+
+    #[test]
+    fn still_image_records_colourfulness() {
+        let grey =
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 8, image::Rgb([90; 3])));
+        let red = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            8,
+            8,
+            image::Rgb([220, 30, 30]),
+        ));
+        let sig = StorySignals::default();
+        let g = score_still_image(&grey, &sig).unwrap();
+        let r = score_still_image(&red, &sig).unwrap();
+        assert!(g.colourfulness.unwrap() < 1e-3);
+        assert!(r.colourfulness.unwrap() > 50.0);
+        assert!(
+            (g.total - r.total).abs() < 1e-6,
+            "colour must not change the absolute total"
+        );
+        // Non-RGB8 frames are converted first and score the same.
+        let rgba = image::DynamicImage::ImageRgba8(red.to_rgba8());
+        let a = score_still_image(&rgba, &sig).unwrap();
+        assert_eq!(a.colourfulness, r.colourfulness);
+    }
+
+    #[test]
+    fn old_score_json_loads_without_colourfulness() {
+        let old = r#"{"sharpness":0.5,"exposure":1.0,"blur":0.5,"total":0.6,"highlight":false,"reasons":[]}"#;
+        let s: Score = serde_json::from_str(old).unwrap();
+        assert_eq!(s.colourfulness, None);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("colourfulness"));
+        let mut s = s;
+        s.colourfulness = Some(42.5);
+        let back: Score = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.colourfulness, Some(42.5));
     }
 
     #[test]

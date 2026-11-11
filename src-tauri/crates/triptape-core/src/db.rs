@@ -32,6 +32,16 @@ CREATE TABLE IF NOT EXISTS plan_edits (
     project_id TEXT PRIMARY KEY REFERENCES projects(id),
     edits_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS preference_events (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    kind TEXT NOT NULL,
+    chosen_id TEXT NOT NULL,
+    rejected_id TEXT NOT NULL,
+    chosen_features TEXT NOT NULL,
+    rejected_features TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (project_id, kind, chosen_id, rejected_id)
+);
 CREATE TABLE IF NOT EXISTS assets (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
@@ -584,6 +594,7 @@ impl Db {
         edits: &crate::plan::PlanEdits,
     ) -> Result<(), String> {
         let json = serde_json::to_string(edits).map_err(|e| e.to_string())?;
+        let before = self.get_plan_edits(project_id)?;
         self.conn
             .execute(
                 "INSERT INTO plan_edits (project_id, edits_json) VALUES (?1, ?2)
@@ -591,7 +602,112 @@ impl Db {
                 params![project_id, json],
             )
             .map_err(|e| e.to_string())?;
+        // Learning is a side channel: a failure there never loses the edit.
+        if let Err(e) = crate::learn::record_edit(self, project_id, &before, edits) {
+            eprintln!("learn: could not record preference events: {e}");
+        }
         Ok(())
+    }
+
+    // -- learned preferences ----------------------------------------------
+    /// Record (or refresh) one preference event of a project.
+    pub fn put_preference_event(
+        &self,
+        project_id: &str,
+        e: &crate::learn::PrefEvent,
+    ) -> Result<(), String> {
+        let feats =
+            |f: &crate::learn::Features| serde_json::to_string(f).map_err(|e| e.to_string());
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO preference_events
+                 (project_id,kind,chosen_id,rejected_id,chosen_features,rejected_features,created_at)
+                 VALUES (?,?,?,?,?,?,?)",
+                params![
+                    project_id,
+                    e.kind.as_str(),
+                    e.chosen_id,
+                    e.rejected_id,
+                    feats(&e.chosen)?,
+                    feats(&e.rejected)?,
+                    now()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Forget the events of an undone edit. `rejected_id: None` matches
+    /// every rejected shot (an undone pin, whatever it displaced).
+    pub fn delete_preference_event(
+        &self,
+        project_id: &str,
+        kind: crate::learn::EventKind,
+        chosen_id: &str,
+        rejected_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM preference_events
+                 WHERE project_id=?1 AND kind=?2 AND chosen_id=?3
+                   AND (?4 IS NULL OR rejected_id=?4)",
+                params![project_id, kind.as_str(), chosen_id, rejected_id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// A project's events in a fixed order (kind, chosen, rejected), so a
+    /// fit over them is deterministic.
+    pub fn list_preference_events(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<crate::learn::PrefEvent>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT kind,chosen_id,rejected_id,chosen_features,rejected_features
+                 FROM preference_events WHERE project_id=?1
+                 ORDER BY kind, chosen_id, rejected_id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map(params![project_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = vec![];
+        for row in rows {
+            let (kind, chosen_id, rejected_id, c, r) = row.map_err(|e| e.to_string())?;
+            let Some(kind) = crate::learn::EventKind::parse(&kind) else {
+                continue;
+            };
+            out.push(crate::learn::PrefEvent {
+                kind,
+                chosen_id,
+                rejected_id,
+                chosen: serde_json::from_str(&c).map_err(|e| e.to_string())?,
+                rejected: serde_json::from_str(&r).map_err(|e| e.to_string())?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Delete all of a project's events (reset to the default weights).
+    /// Returns how many were removed.
+    pub fn clear_preference_events(&self, project_id: &str) -> Result<usize, String> {
+        self.conn
+            .execute(
+                "DELETE FROM preference_events WHERE project_id=?1",
+                params![project_id],
+            )
+            .map_err(|e| e.to_string())
     }
 
     pub fn insert_plan(
@@ -644,12 +760,25 @@ impl Db {
     /// is what every keepsake renders. The stored plan stays pristine, so
     /// edits can be undone and carry over to newer plans of the project.
     pub fn edited_plan(&self, project_id: Option<&str>) -> Result<Option<EditedPlan>, String> {
+        self.edited_plan_with(project_id, None)
+    }
+
+    /// [`Self::edited_plan`] under the owner's itinerary: chapters take the
+    /// itinerary's city (or ship) labels and the route follows it, then the
+    /// Story-editor edits are applied on top, so a user rename still wins.
+    pub fn edited_plan_with(
+        &self,
+        project_id: Option<&str>,
+        itinerary: Option<&crate::itinerary::Itinerary>,
+    ) -> Result<Option<EditedPlan>, String> {
         let Some((project_id, base)) = self.latest_plan_with_project(project_id)? else {
             return Ok(None);
         };
         let edits = self.get_plan_edits(&project_id)?;
         let assets = self.list_assets(&project_id)?;
-        let edited = crate::plan::apply_edits(&base, &assets, &edits);
+        let relabelled = itinerary.map(|i| crate::itinerary::apply_itinerary(&base, &assets, i));
+        let edited =
+            crate::plan::apply_edits(relabelled.as_ref().unwrap_or(&base), &assets, &edits);
         Ok(Some(EditedPlan {
             project_id,
             base,
@@ -903,14 +1032,22 @@ mod tests {
             total: 0.85,
             highlight: true,
             reasons: vec!["clean exposure, good detail".into()],
-            clip_window: Some((4.5, 10.5)),
+            clip_windows: vec![crate::types::ClipSpan {
+                start: 4.5,
+                end: 10.5,
+                quality: 0.7,
+            }],
             ..Default::default()
         });
         db.upsert_asset(&p.id, &a).unwrap();
         let got = db.list_assets(&p.id).unwrap();
         assert_eq!(got.len(), 1);
         let s = got[0].score.as_ref().expect("score round trip");
-        assert_eq!(s.clip_window, Some((4.5, 10.5)));
+        assert_eq!(s.clip_windows.len(), 1);
+        assert_eq!(
+            (s.clip_windows[0].start, s.clip_windows[0].end),
+            (4.5, 10.5)
+        );
         assert!((s.total - 0.85).abs() < 1e-6);
         assert!((s.sharpness - 0.8).abs() < 1e-6);
         assert!(s.highlight);

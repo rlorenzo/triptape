@@ -17,6 +17,10 @@ jobs:
   rust:
     name: cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # CI never attaches a debugger, so skip debug info to compile and link faster.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     strategy:
       matrix:
         os: [macos-latest, windows-latest]
@@ -26,6 +30,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          # Keep compile work when a test fails, so the next run starts ahead.
+          cache-on-failure: true
       - name: Check formatting
         run: cargo fmt --all -- --check
       - uses: actions/setup-node@v4
@@ -45,7 +52,7 @@ jobs:
         run: brew install ffmpeg typst exiftool
       - name: Install system deps (Windows)
         if: runner.os == 'Windows'
-        run: choco install ffmpeg typst exiftool -y
+        run: choco install ffmpeg typst exiftool -y --no-progress
       - run: cargo test --workspace
       # Bash scripts: force Git Bash on Windows (default shell is PowerShell).
       - name: FFmpeg capability check
@@ -75,11 +82,12 @@ jobs:
         with:
           tool: cargo-deny,cargo-audit
       - name: Install deadwood
-        run: cargo install --locked --git https://github.com/rlorenzo/deadwood --rev 1fd13d0c8e5222bb48788451ce5a32e6770129dd deadwood-rs
+        run: cargo install --locked deadwood-rs --version 1.0.0
       - name: Dead Rust code and dependencies (deadwood)
-        # deadwood resolves lib names with `cargo metadata --frozen`; without a
-        # populated registry it falls back to package names and misflags
-        # kamadak-exif (imported as `exif`) as unused.
+        # deadwood reads lib names and proc-macro sources from the registry
+        # cache via `cargo metadata --frozen`. Without it, it falls back to
+        # package names (misflagging kamadak-exif, imported as `exif`) and can't
+        # see that `tauri::generate_context!` expands to `serde_json`.
         run: |
           cargo fetch --locked
           deadwood check .
