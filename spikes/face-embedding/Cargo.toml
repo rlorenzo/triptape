@@ -1,0 +1,31 @@
+[package]
+name = "face-embedding-spike"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "G4 model-selection spike: ONNX face/expression/embedding candidates via ort. Not wired into scoring."
+
+# Standalone: not a member of the main workspace, keeps its own lockfile so
+# the app's dependency graph is untouched.
+[workspace]
+
+[features]
+default = []
+# ort links nothing at build time: `load-dynamic` dlopens the ONNX Runtime
+# library named by ORT_DYLIB_PATH at run time (no silent binary download).
+spike = ["dep:ort", "dep:image", "dep:tokenizers", "dep:serde_json", "dep:libc"]
+coreml = ["ort/coreml"]
+directml = ["ort/directml"]
+
+[dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-31"], optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg"], optional = true }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"], optional = true }
+serde_json = { version = "1", optional = true }
+libc = { version = "0.2", optional = true }
+
+[[bin]]
+name = "spike"
+path = "src/main.rs"
+required-features = ["spike"]
