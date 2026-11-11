@@ -17,6 +17,10 @@ jobs:
   rust:
     name: cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # CI never attaches a debugger, so skip debug info to compile and link faster.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     strategy:
       matrix:
         os: [macos-latest, windows-latest]
@@ -26,6 +30,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          # Keep compile work when a test fails, so the next run starts ahead.
+          cache-on-failure: true
       - name: Check formatting
         run: cargo fmt --all -- --check
       - uses: actions/setup-node@v4
@@ -45,7 +52,7 @@ jobs:
         run: brew install ffmpeg typst exiftool
       - name: Install system deps (Windows)
         if: runner.os == 'Windows'
-        run: choco install ffmpeg typst exiftool -y
+        run: choco install ffmpeg typst exiftool -y --no-progress
       - run: cargo test --workspace
       # Bash scripts: force Git Bash on Windows (default shell is PowerShell).
       - name: FFmpeg capability check
