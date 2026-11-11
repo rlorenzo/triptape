@@ -1266,7 +1266,14 @@ mod tests {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().join("Japan to Singapore 2026 it's: [a],b");
+        // Windows forbids ':' in a file name; there the drive letter's colon
+        // (`C:\...`) still has to survive the filter escaping.
+        let name = if cfg!(windows) {
+            "Japan to Singapore 2026 it's [a],b"
+        } else {
+            "Japan to Singapore 2026 it's: [a],b"
+        };
+        let dir = temp.path().join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let srt = dir.join("film.srt");
         std::fs::write(

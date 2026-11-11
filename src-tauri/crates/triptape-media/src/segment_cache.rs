@@ -555,7 +555,11 @@ impl SegmentCache {
         let result = (|| {
             link_or_copy(produced, &tmp_mp4)?;
             // The data must be durable before the entry becomes visible.
-            std::fs::File::open(&tmp_mp4)?.sync_all()?;
+            // Opened for writing: Windows refuses to flush a read-only handle.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp_mp4)?
+                .sync_all()?;
             let mut f = std::fs::File::create(&tmp_json)?;
             f.write_all(&serde_json::to_vec(meta).map_err(std::io::Error::other)?)?;
             f.sync_all()?;
