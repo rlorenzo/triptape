@@ -1,3 +1,0 @@
-[dependencies.allow-in]
-# tauri::generate_context! expands to serde_json paths, which source analysis can't see.
-triptape-app = ["serde_json"]
