@@ -8,6 +8,7 @@
     getStory,
     setAssetCaption,
     setAssetExcluded,
+    setAssetIncluded,
     setChapterPlace,
     swapAsset
   } from "./lib/tauri";
@@ -199,7 +200,7 @@
   </div>
 
   <p class="save-state" role="status" aria-live="polite">
-    {#if busy}Saving…{:else if everSaved}Saved. Your changes apply to the next film, reels and book.{:else if story && picks > 0}Choose a photo to edit its caption, swap it, or leave it out. Changes save on their own.{/if}
+    {#if busy}Saving…{:else if everSaved}Saved. Your changes apply to the next film, reels and book.{:else if story && picks > 0}Choose a photo to edit its caption, add it to the film, swap it, or leave it out. Changes save on their own.{/if}
   </p>
 
   {#if failure}<ErrorNote {...failure} />{/if}
@@ -300,6 +301,9 @@
               />
 
               <div class="panel-actions">
+                {#if !selected.inHero}
+                  <button class="btn" disabled={busy} on:click={() => editSelected((id, from) => setAssetIncluded(id, from, true))}>Add to film</button>
+                {/if}
                 {#if selected.inHero || selected.inReels}
                   <button class="btn" disabled={busy} aria-expanded={alternativesFor === selected.id} on:click={() => (alternativesFor === selected.id ? (alternativesFor = null) : showAlternatives(selected.id))}>Swap photo</button>
                 {/if}

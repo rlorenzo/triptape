@@ -10,12 +10,15 @@ Regenerate with `scripts/make-gazetteer.sh`.
 
 `attractions.tsv` (name, latitude, longitude) is derived
 from Wikidata items typed as tourist attraction, amusement park,
-urban park, park, museum, botanical garden, zoo, castle, or shopping center (or a
-subclass of one of those), with at least 12 Wikidata sitelinks as a
-notability floor. Items that are only tourist attractions and are also
-typed as a city, town, village, municipality, or spa town are left out
-(archaeological sites stay), so those places keep their `City, Country`
-name from `cities.tsv`. Umbrella resorts parenting two or more
+urban park, park, museum, botanical garden, zoo, castle, shopping center,
+Buddhist temple, Shinto shrine, church building, mosque, Hindu temple, or
+synagogue (or a subclass of one of those), with at least 12 Wikidata sitelinks
+as a notability floor. Items typed as a destroyed building or structure, or
+with a state of use of "demolished or destroyed", are left out (the Asakusa
+tower Ryōunkaku, demolished in 1923, no longer names a day at Sensō-ji).
+Items that are only tourist attractions and are also typed as a city, town,
+village, municipality, or spa town are left out (archaeological sites stay),
+so those places keep their `City, Country` name from `cities.tsv`. Umbrella resorts parenting two or more
 amusement parks are also dropped, so a park keeps its own name
 (`Tokyo DisneySea`, not `Tokyo Disney Resort`). It lets chapter and
 caption naming prefer a place a traveler actually visited

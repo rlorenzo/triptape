@@ -4810,8 +4810,11 @@ dependencies = [
 name = "triptape-media"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "chrono",
+ "dirs",
  "image",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

@@ -2,7 +2,7 @@
 
 Free, open-source desktop app (Tauri v2 + Rust) that turns a messy folder of
 family vacation photos/videos into three keepsakes from one curation pass:
-a Trip Video (1080p hero film), a Reels Pack (3–5 vertical clips), and a
+a Trip Video (4K hero film, 1080p optional via `export --resolution 1080p`), a Reels Pack (3–5 vertical clips), and a
 Photo Book (print-ready PDF + per-page JPEGs). See [PLAN.md](PLAN.md) —
 the source of truth until code exists.
 
@@ -27,7 +27,7 @@ npm run dev                 # browser preview (demo state, no Tauri)
 CLI (`triptape-media` bin `triptape` — headless, no UI):
 
 ```sh
-cargo run -p triptape-media --bin triptape -- scan --folder /path/to/trip --db trip.db --cache /tmp/cache
+cargo run -p triptape-media --bin triptape -- scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|600|10m]
 cargo run -p triptape-media --bin triptape -- plan --db trip.db --out plan.json
 cargo run -p triptape-media --bin triptape -- export --db trip.db --out ~/Movies/TripTape/trip
 ```
@@ -51,7 +51,7 @@ packs, disabled book card) and the Reels share disclosure (no blur gate,
 no extra click).
 
 Gaps: FFmpeg sidecar SHA-256 pins unfilled (system ffmpeg in dev only,
-`zscale`/`drawtext`/`vidstab`/`libass` missing — captions burn and
+`zscale`/`vidstab`/libass (`subtitles`) missing on plain Homebrew ffmpeg — hero captions burn (needs libass) and
 stabilization wait on the sidecar); no signing keys or update channel
 (G5 — updater wired off with a pubkey placeholder); G2/G3/G4 gates open;
 CI not yet green on Windows.
@@ -75,11 +75,12 @@ current state of each privacy control.
 - Windows: install Rust + the pinned static FFmpeg sidecar (see
   `scripts/fetch-ffmpeg`); PATH fallback is dev-only.
 - Thumbnails cache in the OS cache dir with no size cap yet. Export
-  intermediates stay in `.work` inside the export folder.
+  intermediates live in `.work` inside the export folder and are removed
+  when the export ends.
 
 ## Known blockers (Sprint 0)
 
 - Sidecar SHA-256 pins unfilled (`scripts/fetch-ffmpeg` refuses to install).
-- System ffmpeg lacks `zscale`/`drawtext`/`vidstab`/`libass` (recorded G1 gaps).
+- System ffmpeg lacks `zscale`/`drawtext`/`vidstab`/libass `subtitles` (recorded G1 gaps).
 - G2 vendor workflow, G3 offline maps, G4 model budgets, G5 signed update:
   all open — see evidence in [docs/gates.md](docs/gates.md).

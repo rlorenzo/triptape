@@ -1,17 +1,26 @@
 //! triptape-media: FFmpeg/ffprobe orchestration and render-plan execution.
 
+pub mod clip_analysis;
 pub mod export;
 pub mod ffmpeg;
 pub mod map;
+pub mod music;
+pub mod progress;
 pub mod render_book;
 pub mod render_reels;
 pub mod render_video;
+pub mod resolution;
+pub mod routeanim;
+pub mod routetravel;
+pub mod segment_cache;
 pub mod titlecard;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MediaError {
     #[error("ffmpeg failed: {0}")]
     Ffmpeg(String),
+    #[error("cancelled")]
+    Cancelled,
     #[error("io: {0}")]
     Io(String),
     #[error("invalid argument: {0}")]

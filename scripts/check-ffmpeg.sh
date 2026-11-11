@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CI build check for the FFmpeg sidecar (PLAN.md Section 7 / gate G1).
 # Fails on --enable-nonfree or a missing required encoder/filter.
-# Missing nice-to-have filters (zscale/drawtext/vidstab/libass) are REPORTED
+# Missing nice-to-have filters (zscale/drawtext/vidstab/subtitles) are REPORTED
 # as gate gaps but do not fail the check.
 #
 # Usage: ./scripts/check-ffmpeg.sh [ffmpeg-bin]   (default: ffmpeg on PATH)
@@ -26,8 +26,10 @@ need "filter xfade"           "$(echo "$FLT" | grep -o ' xfade ' | head -1)"
 need "filter perspective"     "$(echo "$FLT" | grep -o ' perspective ' | head -1)"
 need "filter loudnorm"        "$(echo "$FLT" | grep -o ' loudnorm ' | head -1)"
 echo "== gate gaps (warn only) =="
-for f in zscale drawtext vidstabdetect vidstabtransform libass; do
-  if echo "$FLT $ENC" | grep -qw "$f"; then echo "ok: $f present";
+# libass has no filter of its own: it provides `subtitles` and `ass`. Check
+# the filter names (the app does the same), not the word "libass".
+for f in zscale drawtext vidstabdetect vidstabtransform subtitles ass; do
+  if echo "$FLT" | grep -Eq "^ [A-Z.]+ +$f +"; then echo "ok: $f present";
   else echo "GAP: $f missing (HDR tone-map path / burned-in captions / stabilization affected)"; fi
 done
 if [ "$fail" -eq 0 ]; then echo "PASS: required FFmpeg capabilities present"

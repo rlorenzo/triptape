@@ -2,21 +2,61 @@
 //! `export` all eligible keepsakes (hero film, reels pack, photo book).
 //!
 //! ```sh
-//! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache
-//! triptape plan --db trip.db --out plan.json [--home LAT,LON]
-//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F] [--keep-ambience]
+//! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m]
+//! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
+//! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...] [--list]
+//! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--itinerary itinerary.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
+//!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
+//! triptape cache stats|clear [--segment-cache DIR]
 //! ```
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
+use triptape_core::plan::PlanEdits;
 use triptape_core::{
-    cluster,
+    asset_ref, cluster,
     db::{Db, EditedPlan},
-    hash, jobs, livephoto, metadata, plan as planmod, privacy, proxies, scan, score,
+    hash, jobs, learn, livephoto, metadata, plan as planmod, privacy, proxies, scan, score,
     types::*,
 };
-use triptape_media::{export::export_all, export::ExportOptions, ffmpeg, render_book::BookPreset};
+use triptape_media::{
+    clip_analysis,
+    export::export_all,
+    export::ExportOptions,
+    ffmpeg,
+    progress::{ConsoleProgress, Progress},
+    render_book::BookPreset,
+    resolution::Resolution,
+    segment_cache::{self, SegmentCacheConfig},
+};
+
+/// Repeatable flags accumulate `;`-joined (`--music A --music B` is
+/// `--music "A;B"`); every other flag keeps its last value.
+fn insert_flag(flags: &mut HashMap<String, String>, k: String, v: String) {
+    if k == "music" {
+        if let Some(prev) = flags.get_mut(&k) {
+            prev.push(';');
+            prev.push_str(&v);
+            return;
+        }
+    }
+    flags.insert(k, v);
+}
+
+/// Split a `--music` value into playlist paths. A value that is itself an
+/// existing file is taken whole (so a `;` in a filename still works).
+fn music_list(v: &str) -> Vec<PathBuf> {
+    if Path::new(v).exists() {
+        return vec![PathBuf::from(v)];
+    }
+    v.split(';')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
 
 fn parse_args() -> (String, HashMap<String, String>) {
     let mut it = std::env::args().skip(1);
@@ -31,11 +71,11 @@ fn parse_args() -> (String, HashMap<String, String>) {
             // A flag directly after a valueless boolean flag must not
             // swallow it as its value: `--keep-ambience --out x`.
             if let Some(p) = pending.take() {
-                flags.insert(p, "true".to_string());
+                insert_flag(&mut flags, p, "true".to_string());
             }
             pending = Some(k.to_string());
         } else if let Some(p) = pending.take() {
-            flags.insert(p, a);
+            insert_flag(&mut flags, p, a);
         }
     }
     // Trailing valueless flag: `--export --keep-ambience`.
@@ -59,6 +99,27 @@ fn need(flags: &HashMap<String, String>, k: &str) -> PathBuf {
             std::process::exit(2);
         })
         .into()
+}
+
+/// The plan-shaping flags shared by `scan` and `learn --apply`:
+/// `--place-override` (user place labels for GPS-unnamed days, e.g. a ship
+/// name for days at sea: `YYYY-MM-DD..YYYY-MM-DD=Label` entries split by
+/// `;`) and `--length` (`auto`, seconds, or e.g. `10m`; default auto, so the
+/// hero film scales with the trip).
+fn plan_flags(
+    flags: &HashMap<String, String>,
+) -> (Vec<planmod::PlaceOverride>, planmod::FilmLength) {
+    let overrides = match flags.get("place-override") {
+        Some(spec) => {
+            planmod::parse_place_overrides(spec).unwrap_or_else(|e| die("place-override", e))
+        }
+        None => vec![],
+    };
+    let length = match flags.get("length") {
+        Some(spec) => planmod::parse_film_length(spec).unwrap_or_else(|e| die("length", e)),
+        None => planmod::FilmLength::Auto,
+    };
+    (overrides, length)
 }
 
 fn flag_or(flags: &HashMap<String, String>, k: &str, default: &str) -> String {
@@ -189,12 +250,39 @@ fn scan_cmd(flags: &HashMap<String, String>) {
                 a.duration_secs = p.duration_secs();
             }
         }
-        scores.insert(
-            a.id.clone(),
-            score_asset(&a, img.as_ref(), &cache, &ffmpeg, &mut thumbs),
-        );
+        // Every asset gets a perceptual hash from the pixels the scan
+        // already has (decoded photo) or the thumbnail/poster it makes
+        // (HEIC, Live Photos, videos), so near-dupes collapse everywhere.
+        let (score, phash) = score_asset(&a, img.as_ref(), &cache, &ffmpeg, &mut thumbs);
+        a.phash = a.phash.or(phash);
+        scores.insert(a.id.clone(), score);
         final_assets.push(a);
     }
+
+    // Best playback window per video, analysed in parallel (ffmpeg-bound).
+    // The clip's score follows the quality of the window that will play.
+    let videos: Vec<(String, PathBuf, f64, score::StorySignals)> = final_assets
+        .iter()
+        .filter(|a| a.kind == AssetKind::Video)
+        .filter_map(|a| {
+            Some((
+                a.id.clone(),
+                a.path.clone(),
+                a.duration_secs?,
+                score::StorySignals::for_asset(a),
+            ))
+        })
+        .collect();
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().min(4));
+    triptape_core::parallel::for_each_parallel(
+        &videos,
+        workers,
+        |(_, path, dur, _)| clip_analysis::analyze_clip(&ffmpeg, &ffprobe, path, *dur),
+        |idx, analysis, _, _| {
+            let (id, _, _, signals) = &videos[idx];
+            scores.insert(id.clone(), analysis.score(signals));
+        },
+    );
 
     // Capture timezones: assets without an EXIF offset inherit the
     // nearest dated neighbor's, so day grouping and displayed times are
@@ -211,11 +299,13 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     let groups = cluster::collapse_near_dupes(&final_assets, &scores);
     let best: HashSet<String> = groups.iter().map(|g| g.best_id.clone()).collect();
     // Non-best near-dupe members stay in the DB but are kept out of the plan.
-    let suppressed: HashSet<&str> = groups
-        .iter()
-        .flat_map(|g| g.members.iter().filter(|m| **m != g.best_id))
-        .map(String::as_str)
-        .collect();
+    let suppressed = cluster::suppressed_ids(&groups);
+
+    // Store scores (including clip windows) on the asset rows so later
+    // `Db::edited_plan` reloads see the same windows as this initial plan.
+    for a in &mut final_assets {
+        a.score = scores.get(&a.id).cloned();
+    }
 
     // Persist assets, clusters, and links in one transaction.
     let persisted = db.in_transaction(|db| {
@@ -254,31 +344,22 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         };
         if let Some(h) = key {
             let dst = proxies::cache_path(&cache, "proxy", h, ".mp4");
-            let args = proxies::proxy_args(src, &dst);
+            let audio = ffmpeg::audio_map(&ffprobe, src);
+            let args = proxies::proxy_args(src, &dst, audio.as_deref());
             if proxies::run_ffmpeg(&ffmpeg, &args, &dst).is_ok() {
                 proxies_n += 1;
             }
         }
     }
 
-    let cluster_of: HashMap<String, String> = clusters
-        .iter()
-        .flat_map(|c| c.asset_ids.iter().map(|id| (id.clone(), c.label.clone())))
-        .collect();
+    let cluster_of = cluster::chapter_labels(&clusters);
     let plan_assets: Vec<Asset> = final_assets
         .iter()
-        .filter(|a| !suppressed.contains(a.id.as_str()))
+        .filter(|a| !suppressed.contains(&a.id))
         .cloned()
         .collect();
-    // Optional user place labels for GPS-unnamed days (e.g. a ship name
-    // for days at sea): `YYYY-MM-DD..YYYY-MM-DD=Label` entries split by `;`.
-    let overrides = match flags.get("place-override") {
-        Some(spec) => {
-            planmod::parse_place_overrides(spec).unwrap_or_else(|e| die("place-override", e))
-        }
-        None => vec![],
-    };
-    let p = planmod::build_plan_with_overrides(&plan_assets, &cluster_of, &scores, &overrides);
+    let (overrides, length) = plan_flags(flags);
+    let p = planmod::build_plan_with_length(&plan_assets, &cluster_of, &scores, &overrides, length);
     let elig = planmod::plan_eligibility(
         plan_assets.len(),
         plan_assets
@@ -342,6 +423,7 @@ fn fill_video(a: &mut Asset, probe: Option<&metadata::FfprobeOutput>) {
     let Some(p) = probe else {
         a.taken_at = Some(a.mtime);
         a.time_guessed = true;
+        (a.user_caption, a.people_count) = metadata::story_fields(&a.path, None);
         return;
     };
     a.duration_secs = p.duration_secs();
@@ -354,6 +436,7 @@ fn fill_video(a: &mut Asset, probe: Option<&metadata::FfprobeOutput>) {
     let ct = metadata::resolve_capture_time(p.creation_time(), a.mtime);
     a.taken_at = Some(ct.unix_secs);
     a.time_guessed = ct.time_guessed;
+    (a.user_caption, a.people_count) = metadata::story_fields(&a.path, None);
 }
 
 /// Fill photo metadata from EXIF; dimensions + pHash from the decoded
@@ -364,10 +447,7 @@ fn fill_photo(a: &mut Asset, img: Option<&image::DynamicImage>) {
     a.taken_at = Some(ct.unix_secs);
     a.time_guessed = ct.time_guessed;
     a.tz_offset_secs = exif.tz_offset_secs;
-    a.user_caption = exif
-        .caption
-        .clone()
-        .or_else(|| metadata::read_sidecar_caption(&a.path));
+    (a.user_caption, a.people_count) = metadata::story_fields(&a.path, Some(&exif));
     a.gps = exif.gps;
     a.rotation_deg = exif
         .orientation
@@ -384,29 +464,20 @@ fn fill_photo(a: &mut Asset, img: Option<&image::DynamicImage>) {
     }
 }
 
-/// Score one asset. Stills score on `img` (already decoded) or, failing
-/// that, a cached FFmpeg thumbnail (counted in `thumbs`); video uses a
-/// duration + GPS-novelty proxy.
+/// Score one asset and fingerprint it. Stills score on `img` (already
+/// decoded) or, failing that, a cached FFmpeg thumbnail (counted in
+/// `thumbs`); videos get a poster-frame thumbnail the same way and a
+/// provisional score (their real one follows clip analysis). The returned
+/// pHash comes from the pixels used for scoring, so HEIC stills, Live
+/// Photos and videos get one too; `None` when nothing could be decoded.
 fn score_asset(
     a: &Asset,
     img: Option<&image::DynamicImage>,
     cache: &Path,
     ffmpeg: &str,
     thumbs: &mut usize,
-) -> Score {
-    if a.kind == AssetKind::Video {
-        let sig = score::StorySignals {
-            gps_novelty: if a.gps.is_some() { 0.6 } else { 0.0 },
-            ..Default::default()
-        };
-        let base = Score {
-            total: 0.55,
-            sharpness: 0.5,
-            exposure: 0.6,
-            ..Default::default()
-        };
-        return score::highlight_score(&base, &sig, false);
-    }
+) -> (Score, Option<u64>) {
+    let signals = score::StorySignals::for_asset(a);
     let mut thumb = || {
         let h = a.content_hash.as_deref()?;
         let dst = proxies::cache_path(cache, "thumb", h, ".jpg");
@@ -414,19 +485,29 @@ fn score_asset(
         *thumbs += 1;
         image::open(&dst).ok()
     };
-    let gray = match img {
-        Some(img) => Some(img.to_luma8()),
-        None => thumb().map(|t| t.to_luma8()),
+    let owned;
+    let pixels = match img {
+        Some(img) => Some(img),
+        None => {
+            owned = thumb();
+            owned.as_ref()
+        }
     };
-    gray.and_then(|g| score::frame_stats(g.as_raw(), g.width(), g.height()))
-        .map(|stats| {
-            let base = score::score_still(&stats);
-            score::highlight_score(&base, &score::StorySignals::default(), false)
-        })
-        .unwrap_or_else(|| Score {
-            total: 0.5,
-            ..Default::default()
-        })
+    let phash = pixels.map(hash::average_hash_from_image);
+    if a.kind == AssetKind::Video {
+        return (score::score_video(None, &signals), phash);
+    }
+    (score::score_still_or_fallback(pixels, &signals), phash)
+}
+
+/// `--itinerary <json>`: the owner's itinerary, which relabels chapters
+/// (city, or the ship when on board) and drives the closing map.
+fn load_itinerary(flags: &HashMap<String, String>) -> Option<triptape_core::itinerary::Itinerary> {
+    let path = flags.get("itinerary")?;
+    Some(
+        triptape_core::itinerary::Itinerary::load(std::path::Path::new(path))
+            .unwrap_or_else(|e| die("itinerary", e)),
+    )
 }
 
 fn plan_cmd(flags: &HashMap<String, String>) {
@@ -434,8 +515,9 @@ fn plan_cmd(flags: &HashMap<String, String>) {
     let out = PathBuf::from(flag_or(flags, "out", "plan.json"));
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
     // Default (no --project): latest plan in the db, for single-project DBs.
+    let itinerary = load_itinerary(flags);
     let mut p = db
-        .edited_plan(flags.get("project").map(String::as_str))
+        .edited_plan_with(flags.get("project").map(String::as_str), itinerary.as_ref())
         .unwrap_or_else(|e| die("plan", e))
         .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"))
         .edited;
@@ -470,21 +552,22 @@ fn export_cmd(flags: &HashMap<String, String>) {
     let ffmpeg_bin = flag_or(flags, "ffmpeg", "ffmpeg");
     let ffprobe_bin = flag_or(flags, "ffprobe", "ffprobe");
     let typst_bin = flag_or(flags, "typst", "typst");
-    let music = flags.get("music").map(PathBuf::from);
-    if let Some(m) = &music {
+    let music = flags.get("music").map_or_else(Vec::new, |v| music_list(v));
+    for m in &music {
         if !m.exists() {
             die("music", format!("not found: {}", m.display()));
         }
     }
 
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
+    let itinerary = load_itinerary(flags);
     let EditedPlan {
         project_id,
         edited: mut plan,
         assets,
         ..
     } = db
-        .edited_plan(flags.get("project").map(String::as_str))
+        .edited_plan_with(flags.get("project").map(String::as_str), itinerary.as_ref())
         .unwrap_or_else(|e| die("plan", e))
         .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
     // Rendered maps get the same home fuzzing as `plan` JSON (Sec 14).
@@ -512,14 +595,43 @@ fn export_cmd(flags: &HashMap<String, String>) {
         caps.vidstabdetect && caps.vidstabtransform,
     );
 
-    // Free-space precheck: ~2 GB estimate for the three keepsakes (the
-    // precheck applies its own 1.5x headroom).
-    if let Err(e) = jobs::free_space_precheck(&out, 2_000_000_000) {
+    // Hero film frame size: 4K unless asked otherwise (reels stay 1080x1920).
+    let resolution = Resolution::from_flag(&flag_or(flags, "resolution", "4k"))
+        .unwrap_or_else(|e| die("resolution", e));
+    let only = flag_or(flags, "only", "all");
+    if !matches!(only.as_str(), "all" | "video" | "reels" | "book") {
+        die(
+            "only",
+            format!("unknown keepsake {only:?} (want all|video|reels|book)"),
+        );
+    }
+    // Free-space precheck (the precheck applies its own 1.5x headroom). Only
+    // the hero film scales with --resolution; reels and the book keep the
+    // 1080p-era estimate.
+    let estimate = if matches!(only.as_str(), "all" | "video") {
+        resolution.export_disk_estimate()
+    } else {
+        Resolution::Hd1080.export_disk_estimate()
+    };
+    if let Err(e) = jobs::free_space_precheck(&out, estimate) {
         die("free space", e);
     }
 
     let keep_ambience = flags.get("keep-ambience").is_some_and(|v| v != "false");
-    let report = export_all(
+    // Hero segments rendered at once (default: cores / 4, memory permitting).
+    let jobs = flags.get("jobs").map(|v| match v.parse::<usize>() {
+        Ok(n) if n >= 1 => n,
+        _ => die("jobs", format!("want a whole number >= 1, got {v:?}")),
+    });
+    // Progress goes to stderr so stdout stays the plain result listing.
+    let console = std::sync::Arc::new(ConsoleProgress::stderr());
+    let progress = if flags.get("quiet").is_some_and(|v| v != "false") {
+        Progress::default()
+    } else {
+        Progress::new(console.clone())
+    };
+    let segment_cache = segment_cache_config(flags);
+    let exported = export_all(
         &caps,
         &plan,
         &assets,
@@ -528,15 +640,27 @@ fn export_cmd(flags: &HashMap<String, String>) {
             preset,
             trip_name,
             typst_bin,
-            music_path: music,
+            music_paths: music,
             keep_ambience,
-            only: flag_or(flags, "only", "all"),
+            only,
+            resolution,
+            jobs,
+            progress,
+            segment_cache,
+            itinerary,
         },
-    )
-    .unwrap_or_else(|e| die("export", e));
+    );
+    console.finish();
+    let report = exported.unwrap_or_else(|e| die("export", e));
 
     if let Some(v) = &report.video {
         println!("video: {v}");
+    }
+    if let Some(c) = &report.segment_cache {
+        println!(
+            "video: segments reused {}/{} from cache, overlays {}/{} ({} new, {} evicted; {})",
+            c.reused, c.total, c.overlays_reused, c.overlays_total, c.stored, c.evicted, c.dir
+        );
     }
     for r in &report.reels {
         println!("reel: {r}");
@@ -553,15 +677,463 @@ fn export_cmd(flags: &HashMap<String, String>) {
     println!("wrote {}", out.join("export.json").display());
 }
 
+/// Segment cache for `export`: on by default in the platform cache dir,
+/// moved by `--segment-cache DIR`, bounded by `--segment-cache-max SIZE`,
+/// off with `--no-segment-cache`.
+fn segment_cache_config(flags: &HashMap<String, String>) -> Option<SegmentCacheConfig> {
+    let off = flags.get("no-segment-cache").is_some_and(|v| v != "false");
+    if off && flags.contains_key("segment-cache") {
+        die(
+            "segment-cache",
+            "--segment-cache and --no-segment-cache conflict",
+        );
+    }
+    let max_bytes = cache_max_flag(flags);
+    if off {
+        return None;
+    }
+    let dir = cache_dir_flag(flags);
+    if dir.is_none() {
+        eprintln!("segment cache off: no cache directory on this platform");
+    }
+    let min_free_bytes = cache_min_free_flag(flags);
+    dir.map(|dir| SegmentCacheConfig {
+        max_bytes,
+        min_free_bytes,
+        ..SegmentCacheConfig::new(dir)
+    })
+}
+
+/// `--segment-cache DIR`, else the platform default.
+fn cache_dir_flag(flags: &HashMap<String, String>) -> Option<PathBuf> {
+    flags
+        .get("segment-cache")
+        .map(PathBuf::from)
+        .or_else(segment_cache::default_dir)
+}
+
+/// `--segment-cache-max SIZE`, when given.
+fn cache_max_flag(flags: &HashMap<String, String>) -> Option<u64> {
+    flags
+        .get("segment-cache-max")
+        .map(|v| segment_cache::parse_size(v).unwrap_or_else(|e| die("segment-cache-max", e)))
+}
+
+/// `--segment-cache-min-free SIZE`, when given.
+fn cache_min_free_flag(flags: &HashMap<String, String>) -> Option<u64> {
+    flags
+        .get("segment-cache-min-free")
+        .map(|v| segment_cache::parse_size(v).unwrap_or_else(|e| die("segment-cache-min-free", e)))
+}
+
+/// `cache stats` / `cache clear`.
+fn cache_cmd(sub: &str, flags: &HashMap<String, String>) {
+    let dir = cache_dir_flag(flags)
+        .unwrap_or_else(|| die("cache", "no cache directory on this platform"));
+    match sub {
+        "stats" => {
+            let st = segment_cache::disk_stats(&dir);
+            let disk = segment_cache::disk_space(&dir);
+            let policy = segment_cache::Policy::resolve(
+                cache_max_flag(flags),
+                cache_min_free_flag(flags),
+                disk,
+            );
+            let free = disk.map(|d| d.free);
+            let size = segment_cache::fmt_bytes;
+            println!("segment cache: {}", dir.display());
+            println!(
+                "entries: {}  size: {}  exports running: {}",
+                st.entries,
+                size(st.bytes),
+                st.live_leases
+            );
+            println!(
+                "limit: {}  free-space floor: {}",
+                size(policy.max_bytes),
+                size(policy.floor_bytes)
+            );
+            println!(
+                "disk free: {}  headroom: {} (room to grow before the limit or the floor)",
+                free.map_or_else(|| "unknown".into(), size),
+                size(policy.headroom(st.bytes, free))
+            );
+        }
+        "clear" => {
+            let r = segment_cache::clear(&dir);
+            println!(
+                "removed {} entries ({})",
+                r.removed,
+                segment_cache::fmt_bytes(r.freed)
+            );
+            if r.protected > 0 {
+                println!(
+                    "kept {} entries in use by a running export; clear again when it finishes",
+                    r.protected
+                );
+            }
+        }
+        other => {
+            eprintln!("unknown cache command {other:?}; want stats|clear");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Parsed `edit` arguments. `--include`, `--exclude`, `--uninclude` and
+/// `--unexclude` each take one or more asset references (id, file name or
+/// path) and may repeat.
+#[derive(Debug, Default, PartialEq)]
+struct EditArgs {
+    db: Option<PathBuf>,
+    project: Option<String>,
+    list: bool,
+    include: Vec<String>,
+    exclude: Vec<String>,
+    uninclude: Vec<String>,
+    unexclude: Vec<String>,
+}
+
+fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
+    let mut out = EditArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i]
+            .strip_prefix("--")
+            .ok_or_else(|| format!("unexpected argument {:?}", args[i]))?;
+        i += 1;
+        let mut values = vec![];
+        while i < args.len() && !args[i].starts_with("--") {
+            values.push(args[i].clone());
+            i += 1;
+        }
+        let single = |values: Vec<String>| match <[String; 1]>::try_from(values) {
+            Ok([v]) => Ok(v),
+            Err(_) => Err(format!("--{flag} wants exactly one value")),
+        };
+        match flag {
+            "db" => out.db = Some(single(values)?.into()),
+            "project" => out.project = Some(single(values)?),
+            "list" if values.is_empty() => out.list = true,
+            "list" => return Err("--list takes no value".to_string()),
+            "include" | "exclude" | "uninclude" | "unexclude" => {
+                if values.is_empty() {
+                    return Err(format!("--{flag} wants at least one asset"));
+                }
+                match flag {
+                    "include" => out.include.extend(values),
+                    "exclude" => out.exclude.extend(values),
+                    "uninclude" => out.uninclude.extend(values),
+                    _ => out.unexclude.extend(values),
+                }
+            }
+            other => return Err(format!("unknown flag --{other}")),
+        }
+    }
+    Ok(out)
+}
+
+/// File name and id of an asset, for messages.
+fn asset_label(a: &Asset) -> String {
+    let name = a
+        .path
+        .file_name()
+        .map_or_else(String::new, |f| f.to_string_lossy().into_owned());
+    format!("{name} [{}]", a.id)
+}
+
+/// Print the Story-editor edits with file names.
+fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
+    let show = |id: &String| {
+        by_id
+            .get(id.as_str())
+            .map_or_else(|| format!("{id} (not in project)"), |a| asset_label(a))
+    };
+    for (title, ids) in [("included", &edits.included), ("excluded", &edits.excluded)] {
+        println!("{title}: {}", ids.len());
+        for id in ids {
+            println!("  {}", show(id));
+        }
+    }
+    println!("swaps: {}", edits.swaps.len());
+    for (from, to) in &edits.swaps {
+        println!("  {} -> {}", show(from), show(to));
+    }
+    println!(
+        "place overrides: {}, caption overrides: {}",
+        edits.place_overrides.len(),
+        edits.caption_overrides.len()
+    );
+}
+
+fn edit_cmd(args: &[String]) {
+    let a = parse_edit_args(args).unwrap_or_else(|e| die("edit", e));
+    let db_path = a.db.as_ref().unwrap_or_else(|| die("edit", "missing --db"));
+    let db = Db::open(db_path).unwrap_or_else(|e| die("open db", e));
+    let ep = db
+        .edited_plan(a.project.as_deref())
+        .unwrap_or_else(|e| die("plan", e))
+        .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
+    let by_id: HashMap<&str, &Asset> = ep.assets.iter().map(|x| (x.id.as_str(), x)).collect();
+    let resolve = |refs: &[String]| -> Vec<&Asset> {
+        refs.iter()
+            .map(|q| asset_ref::resolve_asset(&ep.assets, q).unwrap_or_else(|e| die("edit", e)))
+            .collect()
+    };
+    // Resolve everything first so a bad reference changes nothing.
+    let includes = resolve(&a.include);
+    if let Some(asset) = includes
+        .iter()
+        .find(|x| ep.base.chapter_of(&x.id).is_none())
+    {
+        die(
+            "edit",
+            format!("{} is not in any chapter of the plan", asset_label(asset)),
+        );
+    }
+    type Setter = fn(&mut PlanEdits, String, bool);
+    // Un-dos first, then removals, then pins.
+    let ops: [(Vec<&Asset>, &str, Setter, bool); 4] = [
+        (
+            resolve(&a.uninclude),
+            "uninclude",
+            PlanEdits::set_included,
+            false,
+        ),
+        (
+            resolve(&a.unexclude),
+            "unexclude",
+            PlanEdits::set_excluded,
+            false,
+        ),
+        (
+            resolve(&a.exclude),
+            "exclude",
+            PlanEdits::set_excluded,
+            true,
+        ),
+        (includes, "include", PlanEdits::set_included, true),
+    ];
+    let changed = ops.iter().any(|(assets, ..)| !assets.is_empty());
+    if !changed && !a.list {
+        die(
+            "edit",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude or --list",
+        );
+    }
+    let mut edits = ep.edits.clone();
+    for (assets, verb, set, on) in &ops {
+        for asset in assets {
+            set(&mut edits, asset.id.clone(), *on);
+            println!("{verb}: {}", asset_label(asset));
+        }
+    }
+    if changed {
+        db.save_plan_edits(&ep.project_id, &edits)
+            .unwrap_or_else(|e| die("save edits", e));
+    }
+    print_edits(&edits, &by_id);
+    if !changed {
+        return;
+    }
+    // Show where each included shot landed in the film.
+    let hero = planmod::apply_edits(&ep.base, &ep.assets, &edits).hero;
+    let label_at = |j: Option<usize>| {
+        j.and_then(|j| hero.get(j))
+            .and_then(|e| by_id.get(e.asset_id.as_str()))
+            .map_or_else(|| "(start/end)".to_string(), |x| asset_label(x))
+    };
+    for asset in &ops[3].0 {
+        match hero.iter().position(|e| e.asset_id == asset.id) {
+            Some(i) => println!(
+                "film: {} after {} before {} ({:?})",
+                asset_label(asset),
+                label_at(i.checked_sub(1)),
+                label_at(Some(i + 1)),
+                hero[i].rendition
+            ),
+            None => println!("film: {} is not in the film", asset_label(asset)),
+        }
+    }
+    println!("film now has {} shots", hero.len());
+}
+
+/// `learn`: show, reset or apply the story-score weights learned from the
+/// owner's Story-editor edits. Never changes a plan unless `--apply`.
+fn learn_cmd(flags: &HashMap<String, String>) {
+    let db_path = need(flags, "db");
+    let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
+    let project_id = match flags.get("project") {
+        Some(id) => id.clone(),
+        None => {
+            db.latest_project()
+                .unwrap_or_else(|e| die("project", e))
+                .unwrap_or_else(|| die("learn", "no project in db"))
+                .id
+        }
+    };
+    let on = |k: &str| flags.get(k).is_some_and(|v| v == "true");
+    if on("reset") {
+        let n = db
+            .clear_preference_events(&project_id)
+            .unwrap_or_else(|e| die("reset", e));
+        println!("project: {project_id}");
+        println!("reset: forgot {n} preference events; weights are back to the defaults");
+        println!("a plan built earlier keeps its weights until you rebuild it with --apply");
+        return;
+    }
+    if on("backfill") {
+        learn::backfill(&db, &project_id).unwrap_or_else(|e| die("backfill", e));
+    }
+    let summary = learn::project_summary(&db, &project_id).unwrap_or_else(|e| die("learn", e));
+    let fit = &summary.fit;
+    println!("project: {project_id}");
+    println!(
+        "events: {} ({} informative; weights adapt from {})",
+        fit.events,
+        fit.usable,
+        learn::MIN_USABLE_EVENTS
+    );
+    if fit.weights.is_identity() {
+        if fit.usable < learn::MIN_USABLE_EVENTS {
+            println!(
+                "weights: defaults ({} more informative edits needed before anything adapts)",
+                learn::MIN_USABLE_EVENTS - fit.usable
+            );
+        } else {
+            println!("weights: defaults (your edits agree with them)");
+        }
+    } else {
+        println!("weights:");
+        for def in learn::FEATURES
+            .iter()
+            .filter(|d| fit.weights.multipliers.contains_key(d.name))
+        {
+            println!("  {:<16} x{:.2}", def.label, fit.weights.get(def.name));
+        }
+        for line in &summary.explanations {
+            println!("  - {line}");
+        }
+    }
+    if !on("apply") {
+        return;
+    }
+    if fit.weights.is_identity() {
+        // Still rebuild: after a reset or undo, the stored plan may carry
+        // weights learned earlier.
+        println!("apply: rebuilding with the default weights");
+    }
+    let (overrides, length) = plan_flags(flags);
+    let hero_of = |db: &Db| -> Vec<String> {
+        db.edited_plan(Some(&project_id))
+            .unwrap_or_else(|e| die("plan", e))
+            .map(|ep| ep.edited.hero.into_iter().map(|e| e.asset_id).collect())
+            .unwrap_or_default()
+    };
+    let before = hero_of(&db);
+    let assets = db
+        .list_assets(&project_id)
+        .unwrap_or_else(|e| die("assets", e));
+    let edits = db
+        .get_plan_edits(&project_id)
+        .unwrap_or_else(|e| die("edits", e));
+    let plan = learn::replan(&assets, &fit.weights, &edits, &overrides, length);
+    let plan_id = db
+        .insert_plan(&project_id, &plan, "learned")
+        .unwrap_or_else(|e| die("insert plan", e));
+    let after = hero_of(&db);
+    let by_id: HashMap<&str, &Asset> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
+    let name = |id: &String| {
+        by_id
+            .get(id.as_str())
+            .map_or_else(|| id.clone(), |a| asset_label(a))
+    };
+    println!("apply: new plan {plan_id} (your edits carry over)");
+    let edited = triptape_core::plan::apply_edits(&plan, &assets, &edits);
+    let lost = learn::unapplied_swaps(&edited, &edits);
+    if !lost.is_empty() {
+        println!(
+            "note: {} swap(s) no longer apply: the shot each replaced left the film",
+            lost.len()
+        );
+        for (from, to) in lost.iter().take(10) {
+            println!("  {} -> {} (pin it to keep it)", name(from), name(to));
+        }
+    }
+    println!("film: {} shots before, {} now", before.len(), after.len());
+    if !flags.contains_key("length") {
+        println!("note: film length was rebuilt as auto; pass --length to match your scan");
+    }
+    for (verb, from, to) in [
+        ("now in", &before, &after),
+        ("dropped from", &after, &before),
+    ] {
+        let ids: Vec<&String> = to.iter().filter(|id| !from.contains(id)).collect();
+        println!("{verb} the film: {}", ids.len());
+        for id in ids.iter().take(10) {
+            println!("  {}", name(id));
+        }
+    }
+}
+
 fn main() {
     let (cmd, flags) = parse_args();
     match cmd.as_str() {
         "scan" => scan_cmd(&flags),
         "plan" => plan_cmd(&flags),
         "export" => export_cmd(&flags),
+        "learn" => learn_cmd(&flags),
+        "cache" => cache_cmd(std::env::args().nth(2).as_deref().unwrap_or(""), &flags),
+        "edit" => edit_cmd(&std::env::args().skip(2).collect::<Vec<_>>()),
         _ => {
-            eprintln!("unknown command {cmd}; want scan|plan|export");
+            eprintln!("unknown command {cmd}; want scan|plan|edit|learn|export|cache");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn music_flag_repeats_and_semicolons() {
+        let mut f = HashMap::new();
+        insert_flag(&mut f, "music".into(), "A.wav".into());
+        insert_flag(&mut f, "music".into(), "B.wav;C.wav".into());
+        insert_flag(&mut f, "out".into(), "x".into());
+        insert_flag(&mut f, "out".into(), "y".into());
+        assert_eq!(f["music"], "A.wav;B.wav;C.wav");
+        assert_eq!(f["out"], "y", "other flags keep the last value");
+        let list = music_list(&f["music"]);
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[2], PathBuf::from("C.wav"));
+        assert_eq!(music_list("single.wav"), vec![PathBuf::from("single.wav")]);
+        assert!(music_list("").is_empty());
+    }
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn edit_args_take_several_values_per_flag() {
+        let a = parse_edit_args(&args(
+            "--db t.db --include IMG_1060.JPG a2 --exclude x --include b --list",
+        ))
+        .unwrap();
+        assert_eq!(a.db, Some(PathBuf::from("t.db")));
+        assert_eq!(a.include, ["IMG_1060.JPG", "a2", "b"]);
+        assert_eq!(a.exclude, ["x"]);
+        assert!(a.list);
+    }
+
+    #[test]
+    fn edit_args_reject_bad_input() {
+        assert!(parse_edit_args(&args("--include")).is_err());
+        assert!(parse_edit_args(&args("--bogus x")).is_err());
+        assert!(parse_edit_args(&args("stray")).is_err());
+        assert!(parse_edit_args(&args("--db a b")).is_err());
+        assert!(parse_edit_args(&args("--list x")).is_err());
     }
 }

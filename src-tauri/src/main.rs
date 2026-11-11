@@ -44,11 +44,19 @@ fn emit(app: &tauri::AppHandle, job: &Job) {
 /// so the DB row and the event stream never disagree. Emitting from a
 /// `spawn_blocking` worker is fine (`AppHandle` is shared); callers throttle
 /// to ~5 Hz (one emit per 200 ms) rather than one event per file.
-fn report_ingest(app: &tauri::AppHandle, db: &Db, job_id: &str, progress: f32, step: &str) {
+/// Returns `false` (and writes nothing) when the job was already cancelled, so
+/// a late progress tick never revives a cancelled row back to `Running`.
+/// Callers hold the Db lock, so the check and the update cannot interleave
+/// with `cancel_job`.
+fn report_ingest(app: &tauri::AppHandle, db: &Db, job_id: &str, progress: f32, step: &str) -> bool {
+    if matches!(db.get_job(job_id), Ok(Some(j)) if j.state == JobState::Cancelled) {
+        return false;
+    }
     let _ = db.update_job(job_id, JobState::Running, progress, Some(step), None);
     if let Ok(Some(job)) = db.get_job(job_id) {
         emit(app, &job);
     }
+    true
 }
 
 /// Minimum gap between progress emits (~5 Hz ceiling for the event stream).
@@ -75,29 +83,50 @@ const HASH_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// hold stays short while decode/ffmpeg work stays lock-free.
 const SCORE_FLUSH_FILES: usize = 25;
 
-/// Score one asset for the background ingest pass, mirroring the CLI
-/// (`triptape-media`'s `triptape` binary) constants.
+/// One asset's background scoring result.
+#[derive(Debug, Clone, PartialEq)]
+struct Scored {
+    score: Score,
+    /// Perceptual hash of the pixels scored (thumbnail or poster frame);
+    /// `None` when nothing decoded.
+    phash: Option<u64>,
+}
+
+/// Score and fingerprint one asset for the background ingest pass,
+/// mirroring the CLI (`triptape-media`'s `triptape` binary) constants.
 ///
-/// Videos use the fixed GPS-novelty proxy. Stills and Live Photos score
-/// their still image, preferring the existing 320 px ffmpeg thumbnail
-/// (same `source_cache_key` + `cache_path` convention as `get_thumbnail`,
-/// so scoring warms the Library thumbnail cache) and falling back to the
+/// Every kind is read through its existing 320 px ffmpeg thumbnail (same
+/// `source_cache_key` + `cache_path` convention as `get_thumbnail`, so
+/// scoring warms the Library thumbnail cache; videos use their poster
+/// frame). Stills and Live Photos score that image and fall back to the
 /// source file when the thumbnail cannot be made or decoded; unscorable
-/// stills get the CLI neutral fallback. Pure per-file work: never fails,
+/// stills get the CLI neutral fallback. The pHash comes from the same
+/// pixels, so HEIC stills, Live Photos and videos get one too. Videos
+/// score by the quality of their best playback window (plus people and
+/// caption signals) and keep that window. Pure per-file work: never fails,
 /// never touches the Db.
-fn score_asset_with_cache(cache_dir: &Path, a: &Asset) -> Score {
+fn score_asset_with_cache(cache_dir: &Path, a: &Asset) -> Scored {
+    let signals = score::StorySignals::for_asset(a);
+    let thumb = proxies::source_cache_key(&a.id, &a.path)
+        .ok()
+        .map(|key| proxies::cache_path(cache_dir, "thumb", &key, ".jpg"))
+        .filter(|dst| triptape_media::ffmpeg::render_thumb("ffmpeg", &a.path, a.kind, dst).is_ok())
+        .and_then(|dst| hash::open_image(&dst));
     if a.kind == AssetKind::Video {
-        return score::video_proxy_score(a.gps.is_some());
+        // Any failure keeps the start-of-clip trim and a neutral quality.
+        let analysis = a.duration_secs.map_or_else(Default::default, |d| {
+            triptape_media::clip_analysis::analyze_clip("ffmpeg", "ffprobe", &a.path, d)
+        });
+        return Scored {
+            score: analysis.score(&signals),
+            phash: thumb.as_ref().map(hash::average_hash_from_image),
+        };
     }
-    if let Ok(key) = proxies::source_cache_key(&a.id, &a.path) {
-        let dst = proxies::cache_path(cache_dir, "thumb", &key, ".jpg");
-        if triptape_media::ffmpeg::render_thumb("ffmpeg", &a.path, a.kind, &dst).is_ok() {
-            if let Some(s) = score::score_still_file(&dst) {
-                return s;
-            }
-        }
+    let pixels = thumb.or_else(|| hash::open_image(&a.path));
+    Scored {
+        score: score::score_still_or_fallback(pixels.as_ref(), &signals),
+        phash: pixels.as_ref().map(hash::average_hash_from_image),
     }
-    score::score_still_file(&a.path).unwrap_or_else(score::fallback_score)
 }
 
 /// Upper bound on concurrent scoring workers: each one holds a full-size
@@ -117,7 +146,7 @@ fn score_assets_parallel(
     cache_dir: &Path,
     assets: &[Asset],
     workers: usize,
-    mut on_score: impl FnMut(&Asset, Score, usize, usize),
+    mut on_score: impl FnMut(&Asset, Scored, usize, usize),
 ) {
     triptape_core::parallel::for_each_parallel(
         assets,
@@ -262,21 +291,22 @@ fn background_hash_job(
             .collect();
         let score_total = unscored.len();
         if score_total > 0 {
-            let flush_scores = |pending: &mut Vec<(String, Score)>| -> Result<(), String> {
-                if pending.is_empty() {
-                    return Ok(());
-                }
-                let db = lock()?;
-                db.in_transaction(|db| {
-                    for (id, s) in pending.iter() {
-                        db.update_asset_score(id, s)?;
+            let flush_scores =
+                |pending: &mut Vec<(String, Score, Option<u64>)>| -> Result<(), String> {
+                    if pending.is_empty() {
+                        return Ok(());
                     }
-                    Ok::<(), String>(())
-                })?;
-                pending.clear();
-                Ok(())
-            };
-            let mut pending_scores: Vec<(String, Score)> = vec![];
+                    let db = lock()?;
+                    db.in_transaction(|db| {
+                        for (id, s, phash) in pending.iter() {
+                            db.update_asset_scoring(id, s, *phash)?;
+                        }
+                        Ok::<(), String>(())
+                    })?;
+                    pending.clear();
+                    Ok(())
+                };
+            let mut pending_scores: Vec<(String, Score, Option<u64>)> = vec![];
             // Decode/score work fans out over worker threads; persists and
             // progress stay on this thread via the completion callback,
             // which fires once per scored asset in completion order.
@@ -285,11 +315,10 @@ fn background_hash_job(
                 .unwrap_or(SCORE_WORKERS_MAX)
                 .min(SCORE_WORKERS_MAX);
             score_assets_parallel(&cache_dir, &unscored, workers, |a, s, done, total| {
-                pending_scores.push((a.id.clone(), s));
-                if pending_scores.len() >= SCORE_FLUSH_FILES
-                    && flush_scores(&mut pending_scores).is_ok()
-                {
-                    last_flush = std::time::Instant::now();
+                pending_scores.push((a.id.clone(), s.score, s.phash));
+                // A failed flush keeps its batch; the final flush retries it.
+                if pending_scores.len() >= SCORE_FLUSH_FILES {
+                    let _ = flush_scores(&mut pending_scores);
                 }
                 let candidate = (BACKGROUND_HASH_CEILING_PROGRESS
                     + (done as f32 / total as f32)
@@ -320,18 +349,19 @@ fn background_hash_job(
         // lock; the rebuild itself is pure. Inserting a newer plan only
         // adds a row, so Story edits (PlanEdits applied on read) survive
         // untouched.
-        let assets = lock()?.list_assets(project_id)?;
+        let mut assets = lock()?.list_assets(project_id)?;
         let clusters = cluster::cluster_assets(&assets);
-        let cluster_of: HashMap<String, String> = clusters
-            .iter()
-            .flat_map(|c| c.asset_ids.iter().map(|id| (id.clone(), c.label.clone())))
-            .collect();
+        let cluster_of = cluster::chapter_labels(&clusters);
         // The plan reads the freshly persisted scores (already-scored
         // restores contribute theirs too), so hero trim/cap match CLI use.
         let scores: HashMap<String, Score> = assets
             .iter()
             .filter_map(|a| a.score.clone().map(|s| (a.id.clone(), s)))
             .collect();
+        // Near-duplicates (same moment, similar pixels) stay in the library
+        // but only the best shot of each stack enters the plan, as in the CLI.
+        let suppressed = cluster::suppressed_ids(&cluster::collapse_near_dupes(&assets, &scores));
+        assets.retain(|a| !suppressed.contains(&a.id));
         let plan = planmod::build_plan(&assets, &cluster_of, &scores);
         let db = lock()?;
         db.insert_plan(project_id, &plan, "local")?;
@@ -823,6 +853,96 @@ fn load_plan_assets(
     Ok((plan.edited, plan.assets, name))
 }
 
+/// Export progress for the app: the same `job://progress` stream and job row
+/// ingest uses, fed by the renderers' [`ProgressEvent`]s, plus the cancel
+/// signal (the job row going `cancelled`) the renderers poll.
+struct ExportProgress {
+    app: tauri::AppHandle,
+    job_id: String,
+    /// `(keepsake, start, end)` slices of the job's 0..1 bar.
+    bands: Vec<(&'static str, f32, f32)>,
+    last_emit: std::sync::Mutex<(std::time::Instant, f32)>,
+    last_cancel_poll: std::sync::Mutex<std::time::Instant>,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl ExportProgress {
+    fn new(app: &tauri::AppHandle, job_id: &str, only: &str) -> Self {
+        // Rough share of an export's time per keepsake.
+        let weights = [("video", 0.6f32), ("reels", 0.25), ("book", 0.15)];
+        let chosen: Vec<_> = weights
+            .into_iter()
+            .filter(|(k, _)| only == "all" || only == *k)
+            .collect();
+        let sum: f32 = chosen.iter().map(|(_, w)| w).sum();
+        let mut at = 0.0;
+        let bands = chosen
+            .into_iter()
+            .map(|(k, w)| {
+                let band = (k, at, at + w / sum);
+                at = band.2;
+                band
+            })
+            .collect();
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        Self {
+            app: app.clone(),
+            job_id: job_id.to_string(),
+            bands,
+            last_emit: std::sync::Mutex::new((long_ago, 0.0)),
+            last_cancel_poll: std::sync::Mutex::new(long_ago),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl triptape_media::progress::ProgressSink for ExportProgress {
+    fn report(&self, event: &triptape_media::progress::ProgressEvent) {
+        let Some(&(_, lo, hi)) = self.bands.iter().find(|b| b.0 == event.keepsake()) else {
+            return;
+        };
+        let overall = event.keepsake_fraction().map(|f| lo + (hi - lo) * f as f32);
+        let mut last = self.last_emit.lock().unwrap_or_else(|e| e.into_inner());
+        // Never move the bar backwards between phases or on a step with no
+        // fraction; throttle like ingest (the final tick always goes out).
+        let progress = overall.unwrap_or(last.1).max(last.1);
+        let finished = matches!(event, triptape_media::progress::ProgressEvent::Counted { done, total, .. } if done == total);
+        if last.0.elapsed() < PROGRESS_EMIT_INTERVAL && !finished {
+            return;
+        }
+        *last = (std::time::Instant::now(), progress);
+        let state = self.app.state::<AppState>();
+        let db = state.db.lock();
+        if let Ok(db) = db {
+            if !report_ingest(&self.app, &db, &self.job_id, progress, &event.text()) {
+                self.cancelled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.cancelled.load(Ordering::Relaxed) {
+            return true;
+        }
+        let mut polled = self
+            .last_cancel_poll
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if polled.elapsed() < std::time::Duration::from_millis(250) {
+            return false;
+        }
+        *polled = std::time::Instant::now();
+        let state = self.app.state::<AppState>();
+        let gone = state.db.lock().is_ok_and(
+            |db| matches!(db.get_job(&self.job_id), Ok(Some(j)) if j.state == JobState::Cancelled),
+        );
+        self.cancelled.store(gone, Ordering::Relaxed);
+        gone
+    }
+}
+
 /// Renders run on a blocking worker so ffmpeg/typst never stall the async
 /// executor (and with it `cancel_job` / `get_assets`).
 async fn run_export(
@@ -866,9 +986,19 @@ fn export_blocking(
         preset: triptape_media::render_book::BookPreset::P1,
         trip_name,
         typst_bin: "typst".to_string(),
-        music_path: None,
+        music_paths: Vec::new(),
         keep_ambience: false,
         only: "all".to_string(),
+        resolution: triptape_media::resolution::Resolution::default(),
+        jobs: None,
+        itinerary: None,
+        // The same dir the CLI uses, so `triptape cache` sees the app's
+        // segments: macOS ~/Library/Caches/app.triptape.desktop/segments.
+        segment_cache: triptape_media::segment_cache::default_dir()
+            .map(triptape_media::segment_cache::SegmentCacheConfig::new),
+        progress: triptape_media::progress::Progress::new(std::sync::Arc::new(
+            ExportProgress::new(app, &job.id, "all"),
+        )),
     };
     let rendered = triptape_media::export::export_all(&caps, &plan, &assets, &out_dir, &opts)
         .map_err(|e| e.to_string());
@@ -984,6 +1114,27 @@ async fn set_asset_excluded(
     AppState::check_id(&asset_id)?;
     with_edits(&state, &project_id, |edits| {
         edits.set_excluded(asset_id, excluded)
+    })
+}
+
+/// Pin a photo into the film ("Add to film"), or un-pin it. Film only; the
+/// plan puts it at its capture-time position and trades it for the weakest
+/// unpinned shot of its day to keep the length.
+#[tauri::command]
+async fn set_asset_included(
+    state: State<'_, AppState>,
+    project_id: String,
+    asset_id: String,
+    included: bool,
+) -> Result<StoryView, String> {
+    AppState::check_id(&asset_id)?;
+    state.require_project(&project_id)?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    if included {
+        StoryData::load(&db, &project_id)?.check_include(&asset_id)?;
+    }
+    save_edits(&db, &project_id, |edits| {
+        edits.set_included(asset_id, included)
     })
 }
 
@@ -1106,6 +1257,7 @@ fn main() {
             set_chapter_place,
             set_asset_caption,
             set_asset_excluded,
+            set_asset_included,
             swap_asset,
             get_thumbnail
         ])

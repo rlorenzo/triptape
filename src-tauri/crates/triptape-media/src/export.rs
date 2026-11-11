@@ -5,25 +5,59 @@
 //! and never failed silently.
 
 use crate::ffmpeg::Capabilities;
+use crate::progress::Progress;
 use crate::render_book::{self, BookOptions, BookPhoto};
 use crate::render_reels::{self, ReelOptions};
 use crate::render_video::{self, ResolvedEntry, VideoOptions};
+use crate::resolution::Resolution;
+use crate::segment_cache::{SegmentCache, SegmentCacheConfig};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{check_source_integrity, plan_eligibility, Integrity};
-use triptape_core::types::{AssetKind, Plan, PlanEntry, Rendition};
+use triptape_core::types::{distinct_assets, AssetKind, Plan, PlanEntry, Rendition};
 
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
     pub preset: render_book::BookPreset,
     pub trip_name: String,
     pub typst_bin: String,
-    pub music_path: Option<PathBuf>,
+    /// Music playlist in order (crossfaded); empty uses the bundled theme.
+    pub music_paths: Vec<PathBuf>,
     /// Keep the original film audio at 0.12 under the music bed (default
     /// mutes it; the music is the primary audio).
     pub keep_ambience: bool,
     /// "all" (default), or one keepsake: "video" | "reels" | "book".
     pub only: String,
+    /// Hero film frame size (default 4K). Reels stay 1080x1920.
+    pub resolution: Resolution,
+    /// Hero segments rendered at once; `None` picks the machine default.
+    pub jobs: Option<usize>,
+    /// Progress sink and cancel flag (default: silent, never cancelled).
+    pub progress: Progress,
+    /// Reuse rendered hero segments across exports; `None` renders all.
+    pub segment_cache: Option<SegmentCacheConfig>,
+    /// The owner's itinerary: the closing map travels it, and chapters were
+    /// relabelled with it before the plan got here (see
+    /// `Db::edited_plan_with`).
+    pub itinerary: Option<triptape_core::itinerary::Itinerary>,
+}
+
+/// How the segment cache served one export.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SegmentCacheReport {
+    pub dir: String,
+    /// Segments taken from the cache / segments the cache was asked for.
+    pub reused: usize,
+    pub total: usize,
+    /// Fresh segments written to the cache.
+    pub stored: usize,
+    /// Lower-third overlays taken from the cache / asked of it.
+    pub overlays_reused: usize,
+    pub overlays_total: usize,
+    /// Fresh segments left out because they would break the free-space floor.
+    pub skipped_low_disk: usize,
+    /// Old entries removed to stay within the size cap.
+    pub evicted: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -41,33 +75,43 @@ pub struct ExportReport {
     pub skipped: Vec<Skipped>,
     pub fallbacks: Vec<String>,
     pub attribution: Vec<String>,
+    /// Present when a segment cache was in use.
+    pub segment_cache: Option<SegmentCacheReport>,
+}
+
+/// The place of the chapter holding `asset_id`, for keepsakes that print or
+/// overlay it (reels, book). The hero film never uses it: its lower third
+/// already names the place.
+fn chapter_place<'a>(plan: &'a Plan, asset_id: &str) -> Option<&'a str> {
+    plan.chapters
+        .iter()
+        .find(|c| c.asset_ids.iter().any(|id| id == asset_id))
+        .and_then(|c| c.place.as_deref())
 }
 
 /// Resolve a plan entry to files from the asset map.
 fn resolve_entry(
     plan: &Plan,
     assets: &HashMap<String, triptape_core::types::Asset>,
-    asset_id: &str,
+    entry: &PlanEntry,
 ) -> Option<ResolvedEntry> {
+    let asset_id = entry.asset_id.as_str();
     let a = assets.get(asset_id)?;
-    let entry = plan
-        .hero
-        .iter()
-        .chain(plan.reel_selects.iter())
-        .find(|e| e.asset_id == asset_id)?
-        .clone();
     let (still_path, motion_path) = match a.kind {
         AssetKind::Photo => (a.path.clone(), None),
         AssetKind::Video => (a.path.clone(), Some(a.path.clone())),
         AssetKind::LivePhoto => (a.path.clone(), a.companion_path.clone()),
     };
     Some(ResolvedEntry {
-        entry,
+        // The caller's entry, not a lookup by asset id: sibling windows of
+        // one clip share the id but not the trim.
+        entry: entry.clone(),
         still_path,
         motion_path,
         caption: plan.captions.get(asset_id).cloned(),
         taken_at: a.taken_at,
         tz_offset_secs: a.tz_offset_secs,
+        aspect: a.display_aspect(),
     })
 }
 
@@ -104,6 +148,7 @@ fn verify_source(entry: &PlanEntry, path: &Path) -> Result<(), String> {
 fn asset_snapshot(a: &triptape_core::types::Asset) -> PlanEntry {
     PlanEntry {
         asset_id: a.id.clone(),
+        window: 0,
         content_hash: a.content_hash.clone(),
         size_bytes: a.size_bytes,
         mtime: a.mtime,
@@ -120,7 +165,7 @@ fn resolve_verified(
     label: &str,
     fallbacks: &mut Vec<String>,
 ) -> Option<ResolvedEntry> {
-    let r = resolve_entry(plan, assets, &entry.asset_id)?;
+    let r = resolve_entry(plan, assets, entry)?;
     match verify_source(entry, &r.still_path) {
         Ok(()) => Some(r),
         Err(reason) => {
@@ -139,6 +184,97 @@ pub fn export_all(
     out_dir: &Path,
     opts: &ExportOptions,
 ) -> Result<ExportReport, crate::MediaError> {
+    // Every renderer polls the one cancel flag through its capabilities.
+    let mut caps = crate::ffmpeg::Capabilities {
+        progress: opts.progress.clone(),
+        ..caps.clone()
+    };
+    // The cache takes its lease before any segment is used and gives it back
+    // however the export ends (the handle also releases on drop).
+    let work = out_dir.join(".work");
+    let (cache, cache_note) = match &opts.segment_cache {
+        None => (None, None),
+        Some(cfg) => {
+            let version = crate::segment_cache::ffmpeg_version(&caps.ffmpeg_bin);
+            match SegmentCache::open(cfg, version, &work) {
+                Ok(c) => (Some(c), None),
+                Err(e) => (
+                    None,
+                    Some(format!("segment cache off ({}): {e}", cfg.dir.display())),
+                ),
+            }
+        }
+    };
+    caps.segment_cache = cache.clone();
+    let mut out = export_inner(&caps, plan, assets, out_dir, opts);
+    // Leave no intermediates behind however the export ends (on cancel,
+    // finished outputs and `.partial` siblings are already gone). This must
+    // precede `cache.finish()`: `.work` holds hard links to cache entries, so
+    // while it exists eviction and `cache clear` cannot reclaim their bytes.
+    if let Err(e) = std::fs::remove_dir_all(&work) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            if let Ok(report) = out.as_mut() {
+                report.fallbacks.push(format!(
+                    "could not remove intermediates ({}): {e}; cached segments they share stay allocated",
+                    work.display()
+                ));
+            }
+        }
+    }
+    if let Some(cache) = cache {
+        // Eviction runs only now: the lease is released first, so nothing
+        // this export used is protected any longer than it is needed.
+        let evicted = cache.finish();
+        if let Ok(report) = out.as_mut() {
+            record_cache_use(&cache, evicted.removed, report);
+        }
+    }
+    if let (Ok(report), Some(note)) = (out.as_mut(), cache_note) {
+        report.fallbacks.push(note);
+    }
+    // Written last so the durable record includes the cache diagnostics.
+    if let Ok(report) = &out {
+        std::fs::write(
+            out_dir.join("export.json"),
+            serde_json::to_string_pretty(report)?,
+        )
+        .map_err(|e| crate::MediaError::Io(e.to_string()))?;
+    }
+    out
+}
+
+/// Add how `cache` served this export to `report`: the reuse summary and,
+/// when the volume ran low, a fallback note.
+fn record_cache_use(cache: &SegmentCache, evicted: usize, report: &mut ExportReport) {
+    let stats = cache.stats();
+    let total = stats.hits + stats.misses;
+    if total > 0 {
+        report.segment_cache = Some(SegmentCacheReport {
+            dir: cache.dir().to_string_lossy().into_owned(),
+            reused: stats.hits,
+            total,
+            stored: stats.stored,
+            overlays_reused: stats.overlay_hits,
+            overlays_total: stats.overlay_hits + stats.overlay_misses,
+            skipped_low_disk: stats.skipped_low_disk,
+            evicted,
+        });
+    }
+    if stats.skipped_low_disk > 0 {
+        report.fallbacks.push(format!(
+            "segment cache: {} segments not cached (storing them would drop free space below the floor)",
+            stats.skipped_low_disk
+        ));
+    }
+}
+
+fn export_inner(
+    caps: &Capabilities,
+    plan: &Plan,
+    assets: &[triptape_core::types::Asset],
+    out_dir: &Path,
+    opts: &ExportOptions,
+) -> Result<ExportReport, crate::MediaError> {
     // Validate the keepsake selector before touching the output dir, so a
     // typo (e.g. "reel") fails loudly instead of exporting nothing.
     if !matches!(opts.only.as_str(), "all" | "video" | "reels" | "book") {
@@ -149,7 +285,9 @@ pub fn export_all(
     }
     let by_id: HashMap<String, triptape_core::types::Asset> =
         assets.iter().map(|a| (a.id.clone(), a.clone())).collect();
-    let usable = plan.hero.len();
+    // Eligibility counts assets, not entries: a scene-split clip plays
+    // several windows but is still one usable asset.
+    let usable = distinct_assets(&plan.hero);
     let photos = assets.iter().filter(|a| a.kind != AssetKind::Video).count();
     let elig = plan_eligibility(usable, photos, plan.chapters.len());
 
@@ -165,13 +303,15 @@ pub fn export_all(
         skipped: vec![],
         fallbacks: vec![],
         attribution: vec![crate::map::MAP_ATTRIBUTION.to_string()],
+        segment_cache: None,
     };
 
     // Map card once, shared by the hero film and the book map page.
     let mut map_card: Option<PathBuf> = None;
     if !plan.map_polyline.is_empty() {
         let card = work.join("route_card.png");
-        match crate::map::save_route_card(&plan.map_polyline, &[], 1920, 1080, &card) {
+        let (card_w, card_h) = opts.resolution.dims();
+        match crate::map::save_route_card(&plan.map_polyline, &[], card_w, card_h, &card) {
             Ok(note) => {
                 report.attribution.push(note);
                 map_card = Some(card);
@@ -218,9 +358,24 @@ pub fn export_all(
             &VideoOptions {
                 trip_name: opts.trip_name.clone(),
                 short_mode: elig.video == "short",
-                music_path: opts.music_path.clone(),
+                music_paths: opts.music_paths.clone(),
                 keep_ambience: opts.keep_ambience,
                 typst_bin: opts.typst_bin.clone(),
+                resolution: opts.resolution,
+                jobs: opts.jobs,
+                journey: opts
+                    .itinerary
+                    .as_ref()
+                    .map(|i| triptape_core::journey::Journey::build(i, assets)),
+                route_stops: if opts.itinerary.is_some() {
+                    vec![]
+                } else {
+                    triptape_core::route_stops::chapter_route_stops(
+                        &plan.chapters,
+                        assets,
+                        &plan.map_polyline,
+                    )
+                },
                 ..Default::default()
             },
         ) {
@@ -228,6 +383,7 @@ pub fn export_all(
                 report.video = Some(out_mp4.to_string_lossy().into_owned());
                 report.fallbacks.extend(v.fallbacks);
             }
+            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
             Err(e) => report.skipped.push(Skipped {
                 keepsake: "video".into(),
                 reason: format!("render failed: {e}"),
@@ -254,6 +410,13 @@ pub fn export_all(
             .filter(|e| seen.insert(e.asset_id.clone()))
             .take(elig.reels)
             .filter_map(|e| resolve_verified(plan, &by_id, e, "reels", &mut report.fallbacks))
+            .map(|mut r| {
+                // A reel names where it is; the user's caption wins.
+                if r.caption.is_none() {
+                    r.caption = chapter_place(plan, &r.entry.asset_id).map(String::from);
+                }
+                r
+            })
             .collect();
         // Still highlights become slideshows of their chapter neighbors,
         // never reusing a photo across reels.
@@ -287,7 +450,9 @@ pub fn export_all(
                 &resolved,
                 &reels_dir,
                 &ReelOptions {
-                    music_path: opts.music_path.clone(),
+                    // Reels are short: they loop the first playlist track
+                    // rather than building the crossfaded bed.
+                    music_path: opts.music_paths.first().cloned(),
                     slideshows,
                     typst_bin: opts.typst_bin.clone(),
                     ..Default::default()
@@ -297,6 +462,7 @@ pub fn export_all(
                     report.reels = r.reels.iter().map(|f| f.path.clone()).collect();
                     report.fallbacks.extend(r.fallbacks);
                 }
+                Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
                 Err(e) => report.skipped.push(Skipped {
                     keepsake: "reels".into(),
                     reason: format!("render failed: {e}"),
@@ -341,13 +507,19 @@ pub fn export_all(
                     }
                 },
             };
+            let chapter = chapter_of.get(a.id.as_str()).copied();
             book_photos.push(BookPhoto {
                 asset_id: a.id.clone(),
                 path: a.path.clone(),
                 width: w,
                 height: h,
-                caption: plan.captions.get(&a.id).cloned(),
-                chapter: chapter_of.get(a.id.as_str()).copied(),
+                // The user's caption, else the chapter place.
+                caption: plan
+                    .captions
+                    .get(&a.id)
+                    .or_else(|| chapter.and_then(|i| plan.chapters[i].place.as_ref()))
+                    .cloned(),
+                chapter,
             });
         }
         // Story order: keep db order (taken_at, id).
@@ -368,12 +540,14 @@ pub fn export_all(
                 trip_name: opts.trip_name.clone(),
                 typst_bin: opts.typst_bin.clone(),
                 ffmpeg_bin: caps.ffmpeg_bin.clone(),
+                progress: opts.progress.clone(),
             },
         ) {
             Ok(b) => {
                 report.book_pages = b.counted_pages;
                 report.fallbacks.extend(b.fallbacks);
             }
+            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
             Err(e) => report.skipped.push(Skipped {
                 keepsake: "book".into(),
                 reason: format!("preflight/render blocked: {e}"),
@@ -381,9 +555,6 @@ pub fn export_all(
         }
     }
 
-    let report_path = out_dir.join("export.json");
-    std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)
-        .map_err(|e| crate::MediaError::Io(e.to_string()))?;
     Ok(report)
 }
 
@@ -460,6 +631,30 @@ mod tests {
     }
 
     #[test]
+    fn finished_export_removes_its_work_dir() {
+        // `.work` hard-links cache entries; left behind, it would pin their
+        // bytes past eviction and `cache clear`.
+        let t = tempfile::tempdir().unwrap();
+        let out = t.path().join("out");
+        let opts = ExportOptions {
+            preset: render_book::BookPreset::P1,
+            trip_name: "t".into(),
+            typst_bin: "typst".into(),
+            music_paths: Vec::new(),
+            keep_ambience: false,
+            only: "reels".into(),
+            resolution: Default::default(),
+            jobs: None,
+            progress: Default::default(),
+            segment_cache: Some(SegmentCacheConfig::roomy(t.path().join("cache"))),
+            itinerary: None,
+        };
+        let report = export_all(&Default::default(), &empty_plan(), &[], &out, &opts).unwrap();
+        assert!(!out.join(".work").exists(), "{:?}", report.fallbacks);
+        assert!(out.join("export.json").exists());
+    }
+
+    #[test]
     fn chapter_slideshow_takes_neighbors_once_and_skips_clips() {
         let dir = tempfile::tempdir().unwrap();
         let mut by_id = HashMap::new();
@@ -489,6 +684,7 @@ mod tests {
         let still = |id: &str| ResolvedEntry {
             entry: PlanEntry {
                 asset_id: id.into(),
+                window: 0,
                 content_hash: None,
                 size_bytes: 1,
                 mtime: 0,
@@ -499,6 +695,7 @@ mod tests {
             caption: None,
             taken_at: None,
             tz_offset_secs: None,
+            aspect: None,
         };
         // Both selected stills are reserved up front, as export_all does.
         let mut used: HashSet<PathBuf> = [&by_id["p1"].path, &by_id["p3"].path]
@@ -539,6 +736,7 @@ mod tests {
         let mut plan = empty_plan();
         plan.hero.push(PlanEntry {
             asset_id: "a0".into(),
+            window: 0,
             content_hash: None,
             size_bytes: 1,
             mtime: 0,
@@ -550,8 +748,22 @@ mod tests {
         asset.taken_at = Some(1791288000);
         let assets: HashMap<String, triptape_core::types::Asset> =
             [("a0".to_string(), asset)].into_iter().collect();
-        let r = resolve_entry(&plan, &assets, "a0").expect("resolves");
+        let r = resolve_entry(&plan, &assets, &plan.hero[0]).expect("resolves");
         assert_eq!(r.taken_at, Some(1791288000));
         assert_eq!(r.caption.as_deref(), Some("Overlook"));
+    }
+
+    #[test]
+    fn chapter_place_names_the_chapter_not_the_hero_caption() {
+        let mut plan = empty_plan();
+        plan.chapters.push(triptape_core::types::Chapter {
+            title: "Sensō-ji".into(),
+            asset_ids: vec!["a0".into()],
+            place: Some("Sensō-ji".into()),
+            day_index: None,
+            date_label: None,
+        });
+        assert_eq!(chapter_place(&plan, "a0"), Some("Sensō-ji"));
+        assert_eq!(chapter_place(&plan, "other"), None);
     }
 }

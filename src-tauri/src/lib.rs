@@ -177,6 +177,8 @@ pub struct StoryView {
 /// Everything the Story editor reads for one project, loaded once.
 pub struct StoryData(EditedPlan);
 
+const NOT_IN_CHAPTER: &str = "asset is not in any chapter";
+
 impl StoryData {
     pub fn load(db: &Db, project_id: &str) -> Result<Self, String> {
         db.edited_plan(Some(project_id))?
@@ -253,16 +255,24 @@ impl StoryData {
         let chapter = self
             .0
             .base
-            .chapters
-            .iter()
-            .find(|c| c.asset_ids.iter().any(|id| id == asset_id))
-            .ok_or_else(|| "asset is not in any chapter".to_string())?;
+            .chapter_of(asset_id)
+            .ok_or_else(|| NOT_IN_CHAPTER.to_string())?;
         let entry = self.entry_builder();
         Ok(chapter
             .asset_ids
             .iter()
             .filter_map(|id| entry(id))
             .collect())
+    }
+
+    /// Only assets of a scan-time chapter can be pinned into the film
+    /// (the plan needs the chapter to trade a shot off against).
+    pub fn check_include(&self, asset_id: &str) -> Result<(), String> {
+        self.0
+            .base
+            .chapter_of(asset_id)
+            .map(|_| ())
+            .ok_or_else(|| NOT_IN_CHAPTER.to_string())
     }
 
     /// A swap replaces a current video/reel pick with a different asset of
@@ -315,8 +325,8 @@ pub struct ExportSummary {
 // ---------------------------------------------------------------------------
 
 /// Foreground metadata fill for desktop ingest (the Tauri shell's
-/// `scan_folder`): EXIF capture time / TZ / GPS / rotation / dims / caption
-/// for photos, ffprobe duration / dims / rotation / GPS / capture time for
+/// `scan_folder`): EXIF capture time / TZ / GPS / rotation / dims / caption /
+/// people count for photos, ffprobe duration / dims / rotation / GPS / capture time for
 /// videos. Mirrors the CLI mapping in `triptape-media`'s `triptape` binary
 /// minus pixel-decode work (no phash, no decoded-image dimensions): EXIF
 /// reads are header-only and each video costs one ffprobe spawn.
@@ -326,6 +336,7 @@ pub struct ExportSummary {
 pub fn fill_foreground_metadata(a: &mut Asset) {
     if a.kind == AssetKind::Video {
         let probe = metadata::probe_video("ffprobe", &a.path).ok();
+        (a.user_caption, a.people_count) = metadata::story_fields(&a.path, None);
         let Some(p) = probe else {
             a.taken_at = Some(a.mtime);
             a.time_guessed = true;
@@ -347,10 +358,7 @@ pub fn fill_foreground_metadata(a: &mut Asset) {
         a.taken_at = Some(ct.unix_secs);
         a.time_guessed = ct.time_guessed;
         a.tz_offset_secs = exif.tz_offset_secs;
-        a.user_caption = exif
-            .caption
-            .clone()
-            .or_else(|| metadata::read_sidecar_caption(&a.path));
+        (a.user_caption, a.people_count) = metadata::story_fields(&a.path, Some(&exif));
         a.gps = exif.gps;
         a.rotation_deg = exif
             .orientation
@@ -572,6 +580,17 @@ mod tests {
     }
 
     #[test]
+    fn story_include_requires_a_chapter_member() {
+        let (db, pid) = story_db(&["a", "b"]);
+        let data = StoryData::load(&db, &pid).unwrap();
+        assert!(data.check_include("b").is_ok());
+        assert_eq!(
+            data.check_include("missing").unwrap_err(),
+            "asset is not in any chapter"
+        );
+    }
+
+    #[test]
     fn story_entry_serializes_flat_for_the_webview() {
         let (db, pid) = story_db(&["a"]);
         let view = StoryData::load(&db, &pid).unwrap().view();
@@ -592,7 +611,7 @@ mod tests {
         a.gps = Some((34.9671, 135.7727));
         let view = AssetView::from(&a);
         assert!(view.has_gps);
-        assert_eq!(view.place.as_deref(), Some("Kyoto, Japan"));
+        assert_eq!(view.place.as_deref(), Some("Fushimi Inari-taisha"));
 
         let mut b = Asset::new("nogps", PathBuf::from("/t/nogps.jpg"), AssetKind::Photo);
         b.gps = None;
