@@ -4,6 +4,7 @@
 //! with `time_guessed = true` when no capture time exists.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Minimal ffprobe JSON surface we rely on.
@@ -249,6 +250,9 @@ pub struct ImageExif {
     /// or XMP `dc:description`), cleaned. Their own words outrank every
     /// auto-generated caption downstream.
     pub caption: Option<String>,
+    /// People tagged in the file's own XMP (count only; see
+    /// [`xmp_people_count`]).
+    pub people: Option<u32>,
 }
 
 /// Clean a raw embedded caption: collapse whitespace, drop empties and
@@ -290,29 +294,168 @@ fn xmp_description(data: &[u8]) -> Option<String> {
         inner
     };
     let end = body.find('<')?;
-    let raw = body[..end]
-        .replace("&lt;", "<")
+    clean_caption(&xml_unescape(&body[..end]))
+}
+
+/// Decode the five predefined XML entities in element text.
+fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
-        .replace("&amp;", "&"); // Last, so `&amp;lt;` stays a literal `&lt;`.
-    clean_caption(&raw)
+        .replace("&amp;", "&") // Last, so `&amp;lt;` stays a literal `&lt;`.
 }
 
-/// Caption from an XMP sidecar next to `path` (`IMG_1.heic.xmp`, `IMG_1.xmp`,
-/// or `IMG_1.XMP`). Photos exports write one sidecar per photo and put the
-/// user's caption inside; the image itself may carry none.
-///
-/// `IMG_1.heic.xmp` names exactly this photo, so when it exists it is the
-/// answer even if captionless. `IMG_1.xmp` may belong to a same-stem sibling
-/// (RAW + HEIC), and its caption must not land on this photo instead.
-pub fn read_sidecar_caption(path: &Path) -> Option<String> {
-    if let Ok(data) = read_prefix(&path.with_added_extension("xmp")) {
-        return xmp_description(&data);
+/// Most people counted for one photo: a tagged crowd saturates the story
+/// bonus long before this, and a keyword dump must not look like a crowd.
+const MAX_PEOPLE: u32 = 20;
+/// Longest keyword (chars) still read as a person's name.
+const MAX_NAME_CHARS: usize = 40;
+/// Most words in a keyword still read as a person's name.
+const MAX_NAME_WORDS: usize = 4;
+
+/// The XMP packet inside a file prefix (embedded in an image, or the whole
+/// body of a `.xmp` sidecar), as text. `None` when no packet is present.
+fn xmp_packet(data: &[u8]) -> Option<String> {
+    const OPEN: &[u8] = b"<x:xmpmeta";
+    const CLOSE: &[u8] = b"</x:xmpmeta>";
+    let start = data.windows(OPEN.len()).position(|w| w == OPEN)?;
+    let rest = &data[start..];
+    let end = rest
+        .windows(CLOSE.len())
+        .position(|w| w == CLOSE)
+        .map_or(rest.len(), |e| e + CLOSE.len());
+    Some(String::from_utf8_lossy(&rest[..end]).into_owned())
+}
+
+/// Text of the first `<tag ...>...</tag>` element, or `None` when absent or
+/// self-closed.
+fn xmp_element<'a>(xmp: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}");
+    let mut from = 0;
+    while let Some(i) = xmp[from..].find(&open) {
+        let at = from + i;
+        let after = &xmp[at + open.len()..];
+        // `<dc:subject>` must not match `<dc:subjectFoo>`.
+        if !after.starts_with(['>', ' ', '/', '\n', '\t', '\r']) {
+            from = at + open.len();
+            continue;
+        }
+        let gt = after.find('>')?;
+        if after[..gt].ends_with('/') {
+            return None;
+        }
+        let body = &after[gt + 1..];
+        let end = body.find(&format!("</{tag}>")).unwrap_or(body.len());
+        return Some(&body[..end]);
     }
-    [path.with_extension("xmp"), path.with_extension("XMP")]
-        .iter()
-        .find_map(|c| xmp_description(&read_prefix(c).ok()?))
+    None
+}
+
+/// Unescaped text of every non-empty `<rdf:li>` in an element body.
+fn xmp_list_items(body: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut rest = body;
+    while let Some(i) = rest.find("<rdf:li") {
+        rest = &rest[i + "<rdf:li".len()..];
+        let Some(gt) = rest.find('>') else { break };
+        if rest[..gt].ends_with('/') {
+            continue;
+        }
+        let text = &rest[gt + 1..];
+        let end = text.find('<').unwrap_or(text.len());
+        let item = xml_unescape(&text[..end]);
+        let item = item.trim();
+        if !item.is_empty() {
+            out.push(item.to_string());
+        }
+    }
+    out
+}
+
+/// Distinct (case-insensitive) count of non-empty items.
+fn distinct_count(items: impl IntoIterator<Item = String>) -> u32 {
+    let set: HashSet<String> = items.into_iter().map(|i| i.to_lowercase()).collect();
+    set.len() as u32
+}
+
+/// A `dc:subject` keyword that plausibly names a person: short, no digits,
+/// no hierarchy or URL punctuation.
+fn looks_like_name(keyword: &str) -> bool {
+    keyword.chars().count() <= MAX_NAME_CHARS
+        && keyword.split_whitespace().count() <= MAX_NAME_WORDS
+        && !keyword
+            .chars()
+            .any(|c| c.is_ascii_digit() || matches!(c, '/' | '\\' | ':' | '|' | '>' | '#' | '@'))
+}
+
+/// How many people a file's XMP says appear in the photo. Only the count is
+/// kept; names are personal data and never leave this function.
+///
+/// Sources, in order of trust:
+/// 1. `Iptc4xmpExt:PersonInImage`: the standard people field.
+/// 2. MWG face regions (`mwg-rs:Type` = `Face`): one per detected face.
+/// 3. Plain `dc:subject` keywords. Apple Photos exports each named person
+///    as a keyword, but other libraries put topics there too, so this is a
+///    heuristic: each distinct keyword that looks like a name (1 to 4
+///    words, no digits or path/URL punctuation) counts as one person.
+///
+/// Counts saturate at [`MAX_PEOPLE`]; zero people yields `None`.
+pub fn xmp_people_count(data: &[u8]) -> Option<u32> {
+    let xmp = xmp_packet(data)?;
+    let tagged = xmp_element(&xmp, "Iptc4xmpExt:PersonInImage")
+        .map(|b| distinct_count(xmp_list_items(b)))
+        .filter(|&n| n > 0);
+    let faces = || {
+        let n = xmp.matches("mwg-rs:Type=\"Face\"").count()
+            + xmp.matches("<mwg-rs:Type>Face</mwg-rs:Type>").count();
+        (n > 0).then_some(n as u32)
+    };
+    let keywords = || {
+        xmp_element(&xmp, "dc:subject")
+            .map(|b| distinct_count(xmp_list_items(b).into_iter().filter(|k| looks_like_name(k))))
+            .filter(|&n| n > 0)
+    };
+    tagged
+        .or_else(faces)
+        .or_else(keywords)
+        .map(|n| n.min(MAX_PEOPLE))
+}
+
+/// User caption and people count from an XMP sidecar next to `path`
+/// (`IMG_1.heic.xmp`, `IMG_1.xmp`, or `IMG_1.XMP`), reading each sidecar
+/// at most once. `IMG_1.heic.xmp` names exactly this photo, so when it
+/// exists it is the answer even for fields it lacks. `IMG_1.xmp` may belong
+/// to a same-stem sibling (RAW + HEIC), and its values must not land on
+/// this photo instead. Photos exports write one sidecar per photo and put
+/// the user's caption inside; the image itself may carry none.
+pub fn read_sidecar_story(path: &Path) -> (Option<String>, Option<u32>) {
+    if let Ok(data) = read_prefix(&path.with_added_extension("xmp")) {
+        return (xmp_description(&data), xmp_people_count(&data));
+    }
+    let (mut caption, mut people) = (None, None);
+    for c in [path.with_extension("xmp"), path.with_extension("XMP")] {
+        if caption.is_some() && people.is_some() {
+            break;
+        }
+        let Ok(data) = read_prefix(&c) else { continue };
+        caption = caption.or_else(|| xmp_description(&data));
+        people = people.or_else(|| xmp_people_count(&data));
+    }
+    (caption, people)
+}
+
+/// An asset's story fields `(user caption, people count)`: in-file values
+/// from `exif` (photos) win and the XMP sidecar fills the rest. The sidecar
+/// is not read when `exif` already supplies both.
+pub fn story_fields(path: &Path, exif: Option<&ImageExif>) -> (Option<String>, Option<u32>) {
+    let caption = exif.and_then(|e| e.caption.clone());
+    let people = exif.and_then(|e| e.people);
+    if caption.is_some() && people.is_some() {
+        return (caption, people);
+    }
+    let (side_caption, side_people) = read_sidecar_story(path);
+    (caption.or(side_caption), people.or(side_people))
 }
 
 /// Upper bound on bytes buffered from one image for metadata parsing.
@@ -341,10 +484,11 @@ fn is_tiff_magic(head: &[u8]) -> bool {
 /// `EXIF_READ_CAP`, so memory never scales with full file size.
 pub fn read_image_exif(path: &Path) -> ImageExif {
     let mut out = read_image_exif_fields(path);
-    if out.caption.is_none() {
-        if let Ok(data) = read_prefix(path) {
+    if let Ok(data) = read_prefix(path) {
+        if out.caption.is_none() {
             out.caption = xmp_description(&data);
         }
+        out.people = xmp_people_count(&data);
     }
     out
 }
@@ -418,6 +562,7 @@ fn kamadak_fields(exif: &exif::Exif) -> ImageExif {
         width: dim(exif::Tag::PixelXDimension),
         height: dim(exif::Tag::PixelYDimension),
         caption: ascii(exif::Tag::ImageDescription).and_then(|s| clean_caption(&s)),
+        people: None,
     }
 }
 
@@ -686,7 +831,7 @@ mod tests {
             );
             std::fs::write(dir.path().join(name), body).unwrap();
         };
-        let caption = |photo: &str| read_sidecar_caption(&dir.path().join(photo));
+        let caption = |photo: &str| read_sidecar_story(&dir.path().join(photo)).0;
 
         // Every supported sidecar naming.
         sidecar("IMG_1.xmp", "Replaced extension");
@@ -1027,6 +1172,143 @@ mod tests {
         assert_eq!(
             read_image_exif(&dir.path().join("missing.jpg")),
             ImageExif::default()
+        );
+    }
+
+    const XMP_HEAD: &str = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF><rdf:Description>"#;
+    const XMP_TAIL: &str = "</rdf:Description></rdf:RDF></x:xmpmeta>";
+
+    fn xmp(body: &str) -> Vec<u8> {
+        format!("junk\0{XMP_HEAD}{body}{XMP_TAIL}trailing").into_bytes()
+    }
+
+    #[test]
+    fn people_count_from_dc_subject_keywords() {
+        let data = xmp(
+            "<dc:subject><rdf:Bag><rdf:li>Ann</rdf:li><rdf:li>Bo Lee</rdf:li>\
+             <rdf:li>ann</rdf:li><rdf:li>2026/Japan</rdf:li><rdf:li>Trip 2026</rdf:li>\
+             </rdf:Bag></dc:subject>",
+        );
+        // Duplicates fold, digit and path-like keywords are topics.
+        assert_eq!(xmp_people_count(&data), Some(2));
+    }
+
+    #[test]
+    fn person_in_image_beats_keywords_and_regions() {
+        let data = xmp(
+            "<dc:subject><rdf:Bag><rdf:li>A</rdf:li><rdf:li>B</rdf:li><rdf:li>C</rdf:li>\
+             </rdf:Bag></dc:subject>\
+             <Iptc4xmpExt:PersonInImage><rdf:Bag><rdf:li>Ann</rdf:li></rdf:Bag>\
+             </Iptc4xmpExt:PersonInImage>",
+        );
+        assert_eq!(xmp_people_count(&data), Some(1));
+    }
+
+    #[test]
+    fn face_regions_beat_keywords() {
+        let data = xmp(
+            r#"<mwg-rs:Regions><rdf:Bag><rdf:li><rdf:Description mwg-rs:Type="Face"/></rdf:li>
+               <rdf:li><rdf:Description mwg-rs:Type="Face"/></rdf:li>
+               <rdf:li><rdf:Description mwg-rs:Type="Pet"/></rdf:li></rdf:Bag></mwg-rs:Regions>
+               <dc:subject><rdf:Bag><rdf:li>X</rdf:li></rdf:Bag></dc:subject>"#,
+        );
+        assert_eq!(xmp_people_count(&data), Some(2));
+    }
+
+    #[test]
+    fn people_count_edge_cases() {
+        // No packet, no list, empty and self-closed lists, look-alike tag.
+        assert_eq!(xmp_people_count(b"just a jpeg"), None);
+        assert_eq!(xmp_people_count(&xmp("<dc:title>x</dc:title>")), None);
+        assert_eq!(xmp_people_count(&xmp("<dc:subject/>")), None);
+        assert_eq!(
+            xmp_people_count(&xmp("<dc:subjectX><rdf:li>Ann</rdf:li></dc:subjectX>")),
+            None
+        );
+        // Escapes unescape; a keyword dump saturates.
+        let names: String = (0..40)
+            .map(|i| format!("<rdf:li>{}</rdf:li>", "n".repeat(i + 1)))
+            .collect();
+        let data = xmp(&format!(
+            "<dc:subject><rdf:Bag>{names}</rdf:Bag></dc:subject>"
+        ));
+        assert_eq!(xmp_people_count(&data), Some(MAX_PEOPLE));
+        let amp = xmp("<dc:subject><rdf:Bag><rdf:li>A &amp; B</rdf:li></rdf:Bag></dc:subject>");
+        assert_eq!(xmp_people_count(&amp), Some(1));
+    }
+
+    #[test]
+    fn sidecar_people_follows_caption_sidecar_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, n: usize| {
+            let items: String = (0..n)
+                .map(|i| format!("<rdf:li>P{}</rdf:li>", "z".repeat(i)))
+                .collect();
+            std::fs::write(
+                dir.path().join(name),
+                xmp(&format!(
+                    "<dc:subject><rdf:Bag>{items}</rdf:Bag></dc:subject>"
+                )),
+            )
+            .unwrap();
+        };
+        write("IMG_1.heic.xmp", 3);
+        write("IMG_1.xmp", 1);
+        write("IMG_2.xmp", 2);
+        let people = |photo: &str| read_sidecar_story(&dir.path().join(photo)).1;
+        assert_eq!(people("IMG_1.heic"), Some(3), "exact sidecar wins");
+        assert_eq!(people("IMG_2.heic"), Some(2));
+        assert_eq!(people("IMG_3.heic"), None);
+        // An exact sidecar without people hides the same-stem sibling's.
+        std::fs::write(
+            dir.path().join("IMG_2.heic.xmp"),
+            xmp("<dc:title>t</dc:title>"),
+        )
+        .unwrap();
+        assert_eq!(people("IMG_2.heic"), None);
+    }
+
+    #[test]
+    fn story_fields_prefer_in_file_values_and_fill_from_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let photo = dir.path().join("IMG_1.heic");
+        std::fs::write(
+            dir.path().join("IMG_1.heic.xmp"),
+            "<x:xmpmeta><rdf:Description><dc:description>Sidecar words</dc:description>\
+             <Iptc4xmpExt:PersonInImage><rdf:Bag><rdf:li>Ann</rdf:li><rdf:li>Bo</rdf:li>\
+             </rdf:Bag></Iptc4xmpExt:PersonInImage></rdf:Description></x:xmpmeta>",
+        )
+        .unwrap();
+        // One sidecar read yields both fields.
+        assert_eq!(
+            read_sidecar_story(&photo),
+            (Some("Sidecar words".to_string()), Some(2))
+        );
+        assert_eq!(
+            story_fields(&photo, None),
+            (Some("Sidecar words".to_string()), Some(2))
+        );
+        // In-file values win; the sidecar fills only what is missing.
+        let exif = ImageExif {
+            caption: Some("In-file words".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            story_fields(&photo, Some(&exif)),
+            (Some("In-file words".to_string()), Some(2))
+        );
+        let full = ImageExif {
+            caption: Some("In-file words".into()),
+            people: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(
+            story_fields(&photo, Some(&full)),
+            (Some("In-file words".to_string()), Some(5))
+        );
+        assert_eq!(
+            story_fields(&dir.path().join("IMG_9.heic"), None),
+            (None, None)
         );
     }
 }

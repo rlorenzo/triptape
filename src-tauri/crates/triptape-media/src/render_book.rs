@@ -327,6 +327,8 @@ pub struct BookOptions {
     pub typst_bin: String,
     /// FFmpeg used to decode stills the `image` crate cannot read (HEIC).
     pub ffmpeg_bin: String,
+    /// Progress and cancel handle (default: silent, never cancelled).
+    pub progress: crate::progress::Progress,
 }
 
 #[derive(Debug)]
@@ -631,11 +633,16 @@ pub fn render_book(
     let mut page_no = 0usize;
     let mut announced: HashSet<usize> = HashSet::new();
 
+    let total_pages = flow
+        .iter()
+        .filter(|p| p.kind != PageKind::CoverProxy)
+        .count();
+    opts.progress.counted("book", "page", 0, total_pages);
     for fp in &flow {
-        crate::check_cancelled()?;
         if fp.kind == PageKind::CoverProxy {
             continue;
         }
+        opts.progress.check_cancelled()?;
         page_no += 1;
         let fname = format!("page_{page_no:03}.jpg");
         let out = out_dir.join(&fname);
@@ -744,6 +751,7 @@ pub fn render_book(
             )));
         }
         jpegs.push(out);
+        opts.progress.counted("book", "page", page_no, total_pages);
     }
 
     let issues = preflight(opts.preset, &kinds, &placements);
@@ -775,6 +783,8 @@ pub fn render_book(
     }
 
     let counted = count_pages(&kinds);
+    opts.progress.check_cancelled()?;
+    opts.progress.step("book", "proof and press PDFs", None);
     let proof =
         match write_typst_and_compile(&jpegs, &captions, opts, out_dir, false, cover.as_deref()) {
             Ok(p) => Some(p),
@@ -808,6 +818,8 @@ pub fn render_book(
         v.sort_unstable();
         v
     };
+    opts.progress.check_cancelled()?;
+    opts.progress.step("book", "burning captions", None);
     let captions_burned = if captioned.is_empty() {
         true
     } else if proof.is_some() {
@@ -1929,6 +1941,7 @@ mod tests {
             trip_name: "Test".into(),
             typst_bin: "typst".into(),
             ffmpeg_bin: "ffmpeg".into(),
+            progress: Default::default(),
         };
         let res = render_book(&photos, None, &[], &out, &opts).unwrap();
         assert!(
@@ -2003,6 +2016,7 @@ mod tests {
             trip_name: "Test".into(),
             typst_bin: "typst-not-installed".into(),
             ffmpeg_bin: "ffmpeg".into(),
+            progress: Default::default(),
         };
         render_book(&photos, None, &titles, &out, &opts).unwrap();
         let typ = std::fs::read_to_string(out.join("proof.typ")).unwrap();

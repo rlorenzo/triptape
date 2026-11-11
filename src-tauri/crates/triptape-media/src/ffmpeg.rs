@@ -2,7 +2,7 @@
 //!
 //! The bundled/static FFmpeg varies per machine (system FFmpeg 9.0.2 here:
 //! `libx264`, `xfade`, `perspective`, `tonemap`, `loudnorm` present;
-//! `zscale`/`drawtext`/`vidstab`/`libass` absent). Every renderer probes
+//! `zscale`/`drawtext`/`vidstab`/libass absent). Every renderer probes
 //! once at startup and picks fallback filters accordingly, so exports
 //! degrade instead of failing.
 
@@ -20,10 +20,48 @@ pub const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
 /// blurred fill at `w`x`h` (no crop of the subject, no aspect distortion).
 /// `tag` suffixes the internal labels so several copies can share one graph.
 /// Ends unlabeled after `setsar=1`, ready for [`hold_still`] + [`glide`].
-pub fn fit_over_blur(caps: &Capabilities, input: &str, w: u32, h: u32, tag: &str) -> String {
-    let blur = if caps.gblur { ",gblur=sigma=40" } else { "" };
+/// `sigma` is the fill blur radius in canvas pixels, so larger canvases
+/// scale it to keep the same look.
+pub fn fit_over_blur(
+    caps: &Capabilities,
+    input: &str,
+    w: u32,
+    h: u32,
+    tag: &str,
+    sigma: u32,
+) -> String {
+    let blur = if caps.gblur {
+        format!(",gblur=sigma={sigma}")
+    } else {
+        String::new()
+    };
     format!(
         "{input}split[a{tag}][b{tag}];[a{tag}]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}{blur}[bg{tag}];[b{tag}]scale={w}:{h}:force_original_aspect_ratio=decrease[fg{tag}];[bg{tag}][fg{tag}]overlay=(W-w)/2:(H-h)/2,setsar=1"
+    )
+}
+
+/// Filter-graph fragment (a complete simple filtergraph on the implicit
+/// input) showing each frame whole, centred in `w`x`h` over a blurred
+/// cover-fill of itself. The frame is first fitted to `w`x`h` (`lanczos`
+/// when upscaling), then `tonemap` (an HDR chain) runs on that fitted
+/// frame, converted to 8-bit before the overlay; the fill is built from a
+/// 1/8 copy and scaled back up (bilinear: it holds no detail), so the
+/// blur stays cheap per frame even at 4K. Kept apart from
+/// [`fit_over_blur`], which builds a full-size blur once for a still and
+/// labels its input for multi-input graphs.
+pub fn video_contain_over_blur(
+    caps: &Capabilities,
+    w: u32,
+    h: u32,
+    lanczos: bool,
+    tonemap: Option<&str>,
+) -> String {
+    let (sw, sh) = ((w / 8).max(2) & !1, (h / 8).max(2) & !1);
+    let blur = if caps.gblur { ",gblur=sigma=4" } else { "" };
+    let flags = if lanczos { ":flags=lanczos" } else { "" };
+    let tone = tonemap.map_or(String::new(), |t| format!(",{t},format=yuv420p"));
+    format!(
+        "scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2{flags}{tone},split[a][b];[a]scale={sw}:{sh}:force_original_aspect_ratio=increase,crop={sw}:{sh}{blur},scale={w}:{h}:flags=bilinear[bg];[bg][b]overlay=(W-w)/2:(H-h)/2,setsar=1"
     )
 }
 
@@ -46,6 +84,29 @@ pub fn hold_still(frames: u32) -> String {
 /// re-crops at coarse integer steps, so stills would freeze or jitter.
 /// Without `perspective` the frame holds static at `w`x`h` instead.
 pub fn glide(caps: &Capabilities, frames: u32, w: u32, h: u32, variant: usize) -> String {
+    glide_depth(caps, frames, w, h, variant, GLIDE_DEPTH)
+}
+
+/// Distinct motions [`glide`] cycles through (by `variant`).
+pub const GLIDE_VARIANTS: usize = 4;
+
+/// Window divisor of the standard glide: the window shrinks to
+/// `(D-1)/D` of the frame, i.e. a 1.05x push at 21.
+pub const GLIDE_DEPTH: u32 = 21;
+/// Gentler divisor for clips shown whole over a blurred fill (about 1.5x
+/// less movement: the full subject is on screen, so it must not crowd the
+/// edges).
+pub const GLIDE_DEPTH_GENTLE: u32 = 64;
+
+/// [`glide`] with an explicit window divisor (see [`GLIDE_DEPTH`]).
+pub fn glide_depth(
+    caps: &Capabilities,
+    frames: u32,
+    w: u32,
+    h: u32,
+    variant: usize,
+    depth: u32,
+) -> String {
     if !caps.perspective {
         return format!("scale={w}:{h}:flags=lanczos,setsar=1");
     }
@@ -53,11 +114,12 @@ pub fn glide(caps: &Capabilities, frames: u32, w: u32, h: u32, variant: usize) -
     // Frame progress 0..=1; perspective's `in` counts from 1.
     let p = format!("(min(in-1\\,{denom})/{denom})");
     // Window size as a fraction of the frame, and where its slack sits.
-    let (size, slack) = match variant % 4 {
-        0 => (format!("(1-{p}/21)"), "0.5".to_string()),
-        1 => (format!("((20+{p})/21)"), "0.5".to_string()),
-        2 => ("(20/21)".to_string(), p),
-        _ => ("(20/21)".to_string(), format!("(1-{p})")),
+    let d1 = depth - 1;
+    let (size, slack) = match variant % GLIDE_VARIANTS {
+        0 => (format!("(1-{p}/{depth})"), "0.5".to_string()),
+        1 => (format!("(({d1}+{p})/{depth})"), "0.5".to_string()),
+        2 => (format!("({d1}/{depth})"), p),
+        _ => (format!("({d1}/{depth})"), format!("(1-{p})")),
     };
     let left = format!("W*(1-{size})*{slack}");
     let right = format!("W*((1-{size})*{slack}+{size})");
@@ -65,6 +127,52 @@ pub fn glide(caps: &Capabilities, frames: u32, w: u32, h: u32, variant: usize) -
     let bottom = format!("H*(1+{size})/2");
     format!(
         "perspective=x0='{left}':y0='{top}':x1='{right}':y1='{top}':x2='{left}':y2='{bottom}':x3='{right}':y3='{bottom}':interpolation=cubic:eval=frame,scale={w}:{h}:flags=lanczos,setsar=1"
+    )
+}
+
+/// A panorama strip is scaled so its short side is this multiple of the
+/// output's short side before panning. The pan then crops a 2x window at an
+/// integer strip pixel, so position error is at most half an output pixel
+/// after the lanczos downscale, while per-frame work stays one crop plus one
+/// scale instead of a resampling `perspective` over the whole strip.
+const PANO_SS: u32 = 2;
+
+/// Smooth side-to-side (or top-to-bottom for tall images) pan over a whole
+/// panorama, no zoompan. The photo is scaled once so its short side is 2x
+/// the frame's ([`PANO_SS`]), covering the frame with no bars or blurred
+/// fill; a frame-sized (2x) window then slides across it with smoothstep
+/// easing and is lanczos-downscaled to `w`x`h`. `aspect` is the display
+/// width / height; `coverage` the fraction of the overflow to travel (see
+/// `triptape_core::plan::pano_motion`); `reverse` flips the direction.
+/// Needs only `scale`/`crop`/`loop`, so it works without `perspective`.
+pub fn pano_pan(frames: u32, w: u32, h: u32, aspect: f64, coverage: f64, reverse: bool) -> String {
+    let tall = aspect < 1.0;
+    // Window in strip pixels: the frame at 2x.
+    let (ww, wh) = (w * PANO_SS, h * PANO_SS);
+    let fill = if tall {
+        format!("scale={ww}:-2:flags=lanczos")
+    } else {
+        format!("scale=-2:{wh}:flags=lanczos")
+    };
+    let denom = frames.saturating_sub(1).max(1);
+    let p = format!("(min(n\\,{denom})/{denom})");
+    let eased = format!("({p}*{p}*(3-2*{p}))");
+    let eased = if reverse {
+        format!("(1-{eased})")
+    } else {
+        eased
+    };
+    // Where the window sits within the slack, centered on 0.5 and narrowed
+    // by `coverage`.
+    let slack = format!("(0.5+({eased}-0.5)*{coverage:.4})");
+    let (x, y) = if tall {
+        ("0".to_string(), format!("floor((ih-oh)*{slack})"))
+    } else {
+        (format!("floor((iw-ow)*{slack})"), "0".to_string())
+    };
+    format!(
+        "{fill},setsar=1,{hold},crop=w={ww}:h={wh}:x='{x}':y='{y}':exact=1,scale={w}:{h}:flags=lanczos,setsar=1",
+        hold = hold_still(frames),
     )
 }
 
@@ -118,13 +226,21 @@ pub struct Capabilities {
     pub vidstabdetect: bool,
     pub vidstabtransform: bool,
     pub subtitles: bool,
+    /// Per-process encoder/filter thread cap, set when several renders run
+    /// at once so their ffmpegs share the cores. `None` leaves ffmpeg's
+    /// own default (all cores).
+    pub threads: Option<usize>,
+    /// Cancel flag and progress sink; every [`Capabilities::run`] polls it.
+    pub progress: crate::progress::Progress,
+    /// Hero-segment render cache for the running export (`None`: off).
+    pub segment_cache: Option<std::sync::Arc<crate::segment_cache::SegmentCache>>,
 }
 
 impl Capabilities {
-    /// Captions can only be burned in when libass (or the subtitles filter
-    /// chain) exists; otherwise renderers emit a sidecar SRT plus a note.
+    /// Captions burn in through libass's `subtitles` filter; without it
+    /// renderers emit a sidecar SRT plus a note.
     pub fn can_burn_captions(&self) -> bool {
-        self.libass && self.subtitles
+        self.subtitles
     }
 
     /// Full HDR->SDR chain needs zscale; otherwise tonemap alone is the
@@ -132,6 +248,44 @@ impl Capabilities {
     pub fn full_tonemap(&self) -> bool {
         self.tonemap && self.zscale
     }
+}
+
+/// Escape `v` as a filter option value, then as a filtergraph element, so it
+/// survives both parsing levels (ffmpeg-filters "Notes on filtergraph
+/// escaping"): level one escapes backslash, quote and colon; level two
+/// backslash, quote, comma, semicolon and brackets.
+fn escape_filter_value(v: &str) -> String {
+    backslash_escape(
+        &backslash_escape(v, &['\\', '\'', ':']),
+        &['\\', '\'', ',', ';', '[', ']'],
+    )
+}
+
+/// Prefix every char of `v` found in `special` with a backslash.
+fn backslash_escape(v: &str, special: &[char]) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        if special.contains(&c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `subtitles` filter burning the SRT at `srt` into the frame: white text,
+/// dark outline, bottom-centre and lifted clear of the lower-third. Sizes
+/// are in libass's 288-line default play resolution, so they scale with the
+/// frame height by themselves (1080p: 3.75 px per unit, 4K: 7.5), and the
+/// same style serves every output resolution. Paths with spaces, colons,
+/// commas or apostrophes are escaped for both parsing levels.
+pub fn subtitles_filter(srt: &Path) -> String {
+    let style = "FontName=Helvetica,FontSize=11,PrimaryColour=&H00FFFFFF,OutlineColour=&H80000000,BorderStyle=1,Outline=1.2,Shadow=0.5,Alignment=2,MarginV=60";
+    format!(
+        "subtitles=filename={}:force_style={}",
+        escape_filter_value(&path_arg(srt)),
+        escape_filter_value(style)
+    )
 }
 
 fn flag_present(output: &str, name: &str) -> bool {
@@ -170,14 +324,17 @@ pub fn probe_capabilities(ffmpeg_bin: &str, ffprobe_bin: &str) -> Capabilities {
         crop: filter("crop"),
         gblur: filter("gblur"),
         drawtext: filter("drawtext"),
-        libass: filter("libass"),
+        // ffmpeg has no filter called `libass`; the library surfaces as the
+        // `subtitles` and `ass` filters.
+        libass: filter("subtitles") || filter("ass"),
         vidstabdetect: filter("vidstabdetect"),
         vidstabtransform: filter("vidstabtransform"),
         subtitles: filter("subtitles"),
+        ..Default::default()
     }
 }
 
-fn run_capture(bin: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn run_capture(bin: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(bin).args(args).output().ok()?;
     if out.status.success() {
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -426,14 +583,29 @@ pub fn render_thumb(
     written
 }
 
-/// Run FFmpeg with `args` (whose last element must be `final_out`).
-/// Renders to a `.partial` sibling and atomically renames on success, so a
-/// file at `final_out` is always a complete render. Returns the stderr tail
-/// on failure for the redacted diagnostics bundle.
-pub fn run_ffmpeg(
+/// Extras for [`run_ffmpeg_with`].
+#[derive(Default)]
+pub struct RunOpts<'a> {
+    /// Encoder/filter thread cap for this process.
+    pub threads: Option<usize>,
+    /// Cancel source: when it fires, ffmpeg is killed, its `.partial` is
+    /// removed and `Cancelled` is returned.
+    pub progress: Option<&'a crate::progress::Progress>,
+    /// Expected output seconds and a callback: ffmpeg's `-progress` stream
+    /// (`out_time_us`) is turned into a `0..=1` fraction of that length.
+    pub watch: Option<(f64, &'a dyn Fn(f64))>,
+}
+
+/// Run FFmpeg with `args` (whose last element must be `final_out`), with an
+/// optional thread cap, cancellation and encode progress. Renders to a
+/// `.partial` sibling and atomically renames on success, so a file at
+/// `final_out` is always a complete render. Returns the stderr tail on
+/// failure for the redacted diagnostics bundle.
+pub fn run_ffmpeg_with(
     ffmpeg_bin: &str,
     args: &[String],
     final_out: &Path,
+    opts: &RunOpts<'_>,
 ) -> Result<(), super::MediaError> {
     let Some((last, _)) = args.split_last() else {
         return Err(super::MediaError::Ffmpeg("empty ffmpeg args".into()));
@@ -443,25 +615,170 @@ pub fn run_ffmpeg(
             "ffmpeg output arg does not match destination".into(),
         ));
     }
+    // A job's flag installed on this thread counts too (see `process`).
+    let cancelled = || opts.progress.is_some_and(|p| p.is_cancelled()) || process::cancelled();
+    if cancelled() {
+        return Err(super::MediaError::Cancelled);
+    }
     if let Some(p) = final_out.parent() {
         std::fs::create_dir_all(p).map_err(|e| super::MediaError::Io(e.to_string()))?;
     }
     let partial = partial_sibling(final_out);
-    let mut fixed: Vec<String> = args[..args.len() - 1].to_vec();
+    let watch = opts.watch.filter(|(total, _)| *total > 0.0);
+    let mut fixed: Vec<String> = vec![];
+    if watch.is_some() {
+        fixed.extend(["-nostats", "-progress", "pipe:1"].map(String::from));
+    }
+    fixed.extend_from_slice(&args[..args.len() - 1]);
+    if let Some(n) = opts.threads {
+        // Output-side `-threads` caps the encoder; the simple and complex
+        // filter-graph pools are global. All sit before the output path.
+        let n = n.max(1).to_string();
+        fixed.extend([
+            "-threads".into(),
+            n.clone(),
+            "-filter_threads".into(),
+            n.clone(),
+            "-filter_complex_threads".into(),
+            n,
+        ]);
+    }
     fixed.push(partial.to_string_lossy().into_owned());
-    let out = process::output(Command::new(ffmpeg_bin).args(&fixed))
+    let mut child = Command::new(ffmpeg_bin)
+        .args(&fixed)
+        .stdin(std::process::Stdio::null())
+        .stdout(if watch.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| super::MediaError::Ffmpeg(format!("spawn {ffmpeg_bin}: {e}")))?;
-    if !out.status.success() {
-        let _ = std::fs::remove_file(&partial);
+    // Drain both pipes on helper threads so a full pipe never stalls ffmpeg.
+    let mut stderr = child.stderr.take();
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(e) = stderr.as_mut() {
+            let _ = std::io::Read::read_to_end(e, &mut buf);
+        }
+        buf
+    });
+    let out_time_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let out_thread = child.stdout.take().map(|stdout| {
+        let slot = std::sync::Arc::clone(&out_time_us);
+        std::thread::spawn(move || {
+            for line in
+                std::io::BufRead::lines(std::io::BufReader::new(stdout)).map_while(Result::ok)
+            {
+                if let Some(v) = line.strip_prefix("out_time_us=") {
+                    if let Ok(us) = v.trim().parse::<u64>() {
+                        slot.store(us, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        })
+    });
+    let join_pipes = |out_thread: Option<std::thread::JoinHandle<()>>| {
+        if let Some(t) = out_thread {
+            let _ = t.join();
+        }
+        err_thread.join().unwrap_or_default()
+    };
+    let mut last_reported = u64::MAX;
+    // Short calls (most of them) exit within a few ms, so the poll starts
+    // tight and backs off to the cancel-latency ceiling.
+    let mut nap = std::time::Duration::from_millis(1);
+    let waited = loop {
+        if cancelled() {
+            break Err(super::MediaError::Cancelled);
+        }
+        match child.try_wait() {
+            Ok(Some(st)) => break Ok(st),
+            Ok(None) => {}
+            Err(e) => break Err(super::MediaError::Ffmpeg(format!("wait {ffmpeg_bin}: {e}"))),
+        }
+        if let Some((total, cb)) = watch {
+            let us = out_time_us.load(std::sync::atomic::Ordering::Relaxed);
+            if us != last_reported {
+                last_reported = us;
+                cb((us as f64 / 1e6 / total).clamp(0.0, 1.0));
+            }
+        }
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(std::time::Duration::from_millis(25));
+    };
+    match waited {
+        Ok(status) => {
+            let stderr = join_pipes(out_thread);
+            finish_ffmpeg(status, &stderr, &partial, final_out)
+        }
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            join_pipes(out_thread);
+            let _ = std::fs::remove_file(&partial);
+            Err(e)
+        }
+    }
+}
+
+/// Promote the `.partial` on success; on failure delete it and report the
+/// stderr tail.
+fn finish_ffmpeg(
+    status: std::process::ExitStatus,
+    stderr: &[u8],
+    partial: &Path,
+    final_out: &Path,
+) -> Result<(), super::MediaError> {
+    if !status.success() {
+        let _ = std::fs::remove_file(partial);
         return Err(super::MediaError::Ffmpeg(format!(
             "ffmpeg exit {}: {}",
-            out.status.code().unwrap_or(-1),
-            stderr_tail(&out.stderr),
+            status.code().unwrap_or(-1),
+            stderr_tail(stderr),
         )));
     }
-    std::fs::rename(&partial, final_out)
+    std::fs::rename(partial, final_out)
         .map_err(|e| super::MediaError::Io(format!("rename partial: {e}")))?;
     Ok(())
+}
+
+impl Capabilities {
+    /// [`run_ffmpeg_with`] using this context's thread cap and cancel flag.
+    pub fn run(&self, args: &[String], final_out: &Path) -> Result<(), super::MediaError> {
+        self.run_with(args, final_out, None)
+    }
+
+    /// [`Capabilities::run`] that also reports encode progress, as a
+    /// fraction of `total_secs` of output, to `on_fraction`.
+    pub fn run_progress(
+        &self,
+        args: &[String],
+        final_out: &Path,
+        total_secs: f64,
+        on_fraction: &dyn Fn(f64),
+    ) -> Result<(), super::MediaError> {
+        self.run_with(args, final_out, Some((total_secs, on_fraction)))
+    }
+
+    fn run_with(
+        &self,
+        args: &[String],
+        final_out: &Path,
+        watch: Option<(f64, &dyn Fn(f64))>,
+    ) -> Result<(), super::MediaError> {
+        run_ffmpeg_with(
+            &self.ffmpeg_bin,
+            args,
+            final_out,
+            &RunOpts {
+                threads: self.threads,
+                progress: Some(&self.progress),
+                watch,
+            },
+        )
+    }
 }
 
 /// `<dir>/.<stem>.partial.<ext>` next to the final output. The real
@@ -497,10 +814,58 @@ pub struct ProbeInfo {
     pub height: u32,
     pub fps: f64,
     pub has_video: bool,
+    /// True when at least one *usable* audio stream exists (see
+    /// [`is_unusable_audio_codec`]); apac-only files count as silent.
     pub has_audio: bool,
+    /// Position among the file's audio streams of the one to use
+    /// (`-map 0:a:N`): the first stream we can decode and mux.
+    pub audio_index: usize,
     pub audio_rate: u32,
     pub audio_channels: u32,
     pub color_transfer: String,
+    /// Display rotation in degrees from the stream's display matrix or
+    /// `rotate` tag (iPhone portrait clips are landscape-coded with 90).
+    pub rotation: i32,
+}
+
+/// Audio codecs ffmpeg cannot decode or the MP4 muxer cannot take. iPhone 16
+/// clips carry a spatial `apple_apac` track beside the regular AAC one;
+/// mapping it makes the encode fail ("Invalid argument" opening the output).
+pub fn is_unusable_audio_codec(codec: &str) -> bool {
+    matches!(codec, "" | "none" | "unknown" | "apple_apac")
+}
+
+impl ProbeInfo {
+    /// Width and height as displayed: ffmpeg autorotates by default, so a
+    /// 90/270 degree stream arrives with the two swapped.
+    pub fn display_dims(&self) -> (u32, u32) {
+        if self.rotation.rem_euclid(180) == 90 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        }
+    }
+
+    /// Input specifier for the usable audio stream of input 0, e.g. `0:a:0`.
+    pub fn audio_spec(&self) -> String {
+        format!("0:a:{}", self.audio_index)
+    }
+}
+
+/// Audio specifier for input 0: the probed usable stream, or the first audio
+/// stream when the probe failed.
+pub fn audio_spec(probe: Option<&ProbeInfo>) -> String {
+    probe.map_or_else(|| "0:a:0".to_string(), ProbeInfo::audio_spec)
+}
+
+/// `-map` value for a source's audio: the first usable stream, `None` when the
+/// probe finds no usable audio (e.g. `apple_apac` only), and the optional
+/// first stream when the probe itself fails.
+pub fn audio_map(ffprobe_bin: &str, path: &Path) -> Option<String> {
+    match ffprobe_file(ffprobe_bin, path) {
+        Ok(info) => info.has_audio.then(|| info.audio_spec()),
+        Err(_) => Some("0:a:0?".to_string()),
+    }
 }
 
 /// Probe one media file; errors when ffprobe fails or finds no streams.
@@ -523,6 +888,14 @@ pub fn ffprobe_file(ffprobe_bin: &str, path: &Path) -> Result<ProbeInfo, super::
     }
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(super::MediaError::Json)?;
+    parse_probe(&v, path)
+}
+
+/// Fold `ffprobe -show_streams -show_format -of json` output into [`ProbeInfo`].
+pub(crate) fn parse_probe(
+    v: &serde_json::Value,
+    path: &Path,
+) -> Result<ProbeInfo, super::MediaError> {
     let mut info = ProbeInfo::default();
     if let Some(d) = v
         .pointer("/format/duration")
@@ -531,6 +904,7 @@ pub fn ffprobe_file(ffprobe_bin: &str, path: &Path) -> Result<ProbeInfo, super::
     {
         info.duration_secs = d;
     }
+    let mut audio_seen = 0usize;
     for s in v
         .pointer("/streams")
         .and_then(|s| s.as_array())
@@ -547,6 +921,7 @@ pub fn ffprobe_file(ffprobe_bin: &str, path: &Path) -> Result<ProbeInfo, super::
                     .and_then(|r| r.as_str())
                     .and_then(parse_rate)
                     .unwrap_or(0.0);
+                info.rotation = stream_rotation(s);
                 info.color_transfer = s
                     .get("color_transfer")
                     .and_then(|c| c.as_str())
@@ -554,7 +929,14 @@ pub fn ffprobe_file(ffprobe_bin: &str, path: &Path) -> Result<ProbeInfo, super::
                     .to_string();
             }
             Some("audio") => {
+                let pos = audio_seen;
+                audio_seen += 1;
+                let codec = s.get("codec_name").and_then(|c| c.as_str()).unwrap_or("");
+                if info.has_audio || is_unusable_audio_codec(codec) {
+                    continue;
+                }
                 info.has_audio = true;
+                info.audio_index = pos;
                 info.audio_rate = s
                     .get("sample_rate")
                     .and_then(|r| r.as_str())
@@ -573,6 +955,23 @@ pub fn ffprobe_file(ffprobe_bin: &str, path: &Path) -> Result<ProbeInfo, super::
         )));
     }
     Ok(info)
+}
+
+/// Rotation of a video stream: display-matrix side data, else the legacy
+/// `rotate` tag. 0 when neither is present.
+fn stream_rotation(s: &serde_json::Value) -> i32 {
+    let side = s
+        .get("side_data_list")
+        .and_then(|l| l.as_array())
+        .into_iter()
+        .flatten()
+        .find_map(|d| d.get("rotation").and_then(|r| r.as_f64()));
+    let tag = || {
+        s.pointer("/tags/rotate")
+            .and_then(|r| r.as_str())
+            .and_then(|r| r.parse::<f64>().ok())
+    };
+    side.or_else(tag).map_or(0, |r| r.round() as i32)
 }
 
 fn parse_rate(s: &str) -> Option<f64> {
@@ -759,7 +1158,7 @@ mod tests {
             gblur: true,
             ..Default::default()
         };
-        let g = fit_over_blur(&caps, "[2:v]", 1080, 1920, "2");
+        let g = fit_over_blur(&caps, "[2:v]", 1080, 1920, "2", 40);
         assert!(g.starts_with("[2:v]split[a2][b2]"), "{g}");
         assert!(g.contains("gblur=sigma=40[bg2]"), "{g}");
         assert!(
@@ -767,7 +1166,7 @@ mod tests {
             "{g}"
         );
         caps.gblur = false;
-        assert!(!fit_over_blur(&caps, "[0:v]", 1920, 1080, "").contains("gblur"));
+        assert!(!fit_over_blur(&caps, "[0:v]", 1920, 1080, "", 40).contains("gblur"));
         // Motion runs per frame, with progress clamped at the end.
         caps.perspective = true;
         let g = glide(&caps, 90, 1920, 1080, 0);
@@ -785,6 +1184,143 @@ mod tests {
             hold_still(1),
             "loop=loop=0:size=1:start=0,settb=1/30,setpts=N,fps=30"
         );
+    }
+
+    fn probe_json(streams: &str) -> serde_json::Value {
+        serde_json::from_str(&format!(
+            r#"{{"format":{{"duration":"2.0"}},"streams":[{streams}]}}"#
+        ))
+        .unwrap()
+    }
+
+    const VIDEO: &str = r#"{"codec_type":"video","codec_name":"hevc","width":1920,"height":1080,"avg_frame_rate":"30/1"}"#;
+    const AAC: &str =
+        r#"{"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":1}"#;
+    const APAC: &str =
+        r#"{"codec_type":"audio","codec_name":"apple_apac","sample_rate":"48000","channels":4}"#;
+    const DATA: &str = r#"{"codec_type":"data","codec_name":"none"}"#;
+
+    /// iPhone 16 layout: hevc, aac, apple_apac, data tracks.
+    #[test]
+    fn probe_picks_first_usable_audio_stream() {
+        let v = probe_json(&format!("{VIDEO},{AAC},{APAC},{DATA}"));
+        let info = parse_probe(&v, Path::new("x.mov")).unwrap();
+        assert!(info.has_audio);
+        assert_eq!(info.audio_spec(), "0:a:0");
+        assert_eq!(info.audio_channels, 1);
+        // apac listed first: skip it, map the aac that follows.
+        let v = probe_json(&format!("{VIDEO},{APAC},{AAC}"));
+        let info = parse_probe(&v, Path::new("x.mov")).unwrap();
+        assert_eq!(info.audio_spec(), "0:a:1");
+        assert_eq!(info.audio_rate, 48000);
+    }
+
+    #[test]
+    fn audio_spec_defaults_to_first_stream_without_probe() {
+        assert_eq!(audio_spec(None), "0:a:0");
+        let v = probe_json(&format!("{VIDEO},{APAC},{AAC}"));
+        let info = parse_probe(&v, Path::new("x.mov")).unwrap();
+        assert_eq!(audio_spec(Some(&info)), "0:a:1");
+    }
+
+    #[test]
+    fn apac_only_clip_counts_as_silent() {
+        let v = probe_json(&format!("{VIDEO},{APAC},{DATA}"));
+        let info = parse_probe(&v, Path::new("x.mov")).unwrap();
+        assert!(!info.has_audio);
+    }
+
+    #[test]
+    fn libass_is_detected_by_its_filters() {
+        let full = " .. ass  V->V  Render ASS subtitles using the libass library.\n .. subtitles V->V Render text subtitles.\n";
+        assert!(flag_present(full, "subtitles") && flag_present(full, "ass"));
+        let plain = " ..C scale V->V Scale.\n T.. drawtext V->V Draw text.\n";
+        assert!(!flag_present(plain, "subtitles") && !flag_present(plain, "ass"));
+    }
+
+    #[test]
+    fn subtitles_filter_escapes_awkward_paths() {
+        let f = subtitles_filter(Path::new(
+            "/Movies/Japan to Singapore 2026/it's: a,b[1].srt",
+        ));
+        assert!(
+            f.starts_with(
+                r"subtitles=filename=/Movies/Japan to Singapore 2026/it\\\'s\\: a\,b\[1\].srt:force_style="
+            ),
+            "{f}"
+        );
+        // Style commas are escaped for the filtergraph level.
+        assert!(f.contains(r"FontName=Helvetica\,FontSize=11"), "{f}");
+    }
+
+    /// Burn an SRT through an awkward path with a libass ffmpeg and check
+    /// pixels change at the bottom of the frame. Skips without libass.
+    #[test]
+    fn subtitles_burn_in_through_awkward_path() {
+        let full = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg";
+        let bin = if Path::new(full).exists() {
+            full
+        } else {
+            "ffmpeg"
+        };
+        let caps = probe_capabilities(bin, "ffprobe");
+        if !caps.can_burn_captions() {
+            eprintln!("no libass ffmpeg; skipping caption burn-in test");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        // Windows forbids ':' in a file name; there the drive letter's colon
+        // (`C:\...`) still has to survive the filter escaping.
+        let name = if cfg!(windows) {
+            "Japan to Singapore 2026 it's [a],b"
+        } else {
+            "Japan to Singapore 2026 it's: [a],b"
+        };
+        let dir = temp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let srt = dir.join("film.srt");
+        std::fs::write(
+            &srt,
+            "1\n00:00:00,000 --> 00:00:02,000\nGolden Gate at sunset\n",
+        )
+        .unwrap();
+        let run = |vf: &str| {
+            let out = Command::new(bin)
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=1920x1080:r=30:d=1",
+                ])
+                .args([
+                    "-vf",
+                    vf,
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "gray",
+                    "-",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        let bright = |px: &[u8]| px.iter().filter(|&&p| p > 128).count();
+        let burned = run(&subtitles_filter(&srt));
+        assert_eq!(burned.len(), 1920 * 1080);
+        assert!(bright(&burned) > 500, "text pixels expected");
+        // Text sits in the bottom half, above the lower-third band.
+        assert_eq!(bright(&burned[..1920 * 540]), 0);
+        assert_eq!(bright(&run("null")), 0);
     }
 
     #[test]
@@ -967,5 +1503,120 @@ mod tests {
     fn partial_sibling_keeps_dir_and_ext() {
         let p = Path::new("/tmp/out/hero.mp4");
         assert_eq!(partial_sibling(p), Path::new("/tmp/out/.hero.partial.mp4"));
+    }
+
+    /// A stand-in `ffmpeg` script: logs its args, emits `-progress` lines,
+    /// then creates the output named by its last argument.
+    #[cfg(unix)]
+    fn fake_ffmpeg(dir: &Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("fake-ffmpeg");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nfor a; do last=\"$a\"; done\necho \"$@\" > '{}'\n{body}\n",
+                dir.join("args.txt").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_reports_progress_fractions_and_caps_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_ffmpeg(
+            dir.path(),
+            "echo out_time_us=1000000; sleep 0.3; echo out_time_us=2000000; sleep 0.3; echo out_time_us=4000000; echo progress=end; sleep 0.1; : > \"$last\"",
+        );
+        let out = dir.path().join("o.mp4");
+        let args = vec!["-y".to_string(), out.to_string_lossy().into_owned()];
+        let seen = Mutex::new(vec![]);
+        run_ffmpeg_with(
+            &bin,
+            &args,
+            &out,
+            &RunOpts {
+                threads: Some(3),
+                watch: Some((4.0, &|f| seen.lock().unwrap().push(f))),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let seen = seen.into_inner().unwrap();
+        assert!(seen.len() >= 2, "{seen:?}");
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]));
+        assert!(seen.iter().all(|f| (0.0..=1.0).contains(f)));
+        assert!(*seen.last().unwrap() >= 0.5, "{seen:?}");
+        assert!(out.exists() && !partial_sibling(&out).exists());
+        let logged = std::fs::read_to_string(dir.path().join("args.txt")).unwrap();
+        assert!(
+            logged.contains("-threads 3 -filter_threads 3 -filter_complex_threads 3"),
+            "{logged}"
+        );
+        assert!(logged.contains("-progress pipe:1"), "{logged}");
+        assert!(
+            logged.trim_end().ends_with(".partial.mp4"),
+            "output is the partial: {logged}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_run_reports_stderr_and_removes_the_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_ffmpeg(dir.path(), ": > \"$last\"; echo boom >&2; exit 3");
+        let out = dir.path().join("o.mp4");
+        let args = vec!["-y".to_string(), out.to_string_lossy().into_owned()];
+        let res = run_ffmpeg_with(&bin, &args, &out, &RunOpts::default());
+        let Err(crate::MediaError::Ffmpeg(msg)) = res else {
+            panic!("{res:?}");
+        };
+        assert!(msg.contains("exit 3") && msg.contains("boom"), "{msg}");
+        assert!(!out.exists() && !partial_sibling(&out).exists());
+        let logged = std::fs::read_to_string(dir.path().join("args.txt")).unwrap();
+        assert!(!logged.contains("-progress") && !logged.contains("-threads"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_kills_ffmpeg_and_removes_the_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_ffmpeg(dir.path(), ": > \"$last\"; exec sleep 30");
+        let out = dir.path().join("o.mp4");
+        let args = vec!["-y".to_string(), out.to_string_lossy().into_owned()];
+        let progress = crate::progress::Progress::default();
+        let handle = progress.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            handle.cancel();
+        });
+        let started = std::time::Instant::now();
+        let res = run_ffmpeg_with(
+            &bin,
+            &args,
+            &out,
+            &RunOpts {
+                progress: Some(&progress),
+                ..Default::default()
+            },
+        );
+        canceller.join().unwrap();
+        assert!(matches!(res, Err(crate::MediaError::Cancelled)), "{res:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(!out.exists() && !partial_sibling(&out).exists());
+        // Already cancelled: ffmpeg is never started.
+        let again = run_ffmpeg_with(
+            "/nonexistent/ffmpeg",
+            &args,
+            &out,
+            &RunOpts {
+                progress: Some(&progress),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(again, Err(crate::MediaError::Cancelled)));
     }
 }

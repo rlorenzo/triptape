@@ -14,7 +14,7 @@ image = "0.25"
 chrono = { version = "0.4", features = ["serde"] }
 kamadak-exif = "0.5"
 rexif = "0.7"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

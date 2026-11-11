@@ -4,7 +4,7 @@
 //! never looped to pad). Reframing is center-weighted: landscape sources
 //! fill the frame with a center crop, portrait sources fit over a blurred
 //! background fill (no per-frame tracking in MVP — that is the later pack).
-//! Captions ride the sidecar SRT per reel when libass is absent.
+//! Reel captions ride a sidecar SRT; the place name is burned in via a Typst overlay.
 
 use crate::ffmpeg::{self, path_arg as s, Capabilities};
 use crate::render_video::ResolvedEntry;
@@ -141,7 +141,7 @@ fn concat_pair(
         "[a]".into(),
     ];
     args.extend(quality_tail(out));
-    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out)
+    caps.run(&args, out)
 }
 
 /// A motion highlight shorter than this is extended with its chapter
@@ -302,8 +302,10 @@ pub fn render_reels(
     }
 
     let mut reels: Vec<ReelFile> = vec![];
+    let total = resolved.len().min(5);
     for (i, r) in resolved.iter().take(5).enumerate() {
-        crate::check_cancelled()?;
+        caps.progress.check_cancelled()?;
+        caps.progress.counted("reels", "reel", i, total);
         let src = r.motion_path.as_ref().unwrap_or(&r.still_path);
         if !src.exists() {
             fallbacks.push(format!(
@@ -321,6 +323,9 @@ pub fn render_reels(
         let slides: &[PathBuf] = opts.slideshows.get(i).map_or(&[], Vec::as_slice);
         let dur = match render_one_reel(caps, r, src, &out, opts, slides, &mut fallbacks) {
             Ok(d) => d,
+            // `caps.run` already discarded its `.partial`; `out` is either a
+            // previous export's reel or a fully encoded new one — keep it.
+            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
             Err(e) => {
                 fallbacks.push(format!("reel {} failed ({e}); skipped", r.entry.asset_id));
                 let _ = std::fs::remove_file(&out);
@@ -360,7 +365,7 @@ pub fn render_reels(
             "3".into(),
             s(&cover),
         ];
-        ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &cover_args, &cover)?;
+        caps.run(&cover_args, &cover)?;
         if let Some(c) = &r.caption {
             if !c.trim().is_empty() {
                 std::fs::write(
@@ -395,6 +400,9 @@ pub fn render_reels(
             caption: r.caption.clone(),
         });
     }
+
+    caps.progress.check_cancelled()?;
+    caps.progress.counted("reels", "reel", total, total);
 
     // Per-reel failures are tolerated, but a pack with zero reels from a
     // nonempty selection is a render failure, not a success.
@@ -490,15 +498,16 @@ fn render_clip_reel(
         s(src),
     ];
     // Silent sources get a synthesized silent track (verify requires audio).
+    // Source audio: first usable stream (never iPhone `apple_apac`).
     let (audio_in, music_in) = if has_audio {
-        (0, 1)
+        (ffmpeg::audio_spec(probe.as_ref()), 1)
     } else {
         fallbacks.push(format!(
             "{} has no audio; silent track added",
             src.file_name().unwrap_or_default().to_string_lossy()
         ));
         args.extend(crate::render_video::silent_input(len));
-        (1, 2)
+        ("1:a".to_string(), 2)
     };
     if let Some(m) = music {
         if m.exists() {
@@ -507,7 +516,7 @@ fn render_clip_reel(
             args.extend([
                 "-filter_complex".into(),
                 format!(
-                    "[0:v]{vf}[v];[{audio_in}:a]{src_af}[srca];[{music_in}:a]volume=0.2,aresample=48000,aformat=channel_layouts=stereo[mus];[srca][mus]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+                    "[0:v]{vf}[v];[{audio_in}]{src_af}[srca];[{music_in}:a]volume=0.2,aresample=48000,aformat=channel_layouts=stereo[mus];[srca][mus]amix=inputs=2:duration=first:dropout_transition=0[aout]"
                 ),
                 "-map".into(),
                 "[v]".into(),
@@ -515,20 +524,20 @@ fn render_clip_reel(
                 "[aout]".into(),
             ]);
             args.extend(quality_tail(out));
-            return ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out);
+            return caps.run(&args, out);
         }
         fallbacks.push("reel music missing; source audio only".into());
     }
     args.extend([
         "-filter_complex".into(),
-        format!("[0:v]{vf}[v];[{audio_in}:a]{src_af}[aout]"),
+        format!("[0:v]{vf}[v];[{audio_in}]{src_af}[aout]"),
         "-map".into(),
         "[v]".into(),
         "-map".into(),
         "[aout]".into(),
     ]);
     args.extend(quality_tail(out));
-    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out)
+    caps.run(&args, out)
 }
 
 /// Planned slideshow duration: crossfades overlap adjacent slides.
@@ -548,7 +557,7 @@ fn slideshow_duration(n: usize, slide_secs: f64, fade_secs: f64, xfade: bool) ->
 /// landscape source squashes it into the portrait frame, and its
 /// integer-step re-cropping makes stills jitter.
 fn slideshow_frame_vf(caps: &Capabilities, i: usize, slide_secs: f64) -> String {
-    let base = ffmpeg::fit_over_blur(caps, &format!("[{i}:v]"), 1620, 2880, &i.to_string());
+    let base = ffmpeg::fit_over_blur(caps, &format!("[{i}:v]"), 1620, 2880, &i.to_string(), 40);
     let frames = (slide_secs * 30.0).round().max(1.0) as u32;
     format!(
         "{base},{},{},format=yuv420p[v{i}]",
@@ -652,7 +661,7 @@ fn render_slideshow_reel(
         "[aout]".into(),
     ]);
     args.extend(quality_tail(out));
-    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out)
+    caps.run(&args, out)
 }
 
 fn render_still_reel(
@@ -694,7 +703,7 @@ fn render_still_reel_png(
         frames.to_string(),
     ]);
     args.extend(quality_tail(out));
-    ffmpeg::run_ffmpeg(&caps.ffmpeg_bin, &args, out)
+    caps.run(&args, out)
 }
 
 #[cfg(test)]

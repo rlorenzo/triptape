@@ -32,6 +32,16 @@ CREATE TABLE IF NOT EXISTS plan_edits (
     project_id TEXT PRIMARY KEY REFERENCES projects(id),
     edits_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS preference_events (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    kind TEXT NOT NULL,
+    chosen_id TEXT NOT NULL,
+    rejected_id TEXT NOT NULL,
+    chosen_features TEXT NOT NULL,
+    rejected_features TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (project_id, kind, chosen_id, rejected_id)
+);
 CREATE TABLE IF NOT EXISTS assets (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
@@ -53,6 +63,7 @@ CREATE TABLE IF NOT EXISTS assets (
     rotation_deg INTEGER NOT NULL DEFAULT 0,
     pair_confidence TEXT,
     user_caption TEXT,
+    people_count INTEGER,
     thumb_path TEXT,
     proxy_path TEXT,
     score_json TEXT
@@ -168,6 +179,24 @@ pub struct EditedPlan {
     pub assets: Vec<Asset>,
 }
 
+/// Add `assets.<column>` with type `ddl` unless the table already has it
+/// (forward migration for DBs created before the column existed).
+fn add_column_if_missing(conn: &Connection, column: &str, ddl: &str) -> Result<(), String> {
+    let present = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name=?1",
+            [column],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())?
+        > 0;
+    if !present {
+        conn.execute(&format!("ALTER TABLE assets ADD COLUMN {column} {ddl}"), [])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 impl Db {
     /// Open (creating parent dirs) and apply the schema.
     pub fn open(path: &Path) -> Result<Self, String> {
@@ -186,32 +215,11 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-        // Migration for DBs created before capture timezones were stored.
-        let has_tz_offset = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='tz_offset'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(|e| e.to_string())?
-            > 0;
-        if !has_tz_offset {
-            conn.execute("ALTER TABLE assets ADD COLUMN tz_offset INTEGER", [])
-                .map_err(|e| e.to_string())?;
-        }
-        // Migration for DBs created before embedded user captions were read.
-        let has_caption = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='user_caption'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(|e| e.to_string())?
-            > 0;
-        if !has_caption {
-            conn.execute("ALTER TABLE assets ADD COLUMN user_caption TEXT", [])
-                .map_err(|e| e.to_string())?;
-        }
+        // Migrations for DBs created before capture timezones, embedded
+        // user captions and people counts were stored.
+        add_column_if_missing(&conn, "tz_offset", "INTEGER")?;
+        add_column_if_missing(&conn, "user_caption", "TEXT")?;
+        add_column_if_missing(&conn, "people_count", "INTEGER")?;
         Ok(Self { conn })
     }
 
@@ -290,9 +298,9 @@ impl Db {
         };
         let score_json = a.score.as_ref().and_then(|s| serde_json::to_string(s).ok());
         self.conn.prepare_cached(
-            "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,score_json)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,path=excluded.path,companion_path=excluded.companion_path,kind=excluded.kind,size_bytes=excluded.size_bytes,mtime=excluded.mtime,content_hash=excluded.content_hash,phash=excluded.phash,width=excluded.width,height=excluded.height,duration_secs=excluded.duration_secs,taken_at=excluded.taken_at,tz_offset=excluded.tz_offset,time_guessed=excluded.time_guessed,lat=excluded.lat,lon=excluded.lon,rotation_deg=excluded.rotation_deg,pair_confidence=excluded.pair_confidence,user_caption=excluded.user_caption,score_json=excluded.score_json",
+            "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,people_count,score_json)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,path=excluded.path,companion_path=excluded.companion_path,kind=excluded.kind,size_bytes=excluded.size_bytes,mtime=excluded.mtime,content_hash=excluded.content_hash,phash=excluded.phash,width=excluded.width,height=excluded.height,duration_secs=excluded.duration_secs,taken_at=excluded.taken_at,tz_offset=excluded.tz_offset,time_guessed=excluded.time_guessed,lat=excluded.lat,lon=excluded.lon,rotation_deg=excluded.rotation_deg,pair_confidence=excluded.pair_confidence,user_caption=excluded.user_caption,people_count=excluded.people_count,score_json=excluded.score_json",
         ).and_then(|mut st| st.execute(params![
                 a.id, project_id,
                 a.path.to_string_lossy().to_string(),
@@ -302,7 +310,7 @@ impl Db {
                 a.width.map(|w| w as i64), a.height.map(|h| h as i64),
                 a.duration_secs, a.taken_at, a.tz_offset_secs, i64::from(a.time_guessed),
                 a.gps.map(|g| g.0), a.gps.map(|g| g.1),
-                a.rotation_deg as i64, conf, a.user_caption, score_json,
+                a.rotation_deg as i64, conf, a.user_caption, a.people_count.map(i64::from), score_json,
             ]),
         ).map_err(|e| e.to_string())?;
         Ok(())
@@ -319,14 +327,20 @@ impl Db {
         Ok(())
     }
 
-    /// Record one asset's score without touching the rest of the row.
-    /// The ingest background task flushes these in batches after decoding
-    /// and thumbnail work that must never hold the Db lock.
-    pub fn update_asset_score(&self, asset_id: &str, score: &Score) -> Result<(), String> {
+    /// Record one asset's score and perceptual hash without touching the
+    /// rest of the row. A `None` hash keeps any hash already stored.
+    pub fn update_asset_scoring(
+        &self,
+        asset_id: &str,
+        score: &Score,
+        phash: Option<u64>,
+    ) -> Result<(), String> {
         let json = serde_json::to_string(score).map_err(|e| e.to_string())?;
         self.conn
-            .prepare_cached("UPDATE assets SET score_json=?1 WHERE id=?2")
-            .and_then(|mut st| st.execute(params![json, asset_id]))
+            .prepare_cached(
+                "UPDATE assets SET score_json=?1, phash=COALESCE(?2, phash) WHERE id=?3",
+            )
+            .and_then(|mut st| st.execute(params![json, phash.map(|h| h as i64), asset_id]))
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -356,7 +370,7 @@ impl Db {
         let mut st = self
             .conn
             .prepare(
-                "SELECT id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,score_json FROM assets WHERE project_id=?1 ORDER BY taken_at NULLS LAST, id",
+                "SELECT id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,score_json,people_count FROM assets WHERE project_id=?1 ORDER BY taken_at NULLS LAST, id",
             )
             .map_err(|e| e.to_string())?;
         let rows = st
@@ -395,6 +409,7 @@ impl Db {
                         _ => None,
                     },
                     user_caption: r.get(18)?,
+                    people_count: r.get::<_, Option<i64>>(20)?.map(|n| n as u32),
                     score,
                 })
             })
@@ -579,6 +594,7 @@ impl Db {
         edits: &crate::plan::PlanEdits,
     ) -> Result<(), String> {
         let json = serde_json::to_string(edits).map_err(|e| e.to_string())?;
+        let before = self.get_plan_edits(project_id)?;
         self.conn
             .execute(
                 "INSERT INTO plan_edits (project_id, edits_json) VALUES (?1, ?2)
@@ -586,7 +602,112 @@ impl Db {
                 params![project_id, json],
             )
             .map_err(|e| e.to_string())?;
+        // Learning is a side channel: a failure there never loses the edit.
+        if let Err(e) = crate::learn::record_edit(self, project_id, &before, edits) {
+            eprintln!("learn: could not record preference events: {e}");
+        }
         Ok(())
+    }
+
+    // -- learned preferences ----------------------------------------------
+    /// Record (or refresh) one preference event of a project.
+    pub fn put_preference_event(
+        &self,
+        project_id: &str,
+        e: &crate::learn::PrefEvent,
+    ) -> Result<(), String> {
+        let feats =
+            |f: &crate::learn::Features| serde_json::to_string(f).map_err(|e| e.to_string());
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO preference_events
+                 (project_id,kind,chosen_id,rejected_id,chosen_features,rejected_features,created_at)
+                 VALUES (?,?,?,?,?,?,?)",
+                params![
+                    project_id,
+                    e.kind.as_str(),
+                    e.chosen_id,
+                    e.rejected_id,
+                    feats(&e.chosen)?,
+                    feats(&e.rejected)?,
+                    now()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Forget the events of an undone edit. `rejected_id: None` matches
+    /// every rejected shot (an undone pin, whatever it displaced).
+    pub fn delete_preference_event(
+        &self,
+        project_id: &str,
+        kind: crate::learn::EventKind,
+        chosen_id: &str,
+        rejected_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM preference_events
+                 WHERE project_id=?1 AND kind=?2 AND chosen_id=?3
+                   AND (?4 IS NULL OR rejected_id=?4)",
+                params![project_id, kind.as_str(), chosen_id, rejected_id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// A project's events in a fixed order (kind, chosen, rejected), so a
+    /// fit over them is deterministic.
+    pub fn list_preference_events(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<crate::learn::PrefEvent>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT kind,chosen_id,rejected_id,chosen_features,rejected_features
+                 FROM preference_events WHERE project_id=?1
+                 ORDER BY kind, chosen_id, rejected_id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map(params![project_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = vec![];
+        for row in rows {
+            let (kind, chosen_id, rejected_id, c, r) = row.map_err(|e| e.to_string())?;
+            let Some(kind) = crate::learn::EventKind::parse(&kind) else {
+                continue;
+            };
+            out.push(crate::learn::PrefEvent {
+                kind,
+                chosen_id,
+                rejected_id,
+                chosen: serde_json::from_str(&c).map_err(|e| e.to_string())?,
+                rejected: serde_json::from_str(&r).map_err(|e| e.to_string())?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Delete all of a project's events (reset to the default weights).
+    /// Returns how many were removed.
+    pub fn clear_preference_events(&self, project_id: &str) -> Result<usize, String> {
+        self.conn
+            .execute(
+                "DELETE FROM preference_events WHERE project_id=?1",
+                params![project_id],
+            )
+            .map_err(|e| e.to_string())
     }
 
     pub fn insert_plan(
@@ -639,12 +760,25 @@ impl Db {
     /// is what every keepsake renders. The stored plan stays pristine, so
     /// edits can be undone and carry over to newer plans of the project.
     pub fn edited_plan(&self, project_id: Option<&str>) -> Result<Option<EditedPlan>, String> {
+        self.edited_plan_with(project_id, None)
+    }
+
+    /// [`Self::edited_plan`] under the owner's itinerary: chapters take the
+    /// itinerary's city (or ship) labels and the route follows it, then the
+    /// Story-editor edits are applied on top, so a user rename still wins.
+    pub fn edited_plan_with(
+        &self,
+        project_id: Option<&str>,
+        itinerary: Option<&crate::itinerary::Itinerary>,
+    ) -> Result<Option<EditedPlan>, String> {
         let Some((project_id, base)) = self.latest_plan_with_project(project_id)? else {
             return Ok(None);
         };
         let edits = self.get_plan_edits(&project_id)?;
         let assets = self.list_assets(&project_id)?;
-        let edited = crate::plan::apply_edits(&base, &assets, &edits);
+        let relabelled = itinerary.map(|i| crate::itinerary::apply_itinerary(&base, &assets, i));
+        let edited =
+            crate::plan::apply_edits(relabelled.as_ref().unwrap_or(&base), &assets, &edits);
         Ok(Some(EditedPlan {
             project_id,
             base,
@@ -762,6 +896,7 @@ mod tests {
         let p = db.create_project("trip", "/tmp/trip").unwrap();
         let edits = crate::plan::PlanEdits {
             excluded: vec!["a1".into()],
+            included: vec!["a9".into()],
             swaps: vec![("a2".into(), "a3".into())],
             place_overrides: [("a1".to_string(), "Our Hotel".to_string())].into(),
             caption_overrides: [("a3".to_string(), "Sunset".to_string())].into(),
@@ -809,6 +944,44 @@ mod tests {
         db.save_plan_edits(&p.id, &Default::default()).unwrap();
         let restored = db.edited_plan(Some(&p.id)).unwrap().unwrap();
         assert_eq!(members(&restored.edited), 2);
+    }
+
+    #[test]
+    fn init_adds_people_count_to_older_databases_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        let old_schema = SCHEMA.replace("    people_count INTEGER,\n", "");
+        assert_ne!(old_schema, SCHEMA);
+        conn.execute_batch(&old_schema).unwrap();
+        let db = Db::init(conn).unwrap();
+        let db = Db::init(db.conn).unwrap();
+        let p = db.create_project("trip", "/tmp/trip").unwrap();
+        let mut a = asset("a1");
+        a.people_count = Some(4);
+        db.upsert_asset(&p.id, &a).unwrap();
+        db.upsert_asset(&p.id, &asset("a2")).unwrap();
+        let got = db.list_assets(&p.id).unwrap();
+        assert_eq!(got[0].people_count, Some(4));
+        assert_eq!(got[1].people_count, None);
+    }
+
+    #[test]
+    fn update_asset_scoring_sets_phash_and_keeps_it_when_none() {
+        let db = mem();
+        let p = db.create_project("trip", "/tmp/trip").unwrap();
+        let mut a = asset("a1");
+        a.phash = None;
+        db.upsert_asset(&p.id, &a).unwrap();
+        let s = Score {
+            total: 0.7,
+            ..Default::default()
+        };
+        db.update_asset_scoring("a1", &s, Some(u64::MAX - 5))
+            .unwrap();
+        assert_eq!(db.list_assets(&p.id).unwrap()[0].phash, Some(u64::MAX - 5));
+        db.update_asset_scoring("a1", &s, None).unwrap();
+        let got = db.list_assets(&p.id).unwrap();
+        assert_eq!(got[0].phash, Some(u64::MAX - 5));
+        assert!((got[0].score.as_ref().unwrap().total - 0.7).abs() < 1e-6);
     }
 
     #[test]
@@ -860,11 +1033,22 @@ mod tests {
             total: 0.85,
             highlight: true,
             reasons: vec!["clean exposure, good detail".into()],
+            clip_windows: vec![crate::types::ClipSpan {
+                start: 4.5,
+                end: 10.5,
+                quality: 0.7,
+            }],
+            ..Default::default()
         });
         db.upsert_asset(&p.id, &a).unwrap();
         let got = db.list_assets(&p.id).unwrap();
         assert_eq!(got.len(), 1);
         let s = got[0].score.as_ref().expect("score round trip");
+        assert_eq!(s.clip_windows.len(), 1);
+        assert_eq!(
+            (s.clip_windows[0].start, s.clip_windows[0].end),
+            (4.5, 10.5)
+        );
         assert!((s.total - 0.85).abs() < 1e-6);
         assert!((s.sharpness - 0.8).abs() < 1e-6);
         assert!(s.highlight);
@@ -883,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn update_asset_score_changes_only_the_score() {
+    fn update_asset_scoring_changes_only_the_score() {
         let db = mem();
         let p = db.create_project("trip", "/tmp/trip").unwrap();
         db.upsert_asset(&p.id, &asset("a1")).unwrap();
@@ -891,7 +1075,7 @@ mod tests {
             total: 0.4,
             ..Default::default()
         };
-        db.update_asset_score("a1", &first).unwrap();
+        db.update_asset_scoring("a1", &first, None).unwrap();
         let after_first = db.list_assets(&p.id).unwrap();
         assert!((after_first[0].score.as_ref().unwrap().total - 0.4).abs() < 1e-6);
         // Every other column survives the column-only write.
@@ -903,7 +1087,7 @@ mod tests {
             highlight: true,
             ..Default::default()
         };
-        db.update_asset_score("a1", &second).unwrap();
+        db.update_asset_scoring("a1", &second, None).unwrap();
         let after_second = db.list_assets(&p.id).unwrap();
         assert_eq!(after_second.len(), 1);
         assert!((after_second[0].score.as_ref().unwrap().total - 0.9).abs() < 1e-6);
