@@ -847,7 +847,8 @@ impl Db {
     pub fn jobs_in_state(&self, states: &[JobState]) -> Result<Vec<Job>, String> {
         let names: Vec<&str> = states.iter().map(|s| job_state_to_str(*s)).collect();
         let placeholders = names.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT {JOB_COLS} FROM jobs WHERE state IN ({placeholders})");
+        let sql =
+            format!("SELECT {JOB_COLS} FROM jobs WHERE state IN ({placeholders}) ORDER BY rowid");
         let mut st = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = st
             .query_map(rusqlite::params_from_iter(names), job_from_row)

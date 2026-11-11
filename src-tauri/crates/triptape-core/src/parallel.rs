@@ -20,16 +20,25 @@ pub fn for_each_parallel<T: Sync, R: Send>(
     let live = workers.clamp(1, total);
     let next = AtomicUsize::new(0);
     let (tx, rx) = std::sync::mpsc::channel::<(usize, R)>();
+    // Workers inherit the caller's cancel flag, so a cancel still kills the
+    // child processes they start (see `crate::process`).
+    let cancel = crate::process::current();
     std::thread::scope(|s| {
         // Moved into each worker as shared borrows of the same counter and job.
-        let (next, work) = (&next, &work);
+        let (next, work, cancel) = (&next, &work, &cancel);
         for _ in 0..live {
             let tx = tx.clone();
-            s.spawn(move || loop {
-                let idx = next.fetch_add(1, Ordering::SeqCst);
-                let Some(item) = items.get(idx) else { break };
-                if tx.send((idx, work(item))).is_err() {
-                    break;
+            s.spawn(move || {
+                let run = || loop {
+                    let idx = next.fetch_add(1, Ordering::SeqCst);
+                    let Some(item) = items.get(idx) else { break };
+                    if tx.send((idx, work(item))).is_err() {
+                        break;
+                    }
+                };
+                match cancel {
+                    Some(flag) => crate::process::with_cancel(flag, run),
+                    None => run(),
                 }
             });
         }
@@ -44,6 +53,31 @@ pub fn for_each_parallel<T: Sync, R: Send>(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn workers_inherit_the_callers_cancel_flag() {
+        let flag = crate::jobs::CancelFlag::new();
+        flag.cancel();
+        let mut seen = vec![];
+        crate::process::with_cancel(&flag, || {
+            for_each_parallel(
+                &[1, 2, 3, 4],
+                3,
+                |_| crate::process::cancelled(),
+                |_, r, _, _| seen.push(r),
+            )
+        });
+        assert_eq!(seen, [true; 4]);
+        // Without a flag installed, workers see none.
+        let mut seen = vec![];
+        for_each_parallel(
+            &[1, 2],
+            2,
+            |_| crate::process::cancelled(),
+            |_, r, _, _| seen.push(r),
+        );
+        assert_eq!(seen, [false; 2]);
+    }
 
     #[test]
     fn covers_every_item_once_and_counts_completions() {

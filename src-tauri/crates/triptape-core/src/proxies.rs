@@ -146,21 +146,22 @@ pub fn run_ffmpeg(ffmpeg_bin: &str, args: &[String], out: &Path) -> Result<(), S
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let tmp = temp_sibling(out);
-    let result = std::process::Command::new(ffmpeg_bin)
-        .args(head)
-        .arg(&tmp)
-        .stdin(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("ffmpeg spawn failed: {e}"))
-        .and_then(|status| {
-            if !status.success() {
-                Err(format!("ffmpeg exited with {status}"))
-            } else if !cache_hit(&tmp) {
-                Err("ffmpeg produced empty output".to_string())
-            } else {
-                std::fs::rename(&tmp, out).map_err(|e| e.to_string())
-            }
-        });
+    let result = crate::process::status(
+        std::process::Command::new(ffmpeg_bin)
+            .args(head)
+            .arg(&tmp)
+            .stdin(std::process::Stdio::null()),
+    )
+    .map_err(|e| format!("ffmpeg spawn failed: {e}"))
+    .and_then(|status| {
+        if !status.success() {
+            Err(format!("ffmpeg exited with {status}"))
+        } else if !cache_hit(&tmp) {
+            Err("ffmpeg produced empty output".to_string())
+        } else {
+            std::fs::rename(&tmp, out).map_err(|e| e.to_string())
+        }
+    });
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }

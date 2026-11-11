@@ -141,6 +141,23 @@ export async function cancelJob(jobId: string): Promise<void> {
   if (isTauri()) await invoke("cancel_job", { jobId });
 }
 
+/** The export a quit or crash stopped on this trip, as its job kind. */
+export async function getInterruptedExport(projectId: string): Promise<ExportCmd | null> {
+  if (!isTauri()) return null;
+  const job = await invoke<ProgressEvent | null>("get_interrupted_export", { projectId });
+  if (!job) return null;
+  const byKind: Record<string, ExportCmd> = {
+    "render-video": "export_video",
+    "render-reels": "export_reels",
+    "render-book": "export_book"
+  };
+  return byKind[job.kind] ?? "export_all";
+}
+
+export async function dismissInterruptedExport(projectId: string): Promise<void> {
+  if (isTauri()) await invoke("dismiss_interrupted_export", { projectId });
+}
+
 export type ExportCmd = "export_video" | "export_reels" | "export_book" | "export_all";
 
 export async function exportKeepsake(

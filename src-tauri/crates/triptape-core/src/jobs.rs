@@ -7,7 +7,7 @@
 //! free-space precheck, cooperative cancel flag).
 
 use crate::db::{job_state_to_str, Db};
-use crate::types::JobState;
+use crate::types::{Job, JobState};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -23,6 +23,7 @@ pub fn can_transition(from: JobState, to: JobState) -> bool {
         (Queued, Running | Cancelled)
             | (Running, Finalizing | Done | Failed | Cancelled)
             | (Finalizing, Done | Failed | Cancelled)
+            | (Interrupted, Cancelled)
     )
 }
 
@@ -64,6 +65,36 @@ pub fn mark_interrupted(db: &Db) -> Result<Vec<String>, String> {
         )?;
     }
     Ok(stuck.into_iter().map(|j| j.id).collect())
+}
+
+fn is_export(job: &Job) -> bool {
+    job.kind.starts_with("render-") || job.kind == "export-all"
+}
+
+/// This project's exports that a quit or crash stopped, oldest first.
+pub fn interrupted_exports(db: &Db, project_id: &str) -> Result<Vec<Job>, String> {
+    let mut jobs = db.jobs_in_state(&[JobState::Interrupted])?;
+    jobs.retain(|j| j.project_id == project_id && is_export(j));
+    Ok(jobs)
+}
+
+/// The user has dealt with them: dismissed, or started a new export.
+pub fn clear_interrupted_exports(db: &Db, project_id: &str) -> Result<(), String> {
+    for j in interrupted_exports(db, project_id)? {
+        transition(db, &j.id, JobState::Cancelled, j.progress, None, None)?;
+    }
+    Ok(())
+}
+
+/// Remove the working folder a crashed export left behind. Only ever touches a
+/// folder named `.work`, since the path comes from a stored row.
+pub fn remove_leftover_work(job: &Job) {
+    let Some(dir) = job.temp_dir.as_deref().map(Path::new) else {
+        return;
+    };
+    if dir.file_name().is_some_and(|n| n == ".work") {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// Write a checkpoint payload to `name.partial` inside `temp_dir`.
@@ -184,11 +215,17 @@ pub fn free_space_precheck(dir: &Path, estimate_bytes: u64) -> Result<(), String
     let need = required_free_bytes(estimate_bytes);
     match free_bytes(dir) {
         Some(have) if have < need => Err(format!(
-            "not enough free space in {}: need {need} bytes (1.5x estimate), have {have}",
-            dir.display()
+            "Not enough free space in {}: this needs about {} and {} is free.",
+            dir.display(),
+            format_gb(need),
+            format_gb(have)
         )),
         _ => Ok(()),
     }
+}
+
+fn format_gb(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
 }
 
 /// Cooperative cancel flag shared with a running job task.
@@ -220,6 +257,52 @@ impl CancelFlag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_exports_are_listed_per_project_and_clear() {
+        let db = mem();
+        let p1 = db.create_project("one", "/one").unwrap().id;
+        let p2 = db.create_project("two", "/two").unwrap().id;
+        let export = db.insert_job(&p1, "export-all", None).unwrap();
+        let single = db.insert_job(&p1, "render-book", None).unwrap();
+        let ingest = db.insert_job(&p1, "ingest", None).unwrap();
+        let other = db.insert_job(&p2, "export-all", None).unwrap();
+        for j in [&export, &single, &ingest, &other] {
+            transition(&db, &j.id, JobState::Running, 0.1, None, None).unwrap();
+        }
+        mark_interrupted(&db).unwrap();
+
+        let found = interrupted_exports(&db, &p1).unwrap();
+        let ids: Vec<&str> = found.iter().map(|j| j.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [export.id.as_str(), single.id.as_str()],
+            "oldest first; no ingest jobs, no other projects"
+        );
+
+        clear_interrupted_exports(&db, &p1).unwrap();
+        assert!(interrupted_exports(&db, &p1).unwrap().is_empty());
+        assert_eq!(interrupted_exports(&db, &p2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn leftover_work_removal_only_touches_work_folders() {
+        let d = tempfile::tempdir().unwrap();
+        let work = d.path().join(".work");
+        let keep = d.path().join("Vacation");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&keep).unwrap();
+        let db = mem();
+        let p = db.create_project("trip", "/trip").unwrap().id;
+        let job_at = |dir: &Path| {
+            db.insert_job(&p, "export-all", Some(&dir.to_string_lossy()))
+                .unwrap()
+        };
+        remove_leftover_work(&job_at(&keep));
+        assert!(keep.exists());
+        remove_leftover_work(&job_at(&work));
+        assert!(!work.exists());
+    }
 
     fn mem() -> Db {
         Db::open_in_memory().unwrap()

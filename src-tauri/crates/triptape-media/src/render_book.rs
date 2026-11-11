@@ -1327,14 +1327,12 @@ fn write_typst_and_compile(
     let typ_path = out_dir.join(typ_name);
     std::fs::write(&typ_path, &typ).map_err(|e| crate::MediaError::Io(e.to_string()))?;
     let pdf = out_dir.join(pdf_name);
-    let st = Command::new(&opts.typst_bin)
-        .args([
-            "compile",
-            &typ_path.to_string_lossy(),
-            &pdf.to_string_lossy(),
-        ])
-        .output()
-        .map_err(|e| crate::MediaError::Io(format!("spawn {}: {e}", opts.typst_bin)))?;
+    let st = triptape_core::process::output(Command::new(&opts.typst_bin).args([
+        "compile",
+        &typ_path.to_string_lossy(),
+        &pdf.to_string_lossy(),
+    ]))
+    .map_err(|e| crate::MediaError::Io(format!("spawn {}: {e}", opts.typst_bin)))?;
     if !st.status.success() {
         return Err(crate::MediaError::Io(format!(
             "typst compile failed: {}",
@@ -1363,18 +1361,16 @@ fn burn_captions(
         .collect::<Vec<_>>()
         .join(",");
     let result = (|| {
-        let st = Command::new(&opts.typst_bin)
-            .args([
-                "compile",
-                &out_dir.join("proof.typ").to_string_lossy(),
-                &raster.join("p{p}.png").to_string_lossy(),
-                "--ppi",
-                "300",
-                "--pages",
-                &pages,
-            ])
-            .output()
-            .map_err(|e| crate::MediaError::Io(format!("spawn {}: {e}", opts.typst_bin)))?;
+        let st = triptape_core::process::output(Command::new(&opts.typst_bin).args([
+            "compile",
+            &out_dir.join("proof.typ").to_string_lossy(),
+            &raster.join("p{p}.png").to_string_lossy(),
+            "--ppi",
+            "300",
+            "--pages",
+            &pages,
+        ]))
+        .map_err(|e| crate::MediaError::Io(format!("spawn {}: {e}", opts.typst_bin)))?;
         if !st.status.success() {
             return Err(crate::MediaError::Io(format!(
                 "typst raster failed: {}",

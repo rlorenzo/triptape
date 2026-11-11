@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, PoisonError};
+use triptape_core::process;
 use triptape_core::proxies;
 use triptape_core::types::AssetKind;
 
@@ -470,25 +471,27 @@ fn decode_still_raw(ffmpeg_bin: &str, src: &Path) -> Result<DecodedStill, super:
         }
     };
     let try_ffmpeg = || {
-        ok(Command::new(ffmpeg_bin)
-            .args(["-nostdin", "-i"])
-            .arg(src)
-            .args(["-frames:v", "1"])
-            .arg(&out)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status())
+        ok(process::status(
+            Command::new(ffmpeg_bin)
+                .args(["-nostdin", "-i"])
+                .arg(src)
+                .args(["-frames:v", "1"])
+                .arg(&out)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        ))
     };
     #[cfg(target_os = "macos")]
     let try_sips = || {
-        ok(Command::new("sips")
-            .args(["-s", "format", "png"])
-            .arg(src)
-            .arg("--out")
-            .arg(&out)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status())
+        ok(process::status(
+            Command::new("sips")
+                .args(["-s", "format", "png"])
+                .arg(src)
+                .arg("--out")
+                .arg(&out)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        ))
     };
     #[cfg(target_os = "macos")]
     let (decoded, via_sips) = {
@@ -612,8 +615,10 @@ pub fn run_ffmpeg_with(
             "ffmpeg output arg does not match destination".into(),
         ));
     }
-    if let Some(p) = opts.progress {
-        p.check_cancelled()?;
+    // A job's flag installed on this thread counts too (see `process`).
+    let cancelled = || opts.progress.is_some_and(|p| p.is_cancelled()) || process::cancelled();
+    if cancelled() {
+        return Err(super::MediaError::Cancelled);
     }
     if let Some(p) = final_out.parent() {
         std::fs::create_dir_all(p).map_err(|e| super::MediaError::Io(e.to_string()))?;
@@ -685,7 +690,7 @@ pub fn run_ffmpeg_with(
     // tight and backs off to the cancel-latency ceiling.
     let mut nap = std::time::Duration::from_millis(1);
     let waited = loop {
-        if opts.progress.is_some_and(|p| p.is_cancelled()) {
+        if cancelled() {
             break Err(super::MediaError::Cancelled);
         }
         match child.try_wait() {
@@ -865,18 +870,16 @@ pub fn audio_map(ffprobe_bin: &str, path: &Path) -> Option<String> {
 
 /// Probe one media file; errors when ffprobe fails or finds no streams.
 pub fn ffprobe_file(ffprobe_bin: &str, path: &Path) -> Result<ProbeInfo, super::MediaError> {
-    let out = Command::new(ffprobe_bin)
-        .args([
-            "-v",
-            "error",
-            "-show_streams",
-            "-show_format",
-            "-of",
-            "json",
-            &path.to_string_lossy(),
-        ])
-        .output()
-        .map_err(|e| super::MediaError::Ffmpeg(format!("spawn {ffprobe_bin}: {e}")))?;
+    let out = process::output(Command::new(ffprobe_bin).args([
+        "-v",
+        "error",
+        "-show_streams",
+        "-show_format",
+        "-of",
+        "json",
+        &path.to_string_lossy(),
+    ]))
+    .map_err(|e| super::MediaError::Ffmpeg(format!("spawn {ffprobe_bin}: {e}")))?;
     if !out.status.success() {
         return Err(super::MediaError::Ffmpeg(format!(
             "ffprobe failed: {}",

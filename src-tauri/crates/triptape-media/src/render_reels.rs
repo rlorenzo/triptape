@@ -422,7 +422,14 @@ pub fn render_reels(
         &manifest_path,
         serde_json::to_string_pretty(&serde_json::json!({
             "version": 1,
-            "reels": reels,
+            // File names, not paths: the pack may be moved after rendering.
+            "reels": reels.iter().map(|r| {
+                let mut r = r.clone();
+                let file_name = |p: &str| p.rsplit(['/', '\\']).next().unwrap_or_default().to_string();
+                r.path = file_name(&r.path);
+                r.cover = file_name(&r.cover);
+                r
+            }).collect::<Vec<_>>(),
             "share_disclosure": SHARE_DISCLOSURE,
             "fallbacks": fallbacks,
         }))?,

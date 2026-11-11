@@ -133,13 +133,37 @@ impl Progress {
         }
     }
 
+    /// A handle that stops when `cancel` is set, such as a job's flag the app
+    /// keeps so its Cancel command reaches the render at once.
+    pub fn with_cancel(sink: Arc<dyn ProgressSink>, cancel: CancelFlag) -> Self {
+        Self {
+            sink: Some(sink),
+            cancel,
+        }
+    }
+
     /// Stop the render; clones of this handle share the flag.
     pub fn cancel(&self) {
         self.cancel.cancel();
     }
 
+    /// The flag this handle stops on, for code that only sees the flag
+    /// (`triptape_core::process` kills child processes with it).
+    pub fn cancel_flag(&self) -> CancelFlag {
+        self.cancel.clone()
+    }
+
     pub fn is_cancelled(&self) -> bool {
-        self.cancel.is_cancelled() || self.sink.as_ref().is_some_and(|s| s.cancelled())
+        if self.cancel.is_cancelled() {
+            return true;
+        }
+        // A cancel the sink reports sets the flag too, so everything
+        // watching only the flag stops as well.
+        let by_sink = self.sink.as_ref().is_some_and(|s| s.cancelled());
+        if by_sink {
+            self.cancel.cancel();
+        }
+        by_sink
     }
 
     /// `Err(Cancelled)` once a cancel was requested, for `?` at loop heads.

@@ -175,8 +175,74 @@ fn resolve_verified(
     }
 }
 
+/// Rough disk use of one export while it renders, intermediates included,
+/// sized from a real 110-entry film (near-lossless segments are the bulk).
+fn estimate_export_bytes(plan: &Plan, photos: usize, only: &str) -> u64 {
+    const PER_FILM_ENTRY: u64 = 30_000_000;
+    const PER_REEL: u64 = 60_000_000;
+    const PER_BOOK_PHOTO: u64 = 10_000_000;
+    const MAX_BOOK_PHOTOS: u64 = 120;
+    let wanted = |keepsake: &str| only == "all" || only == keepsake;
+    let mut bytes = 0;
+    if wanted("video") {
+        bytes += PER_FILM_ENTRY * plan.hero.len() as u64;
+    }
+    if wanted("reels") {
+        bytes += PER_REEL * plan.reel_selects.len().min(5) as u64;
+    }
+    if wanted("book") {
+        bytes += PER_BOOK_PHOTO * (photos as u64).min(MAX_BOOK_PHOTOS);
+    }
+    bytes
+}
+
+/// Replace `dst` with `staged`. A rename within the export folder, so `dst` is
+/// always either the old file or the complete new one.
+fn promote_file(staged: &Path, dst: &Path) -> Result<(), crate::MediaError> {
+    std::fs::rename(staged, dst)
+        .map_err(|e| crate::MediaError::Io(format!("finish {}: {e}", dst.display())))
+}
+
+/// Replace the folder `dst` with `staged`, putting the old one back if the swap
+/// fails. `old` must be on the same volume and is removed on success.
+fn promote_dir(staged: &Path, dst: &Path, old: &Path) -> Result<(), crate::MediaError> {
+    let _ = std::fs::remove_dir_all(old);
+    let had_previous = dst.exists();
+    if had_previous {
+        std::fs::rename(dst, old)
+            .map_err(|e| crate::MediaError::Io(format!("replace {}: {e}", dst.display())))?;
+    }
+    if let Err(e) = std::fs::rename(staged, dst) {
+        if had_previous {
+            let _ = std::fs::rename(old, dst);
+        }
+        return Err(crate::MediaError::Io(format!(
+            "finish {}: {e}",
+            dst.display()
+        )));
+    }
+    let _ = std::fs::remove_dir_all(old);
+    Ok(())
+}
+
+/// Write a small file so it is never seen half written.
+fn write_atomic(path: &Path, text: &str) -> Result<(), crate::MediaError> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            crate::MediaError::Io(e.to_string())
+        })
+}
+
 /// Run all eligible keepsake renderers. Layout under `out_dir`:
 /// `hero.mp4`, `reels/`, `book/`, plus `export.json`.
+///
+/// Keepsakes render in `.work/stage` and move into place only after their
+/// renderer has verified them, so a failed or cancelled export leaves any
+/// previous version intact. `.work` is removed when this returns; only a crash
+/// leaves it behind.
 pub fn export_all(
     caps: &Capabilities,
     plan: &Plan,
@@ -206,9 +272,13 @@ pub fn export_all(
         }
     };
     caps.segment_cache = cache.clone();
-    let mut out = export_inner(&caps, plan, assets, out_dir, opts);
-    // Leave no intermediates behind however the export ends (on cancel,
-    // finished outputs and `.partial` siblings are already gone). This must
+    // Installed for this thread so FFmpeg and Typst children started outside
+    // the progress-aware runners die on cancel too (see `triptape_core::process`).
+    let mut out = triptape_core::process::with_cancel(&opts.progress.cancel_flag(), || {
+        export_inner(&caps, plan, assets, out_dir, opts)
+    });
+    // Leave no intermediates behind however the export ends. Keepsakes are
+    // staged in here, so a failed or cancelled one never reaches `out_dir`. This must
     // precede `cache.finish()`: `.work` holds hard links to cache entries, so
     // while it exists eviction and `cache clear` cannot reclaim their bytes.
     if let Err(e) = std::fs::remove_dir_all(&work) {
@@ -234,11 +304,10 @@ pub fn export_all(
     }
     // Written last so the durable record includes the cache diagnostics.
     if let Ok(report) = &out {
-        std::fs::write(
-            out_dir.join("export.json"),
-            serde_json::to_string_pretty(report)?,
-        )
-        .map_err(|e| crate::MediaError::Io(e.to_string()))?;
+        write_atomic(
+            &out_dir.join("export.json"),
+            &serde_json::to_string_pretty(report)?,
+        )?;
     }
     out
 }
@@ -292,8 +361,16 @@ fn export_inner(
     let elig = plan_eligibility(usable, photos, plan.chapters.len());
 
     std::fs::create_dir_all(out_dir).map_err(|e| crate::MediaError::Io(e.to_string()))?;
+    triptape_core::jobs::free_space_precheck(
+        out_dir,
+        estimate_export_bytes(plan, photos, &opts.only),
+    )
+    .map_err(crate::MediaError::NoSpace)?;
     let work = out_dir.join(".work");
-    std::fs::create_dir_all(&work).map_err(|e| crate::MediaError::Io(e.to_string()))?;
+    let stage = work.join("stage");
+    // A crashed run may have left a half-finished keepsake here.
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage).map_err(|e| crate::MediaError::Io(e.to_string()))?;
 
     let mut report = ExportReport {
         trip_name: opts.trip_name.clone(),
@@ -319,16 +396,14 @@ fn export_inner(
             Err(e) => report.fallbacks.push(format!("map card failed: {e}")),
         }
     }
-    let attribution_path = out_dir.join("ATTRIBUTION.txt");
-    std::fs::write(
-        &attribution_path,
-        format!(
+    write_atomic(
+        &out_dir.join("ATTRIBUTION.txt"),
+        &format!(
             "TripTape export — {}\nMap route card: plain styled background (no tile basemap; G3 fallback scope).\nAttribution on every map frame/page: {}\n",
             opts.trip_name,
             crate::map::MAP_ATTRIBUTION
         ),
-    )
-    .map_err(|e| crate::MediaError::Io(e.to_string()))?;
+    )?;
 
     // Keepsake 1 — Trip Video.
     if opts.only != "all" && opts.only != "video" {
@@ -347,6 +422,8 @@ fn export_inner(
             .iter()
             .filter_map(|e| resolve_verified(plan, &by_id, e, "video", &mut report.fallbacks))
             .collect();
+        let staged_video = stage.join("video");
+        std::fs::create_dir_all(&staged_video).map_err(|e| crate::MediaError::Io(e.to_string()))?;
         let out_mp4 = out_dir.join("hero.mp4");
         match render_video::render_hero_video(
             caps,
@@ -354,7 +431,7 @@ fn export_inner(
             &resolved,
             map_card.as_deref(),
             &work.join("video"),
-            &out_mp4,
+            &staged_video.join("hero.mp4"),
             &VideoOptions {
                 trip_name: opts.trip_name.clone(),
                 short_mode: elig.video == "short",
@@ -379,15 +456,30 @@ fn export_inner(
                 ..Default::default()
             },
         ) {
+            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
             Ok(v) => {
+                opts.progress.check_cancelled()?;
+                // Sidecars first, film last. A film with no captions must
+                // not keep the previous film's.
+                for name in ["hero.srt", "hero.edl.json"] {
+                    let staged = staged_video.join(name);
+                    if staged.exists() {
+                        promote_file(&staged, &out_dir.join(name))?;
+                    } else {
+                        let _ = std::fs::remove_file(out_dir.join(name));
+                    }
+                }
+                promote_file(&staged_video.join("hero.mp4"), &out_mp4)?;
                 report.video = Some(out_mp4.to_string_lossy().into_owned());
                 report.fallbacks.extend(v.fallbacks);
             }
-            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
-            Err(e) => report.skipped.push(Skipped {
-                keepsake: "video".into(),
-                reason: format!("render failed: {e}"),
-            }),
+            Err(e) => {
+                opts.progress.check_cancelled()?;
+                report.skipped.push(Skipped {
+                    keepsake: "video".into(),
+                    reason: format!("render failed: {e}"),
+                });
+            }
         }
     }
 
@@ -437,6 +529,7 @@ fn export_inner(
             slideshows.push(slides);
         }
         let reels_dir = out_dir.join("reels");
+        let staged_reels = stage.join("reels");
         if resolved.is_empty() {
             // Every selected reel was filtered out (missing/changed source);
             // details are already in report.fallbacks.
@@ -448,7 +541,7 @@ fn export_inner(
             match render_reels::render_reels(
                 caps,
                 &resolved,
-                &reels_dir,
+                &staged_reels,
                 &ReelOptions {
                     // Reels are short: they loop the first playlist track
                     // rather than building the crossfaded bed.
@@ -458,15 +551,35 @@ fn export_inner(
                     ..Default::default()
                 },
             ) {
+                Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
+                Ok(r) if r.reels.is_empty() => {
+                    opts.progress.check_cancelled()?;
+                    report.fallbacks.extend(r.fallbacks);
+                    report.skipped.push(Skipped {
+                        keepsake: "reels".into(),
+                        reason: "render failed: no reel could be made; see fallbacks".into(),
+                    });
+                }
                 Ok(r) => {
-                    report.reels = r.reels.iter().map(|f| f.path.clone()).collect();
+                    opts.progress.check_cancelled()?;
+                    promote_dir(&staged_reels, &reels_dir, &work.join("old-reels"))?;
+                    report.reels = r
+                        .reels
+                        .iter()
+                        .map(|f| {
+                            let name = Path::new(&f.path).file_name().unwrap_or_default();
+                            reels_dir.join(name).to_string_lossy().into_owned()
+                        })
+                        .collect();
                     report.fallbacks.extend(r.fallbacks);
                 }
-                Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
-                Err(e) => report.skipped.push(Skipped {
-                    keepsake: "reels".into(),
-                    reason: format!("render failed: {e}"),
-                }),
+                Err(e) => {
+                    opts.progress.check_cancelled()?;
+                    report.skipped.push(Skipped {
+                        keepsake: "reels".into(),
+                        reason: format!("render failed: {e}"),
+                    });
+                }
             }
         }
     }
@@ -524,6 +637,7 @@ fn export_inner(
         }
         // Story order: keep db order (taken_at, id).
         let book_dir = out_dir.join("book");
+        let staged_book = stage.join("book");
         // Day-marker titles: day once, with the location.
         let chapter_titles: Vec<String> = plan
             .chapters
@@ -534,7 +648,7 @@ fn export_inner(
             &book_photos,
             map_card.as_deref(),
             &chapter_titles,
-            &book_dir,
+            &staged_book,
             &BookOptions {
                 preset: opts.preset,
                 trip_name: opts.trip_name.clone(),
@@ -543,15 +657,20 @@ fn export_inner(
                 progress: opts.progress.clone(),
             },
         ) {
+            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
             Ok(b) => {
+                opts.progress.check_cancelled()?;
+                promote_dir(&staged_book, &book_dir, &work.join("old-book"))?;
                 report.book_pages = b.counted_pages;
                 report.fallbacks.extend(b.fallbacks);
             }
-            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
-            Err(e) => report.skipped.push(Skipped {
-                keepsake: "book".into(),
-                reason: format!("preflight/render blocked: {e}"),
-            }),
+            Err(e) => {
+                opts.progress.check_cancelled()?;
+                report.skipped.push(Skipped {
+                    keepsake: "book".into(),
+                    reason: format!("preflight/render blocked: {e}"),
+                });
+            }
         }
     }
 
@@ -613,6 +732,112 @@ fn chapter_slideshow(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn promote_dir_replaces_the_old_folder_and_cleans_up() {
+        let d = tempfile::tempdir().unwrap();
+        let (dst, staged, old) = (
+            d.path().join("reels"),
+            d.path().join("s"),
+            d.path().join("o"),
+        );
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("stale.mp4"), "old").unwrap();
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("new.mp4"), "new").unwrap();
+        promote_dir(&staged, &dst, &old).unwrap();
+        assert!(dst.join("new.mp4").exists());
+        assert!(!dst.join("stale.mp4").exists());
+        assert!(!staged.exists() && !old.exists());
+    }
+
+    #[test]
+    fn promote_dir_keeps_the_old_folder_when_the_swap_fails() {
+        let d = tempfile::tempdir().unwrap();
+        let (dst, old) = (d.path().join("reels"), d.path().join("o"));
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("keep.mp4"), "old").unwrap();
+        assert!(promote_dir(&d.path().join("never-rendered"), &dst, &old).is_err());
+        assert!(dst.join("keep.mp4").exists());
+    }
+
+    #[test]
+    fn estimate_counts_only_the_selected_keepsake() {
+        let mut plan = empty_plan();
+        let entry = PlanEntry {
+            asset_id: "a".into(),
+            window: 0,
+            content_hash: None,
+            size_bytes: 0,
+            mtime: 0,
+            rendition: Rendition::Still,
+        };
+        plan.hero = vec![entry.clone(); 10];
+        plan.reel_selects = vec![entry; 9];
+        let (video, reels, book) = (
+            estimate_export_bytes(&plan, 500, "video"),
+            estimate_export_bytes(&plan, 500, "reels"),
+            estimate_export_bytes(&plan, 500, "book"),
+        );
+        assert_eq!(video, 300_000_000);
+        assert_eq!(reels, 300_000_000, "the pack caps at five reels");
+        assert_eq!(book, 1_200_000_000, "the book caps its photo count");
+        assert_eq!(
+            estimate_export_bytes(&plan, 500, "all"),
+            video + reels + book
+        );
+    }
+
+    #[test]
+    fn a_cancelled_export_writes_nothing_and_cleans_up() {
+        let d = tempfile::tempdir().unwrap();
+        let out = d.path().join("trip");
+        std::fs::create_dir_all(out.join("reels")).unwrap();
+        std::fs::write(out.join("hero.mp4"), "previous film").unwrap();
+        std::fs::write(out.join("reels").join("01.mp4"), "previous reel").unwrap();
+        let progress = Progress::default();
+        progress.cancel();
+        // Enough photos that the book is eligible, but no real sources: the
+        // cancel must be reported instead of a skipped keepsake.
+        let mut plan = empty_plan();
+        plan.hero = (0..50)
+            .map(|i| PlanEntry {
+                asset_id: format!("a{i}"),
+                window: 0,
+                content_hash: None,
+                size_bytes: 0,
+                mtime: 0,
+                rendition: Rendition::Still,
+            })
+            .collect();
+        let caps = Capabilities::default();
+        let err = export_all(
+            &caps,
+            &plan,
+            &[],
+            &out,
+            &ExportOptions {
+                preset: render_book::BookPreset::P1,
+                trip_name: "Trip".into(),
+                typst_bin: "typst".into(),
+                music_paths: vec![],
+                keep_ambience: false,
+                only: "all".into(),
+                resolution: Resolution::default(),
+                jobs: None,
+                progress,
+                segment_cache: None,
+                itinerary: None,
+            },
+        );
+        assert!(matches!(err, Err(crate::MediaError::Cancelled)), "{err:?}");
+        assert_eq!(
+            std::fs::read_to_string(out.join("hero.mp4")).unwrap(),
+            "previous film"
+        );
+        assert!(out.join("reels").join("01.mp4").exists());
+        assert!(!out.join(".work").exists());
+    }
 
     fn empty_plan() -> Plan {
         Plan {

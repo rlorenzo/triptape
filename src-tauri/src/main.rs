@@ -826,14 +826,47 @@ async fn cancel_job(
 ) -> Result<JobView, String> {
     AppState::check_id(&job_id)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    jobs::transition(&db, &job_id, JobState::Cancelled, 0.0, None, None)?;
+    let progress = db.get_job(&job_id)?.map_or(0.0, |j| j.progress);
+    jobs::transition(&db, &job_id, JobState::Cancelled, progress, None, None)?;
     let job = db
         .get_job(&job_id)?
         .ok_or_else(|| format!("unknown job {job_id}"))?;
-    // Temp-dir cleanup: the render worker owns deletion on cancel; the row
-    // records the temp dir so a later sweep can reclaim orphans.
+    // Kills the running child at once. The render then returns, and
+    // `export_all` removes its working folder.
+    if let Some(flag) = state
+        .running_exports
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get(&job_id)
+    {
+        flag.cancel();
+    }
     emit(&app, &job);
     Ok(job_view(&job))
+}
+
+/// The newest export of this trip that a quit or crash stopped, if the user
+/// hasn't dealt with it yet.
+#[tauri::command]
+async fn get_interrupted_export(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Option<JobView>, String> {
+    state.require_project(&project_id)?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    Ok(jobs::interrupted_exports(&db, &project_id)?
+        .last()
+        .map(job_view))
+}
+
+#[tauri::command]
+async fn dismiss_interrupted_export(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<(), String> {
+    state.require_project(&project_id)?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    jobs::clear_interrupted_exports(&db, &project_id)
 }
 
 /// Load the latest plan, its assets, and the trip name under one lock.
@@ -955,6 +988,48 @@ async fn run_export(
         .map_err(|e| e.to_string())?
 }
 
+/// Which keepsakes a job kind renders.
+fn keepsakes_of(kind: &str) -> &'static str {
+    match kind {
+        "render-video" => "video",
+        "render-reels" => "reels",
+        "render-book" => "book",
+        _ => "all",
+    }
+}
+
+/// Keeps a running export's cancel flag reachable for exactly as long as it runs.
+struct RunningExport<'a> {
+    state: &'a AppState,
+    job_id: String,
+}
+
+impl<'a> RunningExport<'a> {
+    fn register(state: &'a AppState, job_id: &str) -> Result<(Self, jobs::CancelFlag), String> {
+        let flag = jobs::CancelFlag::new();
+        state
+            .running_exports
+            .lock()
+            .map_err(|e| e.to_string())?
+            .insert(job_id.to_string(), flag.clone());
+        Ok((
+            Self {
+                state,
+                job_id: job_id.to_string(),
+            },
+            flag,
+        ))
+    }
+}
+
+impl Drop for RunningExport<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut running) = self.state.running_exports.lock() {
+            running.remove(&self.job_id);
+        }
+    }
+}
+
 fn export_blocking(
     app: &tauri::AppHandle,
     project_id: &str,
@@ -962,11 +1037,14 @@ fn export_blocking(
 ) -> Result<ExportSummary, String> {
     let state = app.state::<AppState>();
     let (plan, assets, trip_name) = load_plan_assets(&state, project_id)?;
+    let out_dir = default_export_dir(&trip_name, project_id);
     // Insert and mark Running before the render so the progress event
     // carries the job id the UI's Cancel button needs.
     let job = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        let job = db.insert_job(project_id, kind, None)?;
+        jobs::clear_interrupted_exports(&db, project_id)?;
+        let work_dir = out_dir.join(".work");
+        let job = db.insert_job(project_id, kind, Some(&work_dir.to_string_lossy()))?;
         jobs::transition(
             &db,
             &job.id,
@@ -978,17 +1056,18 @@ fn export_blocking(
         db.get_job(&job.id)?
             .ok_or_else(|| "job vanished".to_string())?
     };
+    // Registered before the first emit, so Cancel always finds the flag.
+    let (_running, cancel) = RunningExport::register(&state, &job.id)?;
     emit(app, &job);
 
     let caps = triptape_media::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
-    let out_dir = default_export_dir(&trip_name, project_id);
     let opts = triptape_media::export::ExportOptions {
         preset: triptape_media::render_book::BookPreset::P1,
         trip_name,
         typst_bin: "typst".to_string(),
         music_paths: Vec::new(),
         keep_ambience: false,
-        only: "all".to_string(),
+        only: keepsakes_of(kind).to_string(),
         resolution: triptape_media::resolution::Resolution::default(),
         jobs: None,
         itinerary: None,
@@ -996,9 +1075,12 @@ fn export_blocking(
         // segments: macOS ~/Library/Caches/app.triptape.desktop/segments.
         segment_cache: triptape_media::segment_cache::default_dir()
             .map(triptape_media::segment_cache::SegmentCacheConfig::new),
-        progress: triptape_media::progress::Progress::new(std::sync::Arc::new(
-            ExportProgress::new(app, &job.id, "all"),
-        )),
+        // The registered flag: `cancel_job` sets it, so the render stops at
+        // once instead of at the sink's next database poll.
+        progress: triptape_media::progress::Progress::with_cancel(
+            std::sync::Arc::new(ExportProgress::new(app, &job.id, keepsakes_of(kind))),
+            cancel,
+        ),
     };
     let rendered = triptape_media::export::export_all(&caps, &plan, &assets, &out_dir, &opts)
         .map_err(|e| e.to_string());
@@ -1207,6 +1289,22 @@ async fn export_all(app: tauri::AppHandle, project_id: String) -> Result<ExportS
     run_export(app, project_id, "export-all").await
 }
 
+/// Quitting must not leave FFmpeg rendering with no one to read the result.
+/// Cancels every export and briefly waits for their children to die.
+fn stop_running_exports(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let is_empty = || state.running_exports.lock().map_or(true, |r| r.is_empty());
+    if let Ok(running) = state.running_exports.lock() {
+        for flag in running.values() {
+            flag.cancel();
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// The store lives in the per-user app data dir. `TRIPTAPE_DB` overrides it in
 /// development builds only, so a release never takes this path from outside.
 fn db_path(app: &tauri::App) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -1224,13 +1322,18 @@ fn main() {
         .setup(|app| {
             let state = AppState::open(&db_path(app)?)?;
             // Startup recovery: any `running`/`finalizing` row becomes
-            // `interrupted` (jobs::mark_interrupted); the UI offers
-            // Resume / Discard per job.
+            // `interrupted`. Its working files are reclaimed now, and the
+            // Export screen offers to make the keepsake again.
             {
                 let db = state.db.lock().map_err(|e| e.to_string())?;
                 match jobs::mark_interrupted(&db) {
                     Ok(ids) if !ids.is_empty() => {
-                        eprintln!("recovered {} interrupted job(s)", ids.len())
+                        eprintln!("recovered {} interrupted job(s)", ids.len());
+                        for id in ids {
+                            if let Ok(Some(job)) = db.get_job(&id) {
+                                jobs::remove_leftover_work(&job);
+                            }
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => eprintln!("startup recovery failed: {e}"),
@@ -1248,6 +1351,8 @@ fn main() {
             get_assets,
             start_job,
             cancel_job,
+            get_interrupted_export,
+            dismiss_interrupted_export,
             export_video,
             export_reels,
             export_book,
@@ -1261,13 +1366,26 @@ fn main() {
             swap_asset,
             get_thumbnail
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running TripTape");
+        .build(tauri::generate_context!())
+        .expect("error while building TripTape")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                stop_running_exports(app);
+            }
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_export_kind_renders_only_its_keepsake() {
+        assert_eq!(keepsakes_of("render-video"), "video");
+        assert_eq!(keepsakes_of("render-reels"), "reels");
+        assert_eq!(keepsakes_of("render-book"), "book");
+        assert_eq!(keepsakes_of("export-all"), "all");
+    }
 
     /// The parallel driver must cover every asset exactly once and agree
     /// with serial scoring. Videos score without touching disk or decoders;

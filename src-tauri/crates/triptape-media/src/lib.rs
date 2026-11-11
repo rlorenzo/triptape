@@ -23,6 +23,8 @@ pub enum MediaError {
     Cancelled,
     #[error("io: {0}")]
     Io(String),
+    #[error("{0}")]
+    NoSpace(String),
     #[error("invalid argument: {0}")]
     InvalidArg(String),
     #[error("book preflight blocked: {0}")]
