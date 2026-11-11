@@ -683,7 +683,34 @@ fn pid_alive(pid: u32) -> bool {
         let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
         rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const ERROR_ACCESS_DENIED: u32 = 5;
+        const STILL_ACTIVE: u32 = 259;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+            fn GetExitCodeProcess(process: *mut c_void, code: *mut u32) -> i32;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+            fn GetLastError() -> u32;
+        }
+        // SAFETY: plain Win32 calls; the handle is closed before returning.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                // Another user's process still exists; anything else is gone.
+                return GetLastError() == ERROR_ACCESS_DENIED;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(h, &mut code) != 0;
+            CloseHandle(h);
+            // An exited process whose handle someone still holds is not alive.
+            !ok || code == STILL_ACTIVE
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
