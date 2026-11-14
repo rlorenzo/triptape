@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 use triptape_core::db::{Db, EditedPlan};
 use triptape_core::metadata;
+use triptape_core::scan::{ScannedFile, VIDEO_EXTS};
 use triptape_core::types::{Asset, AssetKind, Chapter, PlanEntry};
 use triptape_media::export::Skipped;
 
@@ -374,6 +375,54 @@ pub fn fill_foreground_metadata(a: &mut Asset) {
             a.height = Some(h);
         }
     }
+}
+
+/// Upper bound on foreground metadata workers. EXIF reads are header-only
+/// and fast, but every video costs one ffprobe spawn, so this stays above
+/// the scoring worker count without fork-storming hundreds of probes.
+pub const FOREGROUND_FILL_WORKERS_MAX: usize = 8;
+
+/// Fill foreground metadata for every walked file on a bounded worker pool.
+/// Pure per-file work: EXIF/ffprobe reads plus struct fill, no Db access,
+/// so workers never contend on the store lock. `on_done(done, total)` runs
+/// on the calling thread once per completed file for progress.
+///
+/// Walk order is restored before returning, so index-based asset ids
+/// (`{pid}_a{i:06}`) are identical to the sequential fill and Story edits
+/// keyed by those ids keep applying across rescans.
+pub fn fill_assets_parallel(
+    pid: &str,
+    files: &[ScannedFile],
+    mut on_done: impl FnMut(usize, usize),
+) -> Vec<Asset> {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(FOREGROUND_FILL_WORKERS_MAX);
+    let mut pairs: Vec<(usize, Asset)> = Vec::with_capacity(files.len());
+    triptape_core::parallel::for_each_parallel(
+        files,
+        workers,
+        |f| {
+            let kind = if VIDEO_EXTS.contains(&f.ext.as_str()) {
+                AssetKind::Video
+            } else {
+                AssetKind::Photo
+            };
+            let mut a = Asset::new(String::new(), f.path.clone(), kind);
+            a.size_bytes = f.size_bytes;
+            a.mtime = f.mtime_secs;
+            fill_foreground_metadata(&mut a);
+            a
+        },
+        |idx, mut asset, done, total| {
+            asset.id = format!("{pid}_a{idx:06}");
+            pairs.push((idx, asset));
+            on_done(done, total);
+        },
+    );
+    pairs.sort_by_key(|(idx, _)| *idx);
+    pairs.into_iter().map(|(_, a)| a).collect()
 }
 
 /// Live Photo pairing for desktop ingest (`scan_folder`): fold each still +
@@ -836,5 +885,83 @@ mod tests {
         let out = apply_live_photo_pairing(vec![still, mov]);
         assert_eq!(out.len(), 2, "unknown-duration MOV must never merge");
         assert!(out.iter().all(|a| a.kind != AssetKind::LivePhoto));
+    }
+
+    fn scanned_file(path: &std::path::Path, ext: &str) -> triptape_core::scan::ScannedFile {
+        let md = std::fs::metadata(path).unwrap();
+        let mtime = md
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        triptape_core::scan::ScannedFile {
+            path: path.to_path_buf(),
+            size_bytes: md.len(),
+            mtime_secs: mtime,
+            ext: ext.to_string(),
+        }
+    }
+
+    fn sequential_fill(pid: &str, files: &[triptape_core::scan::ScannedFile]) -> Vec<Asset> {
+        let mut out = Vec::with_capacity(files.len());
+        for (i, f) in files.iter().enumerate() {
+            let kind = if triptape_core::scan::VIDEO_EXTS.contains(&f.ext.as_str()) {
+                AssetKind::Video
+            } else {
+                AssetKind::Photo
+            };
+            let mut a = Asset::new(format!("{pid}_a{i:06}"), f.path.clone(), kind);
+            a.size_bytes = f.size_bytes;
+            a.mtime = f.mtime_secs;
+            fill_foreground_metadata(&mut a);
+            out.push(a);
+        }
+        out
+    }
+
+    fn asset_signature(a: &Asset) -> (Option<i64>, bool, Option<u32>, Option<f64>, String) {
+        (
+            a.taken_at,
+            a.time_guessed,
+            a.width,
+            a.duration_secs,
+            format!("{:?}", a.kind),
+        )
+    }
+
+    #[test]
+    fn parallel_fill_matches_sequential_fill_in_walk_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // EXIF-less PNGs (mtime fallback) plus undecodable MOVs (probe
+        // fallback): both fallbacks are deterministic, so any divergence
+        // between the two fill paths is a parallelization bug, not data.
+        let mut files = Vec::new();
+        for i in 0..8 {
+            let path = dir.path().join(format!("img_{i}.png"));
+            image::RgbImage::new(4, 4).save(&path).unwrap();
+            files.push(scanned_file(&path, "png"));
+        }
+        for i in 0..4 {
+            let path = dir.path().join(format!("clip_{i}.mov"));
+            std::fs::write(&path, b"not a movie").unwrap();
+            files.push(scanned_file(&path, "mov"));
+        }
+        let seq = sequential_fill("p", &files);
+        let par = fill_assets_parallel("p", &files, |_, _| {});
+        assert_eq!(par.len(), seq.len(), "no file lost in the parallel fill");
+        assert_eq!(
+            par.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
+            seq.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
+            "walk order (and index-based ids) preserved"
+        );
+        for (s, p) in seq.iter().zip(par.iter()) {
+            assert_eq!(
+                asset_signature(s),
+                asset_signature(p),
+                "metadata diverges for {}",
+                s.path.display()
+            );
+        }
     }
 }

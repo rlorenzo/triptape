@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use tauri::{Emitter, Manager, State};
 use triptape_app::{
-    apply_live_photo_pairing, default_export_dir, fill_foreground_metadata, paginate,
+    apply_live_photo_pairing, default_export_dir, fill_assets_parallel, paginate,
     valid_job_kind, AppState, AssetView, ExportSummary, JobView, ScanSummary, StoryData,
     StoryEntryView, StoryView,
 };
@@ -365,6 +365,15 @@ fn background_hash_job(
         let plan = planmod::build_plan(&assets, &cluster_of, &scores);
         let db = lock()?;
         db.insert_plan(project_id, &plan, "local")?;
+        // A superseding rescan owns the progress ticket now: its own Done
+        // drives the Library reload, so this job stays silent instead of
+        // flashing "Library up to date" on the old job's timing. The
+        // hashes and scores written above remain valid either way.
+        if let Ok(Some(j)) = lock()?.get_job(job_id) {
+            if j.state == JobState::Cancelled {
+                return Ok(());
+            }
+        }
         db.update_job(job_id, JobState::Done, 1.0, Some("done"), None)?;
         if let Ok(Some(job)) = db.get_job(job_id) {
             emit(app, &job);
@@ -474,18 +483,26 @@ async fn run_ingest(
     canon: PathBuf,
     refresh: bool,
 ) -> Result<ScanSummary, String> {
-    // Create the ingest job first so progress has a job to attach to, and
-    // snapshot the hash-reuse cache BEFORE the foreground persist below
-    // overwrites the old hashes (foreground upserts write content_hash
-    // None). On refresh the snapshot still carries the previous scan's
-    // digests, so unchanged files skip disk reads in the background task.
+    // Create the ingest job first so progress has a job to attach to. On
+    // refresh, supersede any still-running ingest job for this project: its
+    // progress ticks stop owning the ticket (report_ingest skips cancelled
+    // rows) while its already-flushed hashes and scores stay valid — the
+    // refresh below recomputes metadata for every file, so nothing the old
+    // job still writes is lost, and both jobs' final plan rebuilds re-read
+    // the store. This is what lets Rescan run while scoring is in flight.
     let job_id = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
+        if refresh {
+            if let Ok(running) = db.jobs_in_state(&[JobState::Running]) {
+                for j in running
+                    .iter()
+                    .filter(|j| j.project_id == project.id && j.kind == "ingest")
+                {
+                    let _ = jobs::transition(&db, &j.id, JobState::Cancelled, j.progress, None, None);
+                }
+            }
+        }
         db.insert_job(&project.id, "ingest", None)?.id
-    };
-    let cache = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        db.hash_reuse_cache()?
     };
 
     // Heavy walk runs off the async executor. It shares the app's single
@@ -542,23 +559,26 @@ async fn run_ingest(
             // background task fills in content hashes afterwards. Clustering
             // uses only taken_at/gps and the plan tolerates missing hashes,
             // so both are valid pre-hash.
-            let mut assets: Vec<Asset> = Vec::with_capacity(total);
-            for (i, f) in result.files.iter().enumerate() {
-                let kind = if scan::VIDEO_EXTS.contains(&f.ext.as_str()) {
-                    AssetKind::Video
-                } else {
-                    AssetKind::Photo
-                };
-                let mut a = Asset::new(format!("{pid}_a{i:06}"), f.path.clone(), kind);
-                a.size_bytes = f.size_bytes;
-                a.mtime = f.mtime_secs;
-                // EXIF capture time / GPS (photos) or ffprobe truth (videos)
-                // when readable; mtime + `time_guessed` otherwise. Never
-                // fails the file: clustering and the initial plan below run
-                // on real times/GPS. No pixel decoding on this path.
-                fill_foreground_metadata(&mut a);
-                assets.push(a);
-            }
+            // EXIF capture time / GPS (photos) or ffprobe truth (videos)
+            // when readable; mtime + `time_guessed` otherwise. Never
+            // fails the file: clustering and the initial plan below run
+            // on real times/GPS. No pixel decoding on this path. Bounded
+            // workers fill in parallel while walk order (and index-based
+            // ids) is restored, with per-file progress on the bar.
+            let mut assets = fill_assets_parallel(&pid, &result.files, |done, _| {
+                if done % 25 == 0 || done == total {
+                    if let Ok(db) = lock() {
+                        let progress = 0.05 * (done as f32 / total.max(1) as f32);
+                        report_ingest(
+                            &worker_app,
+                            &db,
+                            &worker_job,
+                            progress,
+                            &scan::fill_step_label(done, total),
+                        );
+                    }
+                }
+            });
             // Same trip-timezone normalization as the CLI: assets whose EXIF
             // lacks an offset inherit the nearest dated neighbor's.
             metadata::fill_tz_offsets(&mut assets);
@@ -601,7 +621,15 @@ async fn run_ingest(
                     db.clear_project_clusters(&pid)?;
                 }
                 for a in &assets {
-                    db.upsert_asset(&pid, a)?;
+                    if refresh {
+                        // Metadata-only refresh: dates, GPS, dims and
+                        // captions overwrite, stored hashes and scores
+                        // survive, so unchanged files skip rehash and
+                        // rescore afterwards.
+                        db.upsert_asset_preserving_analysis(&pid, a)?;
+                    } else {
+                        db.upsert_asset(&pid, a)?;
+                    }
                 }
                 if refresh {
                     // Prune rows whose files left the folder. Kept ids
@@ -678,9 +706,15 @@ async fn run_ingest(
         .ok_or_else(|| "job vanished".to_string())?;
     emit(&app, &job);
     let (files_seen, files) = outcome?;
-    // The reuse cache was snapshotted before the foreground persist (above),
-    // so refresh hits for unchanged files skip disk reads. The background
-    // task never holds the Db mutex while hashing.
+    // Snapshot the reuse cache AFTER the foreground persist: refresh
+    // upserts preserve stored hashes, so the snapshot carries them (plus
+    // any hashes a superseded job flushed while the foreground ran) and
+    // unchanged files skip disk reads. The background task never holds
+    // the Db mutex while hashing.
+    let cache = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.hash_reuse_cache()?
+    };
     // Detached background completion: hashing + plan rebuild. Never awaited —
     // the command returns now so the library is usable ASAP. The join handle
     // is dropped on purpose; the task runs to a terminal job state on its own.

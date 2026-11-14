@@ -316,6 +316,46 @@ impl Db {
         Ok(())
     }
 
+    /// Refresh-path upsert: recomputed foreground metadata overwrites the
+    /// stored row, but analysis columns the foreground never produces
+    /// (`content_hash`, `phash`, `score_json`) survive. A rescan therefore
+    /// corrects dates without wiping hashes and scores, so unchanged files
+    /// skip rehash and rescore through the reuse cache and the
+    /// already-scored skip. Unknown ids fall back to a full insert.
+    pub fn upsert_asset_preserving_analysis(
+        &self,
+        project_id: &str,
+        a: &Asset,
+    ) -> Result<(), String> {
+        let kind = match a.kind {
+            AssetKind::Photo => "photo",
+            AssetKind::Video => "video",
+            AssetKind::LivePhoto => "livephoto",
+        };
+        let conf = match a.pairing_confidence {
+            Some(PairingConfidence::ContentId) => Some("content-id"),
+            Some(PairingConfidence::BasenameOnly) => Some("basename-only"),
+            None => None,
+        };
+        let changed = self.conn.prepare_cached(
+            "UPDATE assets SET project_id=?1,path=?2,companion_path=?3,kind=?4,size_bytes=?5,mtime=?6,width=?7,height=?8,duration_secs=?9,taken_at=?10,tz_offset=?11,time_guessed=?12,lat=?13,lon=?14,rotation_deg=?15,pair_confidence=?16,user_caption=?17,people_count=?18 WHERE id=?19",
+        ).and_then(|mut st| st.execute(params![
+                project_id,
+                a.path.to_string_lossy().to_string(),
+                a.companion_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                kind, a.size_bytes as i64, a.mtime,
+                a.width.map(|w| w as i64), a.height.map(|h| h as i64),
+                a.duration_secs, a.taken_at, a.tz_offset_secs, i64::from(a.time_guessed),
+                a.gps.map(|g| g.0), a.gps.map(|g| g.1),
+                a.rotation_deg as i64, conf, a.user_caption, a.people_count.map(i64::from),
+                a.id,
+            ])).map_err(|e| e.to_string())?;
+        if changed == 0 {
+            self.upsert_asset(project_id, a)?;
+        }
+        Ok(())
+    }
+
     /// Record one file's content hash without touching the rest of the row.
     /// The ingest background task flushes these in batches; a per-file
     /// failure surfaces as `None` (hash unknown), never as a job failure.
@@ -944,6 +984,78 @@ mod tests {
         db.save_plan_edits(&p.id, &Default::default()).unwrap();
         let restored = db.edited_plan(Some(&p.id)).unwrap().unwrap();
         assert_eq!(members(&restored.edited), 2);
+    }
+
+    #[test]
+    fn refresh_upsert_updates_metadata_but_keeps_hashes_and_scores() {
+        let db = mem();
+        let p = db.create_project("trip", "/tmp/trip").unwrap();
+        let mut a = Asset::new(
+            "a1",
+            PathBuf::from("/t/a1.jpg"),
+            crate::types::AssetKind::Photo,
+        );
+        a.taken_at = Some(1_000);
+        a.time_guessed = true;
+        a.content_hash = Some("h1".into());
+        a.phash = Some(7);
+        a.width = Some(10);
+        db.upsert_asset(&p.id, &a).unwrap();
+        db.update_asset_scoring(
+            "a1",
+            &crate::types::Score {
+                total: 0.9,
+                ..Default::default()
+            },
+            Some(9),
+        )
+        .unwrap();
+
+        // A refresh recomputes metadata; analysis columns arrive empty and
+        // must not clobber the stored hash, perceptual hash, or score.
+        let mut b = Asset::new(
+            "a1",
+            PathBuf::from("/t/a1.jpg"),
+            crate::types::AssetKind::Photo,
+        );
+        b.size_bytes = 99;
+        b.mtime = 2_000;
+        b.taken_at = Some(1_800_000_000);
+        b.time_guessed = false;
+        b.width = Some(20);
+        db.upsert_asset_preserving_analysis(&p.id, &b).unwrap();
+
+        let got = db.list_assets(&p.id).unwrap();
+        assert_eq!(got.len(), 1);
+        let got = &got[0];
+        assert_eq!(got.taken_at, Some(1_800_000_000));
+        assert!(!got.time_guessed);
+        assert_eq!(got.width, Some(20));
+        assert_eq!(got.size_bytes, 99);
+        assert_eq!(got.content_hash.as_deref(), Some("h1"));
+        // 9, not 7: the scoring pass above overwrote the upserted value,
+        // and the refresh must preserve the stored one either way.
+        assert_eq!(got.phash, Some(9));
+        assert_eq!(got.score.as_ref().map(|s| s.total), Some(0.9));
+
+        // New files still insert fully, including a fresh hash.
+        let mut c = Asset::new(
+            "a2",
+            PathBuf::from("/t/a2.jpg"),
+            crate::types::AssetKind::Photo,
+        );
+        c.content_hash = Some("h2".into());
+        db.upsert_asset_preserving_analysis(&p.id, &c).unwrap();
+        let got = db.list_assets(&p.id).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got.iter()
+                .find(|a| a.id == "a2")
+                .unwrap()
+                .content_hash
+                .as_deref(),
+            Some("h2")
+        );
     }
 
     #[test]
