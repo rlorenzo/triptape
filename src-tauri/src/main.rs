@@ -13,9 +13,8 @@ use std::path::{Path, PathBuf};
 
 use tauri::{Emitter, Manager, State};
 use triptape_app::{
-    apply_live_photo_pairing, default_export_dir, fill_assets_parallel, paginate,
-    valid_job_kind, AppState, AssetView, ExportSummary, JobView, ScanSummary, StoryData,
-    StoryEntryView, StoryView,
+    apply_live_photo_pairing, default_export_dir, fill_assets_parallel, paginate, valid_job_kind,
+    AppState, AssetView, ExportSummary, JobView, ScanSummary, StoryData, StoryEntryView, StoryView,
 };
 use triptape_core::{
     cluster,
@@ -498,7 +497,8 @@ async fn run_ingest(
                     .iter()
                     .filter(|j| j.project_id == project.id && j.kind == "ingest")
                 {
-                    let _ = jobs::transition(&db, &j.id, JobState::Cancelled, j.progress, None, None);
+                    let _ =
+                        jobs::transition(&db, &j.id, JobState::Cancelled, j.progress, None, None);
                 }
             }
         }
