@@ -70,12 +70,15 @@
   }
 
   // In-place refresh of the current trip's folder (no folder picker).
-  // Disabled while a refresh is in flight or a background ingest job is
-  // running; failures stay on Library as a plain error line.
+  // Safe while a background ingest job runs: the refresh supersedes it
+  // (its ticks stop owning the progress ticket, its hashes/scores still
+  // land) and preserves stored hashes/scores. Disabled only while a
+  // refresh itself is in flight; failures stay on Library as a plain
+  // error line.
   let rescanning = false;
   let rescanError = "";
   $: ingestRunning = $ingestJob?.state === "running";
-  $: rescanDisabled = rescanning || ingestRunning || !$project;
+  $: rescanDisabled = rescanning || !$project;
 
   async function rescan() {
     if (!$project || rescanning) return;

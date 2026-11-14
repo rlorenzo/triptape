@@ -31,6 +31,7 @@ triptape-media = { path = "crates/triptape-media" }
 
 [dev-dependencies]
 tempfile = "3"
+image = "0.25"
 
 [features]
 default = ["custom-protocol"]

@@ -204,6 +204,13 @@ pub fn hash_step_label(done: usize, total: usize) -> String {
     format!("Hashing files… {done} of {total}")
 }
 
+/// Step label for the parallel foreground metadata pass: EXIF capture
+/// time / TZ / GPS for stills, ffprobe truth for videos. Determinate
+/// per-file count; the bar position is mapped by the caller.
+pub fn fill_step_label(done: usize, total: usize) -> String {
+    format!("Reading dates… {done} of {total}")
+}
+
 /// Step label for the background scoring phase, same shape as the hashing
 /// label so the progress text keeps working.
 pub fn score_step_label(done: usize, total: usize) -> String {
@@ -328,6 +335,12 @@ mod tests {
     fn walk_step_label_reports_count_without_faking_percent() {
         assert_eq!(walk_step_label(0), "Finding files… 0 found");
         assert_eq!(walk_step_label(1200), "Finding files… 1200 found");
+    }
+
+    #[test]
+    fn fill_step_label_reports_count_without_faking_percent() {
+        assert_eq!(fill_step_label(0, 12), "Reading dates… 0 of 12");
+        assert_eq!(fill_step_label(3, 12), "Reading dates… 3 of 12");
     }
 
     #[test]
