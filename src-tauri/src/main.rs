@@ -91,6 +91,14 @@ struct Scored {
     phash: Option<u64>,
 }
 
+/// A queued hash write: (asset id, path, size, mtime, digest). The source
+/// fingerprint travels with every write so a superseding rescan's recycled
+/// ids can never receive another job's hash.
+type PendingHash = (String, String, u64, i64, Option<String>);
+/// A queued score write: (asset id, path, size, mtime, score, phash).
+/// Same recycled-id fence as [`PendingHash`].
+type PendingScore = (String, String, u64, i64, Score, Option<u64>);
+
 /// Score and fingerprint one asset for the background ingest pass,
 /// mirroring the CLI (`triptape-media`'s `triptape` binary) constants.
 ///
@@ -188,19 +196,30 @@ fn background_hash_job(
     let mut work = || -> Result<(), String> {
         let mut bytes_done: u64 = 0;
         let mut done: usize = 0;
-        let mut pending: Vec<(String, Option<String>)> = vec![];
+        // (id, path, size, mtime, digest): the fingerprint travels with
+        // every queued write so a superseding rescan's recycled ids can
+        // never receive another job's hash (see
+        // `update_asset_hash_if_source_matches`).
+        let mut pending: Vec<PendingHash> = vec![];
         let mut last_flush = std::time::Instant::now();
         // One short transaction for the pending hashes. On failure the
         // entries stay queued and surface at the final flush; callers keep
-        // every lock hold to this batch only.
-        let flush = |pending: &mut Vec<(String, Option<String>)>| -> Result<(), String> {
+        // every lock hold to this batch only. Writes whose row no longer
+        // describes the same source file are dropped, not failed.
+        let flush = |pending: &mut Vec<PendingHash>| -> Result<(), String> {
             if pending.is_empty() {
                 return Ok(());
             }
             let db = lock()?;
             db.in_transaction(|db| {
-                for (id, digest) in pending.iter() {
-                    db.update_asset_hash(id, digest.as_deref())?;
+                for (id, path, size, mtime, digest) in pending.iter() {
+                    db.update_asset_hash_if_source_matches(
+                        id,
+                        path,
+                        *size,
+                        *mtime,
+                        digest.as_deref(),
+                    )?;
                 }
                 Ok::<(), String>(())
             })?;
@@ -210,19 +229,25 @@ fn background_hash_job(
         // Reuse pass: cache hits never touch disk. Their digests queue into
         // the same batched flush and count up front (bytes + done count),
         // keeping progress monotonic across the reuse + hashing phases.
-        let mut misses: Vec<(String, PathBuf, u64)> = Vec::new();
+        let mut misses: Vec<(String, PathBuf, u64, i64)> = Vec::new();
         for (id, path, size, mtime) in files {
             let key = (path.to_string_lossy().into_owned(), *size, *mtime);
             match cache.get(&key) {
                 Some(digest) => {
                     bytes_done += *size;
                     done += 1;
-                    pending.push((id.clone(), Some(digest.clone())));
+                    pending.push((
+                        id.clone(),
+                        path.to_string_lossy().into_owned(),
+                        *size,
+                        *mtime,
+                        Some(digest.clone()),
+                    ));
                     if pending.len() >= HASH_FLUSH_FILES && flush(&mut pending).is_ok() {
                         last_flush = std::time::Instant::now();
                     }
                 }
-                None => misses.push((id.clone(), path.clone(), *size)),
+                None => misses.push((id.clone(), path.clone(), *size, *mtime)),
             }
         }
         let reused = done;
@@ -252,7 +277,13 @@ fn background_hash_job(
             hash::INGEST_HASH_WORKERS,
             |idx, digest, miss_done, _| {
                 bytes_done += misses[idx].2;
-                pending.push((misses[idx].0.clone(), digest));
+                pending.push((
+                    misses[idx].0.clone(),
+                    misses[idx].1.to_string_lossy().into_owned(),
+                    misses[idx].2,
+                    misses[idx].3,
+                    digest,
+                ));
                 done = reused + miss_done;
                 let candidate = scan::background_hash_progress(
                     bytes_done,
@@ -290,22 +321,26 @@ fn background_hash_job(
             .collect();
         let score_total = unscored.len();
         if score_total > 0 {
-            let flush_scores =
-                |pending: &mut Vec<(String, Score, Option<u64>)>| -> Result<(), String> {
-                    if pending.is_empty() {
-                        return Ok(());
+            // (id, path, size, mtime, score, phash): same recycled-id fence
+            // as the hash flush (see
+            // `update_asset_scoring_if_source_matches`).
+            let flush_scores = |pending: &mut Vec<PendingScore>| -> Result<(), String> {
+                if pending.is_empty() {
+                    return Ok(());
+                }
+                let db = lock()?;
+                db.in_transaction(|db| {
+                    for (id, path, size, mtime, s, phash) in pending.iter() {
+                        db.update_asset_scoring_if_source_matches(
+                            id, path, *size, *mtime, s, *phash,
+                        )?;
                     }
-                    let db = lock()?;
-                    db.in_transaction(|db| {
-                        for (id, s, phash) in pending.iter() {
-                            db.update_asset_scoring(id, s, *phash)?;
-                        }
-                        Ok::<(), String>(())
-                    })?;
-                    pending.clear();
-                    Ok(())
-                };
-            let mut pending_scores: Vec<(String, Score, Option<u64>)> = vec![];
+                    Ok::<(), String>(())
+                })?;
+                pending.clear();
+                Ok(())
+            };
+            let mut pending_scores: Vec<PendingScore> = vec![];
             // Decode/score work fans out over worker threads; persists and
             // progress stay on this thread via the completion callback,
             // which fires once per scored asset in completion order.
@@ -314,7 +349,14 @@ fn background_hash_job(
                 .unwrap_or(SCORE_WORKERS_MAX)
                 .min(SCORE_WORKERS_MAX);
             score_assets_parallel(&cache_dir, &unscored, workers, |a, s, done, total| {
-                pending_scores.push((a.id.clone(), s.score, s.phash));
+                pending_scores.push((
+                    a.id.clone(),
+                    a.path.to_string_lossy().into_owned(),
+                    a.size_bytes,
+                    a.mtime,
+                    s.score,
+                    s.phash,
+                ));
                 // A failed flush keeps its batch; the final flush retries it.
                 if pending_scores.len() >= SCORE_FLUSH_FILES {
                     let _ = flush_scores(&mut pending_scores);
@@ -363,16 +405,18 @@ fn background_hash_job(
         assets.retain(|a| !suppressed.contains(&a.id));
         let plan = planmod::build_plan(&assets, &cluster_of, &scores);
         let db = lock()?;
-        db.insert_plan(project_id, &plan, "local")?;
-        // A superseding rescan owns the progress ticket now: its own Done
-        // drives the Library reload, so this job stays silent instead of
-        // flashing "Library up to date" on the old job's timing. The
-        // hashes and scores written above remain valid either way.
-        if let Ok(Some(j)) = lock()?.get_job(job_id) {
+        // A superseding rescan owns the progress ticket and the plan now:
+        // skip both the insert and the terminal write so a stale plan can
+        // never replace the refreshed one and the Library never reloads on
+        // the old job's timing. Hashes and scores written above stay valid
+        // either way. Checked under this same lock hold so no rescan commit
+        // can land between the check and the insert.
+        if let Ok(Some(j)) = db.get_job(job_id) {
             if j.state == JobState::Cancelled {
                 return Ok(());
             }
         }
+        db.insert_plan(project_id, &plan, "local")?;
         db.update_job(job_id, JobState::Done, 1.0, Some("done"), None)?;
         if let Ok(Some(job)) = db.get_job(job_id) {
             emit(app, &job);

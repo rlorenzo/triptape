@@ -318,10 +318,13 @@ impl Db {
 
     /// Refresh-path upsert: recomputed foreground metadata overwrites the
     /// stored row, but analysis columns the foreground never produces
-    /// (`content_hash`, `phash`, `score_json`) survive. A rescan therefore
-    /// corrects dates without wiping hashes and scores, so unchanged files
-    /// skip rehash and rescore through the reuse cache and the
-    /// already-scored skip. Unknown ids fall back to a full insert.
+    /// (`content_hash`, `phash`, `score_json`) survive — but only when the
+    /// file itself is unchanged (`size_bytes` + `mtime` match). A changed
+    /// file falls through to the full upsert, whose empty analysis columns
+    /// force a rehash (the reuse cache keys on the new fingerprint) and a
+    /// rescore; otherwise the old digest would be filed under the new
+    /// fingerprint and reused without ever reading the changed file.
+    /// Unknown ids fall back to a full insert.
     pub fn upsert_asset_preserving_analysis(
         &self,
         project_id: &str,
@@ -337,6 +340,19 @@ impl Db {
             Some(PairingConfidence::BasenameOnly) => Some("basename-only"),
             None => None,
         };
+        let same_source: Option<bool> = self
+            .conn
+            .query_row(
+                "SELECT size_bytes=?1 AND mtime=?2 FROM assets WHERE id=?3",
+                params![a.size_bytes as i64, a.mtime, a.id],
+                |r| r.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if same_source != Some(true) {
+            self.upsert_asset(project_id, a)?;
+            return Ok(());
+        }
         let changed = self.conn.prepare_cached(
             "UPDATE assets SET project_id=?1,path=?2,companion_path=?3,kind=?4,size_bytes=?5,mtime=?6,width=?7,height=?8,duration_secs=?9,taken_at=?10,tz_offset=?11,time_guessed=?12,lat=?13,lon=?14,rotation_deg=?15,pair_confidence=?16,user_caption=?17,people_count=?18 WHERE id=?19",
         ).and_then(|mut st| st.execute(params![
@@ -367,6 +383,29 @@ impl Db {
         Ok(())
     }
 
+    /// Record one file's content hash only when the row still describes the
+    /// same source file (`path`, `size_bytes`, `mtime`). A superseding
+    /// rescan reassigns index-based ids after pruning, so a late flush from
+    /// the old job must never land on a recycled id. Returns whether the
+    /// write landed; a miss means the row moved on and the result is stale.
+    pub fn update_asset_hash_if_source_matches(
+        &self,
+        asset_id: &str,
+        path: &str,
+        size_bytes: u64,
+        mtime: i64,
+        hash: Option<&str>,
+    ) -> Result<bool, String> {
+        let changed = self
+            .conn
+            .prepare_cached("UPDATE assets SET content_hash=?1 WHERE id=?2 AND path=?3 AND size_bytes=?4 AND mtime=?5")
+            .and_then(|mut st| {
+                st.execute(params![hash, asset_id, path, size_bytes as i64, mtime])
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(changed > 0)
+    }
+
     /// Record one asset's score and perceptual hash without touching the
     /// rest of the row. A `None` hash keeps any hash already stored.
     pub fn update_asset_scoring(
@@ -383,6 +422,37 @@ impl Db {
             .and_then(|mut st| st.execute(params![json, phash.map(|h| h as i64), asset_id]))
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Record one asset's score and perceptual hash only when the row still
+    /// describes the same source file. Same recycled-id hazard as
+    /// [`Db::update_asset_hash_if_source_matches`]: a late score flush from
+    /// a superseded job must not land on another file's row.
+    pub fn update_asset_scoring_if_source_matches(
+        &self,
+        asset_id: &str,
+        path: &str,
+        size_bytes: u64,
+        mtime: i64,
+        score: &Score,
+        phash: Option<u64>,
+    ) -> Result<bool, String> {
+        let json = serde_json::to_string(score).map_err(|e| e.to_string())?;
+        let changed = self
+            .conn
+            .prepare_cached("UPDATE assets SET score_json=?1, phash=COALESCE(?2, phash) WHERE id=?3 AND path=?4 AND size_bytes=?5 AND mtime=?6")
+            .and_then(|mut st| {
+                st.execute(params![
+                    json,
+                    phash.map(|h| h as i64),
+                    asset_id,
+                    path,
+                    size_bytes as i64,
+                    mtime
+                ])
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(changed > 0)
     }
 
     /// Source path and kind of one asset, without loading the project's list.
@@ -1018,8 +1088,6 @@ mod tests {
             PathBuf::from("/t/a1.jpg"),
             crate::types::AssetKind::Photo,
         );
-        b.size_bytes = 99;
-        b.mtime = 2_000;
         b.taken_at = Some(1_800_000_000);
         b.time_guessed = false;
         b.width = Some(20);
@@ -1031,12 +1099,33 @@ mod tests {
         assert_eq!(got.taken_at, Some(1_800_000_000));
         assert!(!got.time_guessed);
         assert_eq!(got.width, Some(20));
-        assert_eq!(got.size_bytes, 99);
         assert_eq!(got.content_hash.as_deref(), Some("h1"));
         // 9, not 7: the scoring pass above overwrote the upserted value,
         // and the refresh must preserve the stored one either way.
         assert_eq!(got.phash, Some(9));
         assert_eq!(got.score.as_ref().map(|s| s.total), Some(0.9));
+
+        // A changed file (new size/mtime) invalidates the stored analysis:
+        // the full upsert clears hash, perceptual hash, and score so the
+        // background rehashes (new reuse-cache fingerprint) and rescores.
+        let mut changed = Asset::new(
+            "a1",
+            PathBuf::from("/t/a1.jpg"),
+            crate::types::AssetKind::Photo,
+        );
+        changed.size_bytes = 99;
+        changed.mtime = 2_000;
+        changed.taken_at = Some(1_800_000_001);
+        db.upsert_asset_preserving_analysis(&p.id, &changed)
+            .unwrap();
+
+        let got = db.list_assets(&p.id).unwrap();
+        assert_eq!(got.len(), 1);
+        let got = &got[0];
+        assert_eq!(got.taken_at, Some(1_800_000_001));
+        assert_eq!(got.content_hash, None);
+        assert_eq!(got.phash, None);
+        assert_eq!(got.score, None);
 
         // New files still insert fully, including a fresh hash.
         let mut c = Asset::new(
@@ -1056,6 +1145,61 @@ mod tests {
                 .as_deref(),
             Some("h2")
         );
+    }
+
+    #[test]
+    fn fenced_writes_land_only_on_matching_source() {
+        let db = mem();
+        let p = db.create_project("trip", "/tmp/trip").unwrap();
+        let mut a = Asset::new(
+            "a1",
+            PathBuf::from("/t/a1.jpg"),
+            crate::types::AssetKind::Photo,
+        );
+        a.size_bytes = 10;
+        a.mtime = 100;
+        db.upsert_asset(&p.id, &a).unwrap();
+
+        // Matching fingerprint: both writes land.
+        assert!(db
+            .update_asset_hash_if_source_matches("a1", "/t/a1.jpg", 10, 100, Some("h"))
+            .unwrap());
+        assert!(db
+            .update_asset_scoring_if_source_matches(
+                "a1",
+                "/t/a1.jpg",
+                10,
+                100,
+                &crate::types::Score::default(),
+                Some(3)
+            )
+            .unwrap());
+        let got = &db.list_assets(&p.id).unwrap()[0];
+        assert_eq!(got.content_hash.as_deref(), Some("h"));
+        assert_eq!(got.phash, Some(3));
+
+        // Recycled id (same id, different source after a rescan prune):
+        // both writes are dropped, and the row is untouched.
+        assert!(!db
+            .update_asset_hash_if_source_matches("a1", "/t/other.jpg", 10, 100, Some("stale"))
+            .unwrap());
+        assert!(!db
+            .update_asset_scoring_if_source_matches(
+                "a1",
+                "/t/a1.jpg",
+                11,
+                100,
+                &crate::types::Score::default(),
+                Some(4)
+            )
+            .unwrap());
+        assert!(!db
+            .update_asset_hash_if_source_matches("missing", "/t/a1.jpg", 10, 100, Some("x"))
+            .unwrap());
+        let got = &db.list_assets(&p.id).unwrap()[0];
+        assert_eq!(got.content_hash.as_deref(), Some("h"));
+        assert_eq!(got.phash, Some(3));
+        assert_eq!(got.score.as_ref().map(|s| s.total), Some(0.0));
     }
 
     #[test]
