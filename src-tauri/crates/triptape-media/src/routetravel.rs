@@ -734,8 +734,8 @@ fn put_grid(img: &mut RgbImage, x: i32, y: i32) {
         if *px == WATER {
             *px = GRID;
         } else {
-            for c in 0..3 {
-                px.0[c] = px.0[c].saturating_add(6);
+            for ch in &mut px.0 {
+                *ch = ch.saturating_add(6);
             }
         }
     }
