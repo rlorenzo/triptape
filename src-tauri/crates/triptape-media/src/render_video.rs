@@ -267,6 +267,9 @@ pub struct VideoOptions {
     /// Keep the original film audio at 0.12 under a ducked music bed.
     /// Default (false) mutes it: the music is the primary audio.
     pub keep_ambience: bool,
+    /// Live Photos in a collage play their motion in their cell (default
+    /// true); false keeps every collage cell a still.
+    pub live_collages: bool,
     /// Typst binary for title/lower-third text PNGs.
     pub typst_bin: String,
     /// Output frame size (default 4K).
@@ -294,6 +297,7 @@ impl Default for VideoOptions {
             map_secs: 3.0,
             music_paths: Vec::new(),
             keep_ambience: false,
+            live_collages: true,
             typst_bin: "typst".into(),
             resolution: Resolution::default(),
             jobs: None,
@@ -1403,6 +1407,7 @@ fn render_group(
             idx,
             variant,
             still_secs,
+            opts.live_collages,
             opts.resolution,
             work_dir,
         )
@@ -1746,18 +1751,23 @@ fn hold_graph(caps: &Capabilities, variant: usize, frames: u32, res: Resolution)
 
 /// Collage segment: up to four same-chapter stills composed into one
 /// supersample canvas (1.5x the frame; cover-fitted cells, dark gaps), then held with the
-/// usual glide. One segment shows the day's spread at once.
+/// usual glide. One segment shows the day's spread at once. With
+/// `live_collages`, a Live Photo member plays its motion in its cell
+/// ([`live_cells`]).
+#[allow(clippy::too_many_arguments)]
 fn render_collage_segment(
     caps: &Capabilities,
     members: &[&ResolvedEntry],
     idx: usize,
     variant: usize,
     still_secs: f64,
+    live_collages: bool,
     res: Resolution,
     work_dir: &Path,
 ) -> Result<(PathBuf, f64, String), crate::MediaError> {
     let out = work_dir.join(format!("seg_{idx:03}.mp4"));
     let dur = collage_hold_secs(members.len(), still_secs);
+    let live = live_collages && members.iter().any(|m| live_motion(m).is_some());
     // Members in order, plus the hold recipe; the layout and crop code is
     // pixel logic outside ffmpeg's arguments, covered by the cache version.
     let key = |c: &SegmentCache| {
@@ -1774,12 +1784,32 @@ fn render_collage_segment(
             res,
             Path::new(KEY_OUT),
         ));
+        if live {
+            // The motion recipe is not in the hold arguments; bump this
+            // tag whenever the moving-cell graph or timing changes.
+            k.part("live", "4");
+            for (i, m) in members.iter().enumerate() {
+                if let Some(p) = live_motion(m) {
+                    k.file(&format!("motion{i}"), p);
+                }
+            }
+        }
         k.finish()
     };
     cached_segment(caps, key, out, "still", |out| {
         let canvas = work_dir.join(format!("collage_{idx:03}.png"));
-        compose_collage(&caps.ffmpeg_bin, members, res, &canvas)?;
-        render_hold_segment(caps, &canvas, dur, variant, res, out)?;
+        let photos = compose_collage(&caps.ffmpeg_bin, members, res, &canvas)?;
+        let moving = if live {
+            live_cells(caps, members, &photos, dur)
+        } else {
+            vec![]
+        };
+        if moving.is_empty() {
+            render_hold_segment(caps, &canvas, dur, variant, res, out)?;
+        } else {
+            let args = live_collage_args(caps, &canvas, &moving, dur, variant, res, out);
+            caps.run(&args, out)?;
+        }
         Ok(dur)
     })
 }
@@ -2037,11 +2067,7 @@ fn contain_over_blur(src: &image::RgbImage, tw: u32, th: u32) -> image::RgbImage
         f64::from(src.width().max(1)),
         f64::from(src.height().max(1)),
     );
-    let scale = (f64::from(tw) / sw).min(f64::from(th) / sh);
-    let (fw, fh) = (
-        ((sw * scale).round() as u32).clamp(1, tw),
-        ((sh * scale).round() as u32).clamp(1, th),
-    );
+    let (fw, fh) = contain_size(sw / sh, tw, th);
     let fg = image::imageops::resize(src, fw, fh, image::imageops::FilterType::Triangle);
     image::imageops::replace(
         &mut cell,
@@ -2050,6 +2076,34 @@ fn contain_over_blur(src: &image::RgbImage, tw: u32, th: u32) -> image::RgbImage
         i64::from((th - fh) / 2),
     );
     cell
+}
+
+/// Size of a photo of aspect `sa` (width / height) shown whole inside
+/// `tw`x`th`.
+fn contain_size(sa: f64, tw: u32, th: u32) -> (u32, u32) {
+    let (tw_f, th_f) = (f64::from(tw), f64::from(th));
+    let (fw, fh) = if sa >= tw_f / th_f {
+        (tw_f, tw_f / sa)
+    } else {
+        (th_f * sa, th_f)
+    };
+    (
+        (fw.round() as u32).clamp(1, tw),
+        (fh.round() as u32).clamp(1, th),
+    )
+}
+
+/// Where [`fill_cell`] puts the photo itself inside a `cw`x`ch` tile at
+/// (`x`, `y`): the whole tile when it cover-crops, the centred fitted
+/// rectangle when the photo is shown whole over its blur.
+fn photo_rect(sa: f64, x: u32, y: u32, cw: u32, ch: u32) -> (u32, u32, u32, u32) {
+    let ca = f64::from(cw) / f64::from(ch.max(1));
+    if crop_loss(sa, ca) <= MAX_CELL_CROP {
+        (x, y, cw, ch)
+    } else {
+        let (fw, fh) = contain_size(sa, cw, ch);
+        (x + (cw - fw) / 2, y + (ch - fh) / 2, fw, fh)
+    }
 }
 
 /// Fill a cell: cover-crop (top-biased) when little is lost, else the
@@ -2073,9 +2127,9 @@ fn compose_collage(
     members: &[&ResolvedEntry],
     res: Resolution,
     out: &Path,
-) -> Result<(), crate::MediaError> {
+) -> Result<Vec<CollageCell>, crate::MediaError> {
     let (w_px, h_px) = res.supersample();
-    let gap = 18 * res.scale();
+    let gap = collage_gap(res);
     // Scoped threads start with no cancel flag; hand them this thread's.
     let cancel = triptape_core::process::current().unwrap_or_default();
     let images = std::thread::scope(|scope| {
@@ -2127,7 +2181,172 @@ fn compose_collage(
     }
     canvas
         .save(out)
-        .map_err(|e| crate::MediaError::Io(format!("collage save: {e}")))
+        .map_err(|e| crate::MediaError::Io(format!("collage save: {e}")))?;
+    // Where each member's photo sits on the canvas, for moving cells.
+    Ok(cells
+        .iter()
+        .map(|c| {
+            let (x, y, w, h) = photo_rect(
+                aspects[c.member],
+                c.x + gap / 2,
+                c.y + gap / 2,
+                c.w - gap,
+                c.h - gap,
+            );
+            CollageCell {
+                member: c.member,
+                x,
+                y,
+                w,
+                h,
+            }
+        })
+        .collect())
+}
+
+/// Dark gap between collage cells, in supersample-canvas pixels.
+fn collage_gap(res: Resolution) -> u32 {
+    18 * res.scale()
+}
+
+/// The Live Photo motion file of a collage member, when it has one.
+fn live_motion(m: &ResolvedEntry) -> Option<&Path> {
+    m.motion_path
+        .as_deref()
+        .filter(|p| *p != m.still_path.as_path() && p.exists())
+}
+
+/// Seconds cut from the end of a Live Photo's motion in a collage: the
+/// phone is usually already being lowered there, and the cell freezes on
+/// its last frame.
+const LIVE_TAIL_TRIM: f64 = 0.6;
+/// Shortest motion worth playing in a collage cell.
+const LIVE_MIN_SECS: f64 = 0.8;
+
+/// One moving collage cell: its motion file, tile rectangle on the
+/// canvas, playable seconds and optional HDR tone-map chain.
+struct LiveCell {
+    src: PathBuf,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    secs: f64,
+    tonemap: Option<String>,
+}
+
+/// Motion cells of a composed collage, from the rectangle each member's
+/// photo occupies (`photos`, as [`compose_collage`] returns). The clip is
+/// cover-cropped onto its still, so a photo shown whole over its blur
+/// moves whole over the same blur. The motion stops [`LIVE_TAIL_TRIM`]
+/// before its end. A clip whose shape is too far from its
+/// still's ([`MAX_CELL_CROP`]) or that is too short to read stays a still.
+fn live_cells(
+    caps: &Capabilities,
+    members: &[&ResolvedEntry],
+    photos: &[CollageCell],
+    dur: f64,
+) -> Vec<LiveCell> {
+    photos
+        .iter()
+        .filter_map(|c| {
+            let src = live_motion(members[c.member])?;
+            let probe = ffmpeg::ffprobe_file(&caps.ffprobe_bin, src).ok()?;
+            let (dw, dh) = probe.display_dims();
+            let sa = f64::from(dw.max(1)) / f64::from(dh.max(1));
+            let ca = f64::from(c.w.max(1)) / f64::from(c.h.max(1));
+            let secs = (probe.duration_secs - LIVE_TAIL_TRIM).min(dur);
+            if !probe.has_video || crop_loss(sa, ca) > MAX_CELL_CROP || secs < LIVE_MIN_SECS {
+                return None;
+            }
+            Some(LiveCell {
+                src: src.to_path_buf(),
+                x: c.x,
+                y: c.y,
+                w: c.w,
+                h: c.h,
+                secs,
+                tonemap: ffmpeg::tonemap_chain(caps, &probe.color_transfer),
+            })
+        })
+        .collect()
+}
+
+/// Filter graph of a collage whose `live` cells move: input 0 is the
+/// composed canvas, inputs 1.. the motion files in `live` order. Each
+/// motion is cover-cropped like its still and plays from the collage's
+/// first frame (the still never shows in that cell), then freezes on its
+/// last frame for the rest of the hold while the whole canvas glides.
+fn live_collage_graph(
+    caps: &Capabilities,
+    live: &[LiveCell],
+    frames: u32,
+    variant: usize,
+    res: Resolution,
+) -> String {
+    let (sw, sh) = res.supersample();
+    let (w, h) = res.dims();
+    let mut g = format!(
+        "[0:v]scale={sw}:{sh},setsar=1,{},format=rgb24[c0];",
+        ffmpeg::hold_still(frames)
+    );
+    for (i, c) in live.iter().enumerate() {
+        let n = i + 1;
+        let tone = c
+            .tonemap
+            .as_ref()
+            .map_or(String::new(), |t| format!("{t},"));
+        g.push_str(&format!(
+            "[{n}:v]fps=30,trim=duration={secs:.3},setpts=PTS-STARTPTS,{tone}format=rgb24,scale={cw}:{ch}:force_original_aspect_ratio=increase:flags=lanczos,crop={cw}:{ch}:(iw-{cw})/2:(ih-{ch})*{fy}:exact=1,setsar=1[m{n}];[c{i}][m{n}]overlay={x}:{y}:eof_action=repeat[c{n}];",
+            secs = c.secs,
+            cw = c.w,
+            ch = c.h,
+            fy = CROP_FOCUS_Y,
+            x = c.x,
+            y = c.y,
+        ));
+    }
+    g.push_str(&format!(
+        "[c{}]{},format=yuv420p[v]",
+        live.len(),
+        ffmpeg::glide(caps, frames, w, h, variant)
+    ));
+    g
+}
+
+/// Arguments of a moving collage: the canvas, each motion file, a silent
+/// track, and [`live_collage_graph`].
+fn live_collage_args(
+    caps: &Capabilities,
+    canvas: &Path,
+    live: &[LiveCell],
+    dur: f64,
+    variant: usize,
+    res: Resolution,
+    out: &Path,
+) -> Vec<String> {
+    let frames = (dur * 30.0).round() as u32;
+    let mut args = vec!["-y".to_string(), "-i".into(), s(canvas)];
+    for c in live {
+        args.extend(["-i".to_string(), s(&c.src)]);
+    }
+    args.extend([
+        "-f".to_string(),
+        "lavfi".into(),
+        "-i".into(),
+        format!("anullsrc=r=48000:cl=stereo:d={dur}"),
+        "-filter_complex".into(),
+        live_collage_graph(caps, live, frames, variant, res),
+        "-map".into(),
+        "[v]".into(),
+        "-map".into(),
+        format!("{}:a", live.len() + 1),
+        "-frames:v".into(),
+        frames.to_string(),
+    ]);
+    args.extend(ffmpeg::x264_aac("veryfast", 16));
+    args.extend(["-shortest".to_string(), s(out)]);
+    args
 }
 
 /// Filter graph of a panorama pan.
@@ -3164,6 +3383,207 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&streams.stdout).lines().count(), 1);
     }
 
+    fn live_cell(src: &str, x: u32, secs: f64) -> LiveCell {
+        LiveCell {
+            src: PathBuf::from(src),
+            x,
+            y: 9,
+            w: 1422,
+            h: 1602,
+            secs,
+            tonemap: None,
+        }
+    }
+
+    #[test]
+    fn live_collage_graph_starts_on_the_video_and_freezes() {
+        let caps = Capabilities {
+            perspective: true,
+            ..Default::default()
+        };
+        let live = [live_cell("a.mov", 9, 2.5), live_cell("b.mov", 1449, 3.0)];
+        let g = live_collage_graph(&caps, &live, 150, 0, Resolution::Hd1080);
+        // Canvas held once, each motion laid over it in input order.
+        assert!(g.starts_with("[0:v]scale=2880:1620"), "{g}");
+        assert!(
+            g.contains("[c0][m1]overlay=9:9:eof_action=repeat[c1]"),
+            "{g}"
+        );
+        assert!(
+            g.contains("[c1][m2]overlay=1449:9:eof_action=repeat[c2]"),
+            "{g}"
+        );
+        // From the first frame, no cross-fade with the still, and the last
+        // frame holds: no delay, no fade, never back to the canvas.
+        assert!(!g.contains("fade="), "{g}");
+        assert!(!g.contains("/TB"), "{g}");
+        assert!(!g.contains("eof_action=pass"), "{g}");
+        assert!(g.contains("trim=duration=2.500"), "{g}");
+        // Cover-cropped to the tile with the stills' top-biased focus.
+        assert!(g.contains("crop=1422:1602:(iw-1422)/2:(ih-1602)*0.35:exact=1"));
+        // The glide runs once, over the finished composite.
+        assert!(g.rfind("overlay").unwrap() < g.find("perspective=").unwrap());
+        assert!(g.ends_with("format=yuv420p[v]"), "{g}");
+    }
+
+    #[test]
+    fn photo_rect_matches_cover_and_contain_fills() {
+        // 4:3 photo in a 16:9 tile loses 25%: it covers the whole tile.
+        assert_eq!(photo_rect(4.0 / 3.0, 9, 9, 1600, 900), (9, 9, 1600, 900));
+        // 3:4 photo in a tall 4:9 tile would lose over a third: shown
+        // whole, full width, centred vertically.
+        assert_eq!(photo_rect(0.75, 9, 9, 400, 900), (9, 192, 400, 533));
+        // Wide photo in a tall tile: same, and never larger than the tile.
+        let (x, y, w, h) = photo_rect(16.0 / 9.0, 0, 0, 400, 900);
+        assert_eq!((x, w), (0, 400));
+        assert_eq!((y, h), ((900 - 225) / 2, 225));
+        // The fitted rectangle is where `contain_over_blur` draws it.
+        assert_eq!(contain_size(0.75, 400, 900), (400, 533));
+    }
+
+    #[test]
+    fn live_collage_graph_tonemaps_hdr_motion_before_compositing() {
+        let caps = Capabilities::default();
+        let mut cell = live_cell("a.mov", 9, 2.0);
+        cell.tonemap = Some("tonemap=hable:desat=0".into());
+        let g = live_collage_graph(&caps, &[cell], 150, 0, Resolution::Hd1080);
+        assert!(
+            g.find("tonemap=hable").unwrap() < g.find("format=rgb24,scale=1422").unwrap(),
+            "{g}"
+        );
+    }
+
+    #[test]
+    fn live_collage_args_feed_canvas_then_motions_then_silence() {
+        let caps = Capabilities::default();
+        let live = [live_cell("a.mov", 9, 2.5), live_cell("b.mov", 1449, 3.0)];
+        let args = live_collage_args(
+            &caps,
+            Path::new("canvas.png"),
+            &live,
+            5.0,
+            0,
+            Resolution::Hd1080,
+            Path::new("out.mp4"),
+        );
+        let inputs: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "-i")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(
+            inputs,
+            [
+                "canvas.png",
+                "a.mov",
+                "b.mov",
+                "anullsrc=r=48000:cl=stereo:d=5"
+            ]
+        );
+        // Audio comes from the silent track (input 3), never the motions.
+        let maps: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "-map")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(maps, ["[v]", "3:a"]);
+        let frames = args.iter().position(|a| a == "-frames:v").unwrap();
+        assert_eq!(args[frames + 1], "150");
+        assert_eq!(args.last().unwrap(), "out.mp4");
+    }
+
+    /// Mean absolute difference, 0..255, between the frame of `va` at `a`
+    /// seconds and the frame of `vb` at `b` seconds.
+    fn frame_diff(caps: &Capabilities, va: &Path, a: f64, vb: &Path, b: f64, dir: &Path) -> f64 {
+        let grab = |video: &Path, t: f64, name: &str| {
+            let png = dir.join(name);
+            let ok = std::process::Command::new(&caps.ffmpeg_bin)
+                .args(["-v", "error", "-y", "-ss", &format!("{t}"), "-i"])
+                .arg(video)
+                .args(["-frames:v", "1", "-vf", "scale=320:180"])
+                .arg(&png)
+                .status()
+                .unwrap();
+            assert!(ok.success());
+            image::open(&png).unwrap().to_rgb8()
+        };
+        let (fa, fb) = (grab(va, a, "fa.png"), grab(vb, b, "fb.png"));
+        let sum: u64 = fa
+            .as_raw()
+            .iter()
+            .zip(fb.as_raw())
+            .map(|(x, y)| u64::from(x.abs_diff(*y)))
+            .sum();
+        sum as f64 / fa.as_raw().len() as f64
+    }
+
+    /// A Live Photo in a collage moves from the first frame, then holds its
+    /// last frame; with the option off the same collage stays still.
+    #[test]
+    fn collage_live_photo_moves_then_freezes() {
+        let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
+        if !caps.libx264 || !caps.perspective {
+            eprintln!("ffmpeg caps insufficient; skipping live collage test");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let still = |name: &str, rgb: [u8; 3]| {
+            let p = dir.join(name);
+            image::RgbImage::from_pixel(480, 640, image::Rgb(rgb))
+                .save(&p)
+                .unwrap();
+            p
+        };
+        let motion = dir.join("live.mov");
+        let made = std::process::Command::new(&caps.ffmpeg_bin)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc2=s=480x640:r=30:d=2")
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&motion)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let mut live = card_entry("live", &still("live.png", [40, 90, 160]));
+        live.motion_path = Some(motion);
+        let plain = card_entry("plain", &still("plain.png", [160, 90, 40]));
+        let members = [&live, &plain];
+        let render = |on: bool, sub: &str| {
+            let work = dir.join(sub);
+            std::fs::create_dir_all(&work).unwrap();
+            let (out, secs, kind) =
+                render_collage_segment(&caps, &members, 0, 0, 4.0, on, Resolution::Hd1080, &work)
+                    .unwrap();
+            assert_eq!(kind, "still");
+            assert!((secs - 5.0).abs() < 0.01);
+            let info = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &out).unwrap();
+            assert!((info.duration_secs - 5.0).abs() < 0.1, "{info:?}");
+            assert!(info.has_audio);
+            out
+        };
+        let moving = render(true, "on");
+        let playing = frame_diff(&caps, &moving, 0.3, &moving, 1.3, dir);
+        let frozen = frame_diff(&caps, &moving, 3.0, &moving, 4.0, dir);
+        let off = render(false, "off");
+        let still_only = frame_diff(&caps, &off, 0.3, &off, 1.3, dir);
+        // The frozen frame still drifts with the canvas glide, so it is
+        // not zero; playback changes the cell far more.
+        assert!(
+            playing > 2.0 * frozen.max(0.2),
+            "playing {playing} frozen {frozen}"
+        );
+        assert!(
+            playing > 4.0 * still_only.max(0.2),
+            "playing {playing} still {still_only}"
+        );
+        // The first frame already shows the video, not the still.
+        let first = frame_diff(&caps, &moving, 0.0, &off, 0.0, dir);
+        assert!(
+            first > 10.0,
+            "first frame matches the still collage: {first}"
+        );
+    }
+
     /// Real iPhone clip with an `apple_apac` track: `TRIPTAPE_APAC_CLIP=<copy of
     /// a .MOV> cargo test -p triptape-media real_apac -- --ignored`.
     #[test]
@@ -3910,8 +4330,25 @@ mod tests {
             .to_vec();
         let refs: Vec<&ResolvedEntry> = members.iter().collect();
         time("collage4", &mut || {
-            let (o, _, _) = render_collage_segment(&caps, &refs, 1, 1, 4.0, res, &work).unwrap();
+            let (o, _, _) =
+                render_collage_segment(&caps, &refs, 1, 1, 4.0, false, res, &work).unwrap();
             std::fs::copy(&o, work.join("collage.mp4")).unwrap();
+        });
+        // Optional s1..s4.mov beside the stills make them Live Photos.
+        let live: Vec<ResolvedEntry> = members
+            .iter()
+            .cloned()
+            .map(|mut m| {
+                let mov = m.still_path.with_extension("mov");
+                m.motion_path = mov.exists().then_some(mov);
+                m
+            })
+            .collect();
+        let refs: Vec<&ResolvedEntry> = live.iter().collect();
+        time("collage4live", &mut || {
+            let (o, _, _) =
+                render_collage_segment(&caps, &refs, 3, 1, 4.0, true, res, &work).unwrap();
+            std::fs::copy(&o, work.join("collage_live.mp4")).unwrap();
         });
         for (label, name, end) in [
             ("clip4k", "clip4k.mov", 5.0),
@@ -4485,7 +4922,7 @@ mod tests {
             .map(|n| card_entry(n, &dir.join(n)))
             .to_vec();
         let refs: Vec<&ResolvedEntry> = members.iter().collect();
-        let (o, _, _) = render_collage_segment(&caps, &refs, 9, 1, 4.0, res, &work).unwrap();
+        let (o, _, _) = render_collage_segment(&caps, &refs, 9, 1, 4.0, true, res, &work).unwrap();
         std::fs::copy(&o, dir.join(format!("vis_{}_collage.mp4", res.label()))).unwrap();
         let (w, h) = res.dims();
         let card = dir.join(format!("map_{}.png", res.label()));

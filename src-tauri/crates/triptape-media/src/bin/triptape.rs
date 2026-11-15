@@ -6,7 +6,7 @@
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
-//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--itinerary itinerary.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--itinerary itinerary.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
 //! triptape cache stats|clear [--segment-cache DIR]
 //! ```
@@ -618,6 +618,8 @@ fn export_cmd(flags: &HashMap<String, String>) {
     }
 
     let keep_ambience = flags.get("keep-ambience").is_some_and(|v| v != "false");
+    // Live Photos move inside hero collages unless switched off.
+    let live_collages = !flags.get("no-live-collages").is_some_and(|v| v != "false");
     // Hero segments rendered at once (default: cores / 4, memory permitting).
     let jobs = flags.get("jobs").map(|v| match v.parse::<usize>() {
         Ok(n) if n >= 1 => n,
@@ -642,6 +644,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             typst_bin,
             music_paths: music,
             keep_ambience,
+            live_collages,
             only,
             resolution,
             jobs,

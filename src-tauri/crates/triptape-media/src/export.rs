@@ -26,6 +26,8 @@ pub struct ExportOptions {
     /// Keep the original film audio at 0.12 under the music bed (default
     /// mutes it; the music is the primary audio).
     pub keep_ambience: bool,
+    /// Live Photos in a hero collage play their motion in their cell.
+    pub live_collages: bool,
     /// "all" (default), or one keepsake: "video" | "reels" | "book".
     pub only: String,
     /// Hero film frame size (default 4K). Reels stay 1080x1920.
@@ -437,6 +439,7 @@ fn export_inner(
                 short_mode: elig.video == "short",
                 music_paths: opts.music_paths.clone(),
                 keep_ambience: opts.keep_ambience,
+                live_collages: opts.live_collages,
                 typst_bin: opts.typst_bin.clone(),
                 resolution: opts.resolution,
                 jobs: opts.jobs,
@@ -822,6 +825,7 @@ mod tests {
                 typst_bin: "typst".into(),
                 music_paths: vec![],
                 keep_ambience: false,
+                live_collages: true,
                 only: "all".into(),
                 resolution: Resolution::default(),
                 jobs: None,
@@ -867,6 +871,7 @@ mod tests {
             typst_bin: "typst".into(),
             music_paths: Vec::new(),
             keep_ambience: false,
+            live_collages: true,
             only: "reels".into(),
             resolution: Default::default(),
             jobs: None,

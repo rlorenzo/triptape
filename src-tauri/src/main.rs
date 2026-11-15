@@ -1145,6 +1145,7 @@ fn export_blocking(
         typst_bin: "typst".to_string(),
         music_paths: Vec::new(),
         keep_ambience: false,
+        live_collages: true,
         only: keepsakes_of(kind).to_string(),
         resolution: triptape_media::resolution::Resolution::default(),
         jobs: None,
