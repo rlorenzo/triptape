@@ -1784,10 +1784,13 @@ fn render_collage_segment(
             res,
             Path::new(KEY_OUT),
         ));
+        // Layout and crop rules are pixel logic the arguments do not
+        // show; bump when they change so old collages are not reused.
+        k.part("collage-layout", "2");
         if live {
             // The motion recipe is not in the hold arguments; bump this
             // tag whenever the moving-cell graph or timing changes.
-            k.part("live", "5");
+            k.part("live", "7");
             for (i, m) in members.iter().enumerate() {
                 if let Some(p) = live_motion(m) {
                     k.file(&format!("motion{i}"), p);
@@ -1850,10 +1853,12 @@ fn collage_eligible(e: &ResolvedEntry) -> bool {
 /// collage layout never puts in a stacked (half-height) cell.
 const PORTRAIT_BELOW: f64 = 0.95;
 /// Most of a photo a collage cell may crop away before the photo is
-/// shown whole over its own blurred fill instead. Faces survive because
+/// shown whole over its own blurred fill instead. Set so four 3:4
+/// portraits side by side (41% cut from the sides) still fill their
+/// columns: a filled panel reads better than a photo floating on blur. Faces survive because
 /// the crop keeps the top ([`CROP_FOCUS_Y`]); beyond this the layout and
 /// the renderer both treat the cell as a poor fit.
-const MAX_CELL_CROP: f64 = 0.35;
+const MAX_CELL_CROP: f64 = 0.45;
 /// Focal height for cover crops that must cut height: people sit in the
 /// upper part of a portrait, so keep the top (0 = top, 0.5 = centre).
 const CROP_FOCUS_Y: f64 = 0.35;
@@ -2223,10 +2228,33 @@ const LIVE_TAIL_TRIM: f64 = 0.6;
 /// Shortest motion worth playing in a collage cell.
 const LIVE_MIN_SECS: f64 = 0.8;
 
+/// Seconds a collage rests after its last moving cell has stopped.
+const LIVE_LINGER: f64 = 1.0;
+
+/// When each moving cell of a collage starts, given their playable
+/// seconds in playing order and the collage's hold. All starting at once
+/// would leave a long frozen wait before the cut, so the starts spread
+/// out until the last motion ends [`LIVE_LINGER`] before the hold does.
+/// A cell never waits past the end of the one before it (no dead gap),
+/// and a single moving cell starts at once.
+fn stagger_starts(secs: &[f64], dur: f64) -> Vec<f64> {
+    let mut starts = vec![0.0; secs.len()];
+    let Some(last) = secs.last() else {
+        return starts;
+    };
+    let even = (dur - LIVE_LINGER - last) / (secs.len().max(2) - 1) as f64;
+    for i in 1..secs.len() {
+        starts[i] = starts[i - 1] + even.clamp(0.0, secs[i - 1]);
+    }
+    starts
+}
+
 /// One moving collage cell: its motion file, tile rectangle on the
-/// canvas, playable seconds and optional HDR tone-map chain.
+/// canvas, when it starts and for how many seconds it plays, and an
+/// optional HDR tone-map chain.
 struct LiveCell {
     src: PathBuf,
+    start: f64,
     x: u32,
     y: u32,
     w: u32,
@@ -2247,8 +2275,11 @@ fn live_cells(
     photos: &[CollageCell],
     dur: f64,
 ) -> Vec<LiveCell> {
-    photos
-        .iter()
+    // Playing order: left to right, then top to bottom.
+    let mut photos: Vec<&CollageCell> = photos.iter().collect();
+    photos.sort_by_key(|c| (c.x, c.y));
+    let mut live: Vec<LiveCell> = photos
+        .into_iter()
         .filter_map(|c| {
             let src = live_motion(members[c.member])?;
             let probe = ffmpeg::ffprobe_file(&caps.ffprobe_bin, src).ok()?;
@@ -2264,6 +2295,7 @@ fn live_cells(
             }
             Some(LiveCell {
                 src: src.to_path_buf(),
+                start: 0.0,
                 x: c.x,
                 y: c.y,
                 w: c.w,
@@ -2272,14 +2304,22 @@ fn live_cells(
                 tonemap: ffmpeg::tonemap_chain(caps, &probe.color_transfer),
             })
         })
-        .collect()
+        .collect();
+    let secs: Vec<f64> = live.iter().map(|c| c.secs).collect();
+    for (c, start) in live.iter_mut().zip(stagger_starts(&secs, dur)) {
+        c.start = start;
+        // Whatever the stagger, the motion ends inside the hold.
+        c.secs = c.secs.min(dur - start);
+    }
+    live
 }
 
 /// Filter graph of a collage whose `live` cells move: input 0 is the
 /// composed canvas, inputs 1.. the motion files in `live` order. Each
-/// motion is cover-cropped like its still and plays from the collage's
-/// first frame (the still never shows in that cell), then freezes on its
-/// last frame for the rest of the hold while the whole canvas glides.
+/// motion is cover-cropped like its still and shows from the collage's
+/// first frame (the still never shows in that cell): it waits on its
+/// first frame until its start, plays, then freezes on its last frame
+/// while the whole canvas glides.
 fn live_collage_graph(
     caps: &Capabilities,
     live: &[LiveCell],
@@ -2299,8 +2339,15 @@ fn live_collage_graph(
             .tonemap
             .as_ref()
             .map_or(String::new(), |t| format!("{t},"));
+        // A cell waiting its turn shows its motion's first frame, so it
+        // starts moving without a jump from the still.
+        let wait = if c.start > 0.0 {
+            format!(",tpad=start_mode=clone:start_duration={:.3}", c.start)
+        } else {
+            String::new()
+        };
         g.push_str(&format!(
-            "[{n}:v]fps=30,trim=duration={secs:.3},setpts=PTS-STARTPTS,{tone}format=rgb24,scale={cw}:{ch}:force_original_aspect_ratio=increase:flags=lanczos,crop={cw}:{ch}:(iw-{cw})/2:(ih-{ch})*{fy}:exact=1,setsar=1[m{n}];[c{i}][m{n}]overlay={x}:{y}:eof_action=repeat[c{n}];",
+            "[{n}:v]fps=30,trim=duration={secs:.3},setpts=PTS-STARTPTS,{tone}format=rgb24,scale={cw}:{ch}:force_original_aspect_ratio=increase:flags=lanczos,crop={cw}:{ch}:(iw-{cw})/2:(ih-{ch})*{fy}:exact=1,setsar=1{wait}[m{n}];[c{i}][m{n}]overlay={x}:{y}:eof_action=repeat[c{n}];",
             secs = c.secs,
             cw = c.w,
             ch = c.h,
@@ -2962,9 +3009,9 @@ mod tests {
 
     #[test]
     fn cells_cover_when_close_and_contain_when_far() {
-        // 3:2 landscape into a 144x162 cell would lose ~40%: shown whole,
+        // 2:1 landscape into a 144x162 cell would lose ~56%: shown whole,
         // so even the photo's top-left corner marker (green) survives.
-        let mut land = image::RgbImage::from_pixel(300, 200, image::Rgb([200, 30, 30]));
+        let mut land = image::RgbImage::from_pixel(400, 200, image::Rgb([200, 30, 30]));
         for y in 0..20 {
             for x in 0..20 {
                 land.put_pixel(x, y, image::Rgb([30, 200, 30]));
@@ -2972,8 +3019,8 @@ mod tests {
         }
         let cell = fill_cell(&land, 144, 162);
         assert_eq!((cell.width(), cell.height()), (144, 162));
-        // Whole photo is 144x96 at y 33..129.
-        assert_eq!(cell.get_pixel(2, 35), &image::Rgb([30, 200, 30]));
+        // Whole photo is 144x72 at y 45..117.
+        assert_eq!(cell.get_pixel(2, 47), &image::Rgb([30, 200, 30]));
         assert_eq!(cell.get_pixel(100, 81), &image::Rgb([200, 30, 30]));
         // Near-matching portrait covers the cell edge to edge.
         let port = image::RgbImage::from_pixel(300, 400, image::Rgb([30, 30, 200]));
@@ -3389,6 +3436,7 @@ mod tests {
     fn live_cell(src: &str, x: u32, secs: f64) -> LiveCell {
         LiveCell {
             src: PathBuf::from(src),
+            start: 0.0,
             x,
             y: 9,
             w: 1422,
@@ -3404,8 +3452,16 @@ mod tests {
             perspective: true,
             ..Default::default()
         };
-        let live = [live_cell("a.mov", 9, 2.5), live_cell("b.mov", 1449, 3.0)];
+        let mut live = [live_cell("a.mov", 9, 2.5), live_cell("b.mov", 1449, 3.0)];
+        live[1].start = 1.5;
         let g = live_collage_graph(&caps, &live, 150, 0, Resolution::Hd1080);
+        // The first cell moves at once; the second waits on its own first
+        // frame (never the still), then plays.
+        assert_eq!(g.matches("tpad=").count(), 1, "{g}");
+        assert!(
+            g.contains("setsar=1,tpad=start_mode=clone:start_duration=1.500[m2]"),
+            "{g}"
+        );
         // Canvas held once, each motion laid over it in input order.
         assert!(g.starts_with("[0:v]scale=2880:1620"), "{g}");
         assert!(
@@ -3430,12 +3486,35 @@ mod tests {
     }
 
     #[test]
+    fn stagger_starts_spread_motion_across_the_hold() {
+        let near = |a: &[f64], b: &[f64]| {
+            assert_eq!(a.len(), b.len());
+            assert!(a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-9), "{a:?}");
+        };
+        // Four 2.2 s motions in a 7 s hold: evenly spaced, the last ends
+        // LIVE_LINGER before the cut.
+        let s = stagger_starts(&[2.2; 4], 7.0);
+        near(&s, &[0.0, 3.8 / 3.0, 7.6 / 3.0, 3.8]);
+        assert!((s[3] + 2.2 - (7.0 - LIVE_LINGER)).abs() < 1e-9);
+        // Short motions never leave a dead gap between cells.
+        near(&stagger_starts(&[1.0, 1.0], 5.0), &[0.0, 1.0]);
+        // Motions longer than the hold allows all start at once.
+        near(&stagger_starts(&[3.0, 3.0], 3.5), &[0.0, 0.0]);
+        // One moving cell starts at once; none is fine.
+        near(&stagger_starts(&[2.0], 5.0), &[0.0]);
+        assert!(stagger_starts(&[], 5.0).is_empty());
+    }
+
+    #[test]
     fn photo_rect_matches_cover_and_contain_fills() {
         // 4:3 photo in a 16:9 tile loses 25%: it covers the whole tile.
         assert_eq!(photo_rect(4.0 / 3.0, 9, 9, 1600, 900), (9, 9, 1600, 900));
-        // 3:4 photo in a tall 4:9 tile would lose over a third: shown
+        // 3:4 photo in a tall 4:9 tile loses 41%: still fills the tile
+        // (four portraits side by side fill their columns).
+        assert_eq!(photo_rect(0.75, 9, 9, 400, 900), (9, 9, 400, 900));
+        // Square photo in the same tile would lose over half: shown
         // whole, full width, centred vertically.
-        assert_eq!(photo_rect(0.75, 9, 9, 400, 900), (9, 192, 400, 533));
+        assert_eq!(photo_rect(1.0, 9, 9, 400, 900), (9, 259, 400, 400));
         // Wide photo in a tall tile: same, and never larger than the tile.
         let (x, y, w, h) = photo_rect(16.0 / 9.0, 0, 0, 400, 900);
         assert_eq!((x, w), (0, 400));
