@@ -48,6 +48,38 @@ fn input_args(path: &Path, pre: &[&str], tail: &[&str]) -> Vec<String> {
     a
 }
 
+/// Frame rate and size the Live Photo steadiness check decodes at.
+const LIVE_FPS: u32 = 15;
+const LIVE_W: usize = 64;
+const LIVE_H: usize = 48;
+
+/// Seconds from the start of a Live Photo's motion that are worth showing:
+/// the clip up to where the phone starts being lowered
+/// ([`triptape_core::clip_window::steady_frames`]), or its whole length.
+/// `None` when the clip cannot be decoded.
+pub fn live_steady_secs(ffmpeg_bin: &str, path: &Path) -> Option<f64> {
+    let vf = format!("fps={LIVE_FPS},scale={LIVE_W}:{LIVE_H},format=gray");
+    // The first video stream: iPhone Live Photos carry auxiliary ones.
+    let args = input_args(
+        path,
+        &[],
+        &[
+            "-map", "0:v:0", "-an", "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+        ],
+    );
+    let raw = run_capture(ffmpeg_bin, &args)?;
+    let (frames, _) = raw.as_chunks::<{ LIVE_W * LIVE_H }>();
+    if frames.is_empty() {
+        return None;
+    }
+    let diffs: Vec<f32> = frames
+        .windows(2)
+        .filter_map(|w| mean_abs_diff(&w[0], &w[1]))
+        .collect();
+    let keep = triptape_core::clip_window::steady_frames(&diffs);
+    Some(keep as f64 / f64::from(LIVE_FPS))
+}
+
 /// Raw per-sample measurements for a clip, or `None` when no frames decode.
 fn measure(ffmpeg_bin: &str, audio_map: Option<&str>, path: &Path) -> Option<Vec<RawSample>> {
     let vf = format!(

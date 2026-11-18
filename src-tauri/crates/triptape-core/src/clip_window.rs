@@ -109,6 +109,48 @@ pub fn mean_abs_diff(a: &[u8], b: &[u8]) -> Option<f32> {
     Some(total as f32 / a.len() as f32 / 255.0)
 }
 
+/// Smallest frame-to-frame change (0..1) that can count as the camera
+/// swinging away, however calm the rest of a Live Photo is.
+pub const SWING_MIN_DIFF: f32 = 4.0 / 255.0;
+/// A swing changes the frame this many times more than the clip's usual
+/// frame-to-frame change.
+pub const SWING_RATIO: f32 = 3.0;
+
+/// How many leading frames of a Live Photo's motion are worth showing.
+/// `diffs[i]` is the [`mean_abs_diff`] between frames `i` and `i + 1`.
+///
+/// A Live Photo often ends with the phone being lowered: the whole frame
+/// then changes far more than it did while the shot was held, and keeps
+/// doing so to the last frame. That tail is cut (with one frame of
+/// margin); a clip that is busy throughout, or calm to the end, is kept
+/// whole, and never less than half a clip survives.
+pub fn steady_frames(diffs: &[f32]) -> usize {
+    let frames = diffs.len() + 1;
+    if diffs.len() < 6 {
+        return frames;
+    }
+    // The usual change, from the part before any drop can have started.
+    let mut head = diffs[..(diffs.len() * 2 / 3).max(3)].to_vec();
+    head.sort_by(f32::total_cmp);
+    let threshold = (head[head.len() / 2] * SWING_RATIO).max(SWING_MIN_DIFF);
+    // A swing is not perfectly even: a change counts when it or a
+    // neighbour is over the threshold.
+    let swinging = |i: usize| {
+        let lo = i.saturating_sub(1);
+        let hi = (i + 1).min(diffs.len() - 1);
+        diffs[lo..=hi].iter().any(|d| *d > threshold)
+    };
+    let mut start = diffs.len();
+    while start > 0 && swinging(start - 1) {
+        start -= 1;
+    }
+    if start == diffs.len() {
+        return frames;
+    }
+    // Frame `start` is the last one before the swinging changes begin.
+    (start + 1).max(frames.div_ceil(2))
+}
+
 /// Mean luma 0..1 of an 8-bit grayscale frame.
 pub fn mean_luma(gray: &[u8]) -> Option<f32> {
     if gray.is_empty() {
@@ -363,6 +405,56 @@ pub fn window_quality(scores: &[f32], window: Option<(f64, f64)>) -> Option<f32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn diffs_255(v: &[u8]) -> Vec<f32> {
+        v.iter().map(|d| f32::from(*d) / 255.0).collect()
+    }
+
+    #[test]
+    fn steady_frames_cuts_a_phone_drop_tail() {
+        // Real Live Photo (15 fps): a child moving, then the phone swings
+        // away from the 22nd change on.
+        let d = diffs_255(&[
+            13, 11, 9, 7, 6, 7, 7, 8, 8, 7, 6, 5, 4, 2, 2, 2, 3, 5, 5, 4, 3, 12, 23, 30, 34, 37,
+            35, 33, 22, 18, 25,
+        ]);
+        let keep = steady_frames(&d);
+        assert!((20..=22).contains(&keep), "{keep}");
+    }
+
+    #[test]
+    fn steady_frames_keeps_calm_and_busy_clips_whole() {
+        // Held steady to the end (one blip mid-clip is not a drop).
+        let calm = diffs_255(&[
+            2, 2, 2, 2, 3, 2, 2, 1, 2, 2, 2, 1, 2, 9, 2, 2, 1, 2, 2, 0, 2, 2,
+        ]);
+        assert_eq!(steady_frames(&calm), calm.len() + 1);
+        // Moving throughout (shot from a vehicle): no calmer part to keep.
+        let busy = diffs_255(&[16, 16, 16, 20, 24, 27, 31, 30, 29, 30, 29, 25, 23, 20]);
+        assert_eq!(steady_frames(&busy), busy.len() + 1);
+        // Too short to judge.
+        assert_eq!(steady_frames(&diffs_255(&[1, 1, 40])), 4);
+    }
+
+    #[test]
+    fn steady_frames_keeps_at_least_half() {
+        // The swing starts 9 changes into a 21-frame clip: the cut would
+        // leave under half, so half is kept.
+        let d = diffs_255(&[
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+        ]);
+        assert_eq!(steady_frames(&d), 11);
+    }
+
+    #[test]
+    fn steady_frames_trims_a_gentle_final_tilt() {
+        let d = diffs_255(&[
+            2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 3, 4, 6, 6, 6, 7, 7,
+            8, 8, 8, 9, 11, 10,
+        ]);
+        let keep = steady_frames(&d);
+        assert!((24..=30).contains(&keep), "{keep}");
+    }
 
     #[test]
     fn laplacian_flat_is_zero_and_checkerboard_is_high() {

@@ -52,8 +52,9 @@
   plus the same signals, replacing the fixed proxy.
 - Hero film: Live Photos play as stills (so they can collage) except the best
   one per chapter; inside a collage a Live Photo plays its motion in its
-  cell from the first frame, muted, and freezes 0.6 s before the clip's end
-  (the phone is usually dropping by then); `--no-live-collages` keeps cells
+  cell from the first frame, muted, and freezes where the phone starts
+  being lowered (frame change over 3x the clip's usual, sustained to the
+  end; otherwise the whole clip plays); `--no-live-collages` keeps cells
   still; chapters of at most 3 assets merge into the closer
   same-day neighbour; time is dealt by `chapter_size^0.75`; a requested
   length is a minimum (the plan fills up to 3% over it, skipping picks that

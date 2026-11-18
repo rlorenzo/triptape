@@ -1787,7 +1787,7 @@ fn render_collage_segment(
         if live {
             // The motion recipe is not in the hold arguments; bump this
             // tag whenever the moving-cell graph or timing changes.
-            k.part("live", "4");
+            k.part("live", "5");
             for (i, m) in members.iter().enumerate() {
                 if let Some(p) = live_motion(m) {
                     k.file(&format!("motion{i}"), p);
@@ -2216,9 +2216,9 @@ fn live_motion(m: &ResolvedEntry) -> Option<&Path> {
         .filter(|p| *p != m.still_path.as_path() && p.exists())
 }
 
-/// Seconds cut from the end of a Live Photo's motion in a collage: the
-/// phone is usually already being lowered there, and the cell freezes on
-/// its last frame.
+/// Seconds cut from the end of a Live Photo's motion in a collage when
+/// its steadiness cannot be measured: the phone is often being lowered
+/// there, and the cell freezes on its last frame.
 const LIVE_TAIL_TRIM: f64 = 0.6;
 /// Shortest motion worth playing in a collage cell.
 const LIVE_MIN_SECS: f64 = 0.8;
@@ -2238,8 +2238,8 @@ struct LiveCell {
 /// Motion cells of a composed collage, from the rectangle each member's
 /// photo occupies (`photos`, as [`compose_collage`] returns). The clip is
 /// cover-cropped onto its still, so a photo shown whole over its blur
-/// moves whole over the same blur. The motion stops [`LIVE_TAIL_TRIM`]
-/// before its end. A clip whose shape is too far from its
+/// moves whole over the same blur. The motion stops where the phone
+/// starts being lowered ([`crate::clip_analysis::live_steady_secs`]). A clip whose shape is too far from its
 /// still's ([`MAX_CELL_CROP`]) or that is too short to read stays a still.
 fn live_cells(
     caps: &Capabilities,
@@ -2255,7 +2255,10 @@ fn live_cells(
             let (dw, dh) = probe.display_dims();
             let sa = f64::from(dw.max(1)) / f64::from(dh.max(1));
             let ca = f64::from(c.w.max(1)) / f64::from(c.h.max(1));
-            let secs = (probe.duration_secs - LIVE_TAIL_TRIM).min(dur);
+            // As long as it looks good: up to where the phone drops.
+            let steady = crate::clip_analysis::live_steady_secs(&caps.ffmpeg_bin, src)
+                .unwrap_or(probe.duration_secs - LIVE_TAIL_TRIM);
+            let secs = steady.min(probe.duration_secs).min(dur);
             if !probe.has_video || crop_loss(sa, ca) > MAX_CELL_CROP || secs < LIVE_MIN_SECS {
                 return None;
             }
