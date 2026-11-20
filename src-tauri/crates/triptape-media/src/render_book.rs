@@ -12,7 +12,7 @@ use image::{Rgb, RgbImage};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use triptape_core::pick;
+use triptape_core::plan::SAME_MOMENT_SECS;
 
 /// Book preset (PLAN.md Sec 11: only two in v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +38,12 @@ impl BookPreset {
             BookPreset::P1 => (3600, 3600),
             BookPreset::P2 => (3300, 2550),
         }
+    }
+
+    /// Trim size in inches: (w, h).
+    pub fn trim_inches(&self) -> (f64, f64) {
+        let (w, h) = self.trim_px();
+        (f64::from(w) / 300.0, f64::from(h) / 300.0)
     }
 
     /// (min, default max) counted interior pages.
@@ -93,20 +99,43 @@ pub struct BookPhoto {
     /// fallback caption does not count.
     pub keep: bool,
     /// Capture time (unix seconds), perceptual hash and tagged people: what
-    /// [`pick::repeats`] needs to tell a near-identical shot of the same
+    /// [`BookPhoto::repeats`] needs to tell a near-identical shot of the same
     /// people from a new scene.
     pub taken_at: Option<i64>,
     pub phash: Option<u64>,
     pub people_sig: Option<u64>,
+    /// Image embedding, when the local model made one: lets the repeat
+    /// test catch the same pose reframed, which pHash misses.
+    pub embedding: Option<triptape_core::embedding::Embedding>,
+    /// 1-based trip day (local date), numbered as the plan's chapters are.
+    /// Pages never mix two days, and each day's first page names it.
+    pub day: Option<u32>,
+    /// People (or detected faces) in the photo: cropping a group shot's
+    /// edges cuts faces, so grid layouts give such photos room.
+    pub people: u32,
 }
 
 impl BookPhoto {
-    fn candidate(&self) -> pick::Candidate {
-        pick::Candidate {
+    /// Whether this photo repeats `other`: the same people at the same
+    /// moment ([`triptape_core::plan::same_moment_at`]). With embeddings,
+    /// the same scene in another framing counts too, as in the film's
+    /// photo picks.
+    fn repeats(&self, other: &BookPhoto) -> bool {
+        // Unknown people (no tags on this copy) match anyone: a folder can
+        // hold the same shot twice with tags on only one copy, and an
+        // untagged frame of a tagged burst is still that burst.
+        let same_people = match (self.people_sig, other.people_sig) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+        same_people && triptape_core::plan::same_moment_at(self.moment(), other.moment())
+    }
+
+    fn moment(&self) -> triptape_core::plan::Moment<'_> {
+        triptape_core::plan::Moment {
             taken_at: self.taken_at,
             phash: self.phash,
-            people_sig: self.people_sig,
-            score: self.score,
+            embedding: self.embedding.as_ref(),
         }
     }
 }
@@ -211,10 +240,11 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
     if order.is_empty() {
         return order;
     }
-    let sharp = |i: usize, kind: PageKind, take: usize| {
-        let (w, h) = slot_inches(preset, kind, take);
+    let sharp_in = |i: usize, (w, h): (f64, f64)| {
         dpi_verdict(photos[i].width, photos[i].height, w, h) == DpiVerdict::Ok
     };
+    let sharp =
+        |i: usize, kind: PageKind, take: usize| sharp_in(i, slot_inches(preset, kind, take));
     // Position (in `order`) of the best-scored photo among `positions` that
     // is sharp full-page as `kind`.
     let best_sharp_at = |order: &[usize], positions: &[usize], kind: PageKind| {
@@ -267,36 +297,46 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
         }
     }
 
-    // Soft photos on a 1- or 2-up page move into a 3/4-up cell of the same
-    // run (pages between dividers), swapping with the nearest photo of the
-    // same chapter there that stays sharp in the bigger slot.
-    let small = slot_inches(preset, PageKind::Grid, 4);
+    // Soft photos in a big cell (a 1-up page, or a large grid cell) move
+    // into a quarter-page-or-smaller cell of the same run (pages between
+    // dividers), swapping with the nearest photo of the same chapter there
+    // that stays sharp in the bigger slot. Cells are sized for the photos
+    // the page holds before the swaps.
+    // A cell counts as small up to a quarter page (1% float slack).
+    let small_cell = {
+        let (w, h) = preset.trim_inches();
+        w * h / 4.0 * 1.01
+    };
     for run in pages.split(|(p, _)| p.kind == PageKind::Divider) {
-        let (small_pages, big_pages): (Vec<_>, Vec<_>) = run
+        let (small_cells, big_cells): (Vec<_>, Vec<_>) = run
             .iter()
             .filter(|(p, _)| matches!(p.kind, PageKind::PhotoCaption | PageKind::Grid))
-            .partition(|(p, _)| slot_inches(preset, p.kind, p.take) == small);
-        let small_cells: Vec<usize> = small_pages
-            .iter()
-            .flat_map(|&&(p, s)| s..s + p.take)
-            .collect();
-        for &&(page, s) in &big_pages {
-            for pos in s..s + page.take {
-                let soft = order[pos];
-                if sharp(soft, page.kind, page.take) || !sharp(soft, PageKind::Grid, 4) {
-                    continue;
-                }
-                let partner = small_cells
-                    .iter()
-                    .copied()
-                    .filter(|&c| {
-                        photos[order[c]].chapter == photos[soft].chapter
-                            && sharp(order[c], page.kind, page.take)
-                    })
-                    .min_by_key(|&c| c.abs_diff(pos));
-                if let Some(c) = partner {
-                    order.swap(pos, c);
-                }
+            .flat_map(|&(p, s)| {
+                let slot: Vec<&BookPhoto> =
+                    order[s..s + p.take].iter().map(|&i| &photos[i]).collect();
+                slot_sizes(preset, p.kind, &slot)
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(k, size)| (s + k, size))
+                    .collect::<Vec<_>>()
+            })
+            .partition(|&(_, (w, h))| w * h <= small_cell);
+        for &(pos, size) in &big_cells {
+            let soft = order[pos];
+            if sharp_in(soft, size) {
+                continue;
+            }
+            let partner = small_cells
+                .iter()
+                .filter(|&&(c, small)| {
+                    photos[order[c]].chapter == photos[soft].chapter
+                        && sharp_in(order[c], size)
+                        && sharp_in(soft, small)
+                })
+                .map(|&(c, _)| c)
+                .min_by_key(|&c| c.abs_diff(pos));
+            if let Some(c) = partner {
+                order.swap(pos, c);
             }
         }
     }
@@ -311,9 +351,12 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
 /// remain — always starting on an even (left) page. The hero opens its own
 /// chapter; every other chapter with a placed photo gets a divider that
 /// consumes one of its photos as background (up to [`MAX_DIVIDERS`];
-/// [`consumption_order`] picks which), and no photo page crosses one.
+/// [`consumption_order`] picks which), and no photo page crosses one. No
+/// photo page mixes two trip days either: `day_of` holds each photo's day
+/// in story order (empty: days unknown, no day breaks).
 pub fn flow_pages(
     chapter_of: &[Option<usize>],
+    day_of: &[Option<u32>],
     wide_idx: Option<usize>,
     has_map: bool,
     cap: usize,
@@ -348,11 +391,12 @@ pub fn flow_pages(
     let counted_before: usize = pages.iter().map(|p| p.kind.counts()).sum();
     // Closing page plus the optional map.
     let extras = 1 + usize::from(has_map);
-    let rest: Vec<Option<usize>> = story_order(n_photos, spread)
+    let rest_idx: Vec<usize> = story_order(n_photos, spread)
         .into_iter()
         .skip(1 + usize::from(spread.is_some()))
-        .map(|i| chapter_of[i])
         .collect();
+    let rest: Vec<Option<usize>> = rest_idx.iter().map(|&i| chapter_of[i]).collect();
+    let day_at = |k: usize| day_of.get(rest_idx[k]).copied().flatten();
     // A chapter opens at its first photo left after the hero and spread.
     let mut opened: HashSet<usize> = chapter_of[0].into_iter().collect();
     let openings: Vec<usize> = rest
@@ -381,40 +425,56 @@ pub fn flow_pages(
         .into_iter()
         .map(|j| eligible[j])
         .collect();
-    // Photo-page runs between dividers. Each divider consumes its photo as a
+    // Photo-page runs between dividers, each cut into one segment per trip
+    // day so no page mixes two days. Each divider consumes its photo as a
     // full-page background, so that photo never repeats later in the book.
-    let mut run_lens: Vec<usize> = vec![];
+    let mut bounds: Vec<(usize, usize)> = vec![];
     let mut start = 0;
     for &d in &dividers {
-        run_lens.push(d - start);
+        bounds.push((start, d));
         start = d + 1;
     }
-    run_lens.push(rest.len() - start);
+    bounds.push((start, rest.len()));
+    let runs: Vec<Vec<usize>> = bounds
+        .into_iter()
+        .map(|(a, b)| {
+            let mut segs: Vec<usize> = vec![];
+            for k in a..b {
+                match segs.last_mut() {
+                    Some(n) if day_at(k) == day_at(k - 1) => *n += 1,
+                    _ => segs.push(1),
+                }
+            }
+            segs
+        })
+        .collect();
     let photo_budget = cap
         .saturating_sub(counted_before + dividers.len() + extras)
         .max(1);
     let per_page = (1..=4)
-        .find(|&p| run_lens.iter().map(|l| l.div_ceil(p)).sum::<usize>() <= photo_budget)
+        .find(|&p| runs.iter().flatten().map(|l| l.div_ceil(p)).sum::<usize>() <= photo_budget)
         .unwrap_or(4);
-    for (i, &run) in run_lens.iter().enumerate() {
+    for (i, run) in runs.iter().enumerate() {
         if i > 0 {
             pages.push(FlowPage {
                 kind: PageKind::Divider,
                 take: 1,
             });
         }
-        let mut left = run;
-        while left > 0 {
-            let take = left.min(per_page);
-            pages.push(FlowPage {
-                kind: if take == 1 {
-                    PageKind::PhotoCaption
-                } else {
-                    PageKind::Grid
-                },
-                take,
-            });
-            left -= take;
+        for &seg in run {
+            let mut left = seg;
+            while left > 0 {
+                let take = left.min(per_page);
+                pages.push(FlowPage {
+                    kind: if take == 1 {
+                        PageKind::PhotoCaption
+                    } else {
+                        PageKind::Grid
+                    },
+                    take,
+                });
+                left -= take;
+            }
         }
     }
     if has_map {
@@ -430,7 +490,22 @@ pub fn flow_pages(
     pages
 }
 
-/// Photo slot size in inches for dpi triage (photo area of the layout).
+/// The size in inches each photo of `slot` gets on a `kind` page, in slot
+/// order. Grid pages lay out by photo shape ([`grid_layout`]); every other
+/// page gives each photo the kind's slot.
+pub fn slot_sizes(preset: BookPreset, kind: PageKind, slot: &[&BookPhoto]) -> Vec<(f64, f64)> {
+    if kind == PageKind::Grid && slot.len() > 1 {
+        let (w, h) = preset.trim_inches();
+        return grid_cells(slot, w, h)
+            .into_iter()
+            .map(|(_, _, cw, ch)| (cw, ch))
+            .collect();
+    }
+    vec![slot_inches(preset, kind, slot.len().max(1)); slot.len()]
+}
+
+/// Photo slot size in inches for dpi triage (photo area of the layout); grid
+/// pages size each photo by [`slot_sizes`].
 pub fn slot_inches(preset: BookPreset, kind: PageKind, take: usize) -> (f64, f64) {
     match preset {
         BookPreset::P1 => match kind {
@@ -532,14 +607,18 @@ pub struct BookOutput {
 const SPREAD_WINDOW: usize = 11;
 
 /// First wide (≥1.5:1) photo in the opening stretch after the hero: the
-/// spread candidate. Pulling the first wide shot of the whole trip (say,
-/// an Osaka landscape from day 8) to page 2 would break the book's
-/// chronology, so no early wide photo means no spread.
+/// spread candidate. Pulling a later wide shot to pages 2–3 would break the
+/// book's chronology, so the candidate must share the hero's chapter: a
+/// Tokyo panorama 4 photos in must not jump ahead of the rest of the
+/// departure-day photos. No early wide photo in that chapter means no
+/// spread.
 fn wide_index(photos: &[BookPhoto]) -> Option<usize> {
+    let opening = photos.first()?.chapter;
     photos
         .iter()
         .skip(1)
         .take(SPREAD_WINDOW)
+        .take_while(|p| p.chapter == opening)
         .position(|p| p.height > 0 && p.width as f64 / p.height as f64 >= 1.5)
         .map(|i| i + 1)
 }
@@ -547,7 +626,8 @@ fn wide_index(photos: &[BookPhoto]) -> Option<usize> {
 /// The page plan for exactly these photos.
 fn book_flow(photos: &[BookPhoto], has_map: bool, cap: usize) -> Vec<FlowPage> {
     let chapter_of: Vec<Option<usize>> = photos.iter().map(|p| p.chapter).collect();
-    flow_pages(&chapter_of, wide_index(photos), has_map, cap)
+    let day_of: Vec<Option<u32>> = photos.iter().map(|p| p.day).collect();
+    flow_pages(&chapter_of, &day_of, wide_index(photos), has_map, cap)
 }
 
 /// Largest selection size found whose flowed book fits `cap` counted pages.
@@ -555,8 +635,10 @@ fn book_flow(photos: &[BookPhoto], has_map: bool, cap: usize) -> Vec<FlowPage> {
 /// so each candidate is flowed for real. That also makes fit non-monotonic:
 /// the search may settle a little low, but what it returns always fits.
 fn fitting_count(pool: &[BookPhoto], has_map: bool, cap: usize) -> usize {
+    // Scenes depend only on the pool: link them once for every probe.
+    let scene = scenes(pool);
     let fits = |n: usize| {
-        let picked: Vec<BookPhoto> = select_for_cap(pool, n)
+        let picked: Vec<BookPhoto> = select_in_scenes(pool, &scene, n)
             .0
             .into_iter()
             .map(|i| pool[i].clone())
@@ -606,6 +688,15 @@ fn evenly_spaced(total: usize, keep: usize) -> Vec<usize> {
 /// selection plus any curated indices that could not fit (more of them than
 /// slots).
 fn select_for_cap(photos: &[BookPhoto], keep: usize) -> (Vec<usize>, Vec<usize>) {
+    select_in_scenes(photos, &scenes(photos), keep)
+}
+
+/// [`select_for_cap`] with the pool's [`scenes`] already linked.
+fn select_in_scenes(
+    photos: &[BookPhoto],
+    scene: &[usize],
+    keep: usize,
+) -> (Vec<usize>, Vec<usize>) {
     let total = photos.len();
     if keep >= total {
         return ((0..total).collect(), vec![]);
@@ -634,11 +725,38 @@ fn select_for_cap(photos: &[BookPhoto], keep: usize) -> (Vec<usize>, Vec<usize>)
     let sizes: Vec<usize> = groups.iter().map(|(_, m)| m.len()).collect();
     let mut sel = curated;
     for ((_, members), quota) in groups.iter().zip(chapter_quotas(&sizes, keep - sel.len())) {
-        let picks = best_per_stretch(photos, members, quota, &sel);
+        let picks = best_per_stretch(photos, scene, members, quota, &sel);
         sel.extend(picks);
     }
     sel.sort_unstable();
     (sel, vec![])
+}
+
+/// A scene id per photo (`photos` in story order): a photo joins the scene
+/// of any earlier photo it [`BookPhoto::repeats`] within
+/// [`SAME_MOMENT_SECS`] (the plan's same-moment window), else opens a new one. Linking
+/// through neighbours keeps a whole posing session together even when its
+/// first and last frames no longer look alike.
+fn scenes(photos: &[BookPhoto]) -> Vec<usize> {
+    let mut scene: Vec<usize> = Vec::with_capacity(photos.len());
+    let mut next = 0;
+    for (i, p) in photos.iter().enumerate() {
+        let linked = (0..i)
+            .rev()
+            .take_while(|&j| match (photos[j].taken_at, p.taken_at) {
+                (Some(a), Some(b)) => (b - a).abs() <= SAME_MOMENT_SECS,
+                _ => false,
+            })
+            .find(|&j| photos[j].repeats(p));
+        scene.push(linked.map_or_else(
+            || {
+                next += 1;
+                next - 1
+            },
+            |j| scene[j],
+        ));
+    }
+    scene
 }
 
 /// Share `slots` among chapters of the given `sizes` (`slots` must not
@@ -689,14 +807,15 @@ fn best_scored(
 
 /// The best-scored photo of each of `quota` equal stretches of `members`
 /// (indices into `photos`, in story order); the earlier photo wins a tie.
-/// A photo that [`pick::repeats`] one in `chosen` (picked for the book
-/// already) or picked here waits, as in [`pick::pick_top`]: the stretch
+/// A photo whose [`scenes`] id matches one in `chosen` (picked for the
+/// book already) or picked here waits, as in [`triptape_core::pick::pick_top`]: the stretch
 /// takes its best photo that is a new scene, or the same view with other
 /// people. A stretch with only repeats leaves its slot to the chapter's
 /// best remaining new scene, and repeats fill only what nothing else can,
 /// so the quota is always met.
 fn best_per_stretch(
     photos: &[BookPhoto],
+    scene: &[usize],
     members: &[usize],
     quota: usize,
     chosen: &[usize],
@@ -705,20 +824,15 @@ fn best_per_stretch(
     if quota >= n {
         return members.to_vec();
     }
-    let candidates = |idx: &[usize]| -> Vec<pick::Candidate> {
-        idx.iter().map(|&i| photos[i].candidate()).collect()
-    };
-    let mut seen = candidates(chosen);
+    let mut seen: Vec<usize> = chosen.to_vec();
+    let fresh_scene = |seen: &[usize], i: usize| !seen.iter().any(|&p| scene[p] == scene[i]);
     let mut picked: Vec<usize> = vec![];
     for j in 0..quota {
         let stretch = &members[j * n / quota..(j + 1) * n / quota];
-        let fresh = stretch.iter().copied().filter(|&i| {
-            let c = photos[i].candidate();
-            !seen.iter().any(|p| pick::repeats(p, &c))
-        });
+        let fresh = stretch.iter().copied().filter(|&i| fresh_scene(&seen, i));
         if let Some(best) = best_scored(fresh, |i| photos[i].score) {
             picked.push(best);
-            seen.push(photos[best].candidate());
+            seen.push(best);
         }
     }
     // Leftover slots go to the rest of the chapter as `pick_top` ranks it:
@@ -732,13 +846,10 @@ fn best_per_stretch(
     while picked.len() < quota {
         let at = waiting
             .iter()
-            .position(|&i| {
-                let c = photos[i].candidate();
-                !seen.iter().any(|p| pick::repeats(p, &c))
-            })
+            .position(|&i| fresh_scene(&seen, i))
             .unwrap_or(0);
         let next = waiting.remove(at);
-        seen.push(photos[next].candidate());
+        seen.push(next);
         picked.push(next);
     }
     picked.sort_unstable();
@@ -764,11 +875,12 @@ fn planned_blocked(
         match fp.kind {
             PageKind::CoverProxy => {}
             PageKind::Hero | PageKind::PhotoCaption | PageKind::Grid | PageKind::Divider => {
-                let slot = &order[cursor..(cursor + fp.take).min(order.len())];
+                let slot: Vec<&BookPhoto> = order[cursor..(cursor + fp.take).min(order.len())]
+                    .iter()
+                    .map(|&oi| &photos[oi])
+                    .collect();
                 cursor += slot.len();
-                let (sw, sh) = slot_inches(preset, fp.kind, fp.take.max(1));
-                for oi in slot {
-                    let p = &photos[*oi];
+                for (p, (sw, sh)) in slot.iter().zip(slot_sizes(preset, fp.kind, &slot)) {
                     if dpi_verdict(p.width, p.height, sw, sh) == DpiVerdict::Block {
                         blocked.push(p.asset_id.clone());
                     }
@@ -905,6 +1017,8 @@ pub fn render_book(
     let mut placements: Vec<(usize, DpiVerdict)> = vec![];
     let mut jpegs: Vec<PathBuf> = vec![];
     let mut captions: HashMap<usize, Vec<String>> = HashMap::new();
+    // Grid pages: the user's captions, each on its own photo's cell.
+    let mut cell_captions: CellCaptions = HashMap::new();
     // Consumption order: hero, then the spread wide photo, then the rest
     // in story order, each page's photos picked for sharpness — every photo
     // placed exactly once, exactly as `planned_blocked` simulated.
@@ -919,7 +1033,9 @@ pub fn render_book(
     );
     let mut cursor = 0usize;
     let mut page_no = 0usize;
-    let mut announced: HashSet<usize> = HashSet::new();
+    let mut announced = Announced::default();
+    // The photos each page shows, for the manifest.
+    let mut page_photos: Vec<Vec<&BookPhoto>> = vec![];
 
     let total_pages = flow
         .iter()
@@ -933,6 +1049,7 @@ pub fn render_book(
         opts.progress.check_cancelled()?;
         page_no += 1;
         let fname = format!("page_{page_no:03}.jpg");
+        let mut shown: Vec<&BookPhoto> = vec![];
         let out = out_dir.join(&fname);
         match fp.kind {
             PageKind::Hero | PageKind::PhotoCaption | PageKind::Grid => {
@@ -941,15 +1058,41 @@ pub fn render_book(
                     .map(|oi| &photos[*oi])
                     .collect();
                 cursor += slot.len();
-                let (sw, sh) = slot_inches(opts.preset, fp.kind, fp.take.max(1));
-                for p in &slot {
+                shown.clone_from(&slot);
+                for (p, (sw, sh)) in slot.iter().zip(slot_sizes(opts.preset, fp.kind, &slot)) {
                     placements.push((page_no, dpi_verdict(p.width, p.height, sw, sh)));
                 }
-                let mut page_caps = page_caption(&slot, fp.kind);
-                // The hero opens its chapter: no divider precedes it.
-                if fp.kind == PageKind::Hero {
-                    page_caps = titled(opening_title(slot[0], chapters, &mut announced), page_caps);
-                }
+                let mut page_caps = if fp.kind == PageKind::Grid {
+                    let (page, cells) = grid_captions(&slot);
+                    if !cells.is_empty() {
+                        // Cell rects as fractions of the page, from the
+                        // same layout the page is drawn with.
+                        let (w, h) = opts.preset.trim_inches();
+                        let rects: Vec<Rect> = grid_cells(&slot, w, h)
+                            .into_iter()
+                            .map(|(x, y, cw, ch)| (x / w, y / h, cw / w, ch / h))
+                            .collect();
+                        cell_captions.insert(
+                            page_no,
+                            cells
+                                .into_iter()
+                                .map(|(k, text)| (rects[k], text))
+                                .collect(),
+                        );
+                    }
+                    page
+                } else {
+                    page_caption(&slot, fp.kind)
+                };
+                // The hero opens its chapter: no divider precedes it. Any
+                // other page that starts a day no title has named carries
+                // that day's banner.
+                let title = if fp.kind == PageKind::Hero {
+                    opening_title(slot[0], chapters, &mut announced)
+                } else {
+                    day_banner(slot[0], chapters, &mut announced)
+                };
+                page_caps = titled(title, page_caps);
                 if !page_caps.is_empty() {
                     captions.entry(page_no).or_default().extend(page_caps);
                 }
@@ -968,6 +1111,7 @@ pub fn render_book(
                     .get(1)
                     .unwrap_or(&0)
                     .min(&photos.len().saturating_sub(1))];
+                shown.push(p);
                 if fp.kind == PageKind::SpreadLeft {
                     let (sw, sh) = slot_inches(opts.preset, fp.kind, 1);
                     placements.push((page_no, dpi_verdict(p.width, p.height, sw, sh)));
@@ -1007,10 +1151,13 @@ pub fn render_book(
                 // Consume the background photo: it belongs to this
                 // day-marker page and is not repeated later.
                 let bg = order.get(cursor).map_or(&photos[0], |&oi| &photos[oi]);
+                shown.push(bg);
                 cursor += fp.take;
                 let (sw, sh) = slot_inches(opts.preset, fp.kind, fp.take);
                 placements.push((page_no, dpi_verdict(bg.width, bg.height, sw, sh)));
-                draw_photo_backed_page(bg, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?;
+                // Full brightness: the title sits in the caption strip, which
+                // carries its own dark backing.
+                draw_fullbleed(bg, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?;
                 let lines = divider_lines(bg, chapters, &mut announced);
                 if !lines.is_empty() {
                     captions.entry(page_no).or_default().extend(lines);
@@ -1021,7 +1168,8 @@ pub fn render_book(
                     draw_text_placeholder(fp.kind, tw, th, &out)?;
                 } else {
                     let last = &photos[photos.len() - 1];
-                    draw_photo_backed_page(last, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?;
+                    shown.push(last);
+                    draw_fullbleed(last, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?;
                     captions
                         .entry(page_no)
                         .or_default()
@@ -1039,6 +1187,7 @@ pub fn render_book(
             )));
         }
         jpegs.push(out);
+        page_photos.push(shown);
         opts.progress.counted("book", "page", page_no, total_pages);
     }
 
@@ -1071,10 +1220,18 @@ pub fn render_book(
     }
 
     let counted = count_pages(&kinds);
+    let texts = PageTexts {
+        lines: captions,
+        cells: cell_captions,
+        // kinds[0] is the uncounted cover-proxy, so kinds[n] is page n.
+        titles: (1..kinds.len())
+            .filter(|&n| kinds[n] == PageKind::Divider)
+            .collect(),
+    };
     opts.progress.check_cancelled()?;
     opts.progress.step("book", "proof and press PDFs", None);
     let proof =
-        match write_typst_and_compile(&jpegs, &captions, opts, out_dir, false, cover.as_deref()) {
+        match write_typst_and_compile(&jpegs, &texts, opts, out_dir, false, cover.as_deref()) {
             Ok(p) => Some(p),
             Err(e) => {
                 // Never leave a previous export's PDF beside the new pages.
@@ -1083,27 +1240,30 @@ pub fn render_book(
                 None
             }
         };
-    let press =
-        match write_typst_and_compile(&jpegs, &captions, opts, out_dir, true, cover.as_deref()) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                // Never leave a previous export's PDF beside the new pages.
-                let _ = std::fs::remove_file(out_dir.join("press.pdf"));
-                fallbacks.push(format!("press.pdf skipped: {e}"));
-                None
-            }
-        };
+    let press = match write_typst_and_compile(&jpegs, &texts, opts, out_dir, true, cover.as_deref())
+    {
+        Ok(p) => Some(p),
+        Err(e) => {
+            // Never leave a previous export's PDF beside the new pages.
+            let _ = std::fs::remove_file(out_dir.join("press.pdf"));
+            fallbacks.push(format!("press.pdf skipped: {e}"));
+            None
+        }
+    };
 
     // Vendors print the JPEGs, not the PDFs: burn captions into the page
     // JPEGs by rasterizing the matching proof pages. Runs after press.pdf so
     // neither PDF picks up a doubled caption.
     let captioned: Vec<usize> = {
-        let mut v: Vec<usize> = captions
+        let mut v: Vec<usize> = texts
+            .lines
             .iter()
             .filter(|(_, l)| !l.is_empty())
             .map(|(k, _)| *k)
+            .chain(texts.cells.keys().copied())
             .collect();
         v.sort_unstable();
+        v.dedup();
         v
     };
     opts.progress.check_cancelled()?;
@@ -1139,6 +1299,11 @@ pub fn render_book(
             "page": i + 1,
             "file": p.file_name().unwrap().to_string_lossy(),
             "kind": kinds[i + 1], // +1: kinds[0] is the uncounted cover-proxy
+            // Which originals the page shows, to find one while reviewing.
+            "photos": page_photos[i].iter().map(|b| serde_json::json!({
+                "asset_id": b.asset_id,
+                "file": b.path.file_name().map(|f| f.to_string_lossy().into_owned()),
+            })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "preflight_warnings": fallbacks.clone(),
     });
@@ -1160,15 +1325,35 @@ pub fn render_book(
     })
 }
 
-/// The title of the chapter `p` opens, once per chapter.
-fn opening_title(
-    p: &BookPhoto,
-    chapters: &[String],
-    announced: &mut HashSet<usize>,
-) -> Option<String> {
-    p.chapter
-        .filter(|&c| announced.insert(c))
-        .and_then(|c| chapters.get(c).cloned())
+/// Chapters and trip days whose title the book has shown so far.
+#[derive(Default)]
+struct Announced {
+    chapters: HashSet<usize>,
+    days: HashSet<u32>,
+}
+
+/// The title of the chapter `p` opens, once per chapter. Showing it also
+/// names `p`'s day, so that day gets no second banner.
+fn opening_title(p: &BookPhoto, chapters: &[String], announced: &mut Announced) -> Option<String> {
+    let title = p
+        .chapter
+        .filter(|&c| announced.chapters.insert(c))
+        .and_then(|c| chapters.get(c).cloned())?;
+    announced.days.extend(p.day);
+    Some(title)
+}
+
+/// The day banner for a photo page starting with `p`: its chapter's title
+/// (`Day 4 · Tue, Oct 6 — Tokyo`) when `p` begins a day no title page or
+/// earlier banner has named. Chapters are single days, so the title names
+/// the day.
+fn day_banner(p: &BookPhoto, chapters: &[String], announced: &mut Announced) -> Option<String> {
+    let day = p.day?;
+    if announced.days.contains(&day) {
+        return None;
+    }
+    // `opening_title` records the day as announced.
+    opening_title(p, chapters, announced)
 }
 
 /// Lead `caps` with a chapter title. An auto dateline or place caption would
@@ -1185,12 +1370,41 @@ fn titled(title: Option<String>, caps: Vec<String>) -> Vec<String> {
 
 /// Caption lines for a divider page: its background photo's chapter title
 /// plus that photo's own caption, since the photo is consumed here.
-fn divider_lines(
-    bg: &BookPhoto,
-    chapters: &[String],
-    announced: &mut HashSet<usize>,
-) -> Vec<String> {
+fn divider_lines(bg: &BookPhoto, chapters: &[String], announced: &mut Announced) -> Vec<String> {
     titled(opening_title(bg, chapters, announced), caption_of(bg))
+}
+
+/// A caption set on one grid cell: the slot index of its photo and its text.
+type CellCaption = (usize, String);
+
+/// Per page number: captions on grid photos, each with its photo's cell
+/// `(x, y, w, h)` as fractions of the page.
+type CellCaptions = HashMap<usize, Vec<(Rect, String)>>;
+
+/// Everything burned over the page JPEGs, keyed by page number.
+struct PageTexts {
+    /// The bottom strip's lines.
+    lines: HashMap<usize, Vec<String>>,
+    /// Captions on individual grid photos.
+    cells: CellCaptions,
+    /// Chapter title (divider) pages, which get a larger strip.
+    titles: HashSet<usize>,
+}
+
+/// Captions for a grid page: the user's own words go on the photo they
+/// describe (a lounge caption must not sit under the plane photos beside
+/// it), and the automatic place/date captions of the rest collapse into
+/// the page line as [`page_caption`] does.
+fn grid_captions(slot: &[&BookPhoto]) -> (Vec<String>, Vec<CellCaption>) {
+    let mut cells = vec![];
+    let mut auto: Vec<&BookPhoto> = vec![];
+    for (k, p) in slot.iter().enumerate() {
+        match caption_of(p).into_iter().next().filter(|_| p.keep) {
+            Some(c) => cells.push((k, c)),
+            None => auto.push(p),
+        }
+    }
+    (page_caption(&auto, PageKind::Grid), cells)
 }
 
 /// Caption lines for one photo page. Single-photo pages keep the photo's
@@ -1209,6 +1423,10 @@ fn page_caption(slot: &[&BookPhoto], kind: PageKind) -> Vec<String> {
     if kind != PageKind::Grid || caps.len() <= 1 {
         return caps;
     }
+    // "Tokyo" beside "Tokyo DisneySea" says nothing more: keep the most
+    // specific place.
+    let all = caps.clone();
+    caps.retain(|c| !all.iter().any(|o| o != c && o.contains(c.as_str())));
     if caps.iter().all(|c| is_dateline(c)) {
         let dates: Vec<String> = caps.iter().map(|c| dateline_date(c)).collect();
         if dates.iter().all(|d| *d == dates[0]) {
@@ -1342,6 +1560,148 @@ fn draw_half(
     )
 }
 
+/// A cell `(x, y, w, h)`.
+type Rect = (f64, f64, f64, f64);
+
+/// Row arrangements for `n` photos: up to 3 rows of 1–3 photos each.
+fn row_splits(n: usize) -> Vec<Vec<usize>> {
+    fn go(left: usize, rows: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+        if left == 0 {
+            out.push(rows.clone());
+            return;
+        }
+        if rows.len() == 3 {
+            return;
+        }
+        for k in 1..=left.min(3) {
+            rows.push(k);
+            go(left - k, rows, out);
+            rows.pop();
+        }
+    }
+    let mut out = vec![];
+    go(n, &mut vec![], &mut out);
+    out
+}
+
+/// Every ordering of `0..n` (n ≤ 4 on a grid page).
+fn orderings(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![vec![]];
+    }
+    let mut out = vec![];
+    for rest in orderings(n - 1) {
+        for at in 0..=rest.len() {
+            let mut o = rest.clone();
+            o.insert(at, n - 1);
+            out.push(o);
+        }
+    }
+    out
+}
+
+/// Cells `(x, y, w, h)` for `slot` on a `w`×`h` page with `gap` between
+/// cells, one per photo in slot order. Rows of 1–3 photos fill the page;
+/// within a row each photo's width follows its shape, and rows share the
+/// height in proportion, so a photo is cropped only as much as the page
+/// shape forces. Of every row split and photo order, the layout with the
+/// least weighted cropping wins: crops cost more the more people a photo
+/// holds (a group shot gets a full-width row instead of losing the faces
+/// at its edges), trimming sky or table off a landscape costs less than
+/// trimming its sides, and very unequal photo sizes and leaving story
+/// order cost a little.
+fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
+    const BALANCE: f64 = 0.3;
+    const REORDER: f64 = 0.02;
+    // How much a photo's faces raise the cost of cropping or shrinking it.
+    let people_weight = |p: &BookPhoto| 1.0 + 0.5 * f64::from(p.people.min(4));
+    let n = slot.len();
+    let aspect = |p: &BookPhoto| {
+        if p.width > 0 && p.height > 0 {
+            p.width as f64 / p.height as f64
+        } else {
+            1.0
+        }
+    };
+    let mut best: Option<(f64, Vec<Rect>)> = None;
+    for rows in row_splits(n) {
+        for order in orderings(n) {
+            let avail_h = h - gap * (rows.len() + 1) as f64;
+            let mut at = 0;
+            // (photo, row, share of the row width); `natural` holds each
+            // row's height before stretching to fill the page.
+            let mut placed: Vec<(usize, usize, f64)> = vec![];
+            let mut natural: Vec<f64> = vec![];
+            for (r, &k) in rows.iter().enumerate() {
+                let members = &order[at..at + k];
+                at += k;
+                let sum: f64 = members.iter().map(|&i| aspect(slot[i])).sum();
+                let row_w = w - gap * (k + 1) as f64;
+                natural.push(row_w / sum);
+                placed.extend(members.iter().map(|&i| (i, r, aspect(slot[i]) / sum)));
+            }
+            let stretch = avail_h / natural.iter().sum::<f64>();
+            let row_h: Vec<f64> = natural.iter().map(|nh| nh * stretch).collect();
+            let mut cells = vec![(0.0, 0.0, 0.0, 0.0); n];
+            let mut cost = 0.0;
+            let mut y = gap;
+            let mut x = gap;
+            let mut row = 0;
+            for &(i, r, share) in &placed {
+                if r != row {
+                    y += row_h[row] + gap;
+                    x = gap;
+                    row = r;
+                }
+                let row_w = w - gap * (rows[r] + 1) as f64;
+                let cw = row_w * share;
+                cells[i] = (x, y, cw, row_h[r]);
+                x += cw + gap;
+                let (a, c) = (aspect(slot[i]), cw / row_h[r]);
+                let weight = people_weight(slot[i]);
+                cost += weight
+                    * if c < a {
+                        1.0 - c / a // sides cut
+                    } else {
+                        (1.0 - a / c) * if a > 1.0 { 0.6 } else { 1.0 } // top/bottom cut
+                    };
+            }
+            // Unequal sizes: shrinking a photo costs as much more as
+            // cropping it does, so people photos get the big cells.
+            let areas: Vec<f64> = cells.iter().map(|c| c.2 * c.3).collect();
+            let mean = areas.iter().sum::<f64>() / n as f64;
+            cost += BALANCE
+                * areas
+                    .iter()
+                    .zip(slot)
+                    .map(|(a, p)| {
+                        let r = (a / mean).ln();
+                        if r < 0.0 {
+                            -r * people_weight(p)
+                        } else {
+                            r
+                        }
+                    })
+                    .sum::<f64>();
+            let inversions = (0..n)
+                .flat_map(|a| (a + 1..n).map(move |b| (a, b)))
+                .filter(|&(a, b)| order[a] > order[b])
+                .count();
+            cost += REORDER * inversions as f64;
+            if best.as_ref().is_none_or(|(c, _)| cost < *c - 1e-9) {
+                best = Some((cost, cells));
+            }
+        }
+    }
+    best.map(|(_, cells)| cells).unwrap_or_default()
+}
+
+/// [`grid_layout`] on a `w` x `h` page (any unit) with the book's gutter,
+/// 1% of the page width: one geometry for sizing, drawing and captions.
+fn grid_cells(slot: &[&BookPhoto], w: f64, h: f64) -> Vec<Rect> {
+    grid_layout(slot, w, h, w / 100.0)
+}
+
 fn draw_grid(
     slot: &[&BookPhoto],
     tw: u32,
@@ -1351,42 +1711,17 @@ fn draw_grid(
     fb: &mut Vec<String>,
 ) -> Result<(), crate::MediaError> {
     let mut page = solid(tw, th, Rgb([18, 20, 26]));
-    let gap = (tw / 100).max(8);
-    let cells: Vec<(u32, u32, u32, u32)> = match slot.len() {
-        1 => vec![(gap, gap, tw - 2 * gap, th - 2 * gap)],
-        2 => vec![
-            (gap, gap, tw - 2 * gap, (th - 3 * gap) / 2),
-            (gap, (th + gap) / 2, tw - 2 * gap, (th - 3 * gap) / 2),
-        ],
-        3 => vec![
-            (gap, gap, tw - 2 * gap, (th - 3 * gap) / 3),
-            (
-                gap,
-                gap + (th + gap) / 3,
-                (tw - 3 * gap) / 2,
-                (th - 3 * gap) / 3,
-            ),
-            (
-                gap + (tw + gap) / 2,
-                gap + (th + gap) / 3,
-                (tw - 3 * gap) / 2,
-                (th - 3 * gap) / 3,
-            ),
-        ],
-        _ => {
-            let cw = (tw - 3 * gap) / 2;
-            let ch = (th - 3 * gap) / 2;
-            vec![
-                (gap, gap, cw, ch),
-                (2 * gap + cw, gap, cw, ch),
-                (gap, 2 * gap + ch, cw, ch),
-                (2 * gap + cw, 2 * gap + ch, cw, ch),
-            ]
-        }
-    };
-    for (p, (x, y, w, h)) in slot.iter().zip(cells) {
+    for (p, (x, y, w, h)) in slot
+        .iter()
+        .zip(grid_cells(slot, f64::from(tw), f64::from(th)))
+    {
+        let (x, y) = (x.round() as u32, y.round() as u32);
+        let (w, h) = (
+            (w.round() as u32).min(tw - x),
+            (h.round() as u32).min(th - y),
+        );
         let fit = cover_fit(&load(p, ff, fb), w.max(1), h.max(1));
-        image::imageops::replace(&mut page, &fit, x as i64, y as i64);
+        image::imageops::replace(&mut page, &fit, i64::from(x), i64::from(y));
     }
     save_jpg(&page, out)
 }
@@ -1403,20 +1738,6 @@ fn darken<'a>(pixels: impl Iterator<Item = &'a mut Rgb<u8>>, pct: u16) {
             *c = (u16::from(*c) * pct / 100) as u8;
         }
     }
-}
-
-/// Full-bleed photo darkened to 45% so burned chapter text stays readable.
-fn draw_photo_backed_page(
-    p: &BookPhoto,
-    tw: u32,
-    th: u32,
-    out: &Path,
-    ffmpeg_bin: &str,
-    fallbacks: &mut Vec<String>,
-) -> Result<(), crate::MediaError> {
-    let mut img = cover_fit(&load(p, ffmpeg_bin, fallbacks), tw, th);
-    darken(img.pixels_mut(), 45);
-    save_jpg(&img, out)
 }
 
 fn draw_text_placeholder(
@@ -1566,16 +1887,13 @@ fn save_jpg(img: &RgbImage, out: &Path) -> Result<(), crate::MediaError> {
 /// (trim + 0.125 in each side); otherwise screen proof geometry.
 fn write_typst_and_compile(
     jpegs: &[PathBuf],
-    captions: &HashMap<usize, Vec<String>>,
+    texts: &PageTexts,
     opts: &BookOptions,
     out_dir: &Path,
     bleed: bool,
     cover: Option<&Path>,
 ) -> Result<PathBuf, crate::MediaError> {
-    let (tw_in, th_in) = match opts.preset {
-        BookPreset::P1 => (12.0, 12.0),
-        BookPreset::P2 => (11.0, 8.5),
-    };
+    let (tw_in, th_in) = opts.preset.trim_inches();
     let (pw, ph) = if bleed {
         (tw_in + 0.25, th_in + 0.25)
     } else {
@@ -1602,11 +1920,21 @@ fn write_typst_and_compile(
             "#rect(width: 100%, height: 100%, fill: rgb(18, 20, 26))\n#place(center + horizon)[#image(\"{}\", width: 100%, height: 100%, fit: \"cover\")]\n",
             jpg.file_name().unwrap().to_string_lossy()
         ));
-        if let Some(lines) = captions.get(&page_no).filter(|l| !l.is_empty()) {
+        if let Some(lines) = texts.lines.get(&page_no).filter(|l| !l.is_empty()) {
+            // Chapter title pages carry a bigger strip, so they read as a
+            // chapter opening without dimming the photo.
+            let (size, inset) = if texts.titles.contains(&page_no) {
+                (24, 14)
+            } else {
+                (14, 8)
+            };
             typ.push_str(&format!(
-                "#place(bottom + center)[#rect(fill: rgb(18, 20, 26).transparentize(20%), inset: 8pt)[{}]]\n",
+                "#place(bottom + center)[#rect(fill: rgb(18, 20, 26).transparentize(20%), inset: {inset}pt)[#text(size: {size}pt)[{}]]]\n",
                 typ_escape(&lines.join(" · "))
             ));
+        }
+        for (rect, text) in texts.cells.get(&page_no).into_iter().flatten() {
+            typ.push_str(&cell_caption_typ((pw, ph), (tw_in, th_in), *rect, text));
         }
         if i + 1 < jpegs.len() {
             typ.push_str("#pagebreak()\n");
@@ -1683,6 +2011,28 @@ fn burn_captions(
     })();
     let _ = std::fs::remove_dir_all(&raster);
     result
+}
+
+/// Typst for one caption on a grid photo whose cell is `rect` (fractions
+/// of the page): a strip along the bottom of that photo, wrapped to the
+/// cell's width. `page` is the PDF page and `trim` the page JPEG's size
+/// (inches); with bleed the JPEG is cover-scaled onto the larger page, so
+/// the cell is mapped the same way.
+fn cell_caption_typ(page: (f64, f64), trim: (f64, f64), (x, y, w, h): Rect, text: &str) -> String {
+    let scale = (page.0 / trim.0).max(page.1 / trim.1);
+    let (ox, oy) = (
+        (page.0 - trim.0 * scale) / 2.0,
+        (page.1 - trim.1 * scale) / 2.0,
+    );
+    let (sw, sh) = (trim.0 * scale, trim.1 * scale);
+    format!(
+        "#place(top + left, dx: {:.4}in, dy: {:.4}in)[#box(width: {:.4}in, height: {:.4}in)[#place(bottom + center, dy: -6pt)[#block(fill: rgb(18, 20, 26).transparentize(20%), inset: 6pt, radius: 2pt)[#text(size: 11pt)[{}]]]]]\n",
+        ox + x * sw,
+        oy + y * sh,
+        w * sw,
+        h * sh,
+        typ_escape(text)
+    )
 }
 
 fn typ_escape(t: &str) -> String {
@@ -1805,6 +2155,9 @@ mod tests {
             taken_at: None,
             phash: None,
             people_sig: None,
+            embedding: None,
+            day: None,
+            people: 0,
         }
     }
 
@@ -1867,7 +2220,7 @@ mod tests {
 
     #[test]
     fn dividers_interleave_never_stack() {
-        let kinds: Vec<PageKind> = flow_pages(&even_chapters(200, 20), None, false, 60)
+        let kinds: Vec<PageKind> = flow_pages(&even_chapters(200, 20), &[], None, false, 60)
             .iter()
             .map(|p| p.kind)
             .collect();
@@ -1886,7 +2239,7 @@ mod tests {
         assert_eq!(cover_grid(4), (2, 2));
         assert_eq!(cover_grid(12), (4, 3));
         // Consumption accounting: dividers take their background photo.
-        let flow = flow_pages(&even_chapters(200, 20), None, false, 60);
+        let flow = flow_pages(&even_chapters(200, 20), &[], None, false, 60);
         let takes: usize = flow.iter().map(|p| p.take).sum();
         assert_eq!(takes, 200, "every photo placed exactly once");
         // Small books and divider-heavy trips: still every photo, once.
@@ -1894,7 +2247,7 @@ mod tests {
             for d in 0..10 {
                 for wide in [None, Some(1)] {
                     let wide = wide.filter(|_| n > 1);
-                    let flow = flow_pages(&even_chapters(n, d), wide, false, 60);
+                    let flow = flow_pages(&even_chapters(n, d), &[], wide, false, 60);
                     let takes: usize = flow.iter().map(|p| p.take).sum();
                     assert_eq!(takes, n, "n={n} d={d} wide={wide:?}");
                 }
@@ -1928,6 +2281,25 @@ mod tests {
         let mut first_wide: Vec<BookPhoto> = (0..15).map(|_| bp(100, 100)).collect();
         first_wide[0] = bp(200, 100);
         assert_eq!(wide_index(&first_wide), None);
+        // A wide shot inside the window but past the hero's chapter (the
+        // Tokyo panorama after the departure-day photos): no spread, so
+        // the departure day stays ahead of Tokyo.
+        let mut crossing: Vec<BookPhoto> = (0..15)
+            .map(|i| BookPhoto {
+                chapter: Some(usize::from(i >= 4)),
+                ..bp(100, 100)
+            })
+            .collect();
+        crossing[5] = BookPhoto {
+            chapter: Some(1),
+            ..bp(200, 100)
+        };
+        assert_eq!(wide_index(&crossing), None);
+        crossing[3] = BookPhoto {
+            chapter: Some(0),
+            ..bp(200, 100)
+        };
+        assert_eq!(wide_index(&crossing), Some(3));
     }
 
     #[test]
@@ -1977,18 +2349,20 @@ mod tests {
     fn chapters_without_placed_photos_get_no_divider() {
         // Chapter 1 has no photo here, and the hero opens chapter 0.
         let chapter_of = [Some(0), Some(0), Some(2), Some(2)];
-        let flow = flow_pages(&chapter_of, None, false, 60);
+        let flow = flow_pages(&chapter_of, &[], None, false, 60);
         let dividers = flow.iter().filter(|p| p.kind == PageKind::Divider).count();
         assert_eq!(dividers, 1);
-        // The spread's wide photo uses up chapter 1: only chapter 2 remains.
-        let chapter_of = sized_chapters(&[3, 1, 3]);
-        let pages = pages_with_chapters(&chapter_of, Some(3), 60);
+        // The spread comes from the hero's chapter, so it never uses up a
+        // later chapter's photo: chapters 1 and 2 both keep their dividers.
+        let chapter_of = sized_chapters(&[4, 1, 3]);
+        let pages = pages_with_chapters(&chapter_of, Some(2), 60);
+        assert!(pages.iter().any(|(k, _)| *k == PageKind::SpreadLeft));
         let divided: Vec<Option<usize>> = pages
             .iter()
             .filter(|(k, _)| *k == PageKind::Divider)
             .map(|(_, taken)| taken[0])
             .collect();
-        assert_eq!(divided, [Some(2)]);
+        assert_eq!(divided, [Some(1), Some(2)]);
     }
 
     #[test]
@@ -2094,10 +2468,12 @@ mod tests {
             .iter()
             .filter(|(k, _)| *k != PageKind::CoverProxy)
             .flat_map(|(k, taken)| {
-                let (w, h) = slot_inches(BookPreset::P1, *k, taken.len().max(1));
-                taken
-                    .iter()
-                    .map(move |&i| dpi_verdict(photos[i].width, photos[i].height, w, h))
+                let slot: Vec<&BookPhoto> = taken.iter().map(|&i| &photos[i]).collect();
+                slot_sizes(BookPreset::P1, *k, &slot)
+                    .into_iter()
+                    .zip(taken)
+                    .map(|((w, h), &i)| dpi_verdict(photos[i].width, photos[i].height, w, h))
+                    .collect::<Vec<_>>()
             })
             .filter(|v| *v != DpiVerdict::Ok)
             .count()
@@ -2143,13 +2519,14 @@ mod tests {
 
     #[test]
     fn soft_photos_move_from_wide_cells_to_small_ones() {
-        // 2560x1708 prints at 233 dpi in a 2-up cell, 310 in a 4-up one;
-        // 48 MP is sharp everywhere, the hero page included.
+        // 2560x1800 prints at ~218 dpi in a 2-up cell (11.8x5.8 in), ~309
+        // in a 4-up one (5.8x5.8 in); 48 MP is sharp everywhere, the hero
+        // page included.
         let book = |n: usize, soft: usize| -> Vec<BookPhoto> {
             (0..n)
                 .map(|i| {
                     let (w, h) = if i == soft {
-                        (2560, 1708)
+                        (2560, 1800)
                     } else {
                         (5712, 4284)
                     };
@@ -2174,6 +2551,44 @@ mod tests {
             .iter()
             .all(|(k, t)| *k != PageKind::Grid || t.len() <= 2));
         assert_eq!(soft_placements(&photos, 24), 1);
+    }
+
+    #[test]
+    fn grid_layout_fits_photo_shapes() {
+        let photo = |w: u32, h: u32, people: u32| BookPhoto {
+            width: w,
+            height: h,
+            people,
+            ..blank_photo()
+        };
+        let (land, tall) = (photo(4032, 3024, 0), photo(3024, 4032, 0));
+        let group = photo(4032, 3024, 6);
+        let fills_page = |cells: &[(f64, f64, f64, f64)]| {
+            for &(x, y, w, h) in cells {
+                assert!(x >= 0.0 && y >= 0.0 && x + w <= 12.0 + 1e-9 && y + h <= 12.0 + 1e-9);
+            }
+            // The lowest cell reaches the bottom margin: no empty band.
+            let bottom = cells.iter().map(|c| c.1 + c.3).fold(0.0, f64::max);
+            assert!((bottom - (12.0 - 0.12)).abs() < 1e-6, "bottom {bottom}");
+        };
+        // Four plain landscapes: the 2x2.
+        let cells = grid_layout(&[&land, &land, &land, &land], 12.0, 12.0, 0.12);
+        fills_page(&cells);
+        assert!(cells.iter().all(|c| (c.2 - cells[0].2).abs() < 1e-6));
+        // A group shot among them gets a full-width row: no faces cut off
+        // its sides.
+        let cells = grid_layout(&[&land, &group, &land, &land], 12.0, 12.0, 0.12);
+        fills_page(&cells);
+        assert!(cells[1].2 > 11.0, "group cell {:?}", cells[1]);
+        let (a, c) = (4.0 / 3.0, cells[1].2 / cells[1].3);
+        assert!(c >= a - 1e-6, "group photo keeps its full width");
+        // Two portraits sit side by side, not stacked into wide strips.
+        let cells = grid_layout(&[&tall, &tall], 12.0, 12.0, 0.12);
+        fills_page(&cells);
+        assert!((cells[0].1 - cells[1].1).abs() < 1e-6, "same row");
+        // Three photos fill the page too (the old 3-up left a third empty).
+        let cells = grid_layout(&[&land, &land, &land], 12.0, 12.0, 0.12);
+        fills_page(&cells);
     }
 
     #[test]
@@ -2293,6 +2708,36 @@ mod tests {
     }
 
     #[test]
+    fn posing_session_is_one_scene() {
+        // A bench session: frames 30 s apart, each like its neighbour
+        // (pHash 8 apart) though the ends no longer look alike (pHash 24).
+        // One copy carries people tags, the rest none. Then a new scene.
+        let frame = |i: usize, t: i64, phash: u64, sig: Option<u64>| BookPhoto {
+            taken_at: Some(t),
+            phash: Some(phash),
+            people_sig: sig,
+            ..scored(i, 0, 0.5, false)
+        };
+        let photos = vec![
+            frame(0, 0, 0, None),
+            frame(1, 30, 0xff, Some(5)),
+            frame(2, 60, 0xffff, None),
+            frame(3, 90, 0xff_ffff, None),
+            frame(4, 3600, 0, None),
+        ];
+        assert!(!photos[0].repeats(&photos[3]), "ends differ");
+        assert_eq!(scenes(&photos), [0, 0, 0, 0, 1]);
+        // Two picks: one from the session, one from the next scene.
+        let sel = select_for_cap(&photos, 2).0;
+        assert_eq!(sel.len(), 2);
+        assert!(sel.contains(&4), "{sel:?}");
+        // Two different tagged groups in one place stay separate scenes.
+        let other = frame(2, 60, 0xffff, Some(9));
+        let photos = [photos[1].clone(), other];
+        assert_eq!(scenes(&photos), [0, 1]);
+    }
+
+    #[test]
     fn cap_selection_skips_repeats_of_the_same_people() {
         // Eight shots an hour apart; 1 and 2 are one burst (same second)
         // across two stretches of the 4-of-8 pick.
@@ -2360,7 +2805,7 @@ mod tests {
 
     #[test]
     fn flow_spread_alignment_and_density() {
-        let flow = flow_pages(&[None; 12], Some(1), false, 60);
+        let flow = flow_pages(&[None; 12], &[], Some(1), false, 60);
         let kinds: Vec<PageKind> = flow.iter().map(|p| p.kind).collect();
         let spread_at = kinds
             .iter()
@@ -2375,7 +2820,7 @@ mod tests {
         // 12 photos one-per-page: 1 hero + 1 spread + 10 singles + closing = 14.
         assert_eq!(count_pages(&kinds), 14);
         // 30 photos still clear the 24-page minimum without padding.
-        let flow = flow_pages(&even_chapters(30, 2), None, false, 60);
+        let flow = flow_pages(&even_chapters(30, 2), &[], None, false, 60);
         let kinds: Vec<PageKind> = flow.iter().map(|p| p.kind).collect();
         let counted = count_pages(&kinds);
         assert!(
@@ -2398,7 +2843,7 @@ mod tests {
             ..blank_photo()
         };
         let titles = ["Tokyo".to_string(), "Kyoto".to_string()];
-        let mut seen = HashSet::new();
+        let mut seen = Announced::default();
         // Title follows the photo's chapter, not the divider's position.
         assert_eq!(
             divider_lines(&photo(Some(1), None), &titles, &mut seen),
@@ -2427,6 +2872,33 @@ mod tests {
         );
         // A photo outside every chapter gets no title.
         assert!(divider_lines(&photo(None, None), &titles, &mut seen).is_empty());
+    }
+
+    #[test]
+    fn each_day_gets_one_banner() {
+        let photo = |chapter: usize, day: u32| BookPhoto {
+            chapter: Some(chapter),
+            day: Some(day),
+            ..blank_photo()
+        };
+        let titles = [
+            "Day 3 — Tokyo".to_string(),
+            "Day 3 — Tokyo".to_string(),
+            "Day 4 — Tokyo".to_string(),
+        ];
+        let mut seen = Announced::default();
+        assert_eq!(
+            day_banner(&photo(0, 3), &titles, &mut seen).as_deref(),
+            Some("Day 3 — Tokyo")
+        );
+        // Same day, next page or a second chapter that day: no banner.
+        assert_eq!(day_banner(&photo(0, 3), &titles, &mut seen), None);
+        assert_eq!(day_banner(&photo(1, 3), &titles, &mut seen), None);
+        // A divider already named day 4: its pages get no banner.
+        assert!(divider_lines(&photo(2, 4), &titles, &mut seen)[0].contains("Day 4"));
+        assert_eq!(day_banner(&photo(2, 4), &titles, &mut seen), None);
+        // Unknown day: no banner.
+        assert_eq!(day_banner(&blank_photo(), &titles, &mut seen), None);
     }
 
     #[test]
@@ -2485,7 +2957,7 @@ mod tests {
 
     #[test]
     fn flow_packs_large_sets_into_grids() {
-        let flow = flow_pages(&[None; 200], None, false, 60);
+        let flow = flow_pages(&[None; 200], &[], None, false, 60);
         let kinds: Vec<PageKind> = flow.iter().map(|p| p.kind).collect();
         assert!(count_pages(&kinds) <= 60, "cap honored");
         assert!(kinds.contains(&PageKind::Grid));

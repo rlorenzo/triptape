@@ -113,7 +113,7 @@ const CHAPTER_TIME_EXPONENT: f64 = 0.75;
 /// over it, absorbing small errors in the timing model.
 pub const LENGTH_OVERSHOOT: f64 = 0.03;
 /// Two shots this close in time are one moment when they also look alike.
-const SAME_MOMENT_SECS: i64 = 120;
+pub const SAME_MOMENT_SECS: i64 = 120;
 /// Shots this close in time are one moment (a burst), looks aside.
 const SAME_MOMENT_BURST_SECS: i64 = 5;
 /// Looks-alike bound (pHash Hamming distance) for [`SAME_MOMENT_SECS`].
@@ -1363,10 +1363,7 @@ pub fn build_plan_with_length(
                 title: place.clone().unwrap_or_else(|| human_chapter_title(label)),
                 asset_ids: members.iter().map(|a| a.id.clone()).collect(),
                 place,
-                day_index: match (first_date, trip_start) {
-                    (Some(d), Some(s)) => Some(((d - s).get_days() + 1).max(1) as u32),
-                    _ => None,
-                },
+                day_index: first_date.zip(trip_start).map(|(d, s)| trip_day(d, s)),
                 date_label: first_date.map(|d| d.strftime(DAY_FORMAT).to_string()),
             }
         })
@@ -1760,6 +1757,12 @@ pub(crate) fn medoid(gps: &[(f64, f64)]) -> Option<(f64, f64)> {
         })
         .min_by(|a, b| a.0.total_cmp(&b.0))?;
     Some(medoid)
+}
+
+/// 1-based trip day of local date `d` when the trip starts on `start`
+/// (dates before the start count as day 1).
+pub fn trip_day(d: jiff::civil::Date, start: jiff::civil::Date) -> u32 {
+    ((d - start).get_days() + 1).max(1) as u32
 }
 
 /// Display title for a cluster label: `2026-10-12 · place 21` (or a bare
@@ -3177,13 +3180,24 @@ mod tests {
     }
 
     #[test]
+    fn trip_day_counts_from_one() {
+        let start = jiff::civil::date(2026, 10, 8);
+        assert_eq!(trip_day(start, start), 1);
+        assert_eq!(trip_day(jiff::civil::date(2026, 10, 11), start), 4);
+        // Before the start (clock skew): still day 1.
+        assert_eq!(trip_day(jiff::civil::date(2026, 10, 7), start), 1);
+    }
+
+    #[test]
     fn display_aspect_applies_rotation() {
         let mut a = asset("a", 0, AssetKind::Photo);
         assert_eq!(a.display_aspect(), None);
         a.width = Some(16350);
         a.height = Some(3686);
         assert!(is_panorama(a.display_aspect().unwrap()));
+        assert!(!a.rotation_swaps_axes());
         a.rotation_deg = 90;
+        assert!(a.rotation_swaps_axes());
         assert!(a.display_aspect().unwrap() < 0.5);
         assert!(is_panorama(a.display_aspect().unwrap()));
     }

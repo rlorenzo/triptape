@@ -14,6 +14,11 @@ use serde::Deserialize;
 /// A shot this close to a docked ship's terminal counts as on board.
 pub const DOCK_RADIUS_M: f64 = 1_500.0;
 
+/// On a port day, fixes this close to the port (and not at the dock) are
+/// ashore even when the coarse land grid calls them water: Jeju's seaside
+/// Seogwipo sits 3-14 km from the Gangjeong cruise terminal.
+pub const PORT_SHORE_RADIUS_M: f64 = 30_000.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LegMode {
@@ -286,7 +291,8 @@ impl Itinerary {
 
     /// The label for a shot taken on `day` at `gps` (`None`: no fix).
     ///
-    /// On a cruise day the shot is on board when it was taken at sea, within
+    /// On a cruise day the shot is on board when it was taken at sea (but
+    /// not within [`PORT_SHORE_RADIUS_M`] of the day's port), within
     /// [`DOCK_RADIUS_M`] of a dock, or has no GPS; otherwise it is ashore and
     /// takes the city of the stop the owner is at that day. Off the cruise
     /// the city of the active stop applies. Never a place-of-interest name.
@@ -311,14 +317,24 @@ impl Itinerary {
                 on_ship: false,
             });
         };
+        // Today's port call, if the ship is docked somewhere today.
+        let port = self
+            .stops
+            .iter()
+            .find(|s| s.kind == StopKind::Port && s.active_on(day));
         let on_board = match gps {
             None => true,
             Some(p) => {
-                land_fraction(p) < 0.5
-                    || self
-                        .docks()
-                        .iter()
-                        .any(|d| haversine_m(p, d.pos()) <= DOCK_RADIUS_M)
+                let at_dock = self
+                    .docks()
+                    .iter()
+                    .any(|d| haversine_m(p, d.pos()) <= DOCK_RADIUS_M);
+                // The land grid is ~5 km cells, so a seaside town reads as
+                // water. On a port day the ship is tied up at the dock, so
+                // a fix near the port but away from the dock is ashore.
+                let ashore_near_port =
+                    port.is_some_and(|s| haversine_m(p, s.pos()) <= PORT_SHORE_RADIUS_M);
+                at_dock || (land_fraction(p) < 0.5 && !ashore_near_port)
             }
         };
         if on_board {
@@ -371,8 +387,9 @@ pub fn asset_day(a: &Asset) -> Option<NaiveDate> {
     crate::metadata::local_date(a.taken_at?, a.tz_offset_secs)
 }
 
-/// Relabel a plan under the itinerary: each chapter takes the label of its
-/// first day and medoid fix (city, or the ship when on board), and the
+/// Relabel a plan under the itinerary: each chapter takes the label most
+/// of its GPS fixes get on its first day (city, or the ship when on
+/// board; see [`chapter_label`]), and the
 /// static route polyline follows the itinerary. Place names from the
 /// gazetteer (POIs, hamlets) are not used. Story-editor renames still win,
 /// because [`crate::plan::apply_edits`] runs after this.
@@ -385,6 +402,33 @@ pub fn apply_itinerary(plan: &Plan, assets: &[Asset], itin: &Itinerary) -> Plan 
     }
     out.map_polyline = itin.polyline();
     out
+}
+
+/// The label most of a chapter's GPS fixes get on `day` (ties: the label
+/// reached first in story order). One medoid fix is not enough on a port
+/// day: a few deck or tender shots near the dock could pull it on board
+/// and title a whole day ashore in Jeju with the ship's name. Shots
+/// without GPS cast no vote; a chapter with none takes the no-fix label.
+fn chapter_label(itin: &Itinerary, day: NaiveDate, members: &[&Asset]) -> Option<DayLabel> {
+    let mut votes: Vec<(DayLabel, usize)> = vec![];
+    for gps in members.iter().filter_map(|a| a.gps) {
+        let Some(label) = itin.label_for(day, Some(gps)) else {
+            continue;
+        };
+        match votes.iter_mut().find(|(l, _)| *l == label) {
+            Some((_, n)) => *n += 1,
+            None => votes.push((label, 1)),
+        }
+    }
+    if votes.is_empty() {
+        return itin.label_for(day, None);
+    }
+    // `max_by_key` keeps the last maximum; reversing keeps the first.
+    votes
+        .into_iter()
+        .rev()
+        .max_by_key(|(_, n)| *n)
+        .map(|(l, _)| l)
 }
 
 fn relabel_chapter(
@@ -400,9 +444,7 @@ fn relabel_chapter(
     let Some(day) = members.iter().filter_map(|a| asset_day(a)).min() else {
         return;
     };
-    let fixes: Vec<(f64, f64)> = members.iter().filter_map(|a| a.gps).collect();
-    let gps = crate::plan::medoid(&fixes);
-    match itin.label_for(day, gps) {
+    match chapter_label(itin, day, &members) {
         Some(l) => {
             ch.title.clone_from(&l.place);
             ch.place = Some(l.place);
@@ -601,5 +643,43 @@ mod tests {
         assert_eq!(places, ["Tokyo", "Carnival Luminosa", "Osaka"]);
         assert_eq!(out.chapters[1].title, "Carnival Luminosa");
         assert_eq!(out.map_polyline.len(), 7);
+    }
+
+    #[test]
+    fn port_day_ashore_majority_beats_dock_shots() {
+        // Osaka port day: two shots at the dock (on board by the dock rule)
+        // and three ashore in the city. The medoid could sit at the dock;
+        // the day was spent in Osaka.
+        let dock = (34.656, 135.4306);
+        let city = [
+            (34.6687, 135.4986),
+            (34.6690, 135.5010),
+            (34.6650, 135.5020),
+        ];
+        let members: Vec<Asset> = [dock, dock]
+            .iter()
+            .chain(city.iter())
+            .enumerate()
+            .map(|(i, &g)| photo(&format!("p{i}"), "2026-10-11", Some(g)))
+            .collect();
+        let refs: Vec<&Asset> = members.iter().collect();
+        let label = chapter_label(&itin(), day("2026-10-11"), &refs).unwrap();
+        assert_eq!(label.place, "Osaka");
+        // Mostly on board: the ship.
+        let refs: Vec<&Asset> = vec![&members[0], &members[1], &members[2]];
+        let label = chapter_label(&itin(), day("2026-10-11"), &refs).unwrap();
+        assert_eq!(label.place, "Carnival Luminosa");
+        // Seaside fixes the coarse land grid reads as water stay ashore on
+        // a port day; the same water fix on a sea day is on board.
+        let seaside = (34.58, 135.33);
+        assert!(land_fraction(seaside) < 0.5, "fixture must read as water");
+        let ashore = itin().label_for(day("2026-10-11"), Some(seaside)).unwrap();
+        assert_eq!(ashore.place, "Osaka");
+        let at_sea = itin().label_for(day("2026-10-10"), Some(seaside)).unwrap();
+        assert_eq!(at_sea.place, "Carnival Luminosa");
+        // No GPS anywhere: the no-fix rule (on board on a cruise day).
+        let blind = photo("x", "2026-10-11", None);
+        let label = chapter_label(&itin(), day("2026-10-11"), &[&blind]).unwrap();
+        assert_eq!(label.place, "Carnival Luminosa");
     }
 }
