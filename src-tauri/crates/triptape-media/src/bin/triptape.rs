@@ -395,6 +395,9 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     for c in &mut clusters {
         c.id = format!("{}_{}", project.id, c.id);
     }
+    // The same file in the library twice: its copies share their caption,
+    // people tags and score, so the one kept below carries all of them.
+    cluster::share_identical_metadata(&mut final_assets, &mut scores);
     let groups = cluster::collapse_near_dupes(&final_assets, &scores);
     let best: HashSet<String> = groups.iter().map(|g| g.best_id.clone()).collect();
     // Non-best near-dupe members stay in the DB but are kept out of the plan.

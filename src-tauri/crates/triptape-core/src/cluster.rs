@@ -288,11 +288,12 @@ fn looks_alike(a: &Asset, b: &Asset) -> bool {
 /// retake by embedding, captured within [`DUPE_WINDOW_SECS`] and, when
 /// both have GPS, [`DUPE_RADIUS_METERS`]) with union-find; groups merge
 /// only when every cross pair is the same moment, so a whole group stays
-/// within the window and radius. The best
-/// shot is the highest `total` score (ties → first in story order).
-/// Videos never collapse: their pHash is only the poster frame, so two
-/// clips (or a clip and a photo) opening on the same view can still hold
-/// different footage.
+/// within the window and radius. The best shot is the highest `total`
+/// score (ties → first in story order). Byte-identical files (same
+/// content hash) always collapse, clips included. Otherwise videos never
+/// collapse: their pHash is only the poster frame, so two clips (or a
+/// clip and a photo) opening on the same view can still hold different
+/// footage.
 pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) -> Vec<DupeGroup> {
     let n = assets.len();
     let mut parent: Vec<usize> = (0..n).collect();
@@ -303,8 +304,23 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
         }
         x
     }
+    /// Join root `from` into root `into`, moving its member list along.
+    fn union(p: &mut [usize], members: &mut [Vec<usize>], into: usize, from: usize) {
+        p[from] = into;
+        let moved = std::mem::take(&mut members[from]);
+        members[into].extend(moved);
+    }
     let alike = |x: usize, y: usize| looks_alike(&assets[x], &assets[y]);
     let mut members: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
+    // Byte-identical files are one item whatever their kind: the same
+    // photo or clip added to the library twice. They join first, with no
+    // look or moment test, so a clip's twin is collapsed too.
+    for twins in identical_files(assets) {
+        let root = twins[0];
+        for &t in &twins[1..] {
+            union(&mut parent, &mut members, root, t);
+        }
+    }
     for i in 0..n {
         for j in (i + 1)..n {
             // The cheap time/place test gates the (embedding) look test;
@@ -323,9 +339,7 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
                         .all(|&y| same_moment(&assets[x], &assets[y]) && alike(x, y))
                 })
             {
-                parent[rj] = ri;
-                let moved = std::mem::take(&mut members[rj]);
-                members[ri].extend(moved);
+                union(&mut parent, &mut members, ri, rj);
             }
         }
     }
@@ -350,6 +364,59 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
         .collect();
     out.sort_by(|a, b| a.best_id.cmp(&b.best_id));
     out
+}
+
+/// Indices of assets that share a content hash, one list per file that
+/// appears more than once, in input order. Unhashed assets are never twins.
+fn identical_files(assets: &[Asset]) -> Vec<Vec<usize>> {
+    let mut by_hash: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, a) in assets.iter().enumerate() {
+        if let Some(h) = a.content_hash.as_deref() {
+            by_hash.entry(h).or_default().push(i);
+        }
+    }
+    let mut twins: Vec<Vec<usize>> = by_hash.into_values().filter(|v| v.len() > 1).collect();
+    twins.sort();
+    twins
+}
+
+/// Make byte-identical copies of a file agree before they are collapsed.
+///
+/// A photo library can hold the same file twice with the caption on one
+/// copy and the people tags on the other (or on neither). Every copy gets
+/// the group's caption, its fullest people tags (count and signature kept
+/// together) and its best library score, and every copy's story score
+/// becomes the best one any copy earned. So whichever copy
+/// [`collapse_near_dupes`] keeps carries everything the owner entered.
+/// Each copy's own file facts (path, dates, size) are left alone.
+pub fn share_identical_metadata(assets: &mut [Asset], scores: &mut HashMap<String, Score>) {
+    for twins in identical_files(assets) {
+        let caption = twins.iter().find_map(|&i| assets[i].user_caption.clone());
+        let people = twins
+            .iter()
+            .map(|&i| (assets[i].people_count, assets[i].people_sig))
+            .max_by_key(|(count, _)| count.unwrap_or(0));
+        let library = twins
+            .iter()
+            .filter_map(|&i| assets[i].library_score)
+            .max_by(f32::total_cmp);
+        let best_score = twins
+            .iter()
+            .filter_map(|&i| scores.get(&assets[i].id))
+            .max_by(|a, b| a.total.total_cmp(&b.total))
+            .cloned();
+        for &i in &twins {
+            let a = &mut assets[i];
+            a.user_caption = caption.clone();
+            if let Some((count, sig)) = people {
+                (a.people_count, a.people_sig) = (count, sig);
+            }
+            a.library_score = library;
+            if let Some(s) = &best_score {
+                scores.insert(a.id.clone(), s.clone());
+            }
+        }
+    }
 }
 
 /// Asset id -> its cluster's label: the chapter map plans are built from.
@@ -453,6 +520,82 @@ mod tests {
             .find(|x| x.members.contains(&"a".to_string()))
             .unwrap();
         assert_eq!(ab.best_id, "b");
+    }
+
+    #[test]
+    fn identical_files_collapse_whatever_their_kind() {
+        // The same clip in the library twice, and a different clip that
+        // opens on the same frame at the same time.
+        let mut clip = asset("clip", Some(1000), None, Some(7));
+        clip.kind = AssetKind::Video;
+        clip.content_hash = Some("h-clip".into());
+        let mut twin = clip.clone();
+        twin.id = "clip-twin".into();
+        let mut other = clip.clone();
+        other.id = "other".into();
+        other.content_hash = Some("h-other".into());
+        // Identical photos collapse even with no pHash and no capture time.
+        let mut photo = asset("photo", None, None, None);
+        photo.content_hash = Some("h-photo".into());
+        let mut photo_twin = photo.clone();
+        photo_twin.id = "photo-twin".into();
+        // Unhashed files are never twins of each other.
+        let bare_a = asset("bare-a", None, None, None);
+        let bare_b = asset("bare-b", None, None, None);
+        let assets = [clip, twin, other, photo, photo_twin, bare_a, bare_b];
+        let groups = collapse_near_dupes(&assets, &HashMap::new());
+        let mut sizes: Vec<usize> = groups.iter().map(|g| g.members.len()).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, [1, 1, 1, 2, 2]);
+        let suppressed = suppressed_ids(&groups);
+        assert_eq!(suppressed.len(), 2);
+        assert!(suppressed.contains("clip-twin") && suppressed.contains("photo-twin"));
+    }
+
+    #[test]
+    fn identical_copies_share_what_the_owner_entered() {
+        let score = |total: f32| Score {
+            total,
+            ..Default::default()
+        };
+        // The caption is on one copy, the people tags on the other.
+        let mut a = asset("a", Some(1000), None, Some(1));
+        a.content_hash = Some("h".into());
+        a.user_caption = Some("Egg tarts".into());
+        let mut b = a.clone();
+        b.id = "b".into();
+        b.user_caption = None;
+        (b.people_count, b.people_sig) = (Some(2), Some(42));
+        b.library_score = Some(0.7);
+        // A different file keeps its own (empty) metadata.
+        let mut c = asset("c", Some(90_000), None, Some(u64::MAX));
+        c.content_hash = Some("other".into());
+        let mut assets = [a, b, c];
+        let mut scores = HashMap::from([
+            ("a".to_string(), score(0.6)),
+            ("b".to_string(), score(0.8)),
+            ("c".to_string(), score(0.9)),
+        ]);
+        share_identical_metadata(&mut assets, &mut scores);
+        for twin in &assets[..2] {
+            assert_eq!(
+                twin.user_caption.as_deref(),
+                Some("Egg tarts"),
+                "{}",
+                twin.id
+            );
+            assert_eq!((twin.people_count, twin.people_sig), (Some(2), Some(42)));
+            assert_eq!(twin.library_score, Some(0.7));
+            assert_eq!(scores[&twin.id].total, 0.8, "the best copy's score");
+        }
+        assert_eq!(assets[2].user_caption, None);
+        assert_eq!(assets[2].people_count, None);
+        assert_eq!(scores["c"].total, 0.9);
+        // Whichever copy the collapse keeps now carries the caption.
+        let groups = collapse_near_dupes(&assets, &scores);
+        let kept = groups.iter().find(|g| g.members.len() == 2).unwrap();
+        let kept = assets.iter().find(|x| x.id == kept.best_id).unwrap();
+        assert!(kept.user_caption.is_some() && kept.people_sig.is_some());
     }
 
     #[test]
