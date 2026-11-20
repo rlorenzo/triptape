@@ -50,6 +50,20 @@ export { isTauri };
 
 // --- Demo state (browser fallback) -----------------------------------------
 
+/**
+ * Browser preview only: `?demo=<name>` (repeatable) switches on a scenario
+ * so states the default demo trip never reaches can be shown: `thin` (too few
+ * photos for a book), `soft` (book pages with soft photos), `missing`
+ * (originals moved or changed before a run).
+ */
+function demoScenario(name: string): boolean {
+  try {
+    return new URLSearchParams(window.location.search).getAll("demo").includes(name);
+  } catch {
+    return false;
+  }
+}
+
 const demoPlaces = ["Kyoto, Japan", "Osaka, Japan", undefined];
 
 // Deterministic demo scores so the browser preview demonstrates the Best
@@ -181,6 +195,30 @@ export async function dismissInterruptedExport(projectId: string): Promise<void>
 
 export type ExportCmd = "export_video" | "export_reels" | "export_book" | "export_all";
 
+export interface KeepsakeEligibility {
+  enabled: boolean;
+  /** Why it can't be made, or why the film will be the short version. */
+  reason: string;
+}
+
+export interface Eligibility {
+  video: KeepsakeEligibility;
+  reels: KeepsakeEligibility;
+  book: KeepsakeEligibility;
+}
+
+/** Which keepsakes this trip can make, decided from its plan before any run. */
+export async function getExportEligibility(projectId: string): Promise<Eligibility> {
+  if (isTauri()) return invoke("get_export_eligibility", { projectId });
+  const ok = { enabled: true, reason: "" };
+  return {
+    video: ok,
+    reels: ok,
+    // The backend's reason, word for word.
+    book: demoScenario("thin") ? { enabled: false, reason: "Add more photos for a printable book (24-page vendor minimum)" } : ok
+  };
+}
+
 export interface ExportChoices {
   /** Caps the book's pages (book and all only). */
   bookPages?: number;
@@ -206,10 +244,13 @@ export async function exportKeepsake(cmd: ExportCmd, projectId: string, choices:
   return {
     jobId: "demo_job",
     outDir: `${destination ?? DEMO_DEFAULT_FOLDER}/Demo Trip (demo_prj)`,
-    video: cmd === "export_video" || cmd === "export_all" ? "hero.mp4" : undefined,
+    video: withFilm ? "hero.mp4" : undefined,
     reels: cmd === "export_reels" || cmd === "export_all" ? ["reel-01.mp4", "reel-02.mp4"] : [],
-    bookPages: cmd === "export_book" || cmd === "export_all" ? 24 : 0,
-    skipped: []
+    bookPages: withBook && !demoScenario("thin") ? 24 : 0,
+    skipped:
+      cmd === "export_all" && demoScenario("thin")
+        ? [{ keepsake: "book", reason: "Add more photos for a printable book (24-page vendor minimum)" }]
+        : []
   };
 }
 

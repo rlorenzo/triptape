@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 
 use tauri::{Emitter, Manager, State};
 use triptape_app::{
-    apply_live_photo_pairing, export_dir_in, fill_assets_parallel, finished_film, paginate,
-    resolve_export_parent, valid_job_kind, AppState, AssetView, ExportSummary, JobView,
-    ScanSummary, StoryData, StoryEntryView, StoryView,
+    apply_live_photo_pairing, export_dir_in, export_eligibility, fill_assets_parallel,
+    finished_film, paginate, resolve_export_parent, valid_job_kind, AppState, AssetView,
+    EligibilityView, ExportSummary, JobView, ScanSummary, StoryData, StoryEntryView, StoryView,
 };
 use triptape_core::{
     cluster,
@@ -1399,6 +1399,17 @@ async fn get_thumbnail(
     .map_err(|e| e.to_string())
 }
 
+/// Which keepsakes this trip can make, with the reason for any that can't,
+/// so the Export screen disables them before a run instead of after.
+#[tauri::command]
+async fn get_export_eligibility(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<EligibilityView, String> {
+    let (plan, assets, _) = load_plan_assets(&state, &project_id)?;
+    Ok(export_eligibility(&plan, &assets))
+}
+
 /// The folder exports go into: `folder` checked as the owner's pick, or the
 /// default folder when `None`. The Export screen shows the result and
 /// rejects an unusable pick before any export starts.
@@ -1547,6 +1558,7 @@ fn main() {
             export_book,
             export_all,
             check_export_folder,
+            get_export_eligibility,
             open_film,
             get_story,
             get_alternatives,

@@ -22,28 +22,81 @@
     cancelJob,
     checkExportFolder,
     dismissInterruptedExport,
+    getExportEligibility,
     getInterruptedExport,
     pickFolder,
     playFilm,
     revealExport,
     REELS_DISCLOSURE,
+    type Eligibility,
     type ExportCmd
   } from "./lib/tauri";
 
-  const KEEPSAKES: { cmd: Exclude<ExportCmd, "export_all">; label: string; blurb: string; button: string; note?: string }[] = [
-    { cmd: "export_video", label: "Trip Video", blurb: "A 1080p film of the trip, up to about 5 minutes.", button: "Make only the film" },
+  type Keepsake = {
+    cmd: Exclude<ExportCmd, "export_all">;
+    key: keyof Eligibility;
+    label: string;
+    /** Its name inside a sentence: "Make the film and the reels". */
+    short: string;
+    blurb: string;
+    button: string;
+    note?: string;
+  };
+
+  const KEEPSAKES: Keepsake[] = [
+    {
+      cmd: "export_video",
+      key: "video",
+      label: "Trip Video",
+      short: "film",
+      blurb: "A 1080p film of the trip, up to about 5 minutes.",
+      button: "Make only the film"
+    },
     {
       cmd: "export_reels",
+      key: "reels",
       label: "Reels Pack",
+      short: "reels",
       blurb: "3–5 vertical clips, ready to post.",
       button: "Make only the reels",
       note: REELS_DISCLOSURE
     },
-    { cmd: "export_book", label: "Photo Book", blurb: "A print-ready PDF proof and a JPEG of every page.", button: "Make only the book" }
+    {
+      cmd: "export_book",
+      key: "book",
+      label: "Photo Book",
+      short: "book",
+      blurb: "A print-ready PDF proof and a JPEG of every page.",
+      button: "Make only the book"
+    }
   ];
 
+  // What the trip can make, from its plan. Unknown (still loading, or no
+  // answer) leaves every card on: the run itself still skips with a reason.
+  let eligibility: Eligibility | null = null;
+  function loadEligibility(projectId: string | undefined) {
+    eligibility = null;
+    if (!projectId) return;
+    getExportEligibility(projectId)
+      .then((e) => {
+        if ($project?.projectId === projectId) eligibility = e;
+      })
+      .catch(() => {
+        // Only a preview of the run: without it, the cards stay on.
+      });
+  }
+  $: loadEligibility($project?.projectId);
+
+  const canMake = (k: Keepsake, e: Eligibility | null) => e?.[k.key].enabled ?? true;
+  $: makeable = KEEPSAKES.filter((k) => canMake(k, eligibility));
+  $: cantMake = KEEPSAKES.filter((k) => !canMake(k, eligibility));
+  // "Make all three" names what it will really make when some can't be.
+  $: someSkipped = cantMake.length > 0 && makeable.length > 0;
+  $: makeableNames = makeable.map((k) => k.short).join(" and the ");
+  $: allLabel = someSkipped ? `The ${makeableNames}` : "All three keepsakes";
+
   function labelFor(cmd: ExportCmd): string {
-    if (cmd === "export_all") return "All three keepsakes";
+    if (cmd === "export_all") return allLabel;
     return KEEPSAKES.find((k) => k.cmd === cmd)?.label ?? "Keepsake";
   }
 
@@ -158,13 +211,18 @@
 
 {#snippet rows()}
   {#each KEEPSAKES as k}
-    <div class="row">
+    {@const can = canMake(k, eligibility)}
+    {@const why = eligibility?.[k.key].reason ?? ""}
+    <div class="row" class:off={!can}>
       <div>
         <h2>{k.label}</h2>
         <p>{k.blurb}</p>
-        {#if k.note && !summary?.reels.length}<p class="note">{k.note}</p>{/if}
+        {#if why}<p class="why" id="why-{k.key}">{can ? `${why}.` : `Can't be made yet. ${why}.`}</p>{/if}
+        {#if can && k.note && !summary?.reels.length}<p class="note">{k.note}</p>{/if}
       </div>
-      <button class="btn" disabled={blocked} on:click={() => start(k.cmd)}>{k.button}</button>
+      <button class="btn" disabled={blocked || !can} aria-describedby={why ? `why-${k.key}` : undefined} on:click={() => start(k.cmd)}>
+        {k.button}
+      </button>
     </div>
   {/each}
 {/snippet}
@@ -174,11 +232,23 @@
     <div>
       <h1 class="headline" tabindex="-1">{madeSomething ? "Your trip is back" : "Make your keepsakes"}</h1>
       {#if !madeSomething && $project}
-        <p class="lede">One pass makes the film, the reels and the book from your story. It can take a while, and you can keep using the app.</p>
+        {#if makeable.length === 0}
+          <p class="lede">This trip doesn't have enough usable photos for a keepsake yet. Add more to the folder and rescan it from the Library.</p>
+        {:else}
+          <p class="lede">One pass makes the film, the reels and the book from your story. It can take a while, and you can keep using the app.</p>
+          {#if cantMake.length > 0}
+            <p class="lede skip-note">
+              {cantMake.map((k) => `The ${k.label}`).join(" and the ")} can't be made yet, so {cantMake.length === 1 ? "it" : "they"} will be
+              skipped.
+            </p>
+          {/if}
+        {/if}
       {/if}
     </div>
     {#if $project && !madeSomething}
-      <button class="btn btn-primary" disabled={blocked} on:click={() => start("export_all")}>Make all three</button>
+      <button class="btn btn-primary" disabled={blocked || makeable.length === 0} on:click={() => start("export_all")}>
+        {someSkipped ? `Make the ${makeableNames}` : "Make all three"}
+      </button>
     {/if}
   </div>
 
@@ -324,7 +394,9 @@
       {#if madeSomething}
         <div class="again">
           <h2>Changed the story? Make them again.</h2>
-          <button class="btn" disabled={blocked} on:click={() => start("export_all")}>Make all three again</button>
+          <button class="btn" disabled={blocked || makeable.length === 0} on:click={() => start("export_all")}>
+            {cantMake.length === 0 ? "Make all three again" : "Make them again"}
+          </button>
         </div>
         <details>
           <summary>Make only one</summary>
@@ -553,6 +625,21 @@
     color: var(--ink);
     font-weight: 500;
     cursor: pointer;
+  }
+
+  .row.off h2,
+  .row.off > div > p:not(.why) {
+    color: var(--ink-3);
+  }
+
+  .row .why {
+    margin-top: 4px;
+    color: var(--ink);
+    font-size: 13px;
+  }
+
+  .skip-note {
+    color: var(--ink);
   }
 
   .row .note {

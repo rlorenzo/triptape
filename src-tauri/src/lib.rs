@@ -22,7 +22,7 @@ use triptape_core::db::{Db, EditedPlan};
 use triptape_core::metadata;
 use triptape_core::osxphotos::OsxPhotosIndex;
 use triptape_core::scan::{ScannedFile, VIDEO_EXTS};
-use triptape_core::types::{Asset, AssetKind, Chapter, PlanEntry};
+use triptape_core::types::{distinct_assets, Asset, AssetKind, Chapter, Plan, PlanEntry};
 use triptape_media::export::Skipped;
 
 // ---------------------------------------------------------------------------
@@ -327,6 +327,43 @@ pub struct ExportSummary {
     pub reels: Vec<String>,
     pub book_pages: usize,
     pub skipped: Vec<Skipped>,
+}
+
+/// Whether one keepsake can be made from the trip, before any run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeepsakeEligibility {
+    pub enabled: bool,
+    /// Why it can't be made; for a film that will be the short version, why
+    /// it is short. Empty when there is nothing to say.
+    pub reason: String,
+}
+
+/// What the Export screen may offer, keepsake by keepsake (PLAN.md Sec 5.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EligibilityView {
+    pub video: KeepsakeEligibility,
+    pub reels: KeepsakeEligibility,
+    pub book: KeepsakeEligibility,
+}
+
+/// The plan's eligibility, counted exactly as `export::export_all` counts it
+/// (distinct film assets, every non-video asset, one moment per chapter), so
+/// the screen disables exactly what a run would skip, with the same reasons.
+pub fn export_eligibility(plan: &Plan, assets: &[Asset]) -> EligibilityView {
+    let usable = distinct_assets(&plan.hero);
+    let photos = assets.iter().filter(|a| a.kind != AssetKind::Video).count();
+    let e = triptape_core::plan::plan_eligibility(usable, photos, plan.chapters.len());
+    let card = |enabled: bool, reason: String, say_why: bool| KeepsakeEligibility {
+        enabled,
+        reason: if say_why { reason } else { String::new() },
+    };
+    EligibilityView {
+        video: card(e.video != "disabled", e.video_reason, e.video != "full"),
+        reels: card(e.reels > 0, e.reels_reason, e.reels == 0),
+        book: card(e.book_enabled, e.book_reason, !e.book_enabled),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -943,6 +980,64 @@ mod tests {
         std::fs::write(&other, b"x").unwrap();
         assert!(finished_film(other.to_str().unwrap()).is_err());
         assert!(finished_film("hero.mp4").is_err());
+    }
+
+    fn photos(n: usize) -> Vec<Asset> {
+        (0..n)
+            .map(|i| {
+                let mut a = Asset::new(
+                    format!("p{i:03}"),
+                    PathBuf::from(format!("/t/p{i:03}.jpg")),
+                    AssetKind::Photo,
+                );
+                // One photo an hour over a few days, so chapters form.
+                a.taken_at = Some(1_714_557_600 + i as i64 * 3_600);
+                a
+            })
+            .collect()
+    }
+
+    fn plan_for(assets: &[Asset]) -> Plan {
+        let cluster_of = assets
+            .iter()
+            .map(|a| (a.id.clone(), format!("day{}", a.taken_at.unwrap() / 86_400)))
+            .collect();
+        build_plan(assets, &cluster_of, &HashMap::new())
+    }
+
+    #[test]
+    fn eligibility_disables_the_book_with_its_reason_on_a_thin_trip() {
+        let assets = photos(12);
+        let e = export_eligibility(&plan_for(&assets), &assets);
+        assert!(!e.book.enabled);
+        assert_eq!(
+            e.book.reason,
+            triptape_core::plan::plan_eligibility(0, 12, 0).book_reason
+        );
+        // A short film is still a film; the reason says why it is short.
+        assert!(e.video.enabled);
+        assert!(e.video.reason.contains("short"));
+        assert!(e.reels.enabled);
+        assert!(e.reels.reason.is_empty());
+    }
+
+    #[test]
+    fn eligibility_disables_everything_on_an_empty_plan() {
+        let e = export_eligibility(&plan_for(&[]), &[]);
+        assert!(!e.video.enabled && !e.reels.enabled && !e.book.enabled);
+        for card in [&e.video, &e.reels, &e.book] {
+            assert!(!card.reason.is_empty());
+        }
+        let json = serde_json::to_value(&e).unwrap();
+        assert_eq!(json["book"]["enabled"], false);
+    }
+
+    #[test]
+    fn eligibility_enables_the_book_for_enough_photos() {
+        let assets = photos(40);
+        let e = export_eligibility(&plan_for(&assets), &assets);
+        assert!(e.book.enabled);
+        assert!(e.book.reason.is_empty());
     }
 
     #[test]
