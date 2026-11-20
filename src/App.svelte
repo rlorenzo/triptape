@@ -17,7 +17,7 @@
     { id: "library", label: "Library" },
     { id: "story", label: "Story" },
     { id: "export", label: "Export" },
-    { id: "settings", label: "About" }
+    { id: "settings", label: "Settings" }
   ] as const;
 
   // Global ingest indicator: App is always mounted, so one subscription

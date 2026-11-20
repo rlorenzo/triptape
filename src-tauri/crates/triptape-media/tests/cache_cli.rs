@@ -3,7 +3,12 @@
 use std::process::Command;
 
 fn triptape(args: &[&str]) -> (bool, String) {
+    // Never the app's saved settings: they would set the cache limit.
     let out = Command::new(env!("CARGO_BIN_EXE_triptape"))
+        .env(
+            "TRIPTAPE_SETTINGS",
+            std::env::temp_dir().join("triptape-tests-no-settings.json"),
+        )
         .args(args)
         .output()
         .expect("run triptape");

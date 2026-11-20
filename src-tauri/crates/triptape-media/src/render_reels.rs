@@ -353,7 +353,7 @@ pub fn render_reels(
         // Cover frame ~1 s in (no earlier than 0.2 s for very short reels).
         let cover = out.with_extension("jpg");
         let at = probed.duration_secs.clamp(0.2, 1.0);
-        let cover_args: Vec<String> = vec![
+        let mut cover_args: Vec<String> = vec![
             "-y".into(),
             "-ss".into(),
             format!("{at:.2}"),
@@ -363,8 +363,9 @@ pub fn render_reels(
             "1".into(),
             "-q:v".into(),
             "3".into(),
-            s(&cover),
         ];
+        cover_args.extend(triptape_core::privacy::exif_strip_args());
+        cover_args.push(s(&cover));
         caps.run(&cover_args, &cover)?;
         if let Some(c) = &r.caption {
             if !c.trim().is_empty() {
@@ -461,6 +462,8 @@ fn vertical_vf(caps: &Capabilities, src_w: u32, src_h: u32) -> String {
 
 fn quality_tail(out: &Path) -> Vec<String> {
     let mut args = ffmpeg::x264_aac("veryfast", 20);
+    // Every reel encode ends here: no source tags in a reel (Sec 14).
+    args.extend(triptape_core::privacy::exif_strip_args());
     args.extend(["-r".into(), "30".into(), "-shortest".into(), s(out)]);
     args
 }

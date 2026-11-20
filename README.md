@@ -138,8 +138,24 @@ which ships inside the app with the GPL text.
 
 Local first. TripTape makes no network calls in its media pipeline and never
 uploads your photos. Face detection and cloud polish are planned but have not
-shipped, and exports do not strip EXIF yet. See `PLAN.md` Section 23 for the
-current state of each privacy control.
+shipped. See `PLAN.md` Section 23 for the current state of each privacy control.
+
+- Every export is stripped, always (no toggle): the film, reels and reel
+  covers carry no tags from your files (no GPS, make/model/lens, serials,
+  capture times or Live Photo `ContentIdentifier`), and book pages, the
+  cover and the PDFs are re-encoded with no EXIF. Rotation is applied to
+  the pixels, so films play upright. `export.json`, `hero.edl.json` and
+  `GUIDE.txt` hold no coordinates or people's names.
+- Hide home on maps: set home in Settings (latitude/longitude, or where the
+  trip starts or ends; no geocoding). Route points within 500 m of home are
+  moved out to 500 m on the film's map and the book's map page. The CLI
+  uses `--home LAT,LON`, else the home saved in the app.
+- A rolling local log (5 files of 4 MB, 7 days) is redacted as it is
+  written: your home folder becomes `~`, other folder and file names become
+  salted short hashes, coordinates become `<gps>`, and the trip name,
+  captions and place names become `<text>`. Settings > Copy diagnostic
+  report puts app, system, tool, cache and recent log facts on the
+  clipboard (or saves a file when there is no clipboard). Nothing is sent.
 
 ## Clean-machine notes
 
@@ -150,8 +166,11 @@ current state of each privacy control.
 - Tool lookup: `TRIPTAPE_FFMPEG`/`TRIPTAPE_FFPROBE`/`TRIPTAPE_TYPST` (or the
   CLI's `--ffmpeg`/`--ffprobe`/`--typst`), then the bundled sidecar next to
   the executable, then `PATH` (dev only, noted).
-- Thumbnails cache in the OS cache dir with no size cap yet. Exports render
-  in `.work` inside the export folder, which is removed when the export ends.
+- Thumbnails and film pieces cache in the OS cache dir. Settings shows both
+  sizes, clears each after a confirmation (only inside the app's cache
+  folder), and sets the film-piece limit (CLI: `--segment-cache-max`, else
+  the app's limit). Thumbnails have no cap. Exports render in `.work`
+  inside the export folder, which is removed when the export ends.
 
 ## Known blockers (Sprint 0)
 

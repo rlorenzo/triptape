@@ -28,6 +28,9 @@ use triptape_core::types::{distinct_assets, Asset, AssetKind, Chapter, Plan, Pla
 use triptape_media::export::Skipped;
 use triptape_media::render_book::{BookPreset, MAX_BOOK_PAGES};
 
+// Settings screen backend (R4): home on maps, caches, licences, the log.
+pub mod settings;
+
 // ---------------------------------------------------------------------------
 // Media tools
 // ---------------------------------------------------------------------------

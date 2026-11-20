@@ -13,6 +13,10 @@
 //! triptape pick --db trip.db --out /path/to/new-folder [--count 800] [--project ID] [--stills-only]
 //! ```
 //!
+//! Without `--home` or `--segment-cache-max`, `plan`, `export` and `cache`
+//! use the home and limit saved in the app's Settings (`TRIPTAPE_SETTINGS`
+//! names another settings file).
+//!
 //! `scan` and `export` take `--ffmpeg`, `--ffprobe` (and `export` `--typst`)
 //! paths; without them each tool comes from `TRIPTAPE_FFMPEG` and friends,
 //! then the bundled sidecar beside this binary, then `PATH` (with a note).
@@ -30,6 +34,7 @@ use triptape_core::{
     pick, plan as planmod, privacy,
     process::{resolve_tool, Tool},
     proxies, scan, score,
+    settings::Settings,
     types::*,
 };
 use triptape_media::{
@@ -595,10 +600,7 @@ fn plan_cmd(flags: &HashMap<String, String>) {
         .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"))
         .edited;
     // Exported plans fuzz route points near home (PLAN.md Sec 14 privacy).
-    if let Some(h) = flags.get("home") {
-        let home = parse_lat_lon(h).unwrap_or_else(|| die("--home", "want LAT,LON"));
-        p.map_polyline = privacy::fuzz_home_route(&p.map_polyline, home);
-    }
+    hide_home(flags, &mut p.map_polyline);
     let json = p.to_json().unwrap_or_else(|e| die("plan json", e));
     std::fs::write(&out, &json).unwrap_or_else(|e| die(&format!("write {}", out.display()), e));
     println!(
@@ -607,6 +609,29 @@ fn plan_cmd(flags: &HashMap<String, String>) {
         p.hero.len(),
         p.reel_selects.len()
     );
+}
+
+/// The app's saved settings (home on maps, segment cache limit), which
+/// apply when the matching flag is not given. `TRIPTAPE_SETTINGS` points
+/// elsewhere; a missing file means the defaults. Read once per run.
+fn saved_settings() -> &'static Settings {
+    static SAVED: std::sync::OnceLock<Settings> = std::sync::OnceLock::new();
+    SAVED.get_or_init(|| {
+        Settings::default_path()
+            .map(|p| Settings::load(&p))
+            .unwrap_or_default()
+    })
+}
+
+/// Fuzz `route` near home: `--home LAT,LON`, else the home saved in the
+/// app's Settings while "Hide home on maps" is on.
+fn hide_home(flags: &HashMap<String, String>, route: &mut Vec<(f64, f64)>) {
+    if let Some(h) = flags.get("home") {
+        let home = parse_lat_lon(h).unwrap_or_else(|| die("--home", "want LAT,LON"));
+        *route = privacy::fuzz_home_route(route, home);
+    } else if saved_settings().hide_home_on(route) {
+        eprintln!("note: home hidden on maps (from the app's settings)");
+    }
 }
 
 /// Parse `"lat,lon"` into a coordinate pair.
@@ -655,10 +680,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
         .unwrap_or_else(|e| die("plan", e))
         .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
     // Rendered maps get the same home fuzzing as `plan` JSON (Sec 14).
-    if let Some(h) = flags.get("home") {
-        let home = parse_lat_lon(h).unwrap_or_else(|| die("--home", "want LAT,LON"));
-        plan.map_polyline = privacy::fuzz_home_route(&plan.map_polyline, home);
-    }
+    hide_home(flags, &mut plan.map_polyline);
     let trip_name = db
         .get_project(&project_id)
         .unwrap_or_else(|e| die("project", e))
@@ -804,11 +826,12 @@ fn cache_dir_flag(flags: &HashMap<String, String>) -> Option<PathBuf> {
         .or_else(segment_cache::default_dir)
 }
 
-/// `--segment-cache-max SIZE`, when given.
+/// `--segment-cache-max SIZE`, else the limit saved in the app's Settings.
 fn cache_max_flag(flags: &HashMap<String, String>) -> Option<u64> {
     flags
         .get("segment-cache-max")
         .map(|v| segment_cache::parse_size(v).unwrap_or_else(|e| die("segment-cache-max", e)))
+        .or_else(|| saved_settings().segment_cache_max_bytes)
 }
 
 /// `--segment-cache-min-free SIZE`, when given.
