@@ -9,7 +9,10 @@ dist/
 
 # Tauri
 src-tauri/target/
-src-tauri/binaries/
+# Sidecar executables (scripts/fetch-sidecars); only the README is tracked
+src-tauri/binaries/*
+!src-tauri/binaries/README.md
+.sidecar-cache/
 src-tauri/gen/
 
 .boost/
