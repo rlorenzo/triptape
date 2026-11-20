@@ -19,6 +19,8 @@ use triptape_core::types::{distinct_assets, AssetKind, Plan, PlanEntry, Renditio
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
     pub preset: render_book::BookPreset,
+    /// Book page cap; `None` keeps the preset's default max.
+    pub book_max_pages: Option<usize>,
     pub trip_name: String,
     pub typst_bin: String,
     /// Music playlist in order (crossfaded); empty uses the bundled theme.
@@ -179,11 +181,14 @@ fn resolve_verified(
 
 /// Rough disk use of one export while it renders, intermediates included,
 /// sized from a real 110-entry film (near-lossless segments are the bulk).
-fn estimate_export_bytes(plan: &Plan, photos: usize, only: &str) -> u64 {
+/// The book budgets two photos per counted page of its cap (120 at the
+/// default 60 pages), so a raised cap raises the estimate with it.
+fn estimate_export_bytes(plan: &Plan, photos: usize, book_cap: usize, only: &str) -> u64 {
     const PER_FILM_ENTRY: u64 = 30_000_000;
     const PER_REEL: u64 = 60_000_000;
     const PER_BOOK_PHOTO: u64 = 10_000_000;
-    const MAX_BOOK_PHOTOS: u64 = 120;
+    const BOOK_PHOTOS_PER_PAGE: u64 = 2;
+    let max_book_photos = BOOK_PHOTOS_PER_PAGE * book_cap as u64;
     let wanted = |keepsake: &str| only == "all" || only == keepsake;
     let mut bytes = 0;
     if wanted("video") {
@@ -193,7 +198,7 @@ fn estimate_export_bytes(plan: &Plan, photos: usize, only: &str) -> u64 {
         bytes += PER_REEL * plan.reel_selects.len().min(5) as u64;
     }
     if wanted("book") {
-        bytes += PER_BOOK_PHOTO * (photos as u64).min(MAX_BOOK_PHOTOS);
+        bytes += PER_BOOK_PHOTO * (photos as u64).min(max_book_photos);
     }
     bytes
 }
@@ -362,10 +367,16 @@ fn export_inner(
     let photos = assets.iter().filter(|a| a.kind != AssetKind::Video).count();
     let elig = plan_eligibility(usable, photos, plan.chapters.len());
 
+    // Validated here too, so a bad cap fails before the free-space check.
+    let book_cap = opts
+        .preset
+        .page_cap(opts.book_max_pages)
+        .map_err(crate::MediaError::InvalidArg)?;
+
     std::fs::create_dir_all(out_dir).map_err(|e| crate::MediaError::Io(e.to_string()))?;
     triptape_core::jobs::free_space_precheck(
         out_dir,
-        estimate_export_bytes(plan, photos, &opts.only),
+        estimate_export_bytes(plan, photos, book_cap, &opts.only),
     )
     .map_err(crate::MediaError::NoSpace)?;
     let work = out_dir.join(".work");
@@ -657,6 +668,7 @@ fn export_inner(
                 trip_name: opts.trip_name.clone(),
                 typst_bin: opts.typst_bin.clone(),
                 ffmpeg_bin: caps.ffmpeg_bin.clone(),
+                max_pages: opts.book_max_pages,
                 progress: opts.progress.clone(),
             },
         ) {
@@ -778,16 +790,26 @@ mod tests {
         plan.hero = vec![entry.clone(); 10];
         plan.reel_selects = vec![entry; 9];
         let (video, reels, book) = (
-            estimate_export_bytes(&plan, 500, "video"),
-            estimate_export_bytes(&plan, 500, "reels"),
-            estimate_export_bytes(&plan, 500, "book"),
+            estimate_export_bytes(&plan, 500, 60, "video"),
+            estimate_export_bytes(&plan, 500, 60, "reels"),
+            estimate_export_bytes(&plan, 500, 60, "book"),
         );
         assert_eq!(video, 300_000_000);
         assert_eq!(reels, 300_000_000, "the pack caps at five reels");
         assert_eq!(book, 1_200_000_000, "the book caps its photo count");
         assert_eq!(
-            estimate_export_bytes(&plan, 500, "all"),
+            estimate_export_bytes(&plan, 500, 60, "all"),
             video + reels + book
+        );
+        // A raised cap budgets for the extra pages (2 photos per page).
+        assert_eq!(
+            estimate_export_bytes(&plan, 500, 200, "book"),
+            4_000_000_000
+        );
+        assert_eq!(
+            estimate_export_bytes(&plan, 500, 400, "book"),
+            5_000_000_000,
+            "never more than the photos the trip has"
         );
     }
 
@@ -821,6 +843,7 @@ mod tests {
             &out,
             &ExportOptions {
                 preset: render_book::BookPreset::P1,
+                book_max_pages: None,
                 trip_name: "Trip".into(),
                 typst_bin: "typst".into(),
                 music_paths: vec![],
@@ -867,6 +890,7 @@ mod tests {
         let out = t.path().join("out");
         let opts = ExportOptions {
             preset: render_book::BookPreset::P1,
+            book_max_pages: None,
             trip_name: "t".into(),
             typst_bin: "typst".into(),
             music_paths: Vec::new(),

@@ -1060,11 +1060,22 @@ async fn run_export(
     app: tauri::AppHandle,
     project_id: String,
     kind: &'static str,
+    book_pages: Option<usize>,
 ) -> Result<ExportSummary, String> {
-    tauri::async_runtime::spawn_blocking(move || export_blocking(&app, &project_id, kind))
-        .await
-        .map_err(|e| e.to_string())?
+    // A bad page count fails here, before a job row or any rendering.
+    if let Some(n) = book_pages {
+        BOOK_PRESET.page_cap(Some(n))?;
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        export_blocking(&app, &project_id, kind, book_pages)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
+
+/// The app's only book preset today (the CLI also offers P2).
+const BOOK_PRESET: triptape_media::render_book::BookPreset =
+    triptape_media::render_book::BookPreset::P1;
 
 /// Which keepsakes a job kind renders.
 fn keepsakes_of(kind: &str) -> &'static str {
@@ -1112,6 +1123,7 @@ fn export_blocking(
     app: &tauri::AppHandle,
     project_id: &str,
     kind: &str,
+    book_pages: Option<usize>,
 ) -> Result<ExportSummary, String> {
     let state = app.state::<AppState>();
     let (plan, assets, trip_name) = load_plan_assets(&state, project_id)?;
@@ -1140,7 +1152,8 @@ fn export_blocking(
 
     let caps = triptape_media::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
     let opts = triptape_media::export::ExportOptions {
-        preset: triptape_media::render_book::BookPreset::P1,
+        preset: BOOK_PRESET,
+        book_max_pages: book_pages,
         trip_name,
         typst_bin: "typst".to_string(),
         music_paths: Vec::new(),
@@ -1349,23 +1362,32 @@ async fn get_thumbnail(
 
 #[tauri::command]
 async fn export_video(app: tauri::AppHandle, project_id: String) -> Result<ExportSummary, String> {
-    run_export(app, project_id, "render-video").await
+    run_export(app, project_id, "render-video", None).await
 }
 
 #[tauri::command]
 async fn export_reels(app: tauri::AppHandle, project_id: String) -> Result<ExportSummary, String> {
-    run_export(app, project_id, "render-reels").await
+    run_export(app, project_id, "render-reels", None).await
 }
 
+/// `book_pages` caps the book's counted pages; `None` keeps the preset default.
 #[tauri::command]
-async fn export_book(app: tauri::AppHandle, project_id: String) -> Result<ExportSummary, String> {
-    run_export(app, project_id, "render-book").await
+async fn export_book(
+    app: tauri::AppHandle,
+    project_id: String,
+    book_pages: Option<usize>,
+) -> Result<ExportSummary, String> {
+    run_export(app, project_id, "render-book", book_pages).await
 }
 
 /// One combined render for "Export all keepsakes" (instead of three passes).
 #[tauri::command]
-async fn export_all(app: tauri::AppHandle, project_id: String) -> Result<ExportSummary, String> {
-    run_export(app, project_id, "export-all").await
+async fn export_all(
+    app: tauri::AppHandle,
+    project_id: String,
+    book_pages: Option<usize>,
+) -> Result<ExportSummary, String> {
+    run_export(app, project_id, "export-all", book_pages).await
 }
 
 /// Quitting must not leave FFmpeg rendering with no one to read the result.

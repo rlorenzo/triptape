@@ -318,7 +318,8 @@
 - MVP presets (only two):
   - Preset P1 "Classic Square": 12×12 in class (with 11×11 export variant for MILK Large Square), 24–60 pages, layflat-friendly spreads.
   - Preset P2 "Travel Landscape": 11×8.5 in class (with 8.6×6.4 in export variant for MILK Medium Landscape), 24–80 pages, mixed single + spread layouts.
-  - Common safe page zone across all three vendors: 24–80 pages. Enforce per-preset caps in preflight.
+  - Common safe page zone across all three vendors: 24–80 pages. Preflight enforces the page cap chosen for each export (the preset max unless the owner sets one).
+  - The preset max (60 / 80) is only the default cap. The owner can raise or lower it per export (24–400 pages; `--pages N` on the CLI, the "Most pages in the Photo Book" field in the app), because vendor limits differ (Shutterfly 111, Snapfish 150, Mixbook 400). More pages means more photos are kept, at the same 1–4 per page.
   - Covers: leave cover assembly to the vendor designer in v1 (spine width depends on final page count and vendor stock). The proof PDF includes a cover-proxy page only.
 - Print math (applies to both deliverables):
   - 300 dpi at printed size. sRGB JPEG quality ~90+. Higher dpi only grows files.

@@ -39,11 +39,26 @@ impl BookPreset {
         }
     }
 
-    /// (min, max) counted interior pages.
+    /// (min, default max) counted interior pages.
     pub fn page_range(&self) -> (usize, usize) {
         match self {
             BookPreset::P1 => (24, 60),
             BookPreset::P2 => (24, 80),
+        }
+    }
+
+    /// The counted-page cap for one export: the preset's default max, or
+    /// the owner's choice. Vendors differ (Shutterfly 111, Snapfish 150,
+    /// Mixbook 400), so the owner picks the cap their book allows.
+    pub fn page_cap(&self, requested: Option<usize>) -> Result<usize, String> {
+        let (min, max) = self.page_range();
+        match requested {
+            None => Ok(max),
+            Some(n) if (min..=MAX_BOOK_PAGES).contains(&n) => Ok(n),
+            Some(n) => Err(format!(
+                "{n} pages is outside {min}-{MAX_BOOK_PAGES} for {}",
+                self.name()
+            )),
         }
     }
 
@@ -54,6 +69,9 @@ impl BookPreset {
         }
     }
 }
+
+/// Most pages any supported vendor binds (Mixbook's 400-page limit).
+pub const MAX_BOOK_PAGES: usize = 400;
 
 /// One placeable still for the book.
 #[derive(Debug, Clone)]
@@ -282,12 +300,13 @@ pub struct PreflightIssue {
 /// the guide instead of blocking.
 pub fn preflight(
     preset: BookPreset,
+    max: usize,
     kinds: &[PageKind],
     placements: &[(usize, DpiVerdict)],
 ) -> Vec<PreflightIssue> {
     let mut issues = vec![];
     let counted = count_pages(kinds);
-    let (min, max) = preset.page_range();
+    let (min, _) = preset.page_range();
     if counted < min {
         issues.push(PreflightIssue {
             level: "block",
@@ -299,7 +318,7 @@ pub fn preflight(
         issues.push(PreflightIssue {
             level: "block",
             page: None,
-            message: format!("{counted} pages over the {max}-page preset cap; remove photos"),
+            message: format!("{counted} pages over the {max}-page cap set for this export; remove photos or raise the cap"),
         });
     }
     for (page, v) in placements {
@@ -327,6 +346,8 @@ pub struct BookOptions {
     pub typst_bin: String,
     /// FFmpeg used to decode stills the `image` crate cannot read (HEIC).
     pub ffmpeg_bin: String,
+    /// Counted-page cap; `None` keeps the preset's default max.
+    pub max_pages: Option<usize>,
     /// Progress and cancel handle (default: silent, never cancelled).
     pub progress: crate::progress::Progress,
 }
@@ -464,11 +485,15 @@ fn has_caption(p: &BookPhoto) -> bool {
 
 /// Simulate the renderer's page assignment and return asset ids whose
 /// dpi verdict blocks at their assigned slot (hero/spread/caption/grid/divider).
-fn planned_blocked(photos: &[BookPhoto], preset: BookPreset, has_map: bool) -> Vec<String> {
+fn planned_blocked(
+    photos: &[BookPhoto],
+    preset: BookPreset,
+    cap: usize,
+    has_map: bool,
+) -> Vec<String> {
     if photos.is_empty() {
         return vec![];
     }
-    let (_, cap) = preset.page_range();
     let flow = book_flow(photos, has_map, cap);
     let has_spread = flow.iter().any(|p| p.kind == PageKind::SpreadLeft);
     let order = consumption_order(photos.len(), wide_index(photos).filter(|_| has_spread));
@@ -511,12 +536,15 @@ pub fn render_book(
     opts: &BookOptions,
 ) -> Result<BookOutput, crate::MediaError> {
     let (tw, th) = opts.preset.trim_px();
-    std::fs::create_dir_all(out_dir).map_err(|e| crate::MediaError::Io(e.to_string()))?;
-    let mut fallbacks: Vec<String> = vec![];
-    // Auto-select for the preset cap: a big trip flows past the cap even at
+    // Auto-select for the page cap: a big trip flows past the cap even at
     // 4 photos/page, so sample evenly across story order instead of
     // blocking the export (PLAN Sec 11: preflight blocks, curation selects).
-    let (_, cap_pre) = opts.preset.page_range();
+    let cap = opts
+        .preset
+        .page_cap(opts.max_pages)
+        .map_err(crate::MediaError::InvalidArg)?;
+    std::fs::create_dir_all(out_dir).map_err(|e| crate::MediaError::Io(e.to_string()))?;
+    let mut fallbacks: Vec<String> = vec![];
     // Drop photos that cannot reach 200 dpi even in the smallest slot
     // (screenshots, tiny renders): preflight would block the whole pack on
     // them, and the plan's fix for that slot is "replace or remove".
@@ -560,7 +588,7 @@ pub fn render_book(
             .collect();
         // Cap math runs on the survivors: dropping the only wide photo
         // removes the spread, which can let more photos fit.
-        let keep = fitting_count(&pool, route_card.is_some(), cap_pre);
+        let keep = fitting_count(&pool, route_card.is_some(), cap);
         let sel: Vec<BookPhoto> = if keep < pool.len() {
             let (sel, dropped) = select_for_cap(&pool, keep);
             // Plan captions are auto-generated for every photo, so caption
@@ -575,7 +603,7 @@ pub fn render_book(
             cap_dropped = vec![];
             pool
         };
-        let blocked: Vec<String> = planned_blocked(&sel, opts.preset, route_card.is_some());
+        let blocked: Vec<String> = planned_blocked(&sel, opts.preset, cap, route_card.is_some());
         if blocked.is_empty() {
             break sel;
         }
@@ -589,23 +617,22 @@ pub fn render_book(
     if !cap_dropped.is_empty() {
         let ids: Vec<&str> = cap_dropped.iter().take(10).map(String::as_str).collect();
         fallbacks.push(format!(
-            "book: {} captioned photos did not fit the {cap_pre}-page cap (kept an even spread; first omitted: {})",
+            "book: {} captioned photos did not fit the {cap}-page cap (kept an even spread; first omitted: {})",
             cap_dropped.len(),
             ids.join(", ")
         ));
     }
     if let Some((keep, of)) = cap_note {
         fallbacks.push(format!(
-            "book: selected {keep} of {of} photos (captioned photos first, the rest evenly across the trip) to fit the {cap_pre}-page cap"
+            "book: selected {keep} of {of} photos (captioned photos first, the rest evenly across the trip) to fit the {cap}-page cap"
         ));
     }
     let photos: &[BookPhoto] = &pruned;
 
-    let (_, cap) = opts.preset.page_range();
     let flow = book_flow(photos, route_card.is_some(), cap);
     let kinds: Vec<PageKind> = flow.iter().map(|p| p.kind).collect();
     // Page-count caps depend only on the flow: block before any image work.
-    let early: Vec<String> = preflight(opts.preset, &kinds, &[])
+    let early: Vec<String> = preflight(opts.preset, cap, &kinds, &[])
         .into_iter()
         .filter(|i| i.level == "block")
         .map(|i| format!("{} ({} photos)", i.message, photos.len()))
@@ -754,7 +781,7 @@ pub fn render_book(
         opts.progress.counted("book", "page", page_no, total_pages);
     }
 
-    let issues = preflight(opts.preset, &kinds, &placements);
+    let issues = preflight(opts.preset, cap, &kinds, &placements);
     let blocks: Vec<&PreflightIssue> = issues.iter().filter(|i| i.level == "block").collect();
     if !blocks.is_empty() {
         let msg = blocks
@@ -1836,7 +1863,7 @@ mod tests {
             photo("p2", 8000, 1),
         ];
         assert_eq!(
-            planned_blocked(&low_res_background, BookPreset::P1, false),
+            planned_blocked(&low_res_background, BookPreset::P1, 60, false),
             vec!["p1".to_string()]
         );
         let low_res_page = [
@@ -1845,7 +1872,7 @@ mod tests {
             photo("p2", 10, 1),
         ];
         assert_eq!(
-            planned_blocked(&low_res_page, BookPreset::P1, false),
+            planned_blocked(&low_res_page, BookPreset::P1, 60, false),
             vec!["p2".to_string()]
         );
     }
@@ -1868,7 +1895,8 @@ mod tests {
         ] {
             assert_ne!(dpi_verdict(w, h, inset.0, inset.1), DpiVerdict::Block);
             let photos = [photo("hero", 8000, 8000), photo("soft", w, h)];
-            assert_eq!(planned_blocked(&photos, preset, false), vec!["soft"]);
+            let (_, cap) = preset.page_range();
+            assert_eq!(planned_blocked(&photos, preset, cap, false), vec!["soft"]);
         }
     }
 
@@ -1888,18 +1916,21 @@ mod tests {
         assert_eq!(dpi_verdict(3000, 3000, 12.0, 12.0), DpiVerdict::Warn);
         assert_eq!(dpi_verdict(2000, 2000, 12.0, 12.0), DpiVerdict::Block);
         let over = vec![PageKind::Grid; 61];
-        let issues = preflight(BookPreset::P1, &over, &[]);
+        let issues = preflight(BookPreset::P1, 60, &over, &[]);
         assert!(issues
             .iter()
             .any(|i| i.level == "block" && i.message.contains("cap")));
+        // A raised cap lets the same 61 pages through.
+        assert!(preflight(BookPreset::P1, 111, &over, &[]).is_empty());
         let tiny = vec![PageKind::Hero, PageKind::Closing];
-        let issues = preflight(BookPreset::P1, &tiny, &[]);
+        let issues = preflight(BookPreset::P1, 60, &tiny, &[]);
         assert!(issues
             .iter()
             .any(|i| i.level == "block" && i.message.contains("minimum")));
         let ok_kinds = vec![PageKind::Hero; 30];
         let issues = preflight(
             BookPreset::P1,
+            60,
             &ok_kinds,
             &[(3, DpiVerdict::Warn), (5, DpiVerdict::Block)],
         );
@@ -1941,6 +1972,7 @@ mod tests {
             trip_name: "Test".into(),
             typst_bin: "typst".into(),
             ffmpeg_bin: "ffmpeg".into(),
+            max_pages: None,
             progress: Default::default(),
         };
         let res = render_book(&photos, None, &[], &out, &opts).unwrap();
@@ -2016,6 +2048,7 @@ mod tests {
             trip_name: "Test".into(),
             typst_bin: "typst-not-installed".into(),
             ffmpeg_bin: "ffmpeg".into(),
+            max_pages: None,
             progress: Default::default(),
         };
         render_book(&photos, None, &titles, &out, &opts).unwrap();
@@ -2038,5 +2071,40 @@ mod tests {
         assert_eq!(BookPreset::from_flag("p1"), Some(BookPreset::P1));
         assert_eq!(BookPreset::from_flag("P2"), Some(BookPreset::P2));
         assert_eq!(BookPreset::from_flag("A4"), None);
+    }
+
+    #[test]
+    fn page_cap_defaults_and_bounds() {
+        assert_eq!(BookPreset::P1.page_cap(None), Ok(60));
+        assert_eq!(BookPreset::P2.page_cap(None), Ok(80));
+        assert_eq!(BookPreset::P1.page_cap(Some(111)), Ok(111));
+        assert_eq!(BookPreset::P1.page_cap(Some(24)), Ok(24));
+        assert_eq!(
+            BookPreset::P1.page_cap(Some(MAX_BOOK_PAGES)),
+            Ok(MAX_BOOK_PAGES)
+        );
+        assert!(BookPreset::P1.page_cap(Some(23)).is_err());
+        assert!(BookPreset::P1.page_cap(Some(MAX_BOOK_PAGES + 1)).is_err());
+    }
+
+    #[test]
+    fn raised_cap_keeps_more_photos() {
+        // 400 photos overflow 60 pages even at 4/page; 111 holds more of them.
+        let pool: Vec<BookPhoto> = (0..400)
+            .map(|i| BookPhoto {
+                asset_id: format!("a{i}"),
+                path: PathBuf::from(format!("a{i}")),
+                width: 6000,
+                height: 4000,
+                caption: None,
+                chapter: None,
+            })
+            .collect();
+        let at_60 = fitting_count(&pool, false, 60);
+        let at_111 = fitting_count(&pool, false, 111);
+        assert!(at_111 > at_60, "{at_111} > {at_60}");
+        let flow = book_flow(&pool[..at_111], false, 111);
+        let kinds: Vec<PageKind> = flow.iter().map(|p| p.kind).collect();
+        assert!(count_pages(&kinds) <= 111);
     }
 }
