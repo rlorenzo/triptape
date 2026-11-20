@@ -68,6 +68,26 @@ bookPages.subscribe((n) => {
   }
 });
 
+const LIVE_COLLAGES_KEY = "triptape-live-collages";
+
+function readLiveCollages(): boolean {
+  try {
+    return localStorage.getItem(LIVE_COLLAGES_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+/** Whether Live Photos move inside the film's collages. On unless turned off. */
+export const liveCollages = writable<boolean>(readLiveCollages());
+liveCollages.subscribe((on) => {
+  try {
+    localStorage.setItem(LIVE_COLLAGES_KEY, String(on));
+  } catch {
+    /* private mode: the choice lasts this session */
+  }
+});
+
 /** Background ingest job (public surface of `job://progress` for kind `ingest`). */
 export interface IngestJobState {
   id: string;

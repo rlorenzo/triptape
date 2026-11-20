@@ -8,6 +8,7 @@
     bookPages,
     exportJob,
     frameNumbers,
+    liveCollages,
     project,
     screen,
     validBookPages
@@ -103,6 +104,15 @@
         <h2>{k.label}</h2>
         <p>{k.blurb}</p>
         {#if k.note && !summary?.reels.length}<p class="note">{k.note}</p>{/if}
+        {#if k.cmd === "export_video"}
+          <div class="live">
+            <label for="live-collages">
+              <input id="live-collages" type="checkbox" disabled={busy} bind:checked={$liveCollages} aria-describedby="live-collages-hint" />
+              Live Photos move in collages
+            </label>
+            <p id="live-collages-hint">Off shows them as stills.</p>
+          </div>
+        {/if}
       </div>
       <button class="btn" disabled={busy} on:click={() => start(k.cmd)}>{k.button}</button>
     </div>
@@ -400,6 +410,22 @@
   .pages p {
     grid-column: 1 / -1;
     color: var(--ink-2);
+    font-size: 13px;
+  }
+
+  .live {
+    margin-top: 8px;
+  }
+
+  .live label {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    font-weight: 500;
+  }
+
+  .live p {
+    margin-left: 24px;
     font-size: 13px;
   }
 

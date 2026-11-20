@@ -160,14 +160,25 @@ export async function dismissInterruptedExport(projectId: string): Promise<void>
 
 export type ExportCmd = "export_video" | "export_reels" | "export_book" | "export_all";
 
-/** `bookPages` caps the book's pages; the film and reels exports ignore it. */
+/**
+ * `bookPages` caps the book's pages (book and all only). `liveCollages` sets
+ * Live Photo motion in the film's collages (film and all only; omitted means on).
+ */
 export async function exportKeepsake(
   cmd: ExportCmd,
   projectId: string,
-  bookPages?: number
+  bookPages?: number,
+  liveCollages?: boolean
 ): Promise<ExportSummary> {
   const withBook = cmd === "export_book" || cmd === "export_all";
-  if (isTauri()) return invoke(cmd, withBook ? { projectId, bookPages } : { projectId });
+  const withFilm = cmd === "export_video" || cmd === "export_all";
+  if (isTauri()) {
+    return invoke(cmd, {
+      projectId,
+      ...(withBook ? { bookPages } : {}),
+      ...(withFilm ? { liveCollages } : {})
+    });
+  }
   await new Promise((r) => setTimeout(r, 600));
   return {
     jobId: "demo_job",

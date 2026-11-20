@@ -1065,16 +1065,23 @@ async fn run_export(
     project_id: String,
     kind: &'static str,
     book_pages: Option<usize>,
+    live_collages: Option<bool>,
 ) -> Result<ExportSummary, String> {
     // A bad page count fails here, before a job row or any rendering.
     if let Some(n) = book_pages {
         BOOK_PRESET.page_cap(Some(n))?;
     }
     tauri::async_runtime::spawn_blocking(move || {
-        export_blocking(&app, &project_id, kind, book_pages)
+        export_blocking(&app, &project_id, kind, book_pages, live_collages)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Live Photo motion in film collages: an omitted value (older frontends)
+/// means on.
+fn live_collages_or_default(live_collages: Option<bool>) -> bool {
+    live_collages.unwrap_or(true)
 }
 
 /// The app's only book preset today (the CLI also offers P2).
@@ -1128,6 +1135,7 @@ fn export_blocking(
     project_id: &str,
     kind: &str,
     book_pages: Option<usize>,
+    live_collages: Option<bool>,
 ) -> Result<ExportSummary, String> {
     let state = app.state::<AppState>();
     let (plan, assets, trip_name) = load_plan_assets(&state, project_id)?;
@@ -1162,7 +1170,7 @@ fn export_blocking(
         typst_bin: "typst".to_string(),
         music_paths: Vec::new(),
         keep_ambience: false,
-        live_collages: true,
+        live_collages: live_collages_or_default(live_collages),
         only: keepsakes_of(kind).to_string(),
         resolution: triptape_media::resolution::Resolution::default(),
         jobs: None,
@@ -1365,13 +1373,17 @@ async fn get_thumbnail(
 }
 
 #[tauri::command]
-async fn export_video(app: tauri::AppHandle, project_id: String) -> Result<ExportSummary, String> {
-    run_export(app, project_id, "render-video", None).await
+async fn export_video(
+    app: tauri::AppHandle,
+    project_id: String,
+    live_collages: Option<bool>,
+) -> Result<ExportSummary, String> {
+    run_export(app, project_id, "render-video", None, live_collages).await
 }
 
 #[tauri::command]
 async fn export_reels(app: tauri::AppHandle, project_id: String) -> Result<ExportSummary, String> {
-    run_export(app, project_id, "render-reels", None).await
+    run_export(app, project_id, "render-reels", None, None).await
 }
 
 /// `book_pages` caps the book's counted pages; `None` keeps the preset default.
@@ -1381,7 +1393,7 @@ async fn export_book(
     project_id: String,
     book_pages: Option<usize>,
 ) -> Result<ExportSummary, String> {
-    run_export(app, project_id, "render-book", book_pages).await
+    run_export(app, project_id, "render-book", book_pages, None).await
 }
 
 /// One combined render for "Export all keepsakes" (instead of three passes).
@@ -1390,8 +1402,9 @@ async fn export_all(
     app: tauri::AppHandle,
     project_id: String,
     book_pages: Option<usize>,
+    live_collages: Option<bool>,
 ) -> Result<ExportSummary, String> {
-    run_export(app, project_id, "export-all", book_pages).await
+    run_export(app, project_id, "export-all", book_pages, live_collages).await
 }
 
 /// Quitting must not leave FFmpeg rendering with no one to read the result.
@@ -1483,6 +1496,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_collages_default_on_and_honor_an_explicit_off() {
+        assert!(live_collages_or_default(None));
+        assert!(live_collages_or_default(Some(true)));
+        assert!(!live_collages_or_default(Some(false)));
+    }
 
     #[test]
     fn each_export_kind_renders_only_its_keepsake() {
