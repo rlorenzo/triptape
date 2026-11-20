@@ -58,6 +58,19 @@ stabilization wait on the sidecar); no signing keys or update channel
 (G5 — updater wired off with a pubkey placeholder); G2/G3/G4 gates open;
 CI not yet green on Windows.
 
+## Git hooks
+
+Install once with `npm run hooks` (needs `brew install pre-commit`). Hooks are
+local and mirror CI (`.pre-commit-config.yaml`):
+
+- **pre-commit** (fast): `cargo fmt --check` when Rust is staged; `npm run check`
+  and `npm run lint` when frontend, Rust (lint only) or their config files change.
+- **pre-push** (slower): `npm run build` if `dist/` is missing or stale, clippy
+  with `-D warnings`, `cargo test --workspace`, then `deadwood`, `cargo deny` and
+  `cargo audit` (each skipped with a notice if not installed).
+
+In an emergency, skip with `git commit --no-verify` or `git push --no-verify`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). FFmpeg stays a separate GPL sidecar

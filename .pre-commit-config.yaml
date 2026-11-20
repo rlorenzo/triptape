@@ -1,0 +1,37 @@
+# Local hooks mirroring CI (.github/workflows/ci.yml). Install with `npm run hooks`.
+default_install_hook_types: [pre-commit, pre-push]
+repos:
+  - repo: local
+    hooks:
+      # --- pre-commit: fast ---
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: svelte-check
+        name: npm run check (svelte-check)
+        entry: npm run check
+        language: system
+        files: '^src/|^package(-lock)?\.json$|\.(ts|svelte)$|^(tsconfig|svelte\.config|vite\.config)'
+        pass_filenames: false
+        stages: [pre-commit]
+      # jscpd also scans Rust (src-tauri), so Rust changes trigger lint too.
+      - id: npm-lint
+        name: npm run lint (fallow, jscpd)
+        entry: npm run lint
+        language: system
+        files: '^src/|^src-tauri/.*\.rs$|^package(-lock)?\.json$|\.(ts|svelte)$|^\.(fallowrc|jscpd)\.json$'
+        pass_filenames: false
+        stages: [pre-commit]
+
+      # --- pre-push: slower, mirrors CI ---
+      - id: ci-checks
+        name: clippy, tests, cargo-deny, cargo-audit, deadwood
+        entry: bash scripts/hooks/pre-push-checks.sh
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]
