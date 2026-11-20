@@ -39,6 +39,8 @@ export interface ExportSummary {
   reels: string[];
   bookPages: number;
   skipped: { keepsake: string; reason: string }[];
+  /** The book's print-check results in plain words. Absent in records saved before they existed. */
+  bookNotes?: string[];
 }
 
 export const REELS_DISCLOSURE =
@@ -275,6 +277,15 @@ export async function exportKeepsake(cmd: ExportCmd, projectId: string, choices:
     skipped:
       cmd === "export_all" && demoScenario("thin")
         ? [{ keepsake: "book", reason: "Add more photos for a printable book (24-page vendor minimum)" }]
+        : [],
+    // The backend's wording for a book with soft photos and a trimmed selection.
+    bookNotes:
+      withBook && demoScenario("soft")
+        ? [
+            "6 pages have a photo at 200-299 dpi and may print a little soft: pages 3, 7, 12, 15, 20, 31.",
+            "2 photos were left out because they were too small to print sharply.",
+            "The book uses 120 of 180 photos to stay within 60 pages. Allow more pages to fit more."
+          ]
         : []
   };
 }

@@ -13,10 +13,10 @@ use std::path::{Path, PathBuf};
 
 use tauri::{Emitter, Manager, State};
 use triptape_app::{
-    apply_live_photo_pairing, book_presets, export_dir_in, export_eligibility,
-    fill_assets_parallel, finished_film, paginate, parse_book_preset, resolve_export_parent,
-    valid_job_kind, AppState, AssetView, BookPresetView, EligibilityView, ExportSummary, JobView,
-    ScanSummary, StoryData, StoryEntryView, StoryView,
+    apply_live_photo_pairing, book_notes, book_presets, export_dir_in, export_eligibility,
+    fill_assets_parallel, finished_film, paginate, parse_book_preset, plain_skip,
+    resolve_export_parent, valid_job_kind, AppState, AssetView, BookPresetView, EligibilityView,
+    ExportSummary, JobView, ScanSummary, StoryData, StoryEntryView, StoryView,
 };
 use triptape_core::{
     cluster,
@@ -1241,7 +1241,12 @@ fn export_blocking(
         video: report.video,
         reels: report.reels,
         book_pages: report.book_pages,
-        skipped: report.skipped,
+        book_notes: if report.book_pages > 0 {
+            book_notes(&report.fallbacks)
+        } else {
+            vec![]
+        },
+        skipped: report.skipped.into_iter().map(plain_skip).collect(),
     })
 }
 

@@ -27,7 +27,9 @@ function mergeSummary(prev: ExportSummary | null, next: ExportSummary): ExportSu
     ...next,
     video: next.video ?? (lost("video") ? undefined : prev?.video),
     reels: next.reels.length > 0 || lost("reels") ? next.reels : (prev?.reels ?? []),
-    bookPages: next.bookPages || (lost("book") ? 0 : prev?.bookPages || 0)
+    bookPages: next.bookPages || (lost("book") ? 0 : prev?.bookPages || 0),
+    // Notes belong to the book they describe: a new book replaces them.
+    bookNotes: next.bookPages || lost("book") ? (next.bookNotes ?? []) : (prev?.bookNotes ?? [])
   };
 }
 

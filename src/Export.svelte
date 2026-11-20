@@ -346,6 +346,12 @@
             <div>
               <h2>Photo Book</h2>
               <p>{summary.bookPages} pages, with a PDF proof and a JPEG of every page. Upload them to your print service when you're ready.</p>
+              {#if summary.bookNotes?.length}
+                <p id="book-notes-title" class="notes-title">Look at these before you order</p>
+                <ul class="book-notes" aria-labelledby="book-notes-title">
+                  {#each summary.bookNotes as note}<li>{note}</li>{/each}
+                </ul>
+              {/if}
             </div>
             <div class="made-actions">
               <button class="btn" on:click={() => summary && open(revealExport, summary.outDir)}>Show in folder</button>
@@ -527,6 +533,21 @@
 
   .retry {
     margin-bottom: 24px;
+  }
+
+  .notes-title {
+    margin-top: 10px;
+    font-weight: 500;
+  }
+
+  .book-notes {
+    margin: 4px 0 0;
+    padding-left: 20px;
+    max-width: 65ch;
+  }
+
+  .book-notes li + li {
+    margin-top: 2px;
   }
 
   .made.not-made {

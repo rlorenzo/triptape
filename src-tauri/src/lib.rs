@@ -328,6 +328,126 @@ pub struct ExportSummary {
     pub reels: Vec<String>,
     pub book_pages: usize,
     pub skipped: Vec<Skipped>,
+    /// What the book's print check found, in plain words (empty when the
+    /// book wasn't made or nothing needs a look).
+    pub book_notes: Vec<String>,
+}
+
+/// The book's preflight results from an export's fallback notes, worded for
+/// the owner. The renderer reports them only as notes in `export.json`; this
+/// groups them so the Export screen can show them. Notes it doesn't know
+/// are left to `export.json`.
+pub fn book_notes(fallbacks: &[String]) -> Vec<String> {
+    use triptape_media::render_book::{preflight, DpiVerdict};
+    // The renderer's own wording of a soft-photo warning, so a reworded
+    // message still matches.
+    let soft = preflight(
+        BookPreset::P1,
+        MAX_BOOK_PAGES,
+        &[],
+        &[(1, DpiVerdict::Warn)],
+    )
+    .into_iter()
+    .find(|i| i.level == "warn")
+    .map(|i| i.message)
+    .unwrap_or_default();
+    let mut soft_pages: Vec<usize> = vec![];
+    let (mut too_small, mut unavailable) = (0usize, 0usize);
+    let mut fit: Option<String> = None;
+    for note in fallbacks {
+        if let Some((page, message)) = note
+            .strip_prefix("page ")
+            .and_then(|rest| rest.split_once(": "))
+        {
+            if message == soft {
+                if let Ok(n) = page.parse() {
+                    soft_pages.push(n);
+                }
+            }
+            continue;
+        }
+        let Some(note) = note.strip_prefix("book: ") else {
+            continue;
+        };
+        if note.contains("excluded (below 200 dpi") {
+            too_small += 1;
+        } else if note.ends_with("; skipped") {
+            unavailable += 1;
+        } else if let Some(rest) = note.strip_prefix("selected ") {
+            fit = fit_note(rest);
+        }
+    }
+    soft_pages.sort_unstable();
+    soft_pages.dedup();
+    let mut notes = vec![];
+    match soft_pages.as_slice() {
+        [] => {}
+        [page] => notes.push(format!(
+            "Page {page} has a photo at 200-299 dpi. It may print a little soft."
+        )),
+        pages => notes.push(format!(
+            "{} pages have a photo at 200-299 dpi and may print a little soft: pages {}.",
+            pages.len(),
+            pages
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+    if too_small > 0 {
+        notes.push(format!(
+            "{} left out because {} too small to print sharply.",
+            photo_count(too_small),
+            if too_small == 1 {
+                "it was"
+            } else {
+                "they were"
+            }
+        ));
+    }
+    if unavailable > 0 {
+        notes.push(format!(
+            "{} left out because {} file was missing, changed or unreadable.",
+            photo_count(unavailable),
+            if unavailable == 1 { "its" } else { "each" }
+        ));
+    }
+    notes.extend(fit);
+    notes
+}
+
+fn photo_count(n: usize) -> String {
+    if n == 1 {
+        "1 photo was".to_string()
+    } else {
+        format!("{n} photos were")
+    }
+}
+
+/// "K of N photos ... to fit the C-page cap" as advice.
+fn fit_note(rest: &str) -> Option<String> {
+    let mut words = rest.split_whitespace();
+    let kept = words.next()?;
+    let of = words.nth(1)?;
+    let cap = rest
+        .rsplit_once("to fit the ")?
+        .1
+        .strip_suffix("-page cap")?;
+    Some(format!(
+        "The book uses {kept} of {of} photos to stay within {cap} pages. Allow more pages to fit more."
+    ))
+}
+
+/// A skipped keepsake's reason, with the book's print-check block reworded.
+pub fn plain_skip(mut skip: Skipped) -> Skipped {
+    if let Some(issue) = skip
+        .reason
+        .strip_prefix("preflight/render blocked: book preflight blocked: ")
+    {
+        skip.reason = format!("It didn't pass its print check: {issue}.");
+    }
+    skip
 }
 
 /// Whether one keepsake can be made from the trip, before any run.
@@ -1100,6 +1220,59 @@ mod tests {
         assert!(parse_book_preset(Some("P3")).is_err());
         let json = serde_json::to_value(&presets[0]).unwrap();
         assert_eq!(json["defaultPages"], 60);
+    }
+
+    #[test]
+    fn book_notes_group_the_print_check_in_plain_words() {
+        use triptape_media::render_book::{preflight, DpiVerdict};
+        let soft = preflight(BookPreset::P1, 60, &[], &[(3, DpiVerdict::Warn)])
+            .into_iter()
+            .find(|i| i.level == "warn")
+            .unwrap()
+            .message;
+        let fallbacks: Vec<String> = vec![
+            format!("page 12: {soft}"),
+            format!("page 3: {soft}"),
+            format!("page 3: {soft}"),
+            "page 4: something else".into(),
+            "book: p001 excluded (below 200 dpi even in the smallest slot)".into(),
+            "book: p002 excluded (below 200 dpi at its assigned slot)".into(),
+            "book: p003 is missing; offer Relink, Rescan, or Skip; skipped".into(),
+            "book: selected 120 of 180 photos (your captioned photos first, then the best-scored of each chapter) to fit the 60-page cap".into(),
+            "video: v1 changed on disk; skipped".into(),
+            "map card failed: x".into(),
+        ];
+        assert_eq!(
+            book_notes(&fallbacks),
+            [
+                "2 pages have a photo at 200-299 dpi and may print a little soft: pages 3, 12.",
+                "2 photos were left out because they were too small to print sharply.",
+                "1 photo was left out because its file was missing, changed or unreadable.",
+                "The book uses 120 of 180 photos to stay within 60 pages. Allow more pages to fit more.",
+            ]
+        );
+        assert_eq!(
+            book_notes(&[format!("page 7: {soft}")]),
+            ["Page 7 has a photo at 200-299 dpi. It may print a little soft."]
+        );
+        assert!(book_notes(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_print_check_block_reads_as_plain_words() {
+        let blocked = plain_skip(Skipped {
+            keepsake: "book".into(),
+            reason: "preflight/render blocked: book preflight blocked: 20 pages below the 24-page vendor minimum; add photos (18 photos)".into(),
+        });
+        assert_eq!(
+            blocked.reason,
+            "It didn't pass its print check: 20 pages below the 24-page vendor minimum; add photos (18 photos)."
+        );
+        let other = plain_skip(Skipped {
+            keepsake: "video".into(),
+            reason: "not selected (--only book)".into(),
+        });
+        assert_eq!(other.reason, "not selected (--only book)");
     }
 
     #[test]
