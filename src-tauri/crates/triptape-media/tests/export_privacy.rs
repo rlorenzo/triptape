@@ -326,6 +326,7 @@ fn film_from_tagged_sources_is_clean_and_carries_no_rotation() {
             track: "bundled".into(),
             rationale: "default".into(),
         },
+        collage: Default::default(),
     };
     let caps = triptape_media::ffmpeg::probe_capabilities(ff(), &tools.ffprobe.bin);
     let film = t.path().join("hero.mp4");
