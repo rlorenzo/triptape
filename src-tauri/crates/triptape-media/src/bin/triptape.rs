@@ -18,7 +18,9 @@ use triptape_core::plan::PlanEdits;
 use triptape_core::{
     asset_ref, cluster,
     db::{Db, EditedPlan},
-    hash, jobs, learn, livephoto, metadata, plan as planmod, privacy, proxies, scan, score,
+    hash, jobs, learn, livephoto, metadata,
+    osxphotos::OsxPhotosIndex,
+    plan as planmod, privacy, proxies, scan, score,
     types::*,
 };
 use triptape_media::{
@@ -163,6 +165,13 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         .unwrap_or_else(|e| die("create project", e));
 
     let result = scan::scan_folder(&folder).unwrap_or_else(|e| die("scan", e));
+    // Captions/people from an `osxphotos export` without sidecars (loaded
+    // once; absent or unreadable means no fallback, never a failed scan).
+    let library = OsxPhotosIndex::load(&folder);
+    let story = StoryCtx {
+        library: library.as_ref(),
+        salt: &project.id,
+    };
 
     // Fingerprint + probe per file (each video probed exactly once).
     let mut stills: Vec<livephoto::StillFile> = vec![];
@@ -233,12 +242,12 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         let img = match a.kind {
             AssetKind::Video => {
                 let probe = probes.get(&a.path);
-                fill_video(&mut a, probe);
+                fill_video(&mut a, probe, &story);
                 None
             }
             _ => {
                 let img = image::open(&a.path).ok();
-                fill_photo(&mut a, img.as_ref());
+                fill_photo(&mut a, img.as_ref(), &story);
                 img
             }
         };
@@ -418,12 +427,28 @@ fn base_asset(
     a
 }
 
+/// Per-scan inputs for an asset's story fields: the photo library's
+/// export database (when the folder has one) and the people-signature salt.
+struct StoryCtx<'a> {
+    library: Option<&'a OsxPhotosIndex>,
+    salt: &'a str,
+}
+
+impl StoryCtx<'_> {
+    /// Caption, people and library score for `a`: in-file values first,
+    /// then the XMP sidecar, then the library export database.
+    fn fill(&self, a: &mut Asset, exif: Option<&metadata::ImageExif>) {
+        let lib = self.library.and_then(|l| l.get(&a.path));
+        metadata::story_fields(&a.path, exif, lib).apply(a, self.salt);
+    }
+}
+
 /// Fill video metadata from its probe; unprobeable videos fall back to mtime.
-fn fill_video(a: &mut Asset, probe: Option<&metadata::FfprobeOutput>) {
+fn fill_video(a: &mut Asset, probe: Option<&metadata::FfprobeOutput>, story: &StoryCtx) {
+    story.fill(a, None);
     let Some(p) = probe else {
         a.taken_at = Some(a.mtime);
         a.time_guessed = true;
-        (a.user_caption, a.people_count) = metadata::story_fields(&a.path, None);
         return;
     };
     a.duration_secs = p.duration_secs();
@@ -436,18 +461,17 @@ fn fill_video(a: &mut Asset, probe: Option<&metadata::FfprobeOutput>) {
     let ct = metadata::resolve_capture_time(p.creation_time(), a.mtime);
     a.taken_at = Some(ct.unix_secs);
     a.time_guessed = ct.time_guessed;
-    (a.user_caption, a.people_count) = metadata::story_fields(&a.path, None);
 }
 
 /// Fill photo metadata from EXIF; dimensions + pHash from the decoded
 /// pixels when decodable (non-HEIC; HEIC proxies cover the rest).
-fn fill_photo(a: &mut Asset, img: Option<&image::DynamicImage>) {
+fn fill_photo(a: &mut Asset, img: Option<&image::DynamicImage>, story: &StoryCtx) {
     let exif = metadata::read_image_exif(&a.path);
     let ct = metadata::resolve_capture_time(exif.taken_at, a.mtime);
     a.taken_at = Some(ct.unix_secs);
     a.time_guessed = ct.time_guessed;
     a.tz_offset_secs = exif.tz_offset_secs;
-    (a.user_caption, a.people_count) = metadata::story_fields(&a.path, Some(&exif));
+    story.fill(a, Some(&exif));
     a.gps = exif.gps;
     a.rotation_deg = exif
         .orientation

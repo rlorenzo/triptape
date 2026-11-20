@@ -64,6 +64,8 @@ CREATE TABLE IF NOT EXISTS assets (
     pair_confidence TEXT,
     user_caption TEXT,
     people_count INTEGER,
+    people_sig INTEGER,
+    library_score REAL,
     thumb_path TEXT,
     proxy_path TEXT,
     score_json TEXT
@@ -216,10 +218,13 @@ impl Db {
             .map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         // Migrations for DBs created before capture timezones, embedded
-        // user captions and people counts were stored.
+        // user captions, people counts/signatures and library scores were
+        // stored.
         add_column_if_missing(&conn, "tz_offset", "INTEGER")?;
         add_column_if_missing(&conn, "user_caption", "TEXT")?;
         add_column_if_missing(&conn, "people_count", "INTEGER")?;
+        add_column_if_missing(&conn, "people_sig", "INTEGER")?;
+        add_column_if_missing(&conn, "library_score", "REAL")?;
         Ok(Self { conn })
     }
 
@@ -298,9 +303,9 @@ impl Db {
         };
         let score_json = a.score.as_ref().and_then(|s| serde_json::to_string(s).ok());
         self.conn.prepare_cached(
-            "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,people_count,score_json)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,path=excluded.path,companion_path=excluded.companion_path,kind=excluded.kind,size_bytes=excluded.size_bytes,mtime=excluded.mtime,content_hash=excluded.content_hash,phash=excluded.phash,width=excluded.width,height=excluded.height,duration_secs=excluded.duration_secs,taken_at=excluded.taken_at,tz_offset=excluded.tz_offset,time_guessed=excluded.time_guessed,lat=excluded.lat,lon=excluded.lon,rotation_deg=excluded.rotation_deg,pair_confidence=excluded.pair_confidence,user_caption=excluded.user_caption,people_count=excluded.people_count,score_json=excluded.score_json",
+            "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,people_count,people_sig,library_score,score_json)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,path=excluded.path,companion_path=excluded.companion_path,kind=excluded.kind,size_bytes=excluded.size_bytes,mtime=excluded.mtime,content_hash=excluded.content_hash,phash=excluded.phash,width=excluded.width,height=excluded.height,duration_secs=excluded.duration_secs,taken_at=excluded.taken_at,tz_offset=excluded.tz_offset,time_guessed=excluded.time_guessed,lat=excluded.lat,lon=excluded.lon,rotation_deg=excluded.rotation_deg,pair_confidence=excluded.pair_confidence,user_caption=excluded.user_caption,people_count=excluded.people_count,people_sig=excluded.people_sig,library_score=excluded.library_score,score_json=excluded.score_json",
         ).and_then(|mut st| st.execute(params![
                 a.id, project_id,
                 a.path.to_string_lossy().to_string(),
@@ -310,7 +315,8 @@ impl Db {
                 a.width.map(|w| w as i64), a.height.map(|h| h as i64),
                 a.duration_secs, a.taken_at, a.tz_offset_secs, i64::from(a.time_guessed),
                 a.gps.map(|g| g.0), a.gps.map(|g| g.1),
-                a.rotation_deg as i64, conf, a.user_caption, a.people_count.map(i64::from), score_json,
+                a.rotation_deg as i64, conf, a.user_caption, a.people_count.map(i64::from),
+                a.people_sig.map(|s| s as i64), a.library_score.map(f64::from), score_json,
             ]),
         ).map_err(|e| e.to_string())?;
         Ok(())
@@ -354,7 +360,7 @@ impl Db {
             return Ok(());
         }
         let changed = self.conn.prepare_cached(
-            "UPDATE assets SET project_id=?1,path=?2,companion_path=?3,kind=?4,size_bytes=?5,mtime=?6,width=?7,height=?8,duration_secs=?9,taken_at=?10,tz_offset=?11,time_guessed=?12,lat=?13,lon=?14,rotation_deg=?15,pair_confidence=?16,user_caption=?17,people_count=?18 WHERE id=?19",
+            "UPDATE assets SET project_id=?1,path=?2,companion_path=?3,kind=?4,size_bytes=?5,mtime=?6,width=?7,height=?8,duration_secs=?9,taken_at=?10,tz_offset=?11,time_guessed=?12,lat=?13,lon=?14,rotation_deg=?15,pair_confidence=?16,user_caption=?17,people_count=?18,people_sig=?19,library_score=?20 WHERE id=?21",
         ).and_then(|mut st| st.execute(params![
                 project_id,
                 a.path.to_string_lossy().to_string(),
@@ -364,6 +370,7 @@ impl Db {
                 a.duration_secs, a.taken_at, a.tz_offset_secs, i64::from(a.time_guessed),
                 a.gps.map(|g| g.0), a.gps.map(|g| g.1),
                 a.rotation_deg as i64, conf, a.user_caption, a.people_count.map(i64::from),
+                a.people_sig.map(|s| s as i64), a.library_score.map(f64::from),
                 a.id,
             ])).map_err(|e| e.to_string())?;
         if changed == 0 {
@@ -480,7 +487,7 @@ impl Db {
         let mut st = self
             .conn
             .prepare(
-                "SELECT id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,score_json,people_count FROM assets WHERE project_id=?1 ORDER BY taken_at NULLS LAST, id",
+                "SELECT id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,score_json,people_count,people_sig,library_score FROM assets WHERE project_id=?1 ORDER BY taken_at NULLS LAST, id",
             )
             .map_err(|e| e.to_string())?;
         let rows = st
@@ -520,6 +527,8 @@ impl Db {
                     },
                     user_caption: r.get(18)?,
                     people_count: r.get::<_, Option<i64>>(20)?.map(|n| n as u32),
+                    people_sig: r.get::<_, Option<i64>>(21)?.map(|s| s as u64),
+                    library_score: r.get::<_, Option<f64>>(22)?.map(|s| s as f32),
                     score,
                 })
             })
@@ -1091,6 +1100,11 @@ mod tests {
         b.taken_at = Some(1_800_000_000);
         b.time_guessed = false;
         b.width = Some(20);
+        // Story fields new to this scan (e.g. from a photo library export
+        // database) fill in on refresh without forcing a rescore.
+        b.people_count = Some(2);
+        b.people_sig = Some(u64::MAX - 1);
+        b.library_score = Some(0.25);
         db.upsert_asset_preserving_analysis(&p.id, &b).unwrap();
 
         let got = db.list_assets(&p.id).unwrap();
@@ -1099,6 +1113,9 @@ mod tests {
         assert_eq!(got.taken_at, Some(1_800_000_000));
         assert!(!got.time_guessed);
         assert_eq!(got.width, Some(20));
+        assert_eq!(got.people_count, Some(2));
+        assert_eq!(got.people_sig, Some(u64::MAX - 1));
+        assert_eq!(got.library_score, Some(0.25));
         assert_eq!(got.content_hash.as_deref(), Some("h1"));
         // 9, not 7: the scoring pass above overwrote the upserted value,
         // and the refresh must preserve the stored one either way.
@@ -1218,6 +1235,30 @@ mod tests {
         let got = db.list_assets(&p.id).unwrap();
         assert_eq!(got[0].people_count, Some(4));
         assert_eq!(got[1].people_count, None);
+    }
+
+    #[test]
+    fn init_adds_people_sig_and_library_score_to_older_databases_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        let old_schema = SCHEMA
+            .replace("    people_sig INTEGER,\n", "")
+            .replace("    library_score REAL,\n", "");
+        assert_ne!(old_schema, SCHEMA);
+        conn.execute_batch(&old_schema).unwrap();
+        let db = Db::init(conn).unwrap();
+        let db = Db::init(db.conn).unwrap();
+        let p = db.create_project("trip", "/tmp/trip").unwrap();
+        let mut a = asset("a1");
+        // High bit set: stored as a bit-cast i64 and read back intact.
+        a.people_sig = Some(0x8000_0000_0000_0001);
+        a.library_score = Some(-0.5);
+        db.upsert_asset(&p.id, &a).unwrap();
+        db.upsert_asset(&p.id, &asset("a2")).unwrap();
+        let got = db.list_assets(&p.id).unwrap();
+        assert_eq!(got[0].people_sig, Some(0x8000_0000_0000_0001));
+        assert_eq!(got[0].library_score, Some(-0.5));
+        assert_eq!(got[1].people_sig, None);
+        assert_eq!(got[1].library_score, None);
     }
 
     #[test]

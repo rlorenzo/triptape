@@ -13,6 +13,7 @@ pub mod journey;
 pub mod learn;
 pub mod livephoto;
 pub mod metadata;
+pub mod osxphotos;
 pub mod parallel;
 pub mod plan;
 pub mod privacy;

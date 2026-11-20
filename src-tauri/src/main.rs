@@ -609,20 +609,24 @@ async fn run_ingest(
             // on real times/GPS. No pixel decoding on this path. Bounded
             // workers fill in parallel while walk order (and index-based
             // ids) is restored, with per-file progress on the bar.
-            let mut assets = fill_assets_parallel(&pid, &result.files, |done, _| {
-                if done % 25 == 0 || done == total {
-                    if let Ok(db) = lock() {
-                        let progress = 0.05 * (done as f32 / total.max(1) as f32);
-                        report_ingest(
-                            &worker_app,
-                            &db,
-                            &worker_job,
-                            progress,
-                            &scan::fill_step_label(done, total),
-                        );
+            // An `osxphotos export` folder's own database (loaded once,
+            // read-only) fills captions/people its files lack.
+            let library = triptape_core::osxphotos::OsxPhotosIndex::load(&canon);
+            let mut assets =
+                fill_assets_parallel(&pid, &result.files, library.as_ref(), |done, _| {
+                    if done % 25 == 0 || done == total {
+                        if let Ok(db) = lock() {
+                            let progress = 0.05 * (done as f32 / total.max(1) as f32);
+                            report_ingest(
+                                &worker_app,
+                                &db,
+                                &worker_job,
+                                progress,
+                                &scan::fill_step_label(done, total),
+                            );
+                        }
                     }
-                }
-            });
+                });
             // Same trip-timezone normalization as the CLI: assets whose EXIF
             // lacks an offset inherit the nearest dated neighbor's.
             metadata::fill_tz_offsets(&mut assets);
