@@ -83,7 +83,18 @@ pub struct BookPhoto {
     pub caption: Option<String>,
     /// Index into the `chapters` titles given to [`render_book`].
     pub chapter: Option<usize>,
+    /// Print score: technical quality plus story bonuses (people, the
+    /// user's caption). Ranks photos within a chapter when the book is
+    /// trimmed to its page cap; [`NEUTRAL_SCORE`] when unscored.
+    pub score: f32,
+    /// The user curated this photo (wrote its caption): it is placed before
+    /// any scored pick and never dropped silently. The chapter-place
+    /// fallback caption does not count.
+    pub keep: bool,
 }
+
+/// Score of a photo nothing could be scored from.
+pub const NEUTRAL_SCORE: f32 = 0.5;
 
 /// Effective-dpi triage for one placed photo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,54 +444,105 @@ fn evenly_spaced(total: usize, keep: usize) -> Vec<usize> {
     (0..keep).map(|i| i * total / keep).collect()
 }
 
-/// Pick `keep` indices for the cap: captioned (user-curated) photos are
-/// reserved first, then the opener if a slot remains, and the remaining
-/// slots are spread evenly over the other photos. Returns the sorted selection plus any captioned
-/// indices that still could not fit (more captions than slots).
+/// Pick `keep` indices for the cap. User-curated photos ([`BookPhoto::keep`])
+/// are reserved first. The remaining slots are shared among the chapters in
+/// proportion to their size (every chapter gets one while slots last), and
+/// each chapter fills its share with its best-scored photos, one per
+/// stretch of consecutive shots, so the picks are the best of each scene
+/// and still span the chapter. Returns the sorted selection plus any
+/// curated indices that could not fit (more of them than slots).
 fn select_for_cap(photos: &[BookPhoto], keep: usize) -> (Vec<usize>, Vec<usize>) {
     let total = photos.len();
     if keep >= total {
         return ((0..total).collect(), vec![]);
     }
-    if keep == 0 {
-        return (
-            vec![],
-            (0..total).filter(|&i| has_caption(&photos[i])).collect(),
-        );
-    }
-    // Captioned photos reserve first; the opener joins only if a slot
-    // remains after every captioned photo is in.
-    let captioned: Vec<usize> = (0..total).filter(|&i| has_caption(&photos[i])).collect();
-    if captioned.len() > keep {
-        let picked: Vec<usize> = evenly_spaced(captioned.len(), keep)
+    let curated: Vec<usize> = (0..total).filter(|&i| photos[i].keep).collect();
+    if curated.len() > keep {
+        let picked: Vec<usize> = evenly_spaced(curated.len(), keep)
             .into_iter()
-            .map(|j| captioned[j])
+            .map(|j| curated[j])
             .collect();
-        let dropped = captioned
+        let dropped = curated
             .iter()
             .copied()
             .filter(|i| !picked.contains(i))
             .collect();
         return (picked, dropped);
     }
-    let mut reserved = captioned;
-    if !reserved.contains(&0) && reserved.len() < keep {
-        reserved.push(0);
+    // Uncurated photos by chapter, chapters and members in story order.
+    let mut groups: Vec<(Option<usize>, Vec<usize>)> = vec![];
+    for i in (0..total).filter(|&i| !photos[i].keep) {
+        match groups.iter_mut().find(|(c, _)| *c == photos[i].chapter) {
+            Some((_, members)) => members.push(i),
+            None => groups.push((photos[i].chapter, vec![i])),
+        }
     }
-    reserved.sort_unstable();
-    let others: Vec<usize> = (0..total).filter(|i| !reserved.contains(i)).collect();
-    let mut sel = reserved.clone();
-    sel.extend(
-        evenly_spaced(others.len(), keep - reserved.len())
-            .into_iter()
-            .map(|j| others[j]),
-    );
+    let sizes: Vec<usize> = groups.iter().map(|(_, m)| m.len()).collect();
+    let mut sel = curated;
+    for ((_, members), quota) in groups.iter().zip(chapter_quotas(&sizes, keep - sel.len())) {
+        sel.extend(best_per_stretch(photos, members, quota));
+    }
     sel.sort_unstable();
     (sel, vec![])
 }
 
-fn has_caption(p: &BookPhoto) -> bool {
-    p.caption.as_deref().is_some_and(|c| !c.trim().is_empty())
+/// Share `slots` among chapters of the given `sizes` (`slots` must not
+/// exceed their sum). Every chapter gets one slot first when there are
+/// enough, so no chapter vanishes from the book; the rest go in proportion
+/// to what each chapter has left (largest remainder, earlier chapter on
+/// ties). With fewer slots than chapters the largest chapters win.
+fn chapter_quotas(sizes: &[usize], slots: usize) -> Vec<usize> {
+    let floor = usize::from(slots >= sizes.len());
+    let mut quotas: Vec<usize> = sizes.iter().map(|&n| floor.min(n)).collect();
+    let room: Vec<usize> = sizes.iter().zip(&quotas).map(|(n, q)| n - q).collect();
+    let room_total: usize = room.iter().sum();
+    let left = slots.saturating_sub(quotas.iter().sum());
+    if room_total == 0 || left == 0 {
+        return quotas;
+    }
+    let mut given = 0;
+    for (q, r) in quotas.iter_mut().zip(&room) {
+        let share = left * r / room_total;
+        *q += share;
+        given += share;
+    }
+    // Hand out what flooring left over, biggest fractional part first.
+    let mut by_remainder: Vec<usize> = (0..sizes.len()).collect();
+    by_remainder.sort_by_key(|&i| (std::cmp::Reverse(left * room[i] % room_total), i));
+    for i in by_remainder {
+        if given == left {
+            break;
+        }
+        if quotas[i] < sizes[i] {
+            quotas[i] += 1;
+            given += 1;
+        }
+    }
+    quotas
+}
+
+/// The best-scored photo of each of `quota` equal stretches of `members`
+/// (indices into `photos`, in story order); the earlier photo wins a tie.
+fn best_per_stretch(photos: &[BookPhoto], members: &[usize], quota: usize) -> Vec<usize> {
+    let n = members.len();
+    if quota >= n {
+        return members.to_vec();
+    }
+    (0..quota)
+        .map(|j| {
+            members[j * n / quota..(j + 1) * n / quota]
+                .iter()
+                .copied()
+                .reduce(|best, i| {
+                    if photos[i].score > photos[best].score {
+                        i
+                    } else {
+                        best
+                    }
+                })
+                .expect("stretches are non-empty when quota < n")
+        })
+        .collect()
 }
 
 /// Simulate the renderer's page assignment and return asset ids whose
@@ -555,9 +617,9 @@ pub fn render_book(
     let viable: Vec<BookPhoto> = photos_in
         .iter()
         .filter(|p| {
-            // Captioned (user-kept) photos are never dropped silently: they
+            // User-curated photos are never dropped silently: they
             // stay in and surface as a blocking preflight issue instead.
-            let ok = has_caption(p)
+            let ok = p.keep
                 || (p.width > 0
                     && p.height > 0
                     && dpi_verdict(p.width, p.height, min_slot_w, min_slot_h) != DpiVerdict::Block);
@@ -624,7 +686,7 @@ pub fn render_book(
     }
     if let Some((keep, of)) = cap_note {
         fallbacks.push(format!(
-            "book: selected {keep} of {of} photos (captioned photos first, the rest evenly across the trip) to fit the {cap}-page cap"
+            "book: selected {keep} of {of} photos (your captioned photos first, then the best-scored of each chapter) to fit the {cap}-page cap"
         ));
     }
     let photos: &[BookPhoto] = &pruned;
@@ -1491,6 +1553,8 @@ mod tests {
             height: 100,
             caption: Some(cap.to_string()),
             chapter: None,
+            score: NEUTRAL_SCORE,
+            keep: false,
         };
         let a = mk("Day 4 · Sun, Oct 5 · 9:00 AM");
         let b = mk("Day 4 · Sun, Oct 5 · 4:32 PM");
@@ -1597,6 +1661,8 @@ mod tests {
             height: h,
             caption: None,
             chapter: None,
+            score: NEUTRAL_SCORE,
+            keep: false,
         };
         // Wide shot at index 20 (a later chapter): no spread.
         let mut photos: Vec<BookPhoto> = (0..25).map(|_| bp(100, 100)).collect();
@@ -1714,6 +1780,8 @@ mod tests {
                 height: 3000,
                 caption: None,
                 chapter: chapters[i],
+                score: NEUTRAL_SCORE,
+                keep: false,
             })
             .collect();
         let keep = fitting_count(&pool, true, 60);
@@ -1728,37 +1796,113 @@ mod tests {
             .map(|p| p.kind)
             .collect();
         assert!(count_pages(&kinds) <= 60, "selected set must fit the cap");
+        let chapters_kept: HashSet<Option<usize>> = picked.iter().map(|p| p.chapter).collect();
+        assert_eq!(chapters_kept.len(), 6, "every chapter stays in the book");
         let idx = evenly_spaced(901, 10);
         assert_eq!(idx.first(), Some(&0), "keeps the opener");
         assert!(idx.windows(2).all(|w| w[0] < w[1]), "story order preserved");
         assert!(*idx.last().unwrap() > 800, "spans to the end of the trip");
     }
 
-    #[test]
-    fn cap_selection_reserves_captioned_photos() {
-        let mk = |i: usize, cap: bool| BookPhoto {
+    fn scored(i: usize, chapter: usize, score: f32, keep: bool) -> BookPhoto {
+        BookPhoto {
             asset_id: format!("a{i}"),
             path: PathBuf::new(),
             width: 4000,
             height: 3000,
-            caption: cap.then(|| "note".to_string()),
-            chapter: None,
-        };
-        let photos: Vec<BookPhoto> = (0..100).map(|i| mk(i, i == 37 || i == 38)).collect();
+            caption: None,
+            chapter: Some(chapter),
+            score,
+            keep,
+        }
+    }
+
+    #[test]
+    fn cap_selection_reserves_curated_photos() {
+        let photos: Vec<BookPhoto> = (0..100)
+            .map(|i| scored(i, 0, NEUTRAL_SCORE, i == 37 || i == 38))
+            .collect();
         let (sel, dropped) = select_for_cap(&photos, 10);
         assert_eq!(sel.len(), 10);
-        assert!(sel.contains(&0) && sel.contains(&37) && sel.contains(&38));
+        assert!(sel.contains(&37) && sel.contains(&38));
         assert!(sel.windows(2).all(|w| w[0] < w[1]), "story order preserved");
         assert!(dropped.is_empty());
 
-        let all_cap: Vec<BookPhoto> = (0..20).map(|i| mk(i, true)).collect();
-        let (sel, dropped) = select_for_cap(&all_cap, 5);
+        let all_kept: Vec<BookPhoto> = (0..20).map(|i| scored(i, 0, 0.5, true)).collect();
+        let (sel, dropped) = select_for_cap(&all_kept, 5);
         assert_eq!(sel.len(), 5);
         assert_eq!(
             sel.len() + dropped.len(),
             20,
-            "every captioned omission reported"
+            "every curated omission reported"
         );
+    }
+
+    #[test]
+    fn cap_selection_ranks_by_score_within_a_chapter() {
+        // One chapter, one slot: the best-scored photo wins, wherever it is.
+        let mut photos: Vec<BookPhoto> = (0..10).map(|i| scored(i, 0, 0.4, false)).collect();
+        photos[7].score = 0.9;
+        assert_eq!(select_for_cap(&photos, 1).0, [7]);
+        // Two slots: the best of each half, so the picks still span the
+        // chapter instead of clumping on one scene.
+        photos[8].score = 0.8;
+        photos[2].score = 0.5;
+        assert_eq!(select_for_cap(&photos, 2).0, [2, 7]);
+        // A place-fallback caption reserves nothing: only `keep` does.
+        photos[0].caption = Some("Tokyo, Japan".to_string());
+        assert_eq!(select_for_cap(&photos, 1).0, [7]);
+    }
+
+    #[test]
+    fn cap_selection_keeps_every_chapter_in_proportion() {
+        // Chapters of 60, 30, 9 and 1 photos; the best photo is each
+        // chapter's last one.
+        let sizes = [60usize, 30, 9, 1];
+        let mut photos = vec![];
+        for (c, &n) in sizes.iter().enumerate() {
+            for j in 0..n {
+                let score = if j == n - 1 { 0.9 } else { 0.4 };
+                photos.push(scored(photos.len(), c, score, false));
+            }
+        }
+        let (sel, _) = select_for_cap(&photos, 20);
+        assert_eq!(sel.len(), 20);
+        let per_chapter: Vec<usize> = (0..sizes.len())
+            .map(|c| {
+                sel.iter()
+                    .filter(|&&i| photos[i].chapter == Some(c))
+                    .count()
+            })
+            .collect();
+        assert!(per_chapter.iter().all(|&n| n >= 1), "{per_chapter:?}");
+        assert!(per_chapter[0] > per_chapter[1] && per_chapter[1] > per_chapter[2]);
+        // Each chapter's best photo made it.
+        for last in [59, 89, 98, 99] {
+            assert!(sel.contains(&last), "best photo {last} missing: {sel:?}");
+        }
+        // Fewer slots than chapters: the largest chapters keep theirs.
+        let (sel, _) = select_for_cap(&photos, 2);
+        assert_eq!(sel, [59, 89]);
+    }
+
+    #[test]
+    fn chapter_quotas_use_every_slot_and_never_overfill() {
+        for (sizes, slots) in [
+            (vec![60, 30, 9, 1], 20),
+            (vec![1, 1, 1], 2),
+            (vec![5, 5], 9),
+            (vec![3], 0),
+            (vec![7, 1, 1, 40], 49),
+        ] {
+            let q = chapter_quotas(&sizes, slots);
+            assert_eq!(q.iter().sum::<usize>(), slots, "{sizes:?} / {slots}");
+            assert!(
+                q.iter().zip(&sizes).all(|(q, n)| q <= n),
+                "{sizes:?} -> {q:?}"
+            );
+        }
+        assert_eq!(chapter_quotas(&[60, 30, 9, 1], 20), [11, 6, 2, 1]);
     }
 
     #[test]
@@ -1812,6 +1956,8 @@ mod tests {
             height: 100,
             caption: caption.map(String::from),
             chapter,
+            score: NEUTRAL_SCORE,
+            keep: false,
         };
         let titles = ["Tokyo".to_string(), "Kyoto".to_string()];
         let mut seen = HashSet::new();
@@ -1854,6 +2000,8 @@ mod tests {
             height: px,
             caption: None,
             chapter: Some(chapter),
+            score: NEUTRAL_SCORE,
+            keep: false,
         };
         // Flow: hero (p0), divider background (p1), photo page (p2).
         // 1200px clears the smallest slot's 200 dpi but prints at 100 dpi full-page.
@@ -1886,6 +2034,8 @@ mod tests {
             height: h,
             caption: None,
             chapter: None,
+            score: NEUTRAL_SCORE,
+            keep: false,
         };
         // Flow: hero, then one caption page. Each size clears 200 dpi inside
         // the photo area an inset layout would have, but not at full bleed.
@@ -1964,6 +2114,8 @@ mod tests {
                 height: 3000,
                 caption: (i == 1).then(|| "Lisbon at dusk".to_string()),
                 chapter: None,
+                score: NEUTRAL_SCORE,
+                keep: false,
             })
             .collect();
         let out = dir.path().join("book");
@@ -2036,6 +2188,8 @@ mod tests {
                     height: 3000,
                     caption: None,
                     chapter,
+                    score: NEUTRAL_SCORE,
+                    keep: false,
                 }
             })
             .collect();
@@ -2098,6 +2252,8 @@ mod tests {
                 height: 4000,
                 caption: None,
                 chapter: None,
+                score: NEUTRAL_SCORE,
+                keep: false,
             })
             .collect();
         let at_60 = fitting_count(&pool, false, 60);

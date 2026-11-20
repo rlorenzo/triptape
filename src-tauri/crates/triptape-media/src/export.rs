@@ -147,6 +147,23 @@ fn verify_source(entry: &PlanEntry, path: &Path) -> Result<(), String> {
     }
 }
 
+/// Asset id -> index of its chapter in the plan's book flow.
+fn book_chapter_of(plan: &Plan) -> HashMap<&str, usize> {
+    plan.chapters
+        .iter()
+        .enumerate()
+        .flat_map(|(i, c)| c.asset_ids.iter().map(move |id| (id.as_str(), i)))
+        .collect()
+}
+
+/// Whether the book may use this asset. The plan's chapters hold near-dupe
+/// winners only, minus everything removed in the Story editor, so the book
+/// and the film draw from the same photos. A plan without chapters (nothing
+/// to flow) lets every still in.
+fn in_book_flow(chapter_of: &HashMap<&str, usize>, asset_id: &str) -> bool {
+    chapter_of.is_empty() || chapter_of.contains_key(asset_id)
+}
+
 /// Snapshot entry for an asset row (used for book photos, which are not
 /// plan entries).
 fn asset_snapshot(a: &triptape_core::types::Asset) -> PlanEntry {
@@ -610,14 +627,12 @@ fn export_inner(
             reason: elig.book_reason.clone(),
         });
     } else {
-        let chapter_of: HashMap<&str, usize> = plan
-            .chapters
-            .iter()
-            .enumerate()
-            .flat_map(|(i, c)| c.asset_ids.iter().map(move |id| (id.as_str(), i)))
-            .collect();
+        let chapter_of = book_chapter_of(plan);
         let mut book_photos: Vec<BookPhoto> = vec![];
-        for a in assets.iter().filter(|a| a.kind != AssetKind::Video) {
+        for a in assets
+            .iter()
+            .filter(|a| a.kind != AssetKind::Video && in_book_flow(&chapter_of, &a.id))
+        {
             if let Err(reason) = verify_source(&asset_snapshot(a), &a.path) {
                 report.fallbacks.push(format!("book: {reason}; skipped"));
                 continue;
@@ -647,6 +662,16 @@ fn export_inner(
                     .or_else(|| chapter.and_then(|i| plan.chapters[i].place.as_ref()))
                     .cloned(),
                 chapter,
+                // Unclamped, so a strong bonus still ranks above a weak one
+                // once `total` saturates.
+                score: a
+                    .score
+                    .as_ref()
+                    .map_or(render_book::NEUTRAL_SCORE, |s| s.tech_quality() + s.bonus),
+                keep: plan
+                    .captions
+                    .get(&a.id)
+                    .is_some_and(|c| !c.trim().is_empty()),
             });
         }
         // Story order: keep db order (taken_at, id).
@@ -811,6 +836,29 @@ mod tests {
             5_000_000_000,
             "never more than the photos the trip has"
         );
+    }
+
+    #[test]
+    fn the_book_draws_only_from_the_plans_chapters() {
+        use triptape_core::types::Chapter;
+        let chapter = |ids: &[&str]| Chapter {
+            title: String::new(),
+            asset_ids: ids.iter().map(|s| s.to_string()).collect(),
+            place: None,
+            day_index: None,
+            date_label: None,
+        };
+        let mut plan = empty_plan();
+        // No chapters: nothing was curated, so every still may flow.
+        assert!(in_book_flow(&book_chapter_of(&plan), "anything"));
+        // "dupe" lost its near-dupe stack and "cut" was removed in the Story
+        // editor: neither is in a chapter, so neither reaches the book.
+        plan.chapters = vec![chapter(&["a", "b"]), chapter(&["c"])];
+        let chapter_of = book_chapter_of(&plan);
+        assert_eq!(chapter_of.get("c"), Some(&1));
+        assert!(in_book_flow(&chapter_of, "a"));
+        assert!(!in_book_flow(&chapter_of, "dupe"));
+        assert!(!in_book_flow(&chapter_of, "cut"));
     }
 
     #[test]
