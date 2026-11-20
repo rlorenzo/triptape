@@ -675,8 +675,37 @@ pub fn read_image_exif(path: &Path) -> ImageExif {
             out.caption = xmp_description(&data);
         }
         out.people = xmp_people(&data);
+        if out.width.is_none() || out.height.is_none() {
+            if let Some((w, h)) = heif_dimensions(&data) {
+                (out.width, out.height) = (Some(w), Some(h));
+            }
+        }
     }
     out
+}
+
+/// Stored pixel size of a HEIF/HEIC still, from its item properties: the
+/// largest `ispe` (image spatial extents) box, which is the full image
+/// (the others are grid tiles and the thumbnail). Photos edited in Apple
+/// Photos are exported without EXIF, so this is their only size. `None`
+/// for anything that is not an ISO-BMFF file or has no usable box.
+pub fn heif_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    if data.get(4..8) != Some(b"ftyp") {
+        return None;
+    }
+    let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    // Properties live in the `meta` box, ahead of the pixel data.
+    let meta_end = data
+        .windows(4)
+        .position(|w| w == b"mdat")
+        .unwrap_or(data.len());
+    data[..meta_end]
+        .windows(20)
+        // size(4) "ispe" version+flags(4) width(4) height(4)
+        .filter(|b| &b[4..8] == b"ispe" && be(&b[0..4]) == 20)
+        .map(|b| (be(&b[12..16]), be(&b[16..20])))
+        .filter(|&(w, h)| w > 0 && h > 0)
+        .max_by_key(|&(w, h)| u64::from(w) * u64::from(h))
 }
 
 fn read_image_exif_fields(path: &Path) -> ImageExif {
@@ -1455,6 +1484,33 @@ mod tests {
                <dc:subject><rdf:Bag><rdf:li>X</rdf:li></rdf:Bag></dc:subject>"#,
         );
         assert_eq!(xmp_people_count(&data), Some(2));
+    }
+
+    #[test]
+    fn heif_dimensions_takes_the_largest_extent_before_the_pixel_data() {
+        let ispe = |w: u32, h: u32| {
+            let mut b = vec![0, 0, 0, 20];
+            b.extend(b"ispe\0\0\0\0");
+            b.extend(w.to_be_bytes());
+            b.extend(h.to_be_bytes());
+            b
+        };
+        let mut heic = b"\0\0\0\x18ftypheic".to_vec();
+        heic.extend(ispe(896, 960)); // grid tile
+        heic.extend(ispe(4284, 5712)); // the photo
+        heic.extend(ispe(576, 768)); // thumbnail
+        heic.extend(b"\0\0\0\x08mdat");
+        heic.extend(ispe(9000, 9000)); // pixel bytes that happen to look like a box
+        assert_eq!(heif_dimensions(&heic), Some((4284, 5712)));
+        // Not ISO-BMFF, no box, or a zero-sized box: no size.
+        assert_eq!(
+            heif_dimensions(b"\xff\xd8\xff\xe0 just a jpeg, long enough"),
+            None
+        );
+        assert_eq!(heif_dimensions(b"\0\0\0\x18ftypheic"), None);
+        let mut empty = b"\0\0\0\x18ftypheic".to_vec();
+        empty.extend(ispe(0, 100));
+        assert_eq!(heif_dimensions(&empty), None);
     }
 
     #[test]

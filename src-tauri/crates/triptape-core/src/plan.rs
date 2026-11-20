@@ -1184,14 +1184,20 @@ fn place_sibling_windows<'a>(
 /// [`SAME_MOMENT_BURST_SECS`]), or close in time
 /// ([`SAME_MOMENT_SECS`]) with similar pixels.
 fn same_moment(a: &Asset, b: &Asset) -> bool {
-    let (Some(ta), Some(tb)) = (a.taken_at, b.taken_at) else {
+    same_moment_at((a.taken_at, a.phash), (b.taken_at, b.phash))
+}
+
+/// [`same_moment`] on bare `(taken_at, phash)` pairs, for callers that
+/// carry less than a whole [`Asset`] (the best-of pick).
+pub(crate) fn same_moment_at(a: (Option<i64>, Option<u64>), b: (Option<i64>, Option<u64>)) -> bool {
+    let (Some(ta), Some(tb)) = (a.0, b.0) else {
         return false;
     };
     let dt = (ta - tb).abs();
     if dt <= SAME_MOMENT_BURST_SECS {
         return true;
     }
-    let (Some(p), Some(q)) = (a.phash, b.phash) else {
+    let (Some(p), Some(q)) = (a.1, b.1) else {
         return false;
     };
     dt <= SAME_MOMENT_SECS && crate::hash::phash_distance(p, q) <= SAME_MOMENT_PHASH_DISTANCE

@@ -32,6 +32,10 @@ cargo run -p triptape-media --bin triptape -- plan --db trip.db --out plan.json
 cargo run -p triptape-media --bin triptape -- export --db trip.db --out ~/Movies/TripTape/trip
 # Bigger photo book (24–400 pages; default 60 for P1, 80 for P2):
 cargo run -p triptape-media --bin triptape -- export --db trip.db --out ~/Movies/TripTape/trip --only book --pages 111
+# Copy the trip's best 800 photos (with their Live Photo motion) into a new folder.
+# Captioned photos come first; a shot that repeats a scene is skipped unless
+# different people are in it. Add --stills-only to leave the motion out.
+cargo run -p triptape-media --bin triptape -- pick --db trip.db --out ~/Pictures/trip-best --count 800
 ```
 
 Desktop app: `cargo run -p triptape-app` (Tauri v2 shell + Svelte frontend).

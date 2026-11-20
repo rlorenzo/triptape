@@ -9,6 +9,7 @@
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--itinerary itinerary.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
 //! triptape cache stats|clear [--segment-cache DIR]
+//! triptape pick --db trip.db --out /path/to/new-folder [--count 800] [--project ID] [--stills-only]
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -20,7 +21,7 @@ use triptape_core::{
     db::{Db, EditedPlan},
     hash, jobs, learn, livephoto, metadata,
     osxphotos::OsxPhotosIndex,
-    plan as planmod, privacy, proxies, scan, score,
+    pick, plan as planmod, privacy, proxies, scan, score,
     types::*,
 };
 use triptape_media::{
@@ -1070,17 +1071,142 @@ fn learn_cmd(flags: &HashMap<String, String>) {
     }
 }
 
+/// Photos `pick` copies when `--count` is not given.
+const DEFAULT_PICK_COUNT: usize = 800;
+
+/// A file name in `dir` for `src` that no earlier copy took: `IMG_1.HEIC`,
+/// then `IMG_1-2.HEIC`, ... (two source folders can hold the same name).
+#[cfg(test)]
+fn free_name(src: &Path, taken: &mut HashSet<String>) -> String {
+    free_names(src, None, taken).0
+}
+
+/// `src`'s file name split into stem and extension (with its dot).
+fn stem_ext(src: &Path) -> (String, String) {
+    let name = src
+        .file_name()
+        .map_or_else(|| "photo".to_string(), |n| n.to_string_lossy().into_owned());
+    match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name, String::new()),
+    }
+}
+
+/// [`free_name`] for a still and its Live Photo motion file together: both
+/// get the still's stem (`IMG_1.HEIC` + `IMG_1.MOV`, or `IMG_1-2.*`) so
+/// the pair still matches by name in the folder.
+fn free_names(
+    still: &Path,
+    motion: Option<&Path>,
+    taken: &mut HashSet<String>,
+) -> (String, Option<String>) {
+    let (stem, ext) = stem_ext(still);
+    let motion_ext = motion
+        .map(|m| stem_ext(m).1)
+        .filter(|m| !m.eq_ignore_ascii_case(&ext));
+    let mut n = 1;
+    loop {
+        let base = if n == 1 {
+            stem.clone()
+        } else {
+            format!("{stem}-{n}")
+        };
+        let s = format!("{base}{ext}");
+        let m = motion_ext.as_ref().map(|e| format!("{base}{e}"));
+        let free = |c: &String| !taken.contains(&c.to_lowercase());
+        if free(&s) && m.as_ref().is_none_or(free) {
+            taken.insert(s.to_lowercase());
+            if let Some(m) = &m {
+                taken.insert(m.to_lowercase());
+            }
+            // A motion file sharing the still's extension can't share its
+            // stem too; it takes the next free name of its own.
+            let m = m.or_else(|| motion.map(|mp| free_names(mp, None, taken).0));
+            return (s, m);
+        }
+        n += 1;
+    }
+}
+
+/// `pick`: copy the trip's best photos (no near-repeats unless different
+/// people are in them) into a new folder. Sources are only read; the
+/// folder must be new or empty so nothing is ever overwritten.
+fn pick_cmd(flags: &HashMap<String, String>) {
+    let db_path = need(flags, "db");
+    let out = need(flags, "out");
+    let count = match flags.get("count") {
+        None => DEFAULT_PICK_COUNT,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => die("--count", "want a whole number of photos, 1 or more"),
+        },
+    };
+    let stills_only = flags.get("stills-only").is_some_and(|v| v != "false");
+    let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
+    let ep = db
+        .edited_plan(flags.get("project").map(String::as_str))
+        .unwrap_or_else(|e| die("plan", e))
+        .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
+    match out.read_dir() {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                die("--out", format!("{} is not empty", out.display()));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => die("--out", format!("{}: {e}", out.display())),
+    }
+    let excluded: HashSet<&str> = ep.edits.excluded.iter().map(String::as_str).collect();
+    let picked = pick::pick_photos(&ep.assets, &excluded, count);
+    if picked.is_empty() {
+        die("pick", "no photos to pick from");
+    }
+    std::fs::create_dir_all(&out).unwrap_or_else(|e| die(&format!("create {}", out.display()), e));
+    let mut taken: HashSet<String> = HashSet::new();
+    let (mut copied, mut failed) = (0usize, 0usize);
+    for a in &picked {
+        let motion = a.companion_path.as_ref().filter(|_| !stills_only);
+        let (still_name, motion_name) =
+            free_names(&a.path, motion.map(PathBuf::as_path), &mut taken);
+        let copies = std::iter::once((&a.path, still_name)).chain(motion.zip(motion_name));
+        for (src, name) in copies {
+            let dest = out.join(name);
+            match std::fs::copy(src, &dest) {
+                Ok(_) if *src == a.path => copied += 1,
+                Ok(_) => {}
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("pick: {} not copied: {e}", src.display());
+                }
+            }
+        }
+    }
+    println!(
+        "picked {copied} of {} photos into {}",
+        ep.assets
+            .iter()
+            .filter(|a| a.kind != AssetKind::Video)
+            .count(),
+        out.display()
+    );
+    if failed > 0 {
+        eprintln!("pick: {failed} files could not be copied");
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     let (cmd, flags) = parse_args();
     match cmd.as_str() {
         "scan" => scan_cmd(&flags),
         "plan" => plan_cmd(&flags),
         "export" => export_cmd(&flags),
+        "pick" => pick_cmd(&flags),
         "learn" => learn_cmd(&flags),
         "cache" => cache_cmd(std::env::args().nth(2).as_deref().unwrap_or(""), &flags),
         "edit" => edit_cmd(&std::env::args().skip(2).collect::<Vec<_>>()),
         _ => {
-            eprintln!("unknown command {cmd}; want scan|plan|edit|learn|export|cache");
+            eprintln!("unknown command {cmd}; want scan|plan|edit|learn|export|pick|cache");
             std::process::exit(2);
         }
     }
@@ -1104,6 +1230,49 @@ mod tests {
         assert_eq!(list[2], PathBuf::from("C.wav"));
         assert_eq!(music_list("single.wav"), vec![PathBuf::from("single.wav")]);
         assert!(music_list("").is_empty());
+    }
+
+    #[test]
+    fn free_name_never_reuses_a_name() {
+        let mut taken = HashSet::new();
+        assert_eq!(
+            free_name(Path::new("/a/IMG_1.HEIC"), &mut taken),
+            "IMG_1.HEIC"
+        );
+        assert_eq!(
+            free_name(Path::new("/b/img_1.heic"), &mut taken),
+            "img_1-2.heic"
+        );
+        assert_eq!(
+            free_name(Path::new("/c/IMG_1.HEIC"), &mut taken),
+            "IMG_1-3.HEIC"
+        );
+        assert_eq!(free_name(Path::new("/a/noext"), &mut taken), "noext");
+    }
+
+    #[test]
+    fn a_live_photo_pair_keeps_one_stem() {
+        let mut taken = HashSet::new();
+        free_name(Path::new("/a/IMG_1.HEIC"), &mut taken);
+        // Only the still collides; the motion file follows it to -2.
+        assert_eq!(
+            free_names(
+                Path::new("/b/IMG_1.HEIC"),
+                Some(Path::new("/b/IMG_1.MOV")),
+                &mut taken
+            ),
+            ("IMG_1-2.HEIC".to_string(), Some("IMG_1-2.MOV".to_string()))
+        );
+        // Only the motion name is taken; the still moves with it.
+        free_name(Path::new("/c/IMG_9.MOV"), &mut taken);
+        assert_eq!(
+            free_names(
+                Path::new("/d/IMG_9.JPG"),
+                Some(Path::new("/d/x.mov")),
+                &mut taken
+            ),
+            ("IMG_9-2.JPG".to_string(), Some("IMG_9-2.mov".to_string()))
+        );
     }
 
     fn args(s: &str) -> Vec<String> {

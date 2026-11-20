@@ -1,0 +1,309 @@
+//! Best-of pick: the top N photos of a trip, without near-repeats.
+//!
+//! Photos are taken best score first. A photo that repeats a scene already
+//! picked (the same moment as the film's planner judges it: a burst, or
+//! close in time and looking alike) waits, unless it shows different
+//! people: the same view with someone else in it is a different keepsake.
+//! Waiting photos only fill the slots left once every distinct scene is in.
+
+use crate::plan::{has_caption, same_moment_at};
+use crate::types::{Asset, AssetKind};
+use std::collections::{HashMap, HashSet};
+
+/// What the pick needs to know about one photo.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Candidate {
+    /// Capture time (unix seconds); unknown never matches a scene.
+    pub taken_at: Option<i64>,
+    pub phash: Option<u64>,
+    /// Who is tagged in the photo (`None`: nobody, or unknown).
+    pub people_sig: Option<u64>,
+    /// Higher is better.
+    pub score: f32,
+}
+
+/// True when `a` and `b` repeat one scene with the same people in it.
+pub fn repeats(a: &Candidate, b: &Candidate) -> bool {
+    a.people_sig == b.people_sig && same_moment_at((a.taken_at, a.phash), (b.taken_at, b.phash))
+}
+
+/// Indices of the `count` best candidates, ascending (the input's order).
+/// Distinct scenes come first, best score first (the earlier photo wins a
+/// tie); repeats fill what is left, also best first.
+pub fn pick_top(candidates: &[Candidate], count: usize) -> Vec<usize> {
+    let mut ranked: Vec<usize> = (0..candidates.len()).collect();
+    ranked.sort_by(|&a, &b| {
+        candidates[b]
+            .score
+            .total_cmp(&candidates[a].score)
+            .then(a.cmp(&b))
+    });
+    let mut picked: Vec<usize> = vec![];
+    let mut waiting: Vec<usize> = vec![];
+    for i in ranked {
+        if picked.len() == count {
+            break;
+        }
+        if picked
+            .iter()
+            .any(|&p| repeats(&candidates[p], &candidates[i]))
+        {
+            waiting.push(i);
+        } else {
+            picked.push(i);
+        }
+    }
+    let room = count.saturating_sub(picked.len());
+    picked.extend(waiting.into_iter().take(room));
+    picked.sort_unstable();
+    picked
+}
+
+/// How much the photo library's own aesthetic score (0..1) adds.
+pub const LIBRARY_SCORE_WEIGHT: f32 = 0.3;
+/// Added for a photo the user captioned: curated photos rank above every
+/// uncaptioned one (scores otherwise stay under 2), so they are picked
+/// first, still without repeating a scene.
+pub const CURATED_BONUS: f32 = 2.0;
+/// Smallest photo worth keeping: under a megapixel is a thumbnail or a
+/// screenshot crop, not a keepsake.
+pub const MIN_PIXELS: u64 = 1_000_000;
+
+/// Best-of score for one photo: its technical quality and story bonuses
+/// (people, your caption), plus the photo library's aesthetic score when
+/// the export carried one. Unscored photos sit at the neutral 0.5. A photo
+/// the user captioned gets [`CURATED_BONUS`] on top.
+pub fn photo_score(a: &Asset) -> f32 {
+    let own = a
+        .score
+        .as_ref()
+        .map_or(0.5, |s| (s.tech_quality() + s.bonus).clamp(0.0, 1.5));
+    let library = a.library_score.map_or(0.0, |l| l.clamp(0.0, 1.0));
+    let curated = if has_caption(a.user_caption.as_deref()) {
+        CURATED_BONUS
+    } else {
+        0.0
+    };
+    own + LIBRARY_SCORE_WEIGHT * library + curated
+}
+
+/// How much a copy of a photo carries: its caption first, then people tags.
+fn richness(a: &Asset) -> (bool, bool) {
+    (
+        has_caption(a.user_caption.as_deref()),
+        a.people_sig.is_some(),
+    )
+}
+
+/// The `count` best photos of `assets`, in the order given (story order
+/// when the assets come from the database). Videos, photos in `excluded`
+/// (removed in the Story editor), photos under [`MIN_PIXELS`] and
+/// extra byte-identical copies of a photo are left out; near-repeats follow
+/// [`pick_top`].
+pub fn pick_photos<'a>(
+    assets: &'a [Asset],
+    excluded: &HashSet<&str>,
+    count: usize,
+) -> Vec<&'a Asset> {
+    let usable: Vec<&Asset> = assets
+        .iter()
+        .filter(|a| {
+            a.kind != AssetKind::Video
+                && !excluded.contains(a.id.as_str())
+                && match (a.width, a.height) {
+                    (Some(w), Some(h)) => u64::from(w) * u64::from(h) >= MIN_PIXELS,
+                    _ => true,
+                }
+        })
+        .collect();
+    // One photo per content hash: the copy that carries the most (a photo
+    // library can hold the same file twice, with the caption and people
+    // tags on only one of them).
+    let mut keeper: HashMap<&str, &Asset> = HashMap::new();
+    for &a in &usable {
+        if let Some(h) = a.content_hash.as_deref() {
+            let kept = keeper.entry(h).or_insert(a);
+            if richness(a) > richness(kept) {
+                *kept = a;
+            }
+        }
+    }
+    let pool: Vec<&Asset> = usable
+        .into_iter()
+        .filter(|a| {
+            a.content_hash
+                .as_deref()
+                .is_none_or(|h| std::ptr::eq(keeper[h], *a))
+        })
+        .collect();
+    let candidates: Vec<Candidate> = pool
+        .iter()
+        .map(|a| Candidate {
+            taken_at: a.taken_at,
+            phash: a.phash,
+            people_sig: a.people_sig,
+            score: photo_score(a),
+        })
+        .collect();
+    pick_top(&candidates, count)
+        .into_iter()
+        .map(|i| pool[i])
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn photo(id: &str, taken_at: i64, hash: &str) -> Asset {
+        let mut a = Asset::new(id, format!("/trip/{id}.heic").into(), AssetKind::Photo);
+        a.taken_at = Some(taken_at);
+        a.content_hash = Some(hash.to_string());
+        (a.width, a.height) = (Some(4032), Some(3024));
+        a
+    }
+
+    #[test]
+    fn pick_photos_drops_copies_videos_small_and_removed_photos() {
+        let mut clip = photo("clip", 5000, "h-clip");
+        clip.kind = AssetKind::Video;
+        let mut tiny = photo("tiny", 6000, "h-tiny");
+        (tiny.width, tiny.height) = (Some(640), Some(480));
+        let mut liked = photo("liked", 7000, "h-liked");
+        liked.library_score = Some(0.9);
+        let assets = [
+            photo("a", 1000, "h-a"),
+            photo("a-copy", 1000, "h-a"),
+            clip,
+            tiny,
+            liked,
+            photo("cut", 8000, "h-cut"),
+            photo("z", 9000, "h-z"),
+        ];
+        let excluded = HashSet::from(["cut"]);
+        let ids = |n| -> Vec<&str> {
+            pick_photos(&assets, &excluded, n)
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect()
+        };
+        assert_eq!(ids(10), ["a", "liked", "z"]);
+        // The library's favourite outranks equal-scored neighbours.
+        assert_eq!(ids(1), ["liked"]);
+    }
+
+    #[test]
+    fn a_captioned_photo_is_picked_before_any_uncaptioned_one() {
+        let mut best = photo("best", 1000, "h-best");
+        best.library_score = Some(1.0);
+        let mut mine = photo("mine", 5000, "h-mine");
+        mine.user_caption = Some("Lanterns at dusk".to_string());
+        let assets = [best, mine];
+        let picked = pick_photos(&assets, &HashSet::new(), 1);
+        assert_eq!(picked[0].id, "mine");
+    }
+
+    #[test]
+    fn a_blank_caption_earns_no_curated_bonus() {
+        let mut blank = photo("blank", 1000, "h-blank");
+        blank.user_caption = Some("   ".to_string());
+        assert_eq!(
+            photo_score(&blank),
+            photo_score(&photo("bare", 1000, "h-bare"))
+        );
+    }
+
+    #[test]
+    fn of_identical_copies_the_captioned_or_tagged_one_is_kept() {
+        let mut tagged = photo("tagged", 1000, "h-1");
+        tagged.people_sig = Some(7);
+        let mut captioned = photo("captioned", 2000, "h-2");
+        captioned.user_caption = Some("Egg tarts".to_string());
+        let assets = [
+            photo("bare-1", 1000, "h-1"),
+            tagged,
+            captioned,
+            photo("bare-2", 2000, "h-2"),
+        ];
+        let ids: Vec<&str> = pick_photos(&assets, &HashSet::new(), 10)
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(ids, ["tagged", "captioned"]);
+    }
+
+    #[test]
+    fn unhashed_and_unsized_photos_still_count() {
+        let mut unhashed = photo("unhashed", 1000, "");
+        unhashed.content_hash = None;
+        let mut no_size = photo("unsized", 9000, "h-u");
+        (no_size.width, no_size.height) = (None, None);
+        let assets = [unhashed, no_size];
+        let ids: Vec<&str> = pick_photos(&assets, &HashSet::new(), 10)
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(ids, ["unhashed", "unsized"]);
+    }
+
+    fn c(taken_at: i64, phash: u64, people_sig: Option<u64>, score: f32) -> Candidate {
+        Candidate {
+            taken_at: Some(taken_at),
+            phash: Some(phash),
+            people_sig,
+            score,
+        }
+    }
+
+    #[test]
+    fn a_repeat_loses_its_slot_to_a_distinct_scene() {
+        // 0 and 1: same view seconds apart. 2: another scene, lower score.
+        let all = [
+            c(1000, 0b1111, None, 0.9),
+            c(1030, 0b1110, None, 0.8),
+            c(9000, u64::MAX, None, 0.3),
+        ];
+        assert_eq!(pick_top(&all, 2), [0, 2]);
+        // With room for everything the repeat comes back.
+        assert_eq!(pick_top(&all, 3), [0, 1, 2]);
+        assert_eq!(pick_top(&all, 10), [0, 1, 2]);
+        assert!(pick_top(&all, 0).is_empty());
+    }
+
+    #[test]
+    fn the_same_view_with_different_people_is_kept() {
+        let all = [
+            c(1000, 0b1111, Some(1), 0.9),
+            c(1030, 0b1110, Some(2), 0.8),
+            c(1060, 0b1111, Some(1), 0.7),
+            c(9000, u64::MAX, None, 0.3),
+        ];
+        // 2 repeats 0 (same people); 1 has someone else in it.
+        assert_eq!(pick_top(&all, 3), [0, 1, 3]);
+        // Tagged and untagged versions of a view differ too.
+        assert!(!repeats(&all[0], &c(1001, 0b1111, None, 0.5)));
+    }
+
+    #[test]
+    fn scenes_need_both_time_and_looks_but_bursts_only_time() {
+        let base = c(1000, 0, None, 0.5);
+        // Alike but ten minutes later: a return visit, not a repeat.
+        assert!(!repeats(&base, &c(1600, 0, None, 0.5)));
+        // A minute later and nothing alike: a different subject.
+        assert!(!repeats(&base, &c(1060, u64::MAX, None, 0.5)));
+        // Three seconds later: one burst even when the hash moved.
+        assert!(repeats(&base, &c(1003, u64::MAX, None, 0.5)));
+        // Unknown capture time never matches.
+        let undated = Candidate {
+            taken_at: None,
+            ..base
+        };
+        assert!(!repeats(&base, &undated));
+    }
+
+    #[test]
+    fn ties_keep_the_earlier_photo() {
+        let all = [c(1000, 0, None, 0.5), c(1010, 0, None, 0.5)];
+        assert_eq!(pick_top(&all, 1), [0]);
+    }
+}
