@@ -4,12 +4,33 @@
 //!   Live Photo pairing UUID go away together, so a shared still cannot be
 //!   quietly re-linked to its motion file.
 //! - Map routes fuzz the first/last ~500 m near home (toggleable).
+//!
+//! What an export file may carry (PLAN.md Sec 14), per kind:
+//!
+//! - Film and reel MP4s, reel cover JPEGs: nothing copied from a source
+//!   file. Every FFmpeg command that writes one ends with
+//!   [`exif_strip_args`], so container and stream tags (GPS `©xyz` and
+//!   ISO 6709 location, make/model/lens, serials, `creation_time`, Apple
+//!   `com.apple.quicktime.*` keys including `content.identifier`) and
+//!   chapters are dropped. Rotation is not metadata here: the filters
+//!   apply it to the pixels, so the file plays upright with no matrix.
+//! - Book page JPEGs and `cover.jpg`: re-encoded from decoded pixels by the
+//!   `image` crate, which writes no EXIF, XMP or MakerNote at all.
+//! - `proof.pdf` / `press.pdf`: Typst embeds those clean JPEGs; the PDF
+//!   info carries only Typst's own producer and the export date.
+//! - Dates: the only capture dates in an export are the ones the owner sees
+//!   on screen or on the page (title-card range, chapter datelines). No
+//!   file carries a source's original capture timestamp as metadata.
 
 use crate::geo::{bearing_deg, haversine_m, project};
 
-/// Extra output args that strip all container/stream metadata on export.
+/// Output args that strip all container/stream metadata and chapters from
+/// an FFmpeg output. FFmpeg otherwise copies the first input's tags, and
+/// that includes a phone video's `©xyz` GPS location.
 pub fn exif_strip_args() -> Vec<String> {
-    vec!["-map_metadata".into(), "-1".into()]
+    ["-map_metadata", "-1", "-map_chapters", "-1"]
+        .map(String::from)
+        .to_vec()
 }
 
 /// Radius (m) around home inside which route points are fuzzed.
@@ -46,6 +67,7 @@ mod tests {
         let a = exif_strip_args();
         assert!(a.contains(&"-map_metadata".to_string()));
         assert!(a.contains(&"-1".to_string()));
+        assert!(a.contains(&"-map_chapters".to_string()));
     }
 
     #[test]

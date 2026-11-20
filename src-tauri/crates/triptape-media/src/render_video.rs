@@ -1059,6 +1059,8 @@ pub fn render_hero_video(
     ]);
     args.extend(ffmpeg::x264_aac("medium", 19));
     args.extend(opts.resolution.x264_level_args());
+    // Nothing from a source file's tags reaches the shared film (Sec 14).
+    args.extend(triptape_core::privacy::exif_strip_args());
     args.extend(["-r".into(), "30".into(), s(out_mp4)]);
     let on_progress = |f: f64| progress.step("video", label, Some(f));
     // Music bed is mandatory: a failed mix fails the film (the old
