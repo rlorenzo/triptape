@@ -142,6 +142,7 @@ fn score_asset_with_cache(cache_dir: &Path, a: &Asset, models: &LocalModels) -> 
             score: analysis.score(&signals),
             phash: thumb.as_ref().map(hash::average_hash_from_image),
             embedding: None,
+            faces: None,
         };
     }
     let pixels = thumb.or_else(|| hash::open_image(&a.path));
@@ -149,10 +150,12 @@ fn score_asset_with_cache(cache_dir: &Path, a: &Asset, models: &LocalModels) -> 
         .as_ref()
         .map(|p| models.analyze(p))
         .unwrap_or_default();
+    let signals = signals.with_faces(found.faces);
     Analysis {
         score: score::score_still_or_fallback(pixels.as_ref(), &signals),
         phash: pixels.as_ref().map(hash::average_hash_from_image),
         embedding: found.embedding,
+        faces: found.faces,
     }
 }
 
@@ -849,7 +852,9 @@ async fn restore_latest_project(
         let models_installed = LocalModels::installed(model_paths(&app).as_ref());
         let needs_scoring = assets.iter().any(|a| {
             a.score.is_none()
-                || (models_installed && a.kind != AssetKind::Video && a.embedding.is_none())
+                || (models_installed
+                    && a.kind != AssetKind::Video
+                    && (a.embedding.is_none() || a.faces.is_none()))
         });
         let files_seen = assets.len();
         let cache = db.hash_reuse_cache()?;

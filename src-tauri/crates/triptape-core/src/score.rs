@@ -98,7 +98,7 @@ pub fn score_still(stats: &FrameStats) -> Score {
     let mut reasons = vec![];
     // Sharpness from edge energy (calibrated so a crisp photo lands ~0.6+).
     let sharpness = (stats.edge_energy * 12.0).clamp(0.0, 1.0);
-    if sharpness < 0.25 {
+    if sharpness < SOFT_SHARPNESS {
         reasons.push("soft/blurry".to_string());
     }
     let blur = (1.0 - sharpness).clamp(0.0, 1.0);
@@ -158,6 +158,24 @@ pub const CAPTION_BONUS: f32 = 0.10;
 pub const CLIP_BONUS: f32 = 0.08;
 /// Technical quality assumed for a clip nothing could be analysed from.
 pub const NEUTRAL_CLIP_QUALITY: f32 = 0.5;
+/// Most a smile adds (a full-size face, smiling for sure). Kept under the
+/// smallest people bonus ([`PEOPLE_BONUS`]) so tagged people stay the
+/// stronger signal, and under the technical spread between a sharp and a
+/// soft frame of one scene.
+pub const SMILE_BONUS: f32 = 0.06;
+/// Size-weighted smile (0..1) from which a photo counts as "smiling".
+pub const SMILE_MIN: f32 = 0.5;
+/// Bonus for a clearly visible face in a photo nobody tagged: someone is
+/// in the shot. Half the one-person tag bonus, because detected faces
+/// include posters, statues and dolls.
+pub const FACE_BONUS: f32 = 0.05;
+/// Largest face, as a fraction of the picture's shorter side, from which
+/// an untagged face counts ([`FACE_BONUS`]): a person in the shot, not a
+/// face in the crowd or on a poster across the street.
+pub const FACE_MIN_SIZE: f32 = 0.12;
+/// Sharpness under which a frame is "soft/blurry": it earns no smile or
+/// face bonus, so a smile never lifts a blurry frame over a sharp one.
+pub const SOFT_SHARPNESS: f32 = 0.25;
 
 /// Story signals that can promote an asset to a highlight.
 #[derive(Debug, Clone, Default)]
@@ -174,6 +192,13 @@ pub struct StorySignals {
     pub movement: f32,
     /// 0..1 GPS novelty (rare place for this trip).
     pub gps_novelty: f32,
+    /// Plausible faces the optional local detector found (not a people
+    /// count: posters and statues count too). 0 = none or not analysed.
+    pub faces: u32,
+    /// Largest face as a fraction of the shorter side (0..1).
+    pub face_size: f32,
+    /// Best size-weighted smile (0..1); 0 when no face was big enough.
+    pub smile: f32,
 }
 
 impl StorySignals {
@@ -181,13 +206,30 @@ impl StorySignals {
     /// people tag count, caption, kind and (for clips) GPS.
     pub fn for_asset(a: &crate::types::Asset) -> Self {
         let is_clip = a.kind == crate::types::AssetKind::Video;
+        let faces = a.faces.unwrap_or_default();
         Self {
             people_count: a.people_count.unwrap_or(0),
             has_caption: a.user_caption.is_some(),
             is_clip,
             gps_novelty: if is_clip && a.gps.is_some() { 0.6 } else { 0.0 },
+            faces: faces.count,
+            face_size: faces.largest,
+            smile: faces.smile.unwrap_or(0.0),
             ..Default::default()
         }
+    }
+}
+
+impl StorySignals {
+    /// These signals with the face fields taken from `faces` (fresh model
+    /// output, before it is stored on the asset); `None` leaves them as is.
+    pub fn with_faces(mut self, faces: Option<crate::types::FaceSignals>) -> Self {
+        if let Some(f) = faces {
+            self.faces = f.count;
+            self.face_size = f.largest;
+            self.smile = f.smile.unwrap_or(0.0);
+        }
+        self
     }
 }
 
@@ -199,10 +241,29 @@ pub fn people_bonus(n: u32) -> f32 {
     }
 }
 
+/// Bonus from the optional face signals, with its reason: a smile
+/// ([`SMILE_BONUS`] scaled by the size-weighted smile, from [`SMILE_MIN`]),
+/// or, in a photo nobody tagged, a clearly visible face ([`FACE_BONUS`]).
+/// Tagged people already earn the stronger [`people_bonus`], so an untagged
+/// face never adds on top of it. Nothing for a soft frame (`sharp` false).
+pub fn face_bonus(signals: &StorySignals, sharp: bool) -> (f32, Option<&'static str>) {
+    if !sharp || signals.faces == 0 {
+        return (0.0, None);
+    }
+    if signals.smile >= SMILE_MIN {
+        return (SMILE_BONUS * signals.smile.min(1.0), Some("smiling"));
+    }
+    if signals.people_count == 0 && signals.face_size >= FACE_MIN_SIZE {
+        return (FACE_BONUS, Some("face in frame"));
+    }
+    (0.0, None)
+}
+
 /// Total story bonus for `signals`, with one reason string per signal.
 /// `for_print` drops motion-only signals (audio/movement) and the clip
-/// bonus: a lively clip never outranks its still for print.
-fn signal_bonus(signals: &StorySignals, for_print: bool) -> (f32, Vec<String>) {
+/// bonus: a lively clip never outranks its still for print. `sharp` false
+/// (a soft/blurry frame) drops the face bonuses ([`face_bonus`]).
+fn signal_bonus(signals: &StorySignals, for_print: bool, sharp: bool) -> (f32, Vec<String>) {
     let mut bonus = 0.0f32;
     let mut reasons = vec![];
     if signals.people_count > 0 {
@@ -215,6 +276,10 @@ fn signal_bonus(signals: &StorySignals, for_print: bool) -> (f32, Vec<String>) {
     if signals.has_caption {
         bonus += CAPTION_BONUS;
         reasons.push("your caption".to_string());
+    }
+    if let (b, Some(reason)) = face_bonus(signals, sharp) {
+        bonus += b;
+        reasons.push(reason.to_string());
     }
     if !for_print {
         if signals.is_clip {
@@ -247,7 +312,8 @@ pub fn squeeze_quality(quality: f32) -> f32 {
 /// bonuses, with reasons. See [`TECH_FLOOR`] for why quality is squeezed.
 pub fn highlight_score(base: &Score, signals: &StorySignals, for_print: bool) -> Score {
     let mut out = base.clone();
-    let (bonus, reasons) = signal_bonus(signals, for_print);
+    let sharp = base.sharpness >= SOFT_SHARPNESS;
+    let (bonus, reasons) = signal_bonus(signals, for_print, sharp);
     out.reasons.extend(reasons);
     let quality = squeeze_quality(base.total);
     out.bonus = bonus;
@@ -269,7 +335,8 @@ pub fn fallback_score() -> Score {
 /// [`fallback_score`] plus whatever story signals the asset carries: an
 /// unscorable photo of five friends still beats an unscorable street.
 pub fn fallback_score_with(signals: &StorySignals) -> Score {
-    let (bonus, reasons) = signal_bonus(signals, false);
+    // No pixels were scored, so no face signals either way.
+    let (bonus, reasons) = signal_bonus(signals, false, false);
     let mut s = fallback_score();
     s.reasons = reasons;
     s.bonus = bonus;
@@ -333,6 +400,74 @@ pub fn score_still_or_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn faces(count: u32, largest: f32, smile: Option<f32>) -> crate::types::FaceSignals {
+        crate::types::FaceSignals {
+            count,
+            largest,
+            smile,
+        }
+    }
+
+    #[test]
+    fn smile_bonus_is_bounded_and_below_the_people_bonus() {
+        let sig = StorySignals::default().with_faces(Some(faces(1, 0.4, Some(1.0))));
+        let (b, reason) = face_bonus(&sig, true);
+        assert!((b - SMILE_BONUS).abs() < 1e-6);
+        assert_eq!(reason, Some("smiling"));
+        const { assert!(SMILE_BONUS < PEOPLE_BONUS[0] && FACE_BONUS < PEOPLE_BONUS[0]) };
+        // Weak smiles add nothing; a smile scales the bonus.
+        let weak = StorySignals::default().with_faces(Some(faces(1, 0.05, Some(0.3))));
+        assert_eq!(face_bonus(&weak, true).0, 0.0);
+        let half = StorySignals::default().with_faces(Some(faces(1, 0.4, Some(0.5))));
+        assert!((face_bonus(&half, true).0 - SMILE_BONUS * 0.5).abs() < 1e-6);
+        // Soft frames and photos without faces earn nothing.
+        assert_eq!(face_bonus(&sig, false), (0.0, None));
+        assert_eq!(face_bonus(&StorySignals::default(), true), (0.0, None));
+    }
+
+    #[test]
+    fn untagged_face_counts_only_when_clearly_visible() {
+        let near = StorySignals::default().with_faces(Some(faces(1, 0.3, None)));
+        assert_eq!(face_bonus(&near, true), (FACE_BONUS, Some("face in frame")));
+        let far = StorySignals::default().with_faces(Some(faces(5, 0.05, None)));
+        assert_eq!(face_bonus(&far, true).0, 0.0, "crowd or poster faces");
+        // Tagged people already earn the people bonus: no double count.
+        let tagged = StorySignals {
+            people_count: 2,
+            ..near.clone()
+        };
+        assert_eq!(face_bonus(&tagged, true).0, 0.0);
+    }
+
+    #[test]
+    fn smile_never_lifts_a_blurry_frame_over_a_sharp_one() {
+        // Same scene: the soft frame has the smile, the sharp one does not.
+        let smiling = StorySignals::default().with_faces(Some(faces(1, 0.5, Some(1.0))));
+        let plain = StorySignals::default().with_faces(Some(faces(1, 0.5, Some(0.0))));
+        let soft = score_still(&stats(0.5, 0.05, (SOFT_SHARPNESS - 0.01) / 12.0));
+        let sharp = score_still(&stats(0.5, 0.05, SOFT_SHARPNESS / 12.0));
+        let a = highlight_score(&soft, &smiling, false);
+        let b = highlight_score(&sharp, &plain, false);
+        assert!(b.total > a.total, "{} vs {}", b.total, a.total);
+        assert!(!a.reasons.iter().any(|r| r == "smiling"));
+        // A sharp smiling frame does get it, for print too.
+        let c = highlight_score(&sharp, &smiling, true);
+        assert!(c.reasons.iter().any(|r| r == "smiling"));
+        assert!(c.total > b.total);
+    }
+
+    #[test]
+    fn signals_read_stored_face_columns() {
+        let mut a =
+            crate::types::Asset::new("a", "/t/a.jpg".into(), crate::types::AssetKind::Photo);
+        assert_eq!(StorySignals::for_asset(&a).faces, 0);
+        a.faces = Some(faces(3, 0.25, Some(0.8)));
+        let s = StorySignals::for_asset(&a);
+        assert_eq!((s.faces, s.face_size, s.smile), (3, 0.25, 0.8));
+        a.faces = Some(faces(2, 0.1, None));
+        assert_eq!(StorySignals::for_asset(&a).smile, 0.0);
+    }
 
     fn stats(mean: f32, var: f32, edge: f32) -> FrameStats {
         FrameStats {

@@ -91,6 +91,25 @@ pub struct Asset {
     /// webview), only stored in the local database.
     #[serde(skip)]
     pub embedding: Option<crate::embedding::Embedding>,
+    /// Face and smile signals from the optional local models (thumbnail
+    /// analysis). `None` until analysed with the models installed. Counts
+    /// and scores only, never boxes; never serialized.
+    #[serde(skip)]
+    pub faces: Option<FaceSignals>,
+}
+
+/// What the optional face models found in one photo: only what scoring
+/// needs (no boxes, crops or identities).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FaceSignals {
+    /// Plausible faces detected. Not a people count: posters, statues and
+    /// dolls are faces to a detector too.
+    pub count: u32,
+    /// Largest face's side as a fraction of the picture's shorter side.
+    pub largest: f32,
+    /// Best size-weighted smile (0..1) among faces big enough to read;
+    /// `None` when none was.
+    pub smile: Option<f32>,
 }
 
 impl Asset {
@@ -133,6 +152,7 @@ impl Asset {
             library_score: None,
             score: None,
             embedding: None,
+            faces: None,
         }
     }
 }
@@ -146,6 +166,8 @@ pub struct Analysis {
     pub phash: Option<u64>,
     /// See [`Asset::embedding`]; `None` without the model.
     pub embedding: Option<crate::embedding::Embedding>,
+    /// See [`Asset::faces`]; `None` without the face models.
+    pub faces: Option<FaceSignals>,
 }
 
 /// How a Live Photo still+motion pair was matched.

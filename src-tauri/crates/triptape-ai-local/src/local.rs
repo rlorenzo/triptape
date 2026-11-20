@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use triptape_core::embedding::Embedding;
+use triptape_core::types::FaceSignals;
 
+use crate::faces;
 use crate::{EmbedResult, Embedder, ModelStatus};
 
 /// Env var naming the models directory.
@@ -32,6 +34,10 @@ pub const MODELS_DIR_ENV: &str = "TRIPTAPE_MODELS_DIR";
 pub const ORT_LIB_ENV: &str = "TRIPTAPE_ORT_LIB";
 /// DINOv2-small int8 (`onnx-community/dinov2-small@8b1f705a3a`).
 pub const DINO_FILE: &str = "dinov2-small-int8.onnx";
+/// YuNet face detector (opencv_zoo `48b10fa`).
+pub const YUNET_FILE: &str = "face_detection_yunet_2026may.onnx";
+/// FER+ expression classifier (onnx/models `c5cae0f`).
+pub const FERPLUS_FILE: &str = "emotion-ferplus-8.onnx";
 /// How to get the files, for the "missing" notes.
 const FETCH_HINT: &str = "run scripts/fetch-models";
 
@@ -298,6 +304,39 @@ impl Embedder for DinoEmbedder {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PhotoAnalysis {
     pub embedding: Option<Embedding>,
+    /// `None` when the face models are not loaded.
+    pub faces: Option<FaceSignals>,
+}
+
+/// YuNet face detector plus FER+ expression, run together.
+struct FaceModels {
+    detector: SessionPool,
+    expression: SessionPool,
+}
+
+impl FaceModels {
+    fn analyze(&self, img: &RgbImage) -> Result<FaceSignals, String> {
+        let (input, shape, scale) = faces::yunet_input(img);
+        let out = self.detector.with(|s| run_f32(s, shape, input))?;
+        let data: Vec<Vec<f32>> = out.into_iter().map(|(_, d)| d).collect();
+        let (h, w) = (shape[2] as u32, shape[3] as u32);
+        let found = faces::yunet_decode(&data, w, h, scale).ok_or("unexpected YuNet outputs")?;
+        let happy: Vec<Option<f32>> = faces::smile_gated(&found)
+            .map(|f| {
+                let input = faces::ferplus_input(img, f);
+                self.expression
+                    .with(|s| run_f32(s, [1, 1, 64, 64], input))
+                    .ok()
+                    .and_then(|o| o.first().and_then(|(_, d)| faces::ferplus_happiness(d)))
+            })
+            .collect();
+        Ok(faces::fold_signals(
+            &found,
+            &happy,
+            img.width(),
+            img.height(),
+        ))
+    }
 }
 
 /// The optional local models that loaded. Every capability is `None` when
@@ -305,6 +344,7 @@ pub struct PhotoAnalysis {
 #[derive(Default)]
 pub struct LocalModels {
     embedder: Option<DinoEmbedder>,
+    faces: Option<FaceModels>,
     notes: Vec<String>,
 }
 
@@ -316,44 +356,67 @@ impl LocalModels {
 
     /// Load whatever is installed under `paths`, with `sessions` sessions
     /// per model (the number of parallel scoring workers, capped at
-    /// [`MAX_SESSIONS`]). Never
-    /// fails: missing pieces become [`LocalModels::notes`].
+    /// [`MAX_SESSIONS`]). Never fails: missing pieces become
+    /// [`LocalModels::notes`], one line each.
     pub fn load(paths: Option<&ModelPaths>, sessions: usize) -> Self {
+        const DUPES_OFF: &str = "near-duplicates use pHash only";
+        const FACES_OFF: &str = "no face or smile signals";
         let Some(paths) = paths else {
             return Self {
                 notes: vec![format!(
-                    "local models: no models directory; near-duplicates use pHash only ({FETCH_HINT})"
+                    "local models: no models directory; {DUPES_OFF}, {FACES_OFF} ({FETCH_HINT})"
                 )],
                 ..Self::default()
             };
         };
-        let dino = paths.dir.join(DINO_FILE);
-        if !dino.is_file() {
-            return Self {
-                notes: vec![format!(
-                    "local models: {DINO_FILE} not found in {}; near-duplicates use pHash only ({FETCH_HINT})",
-                    paths.dir.display()
-                )],
-                ..Self::default()
+        let mut out = Self::default();
+        let missing: Vec<&str> = [DINO_FILE, YUNET_FILE, FERPLUS_FILE]
+            .into_iter()
+            .filter(|f| !paths.dir.join(f).is_file())
+            .collect();
+        for f in &missing {
+            let off = if *f == DINO_FILE {
+                DUPES_OFF
+            } else {
+                FACES_OFF
             };
+            out.notes.push(format!(
+                "local models: {f} not found in {}; {off} ({FETCH_HINT})",
+                paths.dir.display()
+            ));
+        }
+        if missing.len() == 3 {
+            return out;
         }
         let env = match ort_env(&paths.runtime) {
             Ok(env) => env,
             Err(e) => {
-                return Self {
-                    notes: vec![format!(
-                        "local models: {e}; near-duplicates use pHash only ({FETCH_HINT}, or set {ORT_LIB_ENV})"
-                    )],
-                    ..Self::default()
-                }
+                out.notes.push(format!(
+                    "local models: {e}; {DUPES_OFF}, {FACES_OFF} ({FETCH_HINT}, or set {ORT_LIB_ENV})"
+                ));
+                return out;
             }
         };
-        let mut out = Self::default();
-        match SessionPool::load(env, &dino, sessions) {
-            Ok(pool) => out.embedder = Some(DinoEmbedder { pool }),
-            Err(e) => out.notes.push(format!(
-                "local models: {DINO_FILE} failed to load ({e}); near-duplicates use pHash only"
-            )),
+        let pool = |file: &str, out: &mut Self, off: &str| {
+            if missing.contains(&file) {
+                return None;
+            }
+            SessionPool::load(env, &paths.dir.join(file), sessions)
+                .map_err(|e| {
+                    out.notes
+                        .push(format!("local models: {file} failed to load ({e}); {off}"))
+                })
+                .ok()
+        };
+        let embedder = pool(DINO_FILE, &mut out, DUPES_OFF);
+        out.embedder = embedder.map(|pool| DinoEmbedder { pool });
+        let detector = pool(YUNET_FILE, &mut out, FACES_OFF);
+        let expression = pool(FERPLUS_FILE, &mut out, FACES_OFF);
+        if let (Some(detector), Some(expression)) = (detector, expression) {
+            out.faces = Some(FaceModels {
+                detector,
+                expression,
+            });
         }
         out
     }
@@ -362,7 +425,11 @@ impl LocalModels {
     /// file are present, so a reopened project knows whether analysis it
     /// lacks could run at all.
     pub fn installed(paths: Option<&ModelPaths>) -> bool {
-        paths.is_some_and(|p| p.runtime.is_file() && p.dir.join(DINO_FILE).is_file())
+        paths.is_some_and(|p| {
+            p.runtime.is_file()
+                && (p.dir.join(DINO_FILE).is_file()
+                    || (p.dir.join(YUNET_FILE).is_file() && p.dir.join(FERPLUS_FILE).is_file()))
+        })
     }
 
     /// One line per missing or failed piece, for the CLI / app log.
@@ -378,33 +445,41 @@ impl LocalModels {
             let (n, ms) = e.pool.timing();
             out.push(("dinov2-small", n, ms));
         }
+        if let Some(f) = &self.faces {
+            let (n, ms) = f.detector.timing();
+            out.push(("yunet", n, ms));
+            let (n, ms) = f.expression.timing();
+            out.push(("ferplus (per face)", n, ms));
+        }
         out
     }
 
-    /// Whether image embeddings are available.
-    pub fn has_embedder(&self) -> bool {
-        self.embedder.is_some()
+    /// Whether any model loaded (callers skip resizing work otherwise).
+    pub fn any(&self) -> bool {
+        self.embedder.is_some() || self.faces.is_some()
     }
 
     /// Whether `a` (a still or Live Photo still) still lacks something the
     /// loaded models would add: rescans skip assets that have it all.
     pub fn wants(&self, a: &triptape_core::types::Asset) -> bool {
         a.kind != triptape_core::types::AssetKind::Video
-            && self.embedder.is_some()
-            && a.embedding.is_none()
+            && ((self.embedder.is_some() && a.embedding.is_none())
+                || (self.faces.is_some() && a.faces.is_none()))
     }
 
     /// Run the loaded models on a decoded, upright thumbnail.
     pub fn analyze(&self, img: &DynamicImage) -> PhotoAnalysis {
-        let Some(embedder) = &self.embedder else {
+        if !self.any() {
             return PhotoAnalysis::default();
-        };
+        }
         let rgb = img.to_rgb8();
         PhotoAnalysis {
-            embedding: embedder
-                .embed_rgb(&rgb)
-                .ok()
+            embedding: self
+                .embedder
+                .as_ref()
+                .and_then(|e| e.embed_rgb(&rgb).ok())
                 .and_then(|v| Embedding::from_f32(&v)),
+            faces: self.faces.as_ref().and_then(|f| f.analyze(&rgb).ok()),
         }
     }
 }
@@ -448,9 +523,10 @@ mod tests {
             dir,
         };
         let m = LocalModels::load(Some(&paths), 2);
-        assert!(!m.has_embedder());
-        assert_eq!(m.notes().len(), 1);
+        assert!(!m.any());
+        assert_eq!(m.notes().len(), 3, "one line per missing file");
         assert!(m.notes()[0].contains(DINO_FILE), "{:?}", m.notes());
+        assert!(m.notes()[1].contains(YUNET_FILE), "{:?}", m.notes());
         assert!(m.notes()[0].contains("fetch-models"));
         let img = DynamicImage::new_rgb8(8, 8);
         assert_eq!(m.analyze(&img), PhotoAnalysis::default());
@@ -496,7 +572,7 @@ mod tests {
     fn real_dino_embeds_a_picture_and_itself_alike() {
         let paths = ModelPaths::from_env(None, None).expect("set TRIPTAPE_MODELS_DIR");
         let m = LocalModels::load(Some(&paths), 1);
-        assert!(m.has_embedder(), "{:?}", m.notes());
+        assert!(m.any(), "{:?}", m.notes());
         let img = DynamicImage::ImageRgb8(RgbImage::from_fn(320, 240, |x, y| {
             image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
         }));
@@ -508,5 +584,9 @@ mod tests {
             a.cosine(&b).unwrap() > 0.5,
             "a mirrored picture is the same scene"
         );
+        // A synthetic pattern has no face, stored as zero faces.
+        let faces = m.analyze(&img).faces.expect("face models loaded");
+        assert_eq!(faces.count, 0);
+        assert_eq!(faces.smile, None);
     }
 }

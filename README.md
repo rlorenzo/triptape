@@ -47,8 +47,9 @@ Optional local models (nothing is downloaded by the app or the build):
 ./scripts/fetch-models   # pinned + SHA-256-verified, into the app data dir's models/
 ```
 
-With them installed, scans add an on-device image embedding per photo, so
-"same scene, different framing" counts as a near-duplicate alongside pHash.
+With them installed, scans add an on-device image embedding per photo (so a
+retake in another framing counts as a near-duplicate alongside pHash) and
+face / smile signals that give a small, bounded score bonus ("smiling").
 Without them (or with any file missing) TripTape prints one line saying what
 is missing and behaves exactly as before. The CLI takes `--models DIR`; both
 the CLI and the app honour `TRIPTAPE_MODELS_DIR` and `TRIPTAPE_ORT_LIB` (the

@@ -78,3 +78,12 @@ Singapore 2026` (4,913 files, 2,931 assets, 2,883 stills), CLI
   same-moment check and 0.95 for near-duplicate collapse.
 - Near-duplicate collapse: pHash only 1,145 groups / 1,538 suppressed; with
   embeddings 1,149 / 1,542. With the spike's 0.6 it was 951 / 1,722.
+- Stage 2, YuNet + FER+ on the same thumbnails (all three models, same
+  machine, warm cache): DINOv2 127 ms/run, YuNet 7.4 ms/photo, FER+ 0.7 ms
+  per readable face (942 faces). Stills pass 53 s -> 214 s (about 56 ms/photo
+  added for all three models); whole warm scan 142 s -> 357 s; peak RSS
+  1.41 GB. 1,872 of 2,883 stills have a plausible face (posters and statues
+  included, hence no people count from it), 742 have a face of 40 px or more
+  to read, 421 earn "smiling" and 369 untagged ones "face in frame". Top 50
+  stills by score: 11 moved in (all "smiling"; four group selfies checked by
+  eye, all smiling), 11 moved out.

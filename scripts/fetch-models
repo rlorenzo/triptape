@@ -31,6 +31,8 @@ OUT="${1:-$DATA_DIR/$APP_ID/models}"
 # name | url (immutable revision) | sha256 | bytes
 MODELS=(
   "dinov2-small-int8.onnx|https://huggingface.co/onnx-community/dinov2-small/resolve/8b1f705a3a7f6f062f6bdd21986c1583d3ef105d/onnx/model_int8.onnx|dfce54a839b491f395c516350ebb4a78f947e9170a6beac0f2bc5638e0f09d61|24446700"
+  "face_detection_yunet_2026may.onnx|https://media.githubusercontent.com/media/opencv/opencv_zoo/48b10fa505aeb51fbd127fc60a5c660040e823b7/models/face_detection_yunet/face_detection_yunet_2026may.onnx|ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0|229738"
+  "emotion-ferplus-8.onnx|https://media.githubusercontent.com/media/onnx/models/c5cae0f1942c8d7727372c7b1f6b485aa39e4421/validated/vision/body_analysis/emotion_ferplus/model/emotion-ferplus-8.onnx|a2a2ba6a335a3b29c21acb6272f962bd3d47f84952aaffa03b60986e04efa61c|35040571"
 )
 
 # ONNX Runtime 1.31.1 (MIT), Microsoft's GitHub release. The full SHA-256 of

@@ -17,6 +17,7 @@
 //!   data. Without those files it loads nothing and callers keep the
 //!   heuristic behaviour. See `THIRD_PARTY_MODELS.md` for pins and blockers.
 
+pub mod faces;
 pub mod local;
 
 use triptape_core::types::{Asset, AssetKind, MusicPick};

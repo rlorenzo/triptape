@@ -314,11 +314,7 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     // Score stills in parallel from the same pixels as before (the decoded
     // photo, or its thumbnail), adding the optional model outputs.
     let started = std::time::Instant::now();
-    let mut stills_done: Vec<(
-        usize,
-        Option<u64>,
-        Option<triptape_core::embedding::Embedding>,
-    )> = vec![];
+    let mut stills_done: Vec<(usize, Analysis)> = vec![];
     triptape_core::parallel::for_each_parallel(
         &still_sources,
         workers,
@@ -326,18 +322,31 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         |i, analysis, _, _| {
             let idx = still_sources[i].0;
             let a = &final_assets[idx];
-            scores.insert(a.id.clone(), analysis.score);
-            stills_done.push((idx, analysis.phash, analysis.embedding));
+            scores.insert(a.id.clone(), analysis.score.clone());
+            stills_done.push((idx, analysis));
         },
     );
-    for (idx, phash, embedding) in stills_done.drain(..) {
+    for (idx, analysis) in stills_done.drain(..) {
         let a = &mut final_assets[idx];
-        a.phash = a.phash.or(phash);
-        a.embedding = embedding;
+        a.phash = a.phash.or(analysis.phash);
+        a.embedding = analysis.embedding;
+        a.faces = analysis.faces;
     }
     let embedded = final_assets
         .iter()
         .filter(|a| a.embedding.is_some())
+        .count();
+    let with_faces = final_assets
+        .iter()
+        .filter(|a| a.faces.is_some_and(|f| f.count > 0))
+        .count();
+    let smiling = final_assets
+        .iter()
+        .filter(|a| {
+            a.faces
+                .and_then(|f| f.smile)
+                .is_some_and(|s| s >= score::SMILE_MIN)
+        })
         .count();
     for (name, runs, ms) in models.timings() {
         println!("model {name}: {runs} runs, {ms:.1} ms/run");
@@ -471,7 +480,7 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     );
     println!("thumbs: {thumbs} proxies: {proxies_n}");
     println!(
-        "stills: {} scored in {:.1}s, embeddings: {embedded}",
+        "stills: {} scored in {:.1}s, embeddings: {embedded}, with faces: {with_faces}, smiling: {smiling}",
         still_sources.len(),
         started.elapsed().as_secs_f64()
     );
@@ -565,7 +574,7 @@ fn analyze_still(a: &Asset, source: &StillPixels, models: &LocalModels) -> Analy
         StillPixels::Nothing => None,
     };
     let found = match (&pixels, source) {
-        (Some(p), StillPixels::Original) if models.has_embedder() => {
+        (Some(p), StillPixels::Original) if models.any() => {
             let small = p.thumbnail(proxies::THUMB_LONG_EDGE, proxies::THUMB_LONG_EDGE);
             let upright = match a.rotation_deg {
                 90 => small.rotate90(),
@@ -578,11 +587,12 @@ fn analyze_still(a: &Asset, source: &StillPixels, models: &LocalModels) -> Analy
         (Some(p), _) => models.analyze(p),
         (None, _) => Default::default(),
     };
-    let signals = score::StorySignals::for_asset(a);
+    let signals = score::StorySignals::for_asset(a).with_faces(found.faces);
     Analysis {
         score: score::score_still_or_fallback(pixels.as_ref(), &signals),
         phash: pixels.as_ref().map(hash::average_hash_from_image),
         embedding: found.embedding,
+        faces: found.faces,
     }
 }
 
