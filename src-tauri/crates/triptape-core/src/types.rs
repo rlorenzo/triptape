@@ -71,6 +71,16 @@ pub struct Asset {
     /// only, never the names: they are personal data and stay out of logs,
     /// plans and exports). `None` when untagged or unknown.
     pub people_count: Option<u32>,
+    /// Signature of WHO is tagged (see `metadata::PeopleTags::signature`):
+    /// equal for the same people, different for different people at the
+    /// same count, salted with the project id. Never the names themselves.
+    /// `None` when nobody is tagged.
+    #[serde(default)]
+    pub people_sig: Option<u64>,
+    /// The photo library's own aesthetic score (Apple Photos
+    /// `score.overall`, roughly -1..1), stored as-is. `None` when unknown.
+    #[serde(default)]
+    pub library_score: Option<f32>,
     /// Local quality/story score, filled by background scoring after ingest.
     /// `None` until scored (or when scoring was skipped).
     pub score: Option<Score>,
@@ -112,6 +122,8 @@ impl Asset {
             pairing_confidence: None,
             user_caption: None,
             people_count: None,
+            people_sig: None,
+            library_score: None,
             score: None,
         }
     }

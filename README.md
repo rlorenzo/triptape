@@ -45,6 +45,28 @@ Docs: [docs/ffmpeg-build.md](docs/ffmpeg-build.md),
 [docs/submission-checklist.md](docs/submission-checklist.md).
 Third-party model ledger: [THIRD_PARTY_MODELS.md](THIRD_PARTY_MODELS.md).
 
+## Exporting from Apple Photos
+
+[osxphotos](https://github.com/RhetTbull/osxphotos) is the recommended way to
+get a trip out of Photos:
+
+```sh
+osxphotos export "<folder>" --album "<album>" --skip-original-if-edited --download-missing --update
+```
+
+- `--skip-original-if-edited` keeps your edits: the edited version is
+  exported instead of the original.
+- Live Photos export as a still + `.mov` and pair up automatically,
+  `_edited` pairs included. Leave out `--only-photos` if you want video
+  clips in the film.
+- TripTape reads the `.osxphotos_export.db` osxphotos leaves in the folder
+  (read-only, nothing is written next to it) for captions, who is tagged
+  (stored only as a count and an anonymous signature, never names), and
+  the capture date and place of edited files that lost their EXIF.
+  A file's own EXIF date and GPS always win.
+- XMP sidecars (`--sidecar xmp`) work too, and their captions and people
+  win when both exist.
+
 ## MVP status + honest gaps
 
 Ships: local ingest → Library grid → Story review → all three keepsakes

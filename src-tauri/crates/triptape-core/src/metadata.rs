@@ -4,7 +4,6 @@
 //! with `time_guessed = true` when no capture time exists.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::path::Path;
 
 /// Minimal ffprobe JSON surface we rely on.
@@ -133,7 +132,7 @@ impl FfprobeOutput {
     }
 }
 
-fn valid_lat_lon(lat: f64, lon: f64) -> Option<(f64, f64)> {
+pub(crate) fn valid_lat_lon(lat: f64, lon: f64) -> Option<(f64, f64)> {
     ((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)).then_some((lat, lon))
 }
 
@@ -209,6 +208,94 @@ pub fn resolve_capture_time(exif_secs: Option<i64>, mtime_secs: i64) -> CaptureT
     }
 }
 
+/// Fill a still's capture time, UTC offset and GPS on `a`. The file's own
+/// EXIF wins; when it has no capture time (osxphotos-exported edits carry
+/// none) the photo library's date and offset (`library`) come next, and
+/// only then file mtime with `time_guessed`. GPS likewise falls back to
+/// the library only when the file has none.
+pub fn fill_photo_capture(
+    a: &mut crate::types::Asset,
+    exif: &ImageExif,
+    library: Option<&crate::osxphotos::LibraryEntry>,
+) {
+    let (taken_at, tz_offset_secs) = match (exif.taken_at, library.and_then(|l| l.taken_at)) {
+        (Some(t), _) => (Some(t), exif.tz_offset_secs),
+        (None, Some(t)) => (Some(t), library.and_then(|l| l.tz_offset_secs)),
+        (None, None) => (None, exif.tz_offset_secs),
+    };
+    let ct = resolve_capture_time(taken_at, a.mtime);
+    a.taken_at = Some(ct.unix_secs);
+    a.time_guessed = ct.time_guessed;
+    a.tz_offset_secs = tz_offset_secs;
+    a.gps = exif.gps.or_else(|| library.and_then(|l| l.gps));
+}
+
+/// Fill a still's metadata from its `exif`: capture time, offset and GPS
+/// ([`fill_photo_capture`]), story fields ([`story_fields`]), rotation and
+/// the EXIF pixel size. `library` is the folder's osxphotos index (looked
+/// up once per asset); `salt` (the project id) salts the people signature.
+/// Shared by the CLI and app ingest so the two cannot drift.
+pub fn fill_photo(
+    a: &mut crate::types::Asset,
+    exif: &ImageExif,
+    library: Option<&crate::osxphotos::OsxPhotosIndex>,
+    salt: &str,
+) {
+    let lib = library.and_then(|l| l.get(&a.path));
+    fill_photo_capture(a, exif, lib);
+    story_fields(&a.path, Some(exif), lib).apply(a, salt);
+    a.rotation_deg = exif.orientation.map(orientation_to_degrees).unwrap_or(0);
+    if let (Some(w), Some(h)) = (exif.width, exif.height) {
+        a.width = Some(w);
+        a.height = Some(h);
+    }
+}
+
+/// Fill a video's metadata from its ffprobe output plus its story fields
+/// (see [`fill_photo`] for `library` and `salt`). Unprobeable videos fall
+/// back to file mtime with `time_guessed`.
+pub fn fill_video(
+    a: &mut crate::types::Asset,
+    probe: Option<&FfprobeOutput>,
+    library: Option<&crate::osxphotos::OsxPhotosIndex>,
+    salt: &str,
+) {
+    let lib = library.and_then(|l| l.get(&a.path));
+    story_fields(&a.path, None, lib).apply(a, salt);
+    let Some(p) = probe else {
+        a.taken_at = Some(a.mtime);
+        a.time_guessed = true;
+        return;
+    };
+    a.duration_secs = p.duration_secs();
+    if let Some((w, h)) = p.video_dims() {
+        a.width = Some(w);
+        a.height = Some(h);
+    }
+    a.rotation_deg = p.rotation_deg();
+    a.gps = p.gps();
+    let ct = resolve_capture_time(p.creation_time(), a.mtime);
+    a.taken_at = Some(ct.unix_secs);
+    a.time_guessed = ct.time_guessed;
+}
+
+/// Parse an ISO 8601 / RFC 3339 instant with a UTC offset (as osxphotos
+/// writes: `2026-10-27T10:05:38.928000+08:00`) to unix seconds (floored)
+/// and the offset in seconds east of UTC. `None` without an offset.
+pub fn parse_iso_instant(s: &str) -> Option<(i64, i32)> {
+    use jiff::fmt::temporal::{Pieces, PiecesOffset};
+    let pieces = Pieces::parse(s.trim()).ok()?;
+    let offset = match pieces.offset()? {
+        PiecesOffset::Zulu => jiff::tz::Offset::UTC,
+        PiecesOffset::Numeric(n) => n.offset(),
+        _ => return None,
+    };
+    let ts = offset
+        .to_timestamp(pieces.date().to_datetime(pieces.time()?))
+        .ok()?;
+    Some((unix_floor(ts), offset.seconds()))
+}
+
 /// Run ffprobe and parse its JSON. `ffprobe_bin` allows tests to stub it.
 pub fn probe_video(ffprobe_bin: &str, path: &Path) -> Result<FfprobeOutput, String> {
     let out = std::process::Command::new(ffprobe_bin)
@@ -250,9 +337,9 @@ pub struct ImageExif {
     /// or XMP `dc:description`), cleaned. Their own words outrank every
     /// auto-generated caption downstream.
     pub caption: Option<String>,
-    /// People tagged in the file's own XMP (count only; see
-    /// [`xmp_people_count`]).
-    pub people: Option<u32>,
+    /// People tagged in the file's own XMP (see [`xmp_people`]; only
+    /// their count and salted signature are ever stored).
+    pub people: Option<PeopleTags>,
 }
 
 /// Clean a raw embedded caption: collapse whitespace, drop empties and
@@ -373,10 +460,75 @@ fn xmp_list_items(body: &str) -> Vec<String> {
     out
 }
 
-/// Distinct (case-insensitive) count of non-empty items.
-fn distinct_count(items: impl IntoIterator<Item = String>) -> u32 {
-    let set: HashSet<String> = items.into_iter().map(|i| i.to_lowercase()).collect();
-    set.len() as u32
+/// Who a photo library tagged in one photo, held only long enough to count
+/// and sign. Names are personal data: they never leave this type (its
+/// `Debug` prints counts only), and only [`PeopleTags::count`] and the
+/// salted [`PeopleTags::signature`] are ever stored.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct PeopleTags {
+    /// Trimmed, lowercased, sorted, distinct names.
+    named: Vec<String>,
+    /// Faces or tags without a name.
+    unnamed: u32,
+}
+
+impl std::fmt::Debug for PeopleTags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeopleTags")
+            .field("named", &self.named.len())
+            .field("unnamed", &self.unnamed)
+            .finish()
+    }
+}
+
+/// Domain tag mixed into every people signature (bump on format changes).
+const PEOPLE_SIG_DOMAIN: &[u8] = b"triptape.people_sig.v1";
+
+impl PeopleTags {
+    /// Tags from `named` people (normalized: trimmed, lowercased, empties
+    /// dropped, duplicates collapsed) plus `unnamed` faces. `None` when
+    /// nobody is tagged.
+    pub fn new(named: impl IntoIterator<Item = String>, unnamed: u32) -> Option<Self> {
+        let mut named: Vec<String> = named
+            .into_iter()
+            .map(|n| n.trim().to_lowercase())
+            .filter(|n| !n.is_empty())
+            .collect();
+        named.sort();
+        named.dedup();
+        (!named.is_empty() || unnamed > 0).then_some(Self { named, unnamed })
+    }
+
+    /// How many people are tagged, saturating at [`MAX_PEOPLE`].
+    pub fn count(&self) -> u32 {
+        u32::try_from(self.named.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(self.unnamed)
+            .min(MAX_PEOPLE)
+    }
+
+    /// Stable signature of WHO is tagged: the same people (in any order or
+    /// case) give the same value, different people give different values
+    /// even at the same count. `salt` (the project id) keeps signatures
+    /// from being comparable across projects. BLAKE3 over length-prefixed
+    /// fields, so it is stable across runs and builds (unlike
+    /// `DefaultHasher`).
+    pub fn signature(&self, salt: &str) -> u64 {
+        let mut h = blake3::Hasher::new();
+        let mut field = |bytes: &[u8]| {
+            h.update(&(bytes.len() as u64).to_le_bytes());
+            h.update(bytes);
+        };
+        field(PEOPLE_SIG_DOMAIN);
+        field(salt.as_bytes());
+        for name in &self.named {
+            field(name.as_bytes());
+        }
+        field(&self.unnamed.to_le_bytes());
+        let digest = h.finalize();
+        let first: [u8; 8] = digest.as_bytes()[..8].try_into().expect("32-byte digest");
+        u64::from_le_bytes(first)
+    }
 }
 
 /// A `dc:subject` keyword that plausibly names a person: short, no digits,
@@ -389,49 +541,48 @@ fn looks_like_name(keyword: &str) -> bool {
             .any(|c| c.is_ascii_digit() || matches!(c, '/' | '\\' | ':' | '|' | '>' | '#' | '@'))
 }
 
-/// How many people a file's XMP says appear in the photo. Only the count is
-/// kept; names are personal data and never leave this function.
+/// Who a file's XMP says appears in the photo.
 ///
 /// Sources, in order of trust:
 /// 1. `Iptc4xmpExt:PersonInImage`: the standard people field.
-/// 2. MWG face regions (`mwg-rs:Type` = `Face`): one per detected face.
+/// 2. MWG face regions (`mwg-rs:Type` = `Face`): one unnamed person per
+///    detected face.
 /// 3. Plain `dc:subject` keywords. Apple Photos exports each named person
 ///    as a keyword, but other libraries put topics there too, so this is a
 ///    heuristic: each distinct keyword that looks like a name (1 to 4
 ///    words, no digits or path/URL punctuation) counts as one person.
 ///
-/// Counts saturate at [`MAX_PEOPLE`]; zero people yields `None`.
-pub fn xmp_people_count(data: &[u8]) -> Option<u32> {
+/// Zero people yields `None`.
+pub fn xmp_people(data: &[u8]) -> Option<PeopleTags> {
     let xmp = xmp_packet(data)?;
     let tagged = xmp_element(&xmp, "Iptc4xmpExt:PersonInImage")
-        .map(|b| distinct_count(xmp_list_items(b)))
-        .filter(|&n| n > 0);
+        .and_then(|b| PeopleTags::new(xmp_list_items(b), 0));
     let faces = || {
         let n = xmp.matches("mwg-rs:Type=\"Face\"").count()
             + xmp.matches("<mwg-rs:Type>Face</mwg-rs:Type>").count();
-        (n > 0).then_some(n as u32)
+        PeopleTags::new([], u32::try_from(n).unwrap_or(u32::MAX))
     };
     let keywords = || {
-        xmp_element(&xmp, "dc:subject")
-            .map(|b| distinct_count(xmp_list_items(b).into_iter().filter(|k| looks_like_name(k))))
-            .filter(|&n| n > 0)
+        xmp_element(&xmp, "dc:subject").and_then(|b| {
+            PeopleTags::new(
+                xmp_list_items(b).into_iter().filter(|k| looks_like_name(k)),
+                0,
+            )
+        })
     };
-    tagged
-        .or_else(faces)
-        .or_else(keywords)
-        .map(|n| n.min(MAX_PEOPLE))
+    tagged.or_else(faces).or_else(keywords)
 }
 
-/// User caption and people count from an XMP sidecar next to `path`
+/// User caption and tagged people from an XMP sidecar next to `path`
 /// (`IMG_1.heic.xmp`, `IMG_1.xmp`, or `IMG_1.XMP`), reading each sidecar
 /// at most once. `IMG_1.heic.xmp` names exactly this photo, so when it
 /// exists it is the answer even for fields it lacks. `IMG_1.xmp` may belong
 /// to a same-stem sibling (RAW + HEIC), and its values must not land on
 /// this photo instead. Photos exports write one sidecar per photo and put
 /// the user's caption inside; the image itself may carry none.
-pub fn read_sidecar_story(path: &Path) -> (Option<String>, Option<u32>) {
+pub fn read_sidecar_story(path: &Path) -> (Option<String>, Option<PeopleTags>) {
     if let Ok(data) = read_prefix(&path.with_added_extension("xmp")) {
-        return (xmp_description(&data), xmp_people_count(&data));
+        return (xmp_description(&data), xmp_people(&data));
     }
     let (mut caption, mut people) = (None, None);
     for c in [path.with_extension("xmp"), path.with_extension("XMP")] {
@@ -440,22 +591,57 @@ pub fn read_sidecar_story(path: &Path) -> (Option<String>, Option<u32>) {
         }
         let Ok(data) = read_prefix(&c) else { continue };
         caption = caption.or_else(|| xmp_description(&data));
-        people = people.or_else(|| xmp_people_count(&data));
+        people = people.or_else(|| xmp_people(&data));
     }
     (caption, people)
 }
 
-/// An asset's story fields `(user caption, people count)`: in-file values
-/// from `exif` (photos) win and the XMP sidecar fills the rest. The sidecar
-/// is not read when `exif` already supplies both.
-pub fn story_fields(path: &Path, exif: Option<&ImageExif>) -> (Option<String>, Option<u32>) {
-    let caption = exif.and_then(|e| e.caption.clone());
-    let people = exif.and_then(|e| e.people);
-    if caption.is_some() && people.is_some() {
-        return (caption, people);
+/// An asset's story fields, resolved across every source.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Story {
+    pub caption: Option<String>,
+    pub people: Option<PeopleTags>,
+    /// The photo library's own aesthetic score, carried as-is.
+    pub library_score: Option<f32>,
+}
+
+impl Story {
+    /// Write these fields onto `a`. Only the people count and the salted
+    /// signature land on the asset, never the names.
+    pub fn apply(self, a: &mut crate::types::Asset, salt: &str) {
+        a.user_caption = self.caption;
+        a.people_count = self.people.as_ref().map(PeopleTags::count);
+        a.people_sig = self.people.as_ref().map(|p| p.signature(salt));
+        a.library_score = self.library_score;
     }
-    let (side_caption, side_people) = read_sidecar_story(path);
-    (caption.or(side_caption), people.or(side_people))
+}
+
+/// An asset's story fields. Per field, in-file values from `exif` (photos)
+/// win, the XMP sidecar comes next, and the photo library's export
+/// database (`library`, see [`crate::osxphotos`]) fills what is still
+/// missing. The sidecar is not read when `exif` already supplies both
+/// caption and people.
+pub fn story_fields(
+    path: &Path,
+    exif: Option<&ImageExif>,
+    library: Option<&crate::osxphotos::LibraryEntry>,
+) -> Story {
+    let mut caption = exif.and_then(|e| e.caption.clone());
+    let mut people = exif.and_then(|e| e.people.clone());
+    if caption.is_none() || people.is_none() {
+        let (side_caption, side_people) = read_sidecar_story(path);
+        caption = caption.or(side_caption);
+        people = people.or(side_people);
+    }
+    if let Some(lib) = library {
+        caption = caption.or_else(|| lib.description.as_deref().and_then(clean_caption));
+        people = people.or_else(|| lib.people());
+    }
+    Story {
+        caption,
+        people,
+        library_score: library.and_then(|l| l.overall),
+    }
 }
 
 /// Upper bound on bytes buffered from one image for metadata parsing.
@@ -488,7 +674,7 @@ pub fn read_image_exif(path: &Path) -> ImageExif {
         if out.caption.is_none() {
             out.caption = xmp_description(&data);
         }
-        out.people = xmp_people_count(&data);
+        out.people = xmp_people(&data);
     }
     out
 }
@@ -1311,7 +1497,11 @@ mod tests {
         write("IMG_1.heic.xmp", 3);
         write("IMG_1.xmp", 1);
         write("IMG_2.xmp", 2);
-        let people = |photo: &str| read_sidecar_story(&dir.path().join(photo)).1;
+        let people = |photo: &str| {
+            read_sidecar_story(&dir.path().join(photo))
+                .1
+                .map(|p| p.count())
+        };
         assert_eq!(people("IMG_1.heic"), Some(3), "exact sidecar wins");
         assert_eq!(people("IMG_2.heic"), Some(2));
         assert_eq!(people("IMG_3.heic"), None);
@@ -1322,6 +1512,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(people("IMG_2.heic"), None);
+    }
+
+    fn xmp_people_count(data: &[u8]) -> Option<u32> {
+        xmp_people(data).map(|p| p.count())
+    }
+
+    fn count_of(story: &Story) -> Option<u32> {
+        story.people.as_ref().map(PeopleTags::count)
+    }
+
+    fn names(n: &[&str]) -> Option<PeopleTags> {
+        PeopleTags::new(n.iter().map(|s| s.to_string()), 0)
     }
 
     #[test]
@@ -1336,35 +1538,177 @@ mod tests {
         )
         .unwrap();
         // One sidecar read yields both fields.
-        assert_eq!(
-            read_sidecar_story(&photo),
-            (Some("Sidecar words".to_string()), Some(2))
-        );
-        assert_eq!(
-            story_fields(&photo, None),
-            (Some("Sidecar words".to_string()), Some(2))
-        );
+        let (caption, people) = read_sidecar_story(&photo);
+        assert_eq!(caption.as_deref(), Some("Sidecar words"));
+        assert_eq!(people, names(&["Ann", "Bo"]));
+        let s = story_fields(&photo, None, None);
+        assert_eq!(s.caption.as_deref(), Some("Sidecar words"));
+        assert_eq!(count_of(&s), Some(2));
         // In-file values win; the sidecar fills only what is missing.
         let exif = ImageExif {
             caption: Some("In-file words".into()),
             ..Default::default()
         };
-        assert_eq!(
-            story_fields(&photo, Some(&exif)),
-            (Some("In-file words".to_string()), Some(2))
-        );
+        let s = story_fields(&photo, Some(&exif), None);
+        assert_eq!(s.caption.as_deref(), Some("In-file words"));
+        assert_eq!(count_of(&s), Some(2));
         let full = ImageExif {
             caption: Some("In-file words".into()),
-            people: Some(5),
+            people: PeopleTags::new([], 5),
             ..Default::default()
         };
+        let s = story_fields(&photo, Some(&full), None);
+        assert_eq!(s.caption.as_deref(), Some("In-file words"));
+        assert_eq!(count_of(&s), Some(5));
         assert_eq!(
-            story_fields(&photo, Some(&full)),
-            (Some("In-file words".to_string()), Some(5))
+            story_fields(&dir.path().join("IMG_9.heic"), None, None),
+            Story::default()
+        );
+    }
+
+    #[test]
+    fn xmp_wins_over_the_library_which_fills_the_gaps() {
+        use crate::osxphotos::LibraryEntry;
+        let dir = tempfile::tempdir().unwrap();
+        let photo = dir.path().join("IMG_1.heic");
+        std::fs::write(
+            dir.path().join("IMG_1.heic.xmp"),
+            xmp("<Iptc4xmpExt:PersonInImage><rdf:Bag><rdf:li>Ann</rdf:li>\
+                 </rdf:Bag></Iptc4xmpExt:PersonInImage>"),
+        )
+        .unwrap();
+        let lib = LibraryEntry {
+            description: Some("  Library   words ".into()),
+            persons: vec!["Cy".into(), "Di".into(), "_UNKNOWN_".into()],
+            overall: Some(0.3),
+            ..Default::default()
+        };
+        // Sidecar people win; the library supplies the missing caption and
+        // its score.
+        let s = story_fields(&photo, None, Some(&lib));
+        assert_eq!(s.caption.as_deref(), Some("Library words"));
+        assert_eq!(s.people, names(&["Ann"]));
+        assert_eq!(s.library_score, Some(0.3));
+        // An in-file caption wins over the library's.
+        let exif = ImageExif {
+            caption: Some("Mine".into()),
+            ..Default::default()
+        };
+        let s = story_fields(&photo, Some(&exif), Some(&lib));
+        assert_eq!(s.caption.as_deref(), Some("Mine"));
+        // No XMP at all: everything comes from the library.
+        let bare = dir.path().join("IMG_2.heic");
+        let s = story_fields(&bare, None, Some(&lib));
+        assert_eq!(count_of(&s), Some(3));
+        // Applying the story stores only the count and the salted sig.
+        let mut a = crate::types::Asset::new("a", bare, crate::types::AssetKind::Photo);
+        s.clone().apply(&mut a, "prj_1");
+        assert_eq!(a.user_caption.as_deref(), Some("Library words"));
+        assert_eq!(a.people_count, Some(3));
+        assert_eq!(a.people_sig, s.people.map(|p| p.signature("prj_1")));
+        assert_eq!(a.library_score, Some(0.3));
+    }
+
+    #[test]
+    fn people_signature_tracks_who_not_order_or_case() {
+        let ab = names(&["Ann", "Bo"]).unwrap();
+        let ba = names(&[" bo ", "ANN", "Ann"]).unwrap();
+        assert_eq!(ab, ba);
+        assert_eq!(ab.signature("p"), ba.signature("p"));
+        // Same count, different people.
+        let cd = names(&["Cy", "Di"]).unwrap();
+        assert_eq!(ab.count(), cd.count());
+        assert_ne!(ab.signature("p"), cd.signature("p"));
+        // Unnamed faces matter, and the salt separates projects.
+        let ab_face = PeopleTags::new(["Ann".to_string(), "Bo".to_string()], 1).unwrap();
+        assert_ne!(ab.signature("p"), ab_face.signature("p"));
+        assert_ne!(ab.signature("p"), ab.signature("q"));
+        assert_eq!(PeopleTags::new([" ".to_string()], 0), None);
+        assert_eq!(PeopleTags::new([], 0), None);
+        assert!(!format!("{ab:?}").contains("ann"));
+        // The XMP path signs the names it parses, like the library path.
+        let data = xmp("<Iptc4xmpExt:PersonInImage><rdf:Bag><rdf:li>Bo</rdf:li>\
+                        <rdf:li>Ann</rdf:li></rdf:Bag></Iptc4xmpExt:PersonInImage>");
+        assert_eq!(xmp_people(&data), Some(ab));
+    }
+
+    #[test]
+    fn iso_instants_parse_with_fraction_and_offset() {
+        // 2026-10-27T02:05:38.928Z, floored to the second.
+        assert_eq!(
+            parse_iso_instant("2026-10-27T10:05:38.928000+08:00"),
+            Some((1_793_066_738, 8 * 3600))
         );
         assert_eq!(
-            story_fields(&dir.path().join("IMG_9.heic"), None),
-            (None, None)
+            parse_iso_instant("2026-10-26T21:05:38.5-05:00"),
+            Some((1_793_066_738, -5 * 3600))
         );
+        assert_eq!(
+            parse_iso_instant("2026-10-27T02:05:38Z"),
+            Some((1_793_066_738, 0))
+        );
+        assert_eq!(
+            parse_iso_instant("2026-10-27T07:35:38+05:30"),
+            Some((1_793_066_738, 5 * 3600 + 1800))
+        );
+        // Floor, not truncate: half a second before the epoch is -1.
+        assert_eq!(
+            parse_iso_instant("1969-12-31T23:59:59.500+00:00"),
+            Some((-1, 0))
+        );
+        assert_eq!(parse_iso_instant("2026-10-27T10:05:38"), None);
+        assert_eq!(parse_iso_instant(""), None);
+    }
+
+    #[test]
+    fn photo_capture_prefers_exif_then_library_then_mtime() {
+        use crate::osxphotos::LibraryEntry;
+        use crate::types::{Asset, AssetKind};
+        let lib = LibraryEntry {
+            taken_at: Some(1_793_066_738),
+            tz_offset_secs: Some(8 * 3600),
+            gps: Some((1.29, 103.85)),
+            ..Default::default()
+        };
+        let fresh = || {
+            let mut a = Asset::new("a", "/t/IMG_1_edited.heic".into(), AssetKind::Photo);
+            a.mtime = 2_000_000_000;
+            a
+        };
+        // No EXIF date: the library's date, offset and place, not mtime.
+        let mut a = fresh();
+        fill_photo_capture(&mut a, &ImageExif::default(), Some(&lib));
+        assert_eq!(a.taken_at, Some(1_793_066_738));
+        assert!(!a.time_guessed);
+        assert_eq!(a.tz_offset_secs, Some(8 * 3600));
+        assert_eq!(a.gps, Some((1.29, 103.85)));
+        // EXIF wins for each field it has.
+        let exif = ImageExif {
+            taken_at: Some(1_700_000_000),
+            tz_offset_secs: Some(9 * 3600),
+            gps: Some((35.0, 139.0)),
+            ..Default::default()
+        };
+        let mut a = fresh();
+        fill_photo_capture(&mut a, &exif, Some(&lib));
+        assert_eq!(a.taken_at, Some(1_700_000_000));
+        assert_eq!(a.tz_offset_secs, Some(9 * 3600));
+        assert_eq!(a.gps, Some((35.0, 139.0)));
+        // EXIF date without GPS: the library fills only the place.
+        let dated = ImageExif {
+            taken_at: Some(1_700_000_000),
+            ..Default::default()
+        };
+        let mut a = fresh();
+        fill_photo_capture(&mut a, &dated, Some(&lib));
+        assert_eq!(a.taken_at, Some(1_700_000_000));
+        assert_eq!(a.tz_offset_secs, None);
+        assert_eq!(a.gps, Some((1.29, 103.85)));
+        // Nothing anywhere: mtime, guessed.
+        let mut a = fresh();
+        fill_photo_capture(&mut a, &ImageExif::default(), None);
+        assert_eq!(a.taken_at, Some(2_000_000_000));
+        assert!(a.time_guessed);
+        assert_eq!(a.gps, None);
     }
 }

@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 use triptape_core::db::{Db, EditedPlan};
 use triptape_core::metadata;
+use triptape_core::osxphotos::OsxPhotosIndex;
 use triptape_core::scan::{ScannedFile, VIDEO_EXTS};
 use triptape_core::types::{Asset, AssetKind, Chapter, PlanEntry};
 use triptape_media::export::Skipped;
@@ -338,42 +339,18 @@ pub struct ExportSummary {
 ///
 /// Per-file fault-tolerant: unreadable EXIF or a failed probe falls back to
 /// file mtime with `time_guessed = true` and never fails the scan.
-pub fn fill_foreground_metadata(a: &mut Asset) {
+///
+/// Story fields (caption, people, library score) come from in-file XMP,
+/// then the XMP sidecar, then `library` (the folder's osxphotos export
+/// database, when present). `salt` (the project id) salts the people
+/// signature.
+pub fn fill_foreground_metadata(a: &mut Asset, library: Option<&OsxPhotosIndex>, salt: &str) {
     if a.kind == AssetKind::Video {
         let probe = metadata::probe_video("ffprobe", &a.path).ok();
-        (a.user_caption, a.people_count) = metadata::story_fields(&a.path, None);
-        let Some(p) = probe else {
-            a.taken_at = Some(a.mtime);
-            a.time_guessed = true;
-            return;
-        };
-        a.duration_secs = p.duration_secs();
-        if let Some((w, h)) = p.video_dims() {
-            a.width = Some(w);
-            a.height = Some(h);
-        }
-        a.rotation_deg = p.rotation_deg();
-        a.gps = p.gps();
-        let ct = metadata::resolve_capture_time(p.creation_time(), a.mtime);
-        a.taken_at = Some(ct.unix_secs);
-        a.time_guessed = ct.time_guessed;
+        metadata::fill_video(a, probe.as_ref(), library, salt);
     } else {
         let exif = metadata::read_image_exif(&a.path);
-        let ct = metadata::resolve_capture_time(exif.taken_at, a.mtime);
-        a.taken_at = Some(ct.unix_secs);
-        a.time_guessed = ct.time_guessed;
-        a.tz_offset_secs = exif.tz_offset_secs;
-        (a.user_caption, a.people_count) = metadata::story_fields(&a.path, Some(&exif));
-        a.gps = exif.gps;
-        a.rotation_deg = exif
-            .orientation
-            .map(metadata::orientation_to_degrees)
-            .unwrap_or(0);
-        // Undecoded stills (e.g. HEIC): EXIF carries the true size.
-        if let (Some(w), Some(h)) = (exif.width, exif.height) {
-            a.width = Some(w);
-            a.height = Some(h);
-        }
+        metadata::fill_photo(a, &exif, library, salt);
     }
 }
 
@@ -389,10 +366,12 @@ pub const FOREGROUND_FILL_WORKERS_MAX: usize = 8;
 ///
 /// Walk order is restored before returning, so index-based asset ids
 /// (`{pid}_a{i:06}`) are identical to the sequential fill and Story edits
-/// keyed by those ids keep applying across rescans.
+/// keyed by those ids keep applying across rescans. `library` is the
+/// folder's osxphotos export index (see [`fill_foreground_metadata`]).
 pub fn fill_assets_parallel(
     pid: &str,
     files: &[ScannedFile],
+    library: Option<&OsxPhotosIndex>,
     mut on_done: impl FnMut(usize, usize),
 ) -> Vec<Asset> {
     let workers = std::thread::available_parallelism()
@@ -412,7 +391,7 @@ pub fn fill_assets_parallel(
             let mut a = Asset::new(String::new(), f.path.clone(), kind);
             a.size_bytes = f.size_bytes;
             a.mtime = f.mtime_secs;
-            fill_foreground_metadata(&mut a);
+            fill_foreground_metadata(&mut a, library, pid);
             a
         },
         |idx, mut asset, done, total| {
@@ -778,7 +757,7 @@ mod tests {
         let mut a = Asset::new("a1", path.clone(), AssetKind::Photo);
         a.size_bytes = 19;
         a.mtime = 1_700_000_000;
-        fill_foreground_metadata(&mut a);
+        fill_foreground_metadata(&mut a, None, "p");
         assert_eq!(a.taken_at, Some(1_700_000_000));
         assert!(a.time_guessed);
         assert_eq!(a.gps, None);
@@ -792,7 +771,7 @@ mod tests {
         let mut a = Asset::new("v1", dir.path().join("gone.mp4"), AssetKind::Video);
         a.size_bytes = 10;
         a.mtime = 1_700_000_001;
-        fill_foreground_metadata(&mut a);
+        fill_foreground_metadata(&mut a, None, "p");
         assert_eq!(a.taken_at, Some(1_700_000_001));
         assert!(a.time_guessed);
         assert_eq!(a.duration_secs, None);
@@ -914,7 +893,7 @@ mod tests {
             let mut a = Asset::new(format!("{pid}_a{i:06}"), f.path.clone(), kind);
             a.size_bytes = f.size_bytes;
             a.mtime = f.mtime_secs;
-            fill_foreground_metadata(&mut a);
+            fill_foreground_metadata(&mut a, None, "p");
             out.push(a);
         }
         out
@@ -948,7 +927,7 @@ mod tests {
             files.push(scanned_file(&path, "mov"));
         }
         let seq = sequential_fill("p", &files);
-        let par = fill_assets_parallel("p", &files, |_, _| {});
+        let par = fill_assets_parallel("p", &files, None, |_, _| {});
         assert_eq!(par.len(), seq.len(), "no file lost in the parallel fill");
         assert_eq!(
             par.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
