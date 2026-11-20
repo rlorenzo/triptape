@@ -1855,11 +1855,11 @@ fn collage_eligible(e: &ResolvedEntry) -> bool {
 /// Hero segments in playback order: each is one entry or a collage of
 /// same-chapter stills, as [`plan::collage_groups`] decides (the plan's
 /// length estimate groups the same way).
-fn hero_groups<'a>(
+fn hero_groups<'a, C: PartialEq>(
     entries: &[&'a ResolvedEntry],
-    chapter_of: impl Fn(&str) -> usize,
+    chapter_of: impl Fn(&str) -> C,
 ) -> Vec<Vec<&'a ResolvedEntry>> {
-    let slots: Vec<GroupSlot<usize>> = entries
+    let slots: Vec<GroupSlot<C>> = entries
         .iter()
         .map(|r| GroupSlot {
             chapter: chapter_of(&r.entry.asset_id),
@@ -2772,11 +2772,10 @@ mod tests {
                     })
                     .collect();
                 let refs: Vec<&ResolvedEntry> = resolved.iter().collect();
-                let groups: Vec<Vec<&PlanEntry>> =
-                    hero_groups(&refs, |id| id[1..3].parse::<usize>().unwrap())
-                        .into_iter()
-                        .map(|g| g.into_iter().map(|r| &r.entry).collect())
-                        .collect();
+                let groups: Vec<Vec<&PlanEntry>> = hero_groups(&refs, chapter_of)
+                    .into_iter()
+                    .map(|g| g.into_iter().map(|r| &r.entry).collect())
+                    .collect();
                 // (asset id, duration, kind) as in the renderer's `segs`.
                 let mut segs: Vec<(String, f64, &str)> =
                     vec![("title".into(), opts.title_secs, "title")];
