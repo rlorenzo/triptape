@@ -12,6 +12,7 @@ use image::{Rgb, RgbImage};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use triptape_core::pick;
 
 /// Book preset (PLAN.md Sec 11: only two in v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +92,23 @@ pub struct BookPhoto {
     /// any scored pick and never dropped silently. The chapter-place
     /// fallback caption does not count.
     pub keep: bool,
+    /// Capture time (unix seconds), perceptual hash and tagged people: what
+    /// [`pick::repeats`] needs to tell a near-identical shot of the same
+    /// people from a new scene.
+    pub taken_at: Option<i64>,
+    pub phash: Option<u64>,
+    pub people_sig: Option<u64>,
+}
+
+impl BookPhoto {
+    fn candidate(&self) -> pick::Candidate {
+        pick::Candidate {
+            taken_at: self.taken_at,
+            phash: self.phash,
+            people_sig: self.people_sig,
+            score: self.score,
+        }
+    }
 }
 
 /// Score of a photo nothing could be scored from.
@@ -595,8 +613,10 @@ fn evenly_spaced(total: usize, keep: usize) -> Vec<usize> {
 /// proportion to their size (every chapter gets one while slots last), and
 /// each chapter fills its share with its best-scored photos, one per
 /// stretch of consecutive shots, so the picks are the best of each scene
-/// and still span the chapter. Returns the sorted selection plus any
-/// curated indices that could not fit (more of them than slots).
+/// and still span the chapter; a near-identical shot of the same people as
+/// one already picked waits (see [`best_per_stretch`]). Returns the sorted
+/// selection plus any curated indices that could not fit (more of them than
+/// slots).
 fn select_for_cap(photos: &[BookPhoto], keep: usize) -> (Vec<usize>, Vec<usize>) {
     let total = photos.len();
     if keep >= total {
@@ -626,7 +646,8 @@ fn select_for_cap(photos: &[BookPhoto], keep: usize) -> (Vec<usize>, Vec<usize>)
     let sizes: Vec<usize> = groups.iter().map(|(_, m)| m.len()).collect();
     let mut sel = curated;
     for ((_, members), quota) in groups.iter().zip(chapter_quotas(&sizes, keep - sel.len())) {
-        sel.extend(best_per_stretch(photos, members, quota));
+        let picks = best_per_stretch(photos, members, quota, &sel);
+        sel.extend(picks);
     }
     sel.sort_unstable();
     (sel, vec![])
@@ -681,20 +702,56 @@ fn best_scored(photos: &[BookPhoto], cands: impl IntoIterator<Item = usize>) -> 
 
 /// The best-scored photo of each of `quota` equal stretches of `members`
 /// (indices into `photos`, in story order); the earlier photo wins a tie.
-fn best_per_stretch(photos: &[BookPhoto], members: &[usize], quota: usize) -> Vec<usize> {
+/// A photo that [`pick::repeats`] one in `chosen` (picked for the book
+/// already) or picked here waits, as in [`pick::pick_top`]: the stretch
+/// takes its best photo that is a new scene, or the same view with other
+/// people. A stretch with only repeats leaves its slot to the chapter's
+/// best remaining new scene, and repeats fill only what nothing else can,
+/// so the quota is always met.
+fn best_per_stretch(
+    photos: &[BookPhoto],
+    members: &[usize],
+    quota: usize,
+    chosen: &[usize],
+) -> Vec<usize> {
     let n = members.len();
     if quota >= n {
         return members.to_vec();
     }
-    (0..quota)
-        .map(|j| {
-            best_scored(
-                photos,
-                members[j * n / quota..(j + 1) * n / quota].iter().copied(),
-            )
-            .expect("stretches are non-empty when quota < n")
-        })
-        .collect()
+    let repeats = |i: usize, picked: &[usize]| {
+        let c = photos[i].candidate();
+        chosen
+            .iter()
+            .chain(picked)
+            .any(|&p| pick::repeats(&photos[p].candidate(), &c))
+    };
+    let mut picked: Vec<usize> = vec![];
+    for j in 0..quota {
+        let stretch = &members[j * n / quota..(j + 1) * n / quota];
+        let fresh: Vec<usize> = stretch
+            .iter()
+            .copied()
+            .filter(|&i| !repeats(i, &picked))
+            .collect();
+        picked.extend(best_scored(photos, fresh));
+    }
+    // Leftover slots, best first: new scenes anywhere in the chapter, then
+    // the waiting repeats.
+    let mut waiting: Vec<usize> = members
+        .iter()
+        .copied()
+        .filter(|i| !picked.contains(i))
+        .collect();
+    waiting.sort_by(|&a, &b| photos[b].score.total_cmp(&photos[a].score).then(a.cmp(&b)));
+    while picked.len() < quota {
+        let at = waiting
+            .iter()
+            .position(|&i| !repeats(i, &picked))
+            .unwrap_or(0);
+        picked.push(waiting.remove(at));
+    }
+    picked.sort_unstable();
+    picked
 }
 
 /// Simulate the renderer's page assignment and return asset ids whose
@@ -1706,6 +1763,9 @@ mod tests {
             chapter: None,
             score: NEUTRAL_SCORE,
             keep: false,
+            taken_at: None,
+            phash: None,
+            people_sig: None,
         };
         let a = mk("Day 4 · Sun, Oct 5 · 9:00 AM");
         let b = mk("Day 4 · Sun, Oct 5 · 4:32 PM");
@@ -1755,6 +1815,9 @@ mod tests {
             chapter,
             score,
             keep: false,
+            taken_at: None,
+            phash: None,
+            people_sig: None,
         }
     }
 
@@ -1846,6 +1909,9 @@ mod tests {
             chapter: None,
             score: NEUTRAL_SCORE,
             keep: false,
+            taken_at: None,
+            phash: None,
+            people_sig: None,
         };
         // Wide shot at index 20 (a later chapter): no spread.
         let mut photos: Vec<BookPhoto> = (0..25).map(|_| bp(100, 100)).collect();
@@ -2136,6 +2202,9 @@ mod tests {
                 chapter: chapters[i],
                 score: NEUTRAL_SCORE,
                 keep: false,
+                taken_at: None,
+                phash: None,
+                people_sig: None,
             })
             .collect();
         let keep = fitting_count(&pool, true, 60);
@@ -2168,6 +2237,9 @@ mod tests {
             chapter: Some(chapter),
             score,
             keep,
+            taken_at: None,
+            phash: None,
+            people_sig: None,
         }
     }
 
@@ -2238,6 +2310,45 @@ mod tests {
         // Fewer slots than chapters: the largest chapters keep theirs.
         let (sel, _) = select_for_cap(&photos, 2);
         assert_eq!(sel, [59, 89]);
+    }
+
+    #[test]
+    fn cap_selection_skips_repeats_of_the_same_people() {
+        // Eight shots an hour apart; 1 and 2 are one burst (same second)
+        // across two stretches of the 4-of-8 pick.
+        let book = |people_of_2: Option<u64>| -> Vec<BookPhoto> {
+            (0..8)
+                .map(|i| {
+                    let score = [0.5, 0.9, 0.8, 0.5, 0.5, 0.5, 0.5, 0.5][i];
+                    BookPhoto {
+                        taken_at: Some(if i == 2 { 3600 } else { i as i64 * 3600 }),
+                        people_sig: if i == 2 { people_of_2 } else { Some(7) },
+                        ..scored(i, 0, score, false)
+                    }
+                })
+                .collect()
+        };
+        // Same people: the burst's second shot waits; its stretch takes 3.
+        assert_eq!(select_for_cap(&book(Some(7)), 4).0, [1, 3, 4, 6]);
+        // The same view with someone else in it is a new keepsake.
+        assert_eq!(select_for_cap(&book(Some(9)), 4).0, [1, 2, 4, 6]);
+        // Everything one burst: repeats still fill the quota, best first.
+        let burst: Vec<BookPhoto> = book(Some(7))
+            .into_iter()
+            .map(|p| BookPhoto {
+                taken_at: Some(0),
+                ..p
+            })
+            .collect();
+        assert_eq!(select_for_cap(&burst, 4).0, [0, 1, 2, 3]);
+        // A curated photo is reserved first and never dropped; the better
+        // shot it repeats is the one that waits.
+        let mut curated = book(Some(7));
+        curated[2].keep = true;
+        let (sel, dropped) = select_for_cap(&curated, 4);
+        assert!(dropped.is_empty());
+        assert!(sel.contains(&2) && !sel.contains(&1), "{sel:?}");
+        assert!(sel.windows(2).all(|w| w[0] < w[1]), "story order: {sel:?}");
     }
 
     #[test]
@@ -2312,6 +2423,9 @@ mod tests {
             chapter,
             score: NEUTRAL_SCORE,
             keep: false,
+            taken_at: None,
+            phash: None,
+            people_sig: None,
         };
         let titles = ["Tokyo".to_string(), "Kyoto".to_string()];
         let mut seen = HashSet::new();
@@ -2356,6 +2470,9 @@ mod tests {
             chapter: Some(chapter),
             score: NEUTRAL_SCORE,
             keep: false,
+            taken_at: None,
+            phash: None,
+            people_sig: None,
         };
         // Flow: hero (p0), divider background (p1), photo page (p2).
         // 1200px clears the smallest slot's 200 dpi but prints at 100 dpi full-page.
@@ -2390,6 +2507,9 @@ mod tests {
             chapter: None,
             score: NEUTRAL_SCORE,
             keep: false,
+            taken_at: None,
+            phash: None,
+            people_sig: None,
         };
         // Flow: hero, then one caption page. Each size clears 200 dpi inside
         // the photo area an inset layout would have, but not at full bleed.
@@ -2470,6 +2590,9 @@ mod tests {
                 chapter: None,
                 score: NEUTRAL_SCORE,
                 keep: false,
+                taken_at: None,
+                phash: None,
+                people_sig: None,
             })
             .collect();
         let out = dir.path().join("book");
@@ -2544,6 +2667,9 @@ mod tests {
                     chapter,
                     score: NEUTRAL_SCORE,
                     keep: false,
+                    taken_at: None,
+                    phash: None,
+                    people_sig: None,
                 }
             })
             .collect();
@@ -2608,6 +2734,9 @@ mod tests {
                 chapter: None,
                 score: NEUTRAL_SCORE,
                 keep: false,
+                taken_at: None,
+                phash: None,
+                people_sig: None,
             })
             .collect();
         let at_60 = fitting_count(&pool, false, 60);

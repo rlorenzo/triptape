@@ -672,6 +672,9 @@ fn export_inner(
                     .captions
                     .get(&a.id)
                     .is_some_and(|c| !c.trim().is_empty()),
+                taken_at: a.taken_at,
+                phash: a.phash,
+                people_sig: a.people_sig,
             });
         }
         // Story order: keep db order (taken_at, id).
