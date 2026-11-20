@@ -197,19 +197,9 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
         let (w, h) = slot_inches(preset, kind, take);
         dpi_verdict(photos[i].width, photos[i].height, w, h) == DpiVerdict::Ok
     };
-    // Best-scored sharp candidate; the earlier photo wins a tie.
+    // Best-scored candidate that is sharp full-page.
     let pick = |cands: &[usize], kind: PageKind| {
-        cands
-            .iter()
-            .copied()
-            .filter(|&i| sharp(i, kind, 1))
-            .reduce(|best, i| {
-                if photos[i].score > photos[best].score {
-                    i
-                } else {
-                    best
-                }
-            })
+        best_scored(photos, cands.iter().copied().filter(|&i| sharp(i, kind, 1)))
     };
 
     // Hero: the opening chapter's leading photos in `order` (position 0,
@@ -677,6 +667,18 @@ fn chapter_quotas(sizes: &[usize], slots: usize) -> Vec<usize> {
     quotas
 }
 
+/// The best-scored of `cands` (indices into `photos`); the earlier photo
+/// wins a tie. `None` when there are no candidates.
+fn best_scored(photos: &[BookPhoto], cands: impl IntoIterator<Item = usize>) -> Option<usize> {
+    cands.into_iter().reduce(|best, i| {
+        if photos[i].score > photos[best].score {
+            i
+        } else {
+            best
+        }
+    })
+}
+
 /// The best-scored photo of each of `quota` equal stretches of `members`
 /// (indices into `photos`, in story order); the earlier photo wins a tie.
 fn best_per_stretch(photos: &[BookPhoto], members: &[usize], quota: usize) -> Vec<usize> {
@@ -686,17 +688,11 @@ fn best_per_stretch(photos: &[BookPhoto], members: &[usize], quota: usize) -> Ve
     }
     (0..quota)
         .map(|j| {
-            members[j * n / quota..(j + 1) * n / quota]
-                .iter()
-                .copied()
-                .reduce(|best, i| {
-                    if photos[i].score > photos[best].score {
-                        i
-                    } else {
-                        best
-                    }
-                })
-                .expect("stretches are non-empty when quota < n")
+            best_scored(
+                photos,
+                members[j * n / quota..(j + 1) * n / quota].iter().copied(),
+            )
+            .expect("stretches are non-empty when quota < n")
         })
         .collect()
 }
