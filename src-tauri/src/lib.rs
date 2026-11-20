@@ -207,6 +207,24 @@ pub struct StoryEntryView {
     pub caption: Option<String>,
     pub in_hero: bool,
     pub in_reels: bool,
+    /// How the film plays this pick, when it is in the film: on its own or
+    /// as one photo of a collage. Set for film picks only.
+    pub film_group: Option<FilmGroupView>,
+}
+
+/// The film segment a pick plays in, as the renderer groups the film
+/// ([`triptape_core::plan::hero_collage_groups`]). A group of one plays on
+/// its own; a longer one is a collage shown at its first photo's place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilmGroupView {
+    /// The segment's place in the film's hero order (0-based); photos with
+    /// the same id share a collage.
+    pub id: usize,
+    /// This photo's place in its collage (0-based); 0 when solo.
+    pub position: usize,
+    /// Photos in the segment; 1 = plays on its own.
+    pub size: usize,
 }
 
 /// One day/place chapter in the Story editor. `key` is the chapter's
@@ -253,12 +271,30 @@ impl StoryData {
             self.0.assets.iter().map(|a| (a.id.as_str(), a)).collect();
         let hero = ids(&self.0.edited.hero);
         let reels = ids(&self.0.edited.reel_selects);
+        // An asset's first hero entry names its segment: only clips have
+        // several (one per window), and clips always play on their own.
+        let mut film_group: HashMap<&str, FilmGroupView> = HashMap::new();
+        let groups = triptape_core::plan::hero_collage_groups(&self.0.edited, |id| {
+            by_id.get(id).and_then(|a| a.display_aspect())
+        });
+        for (gid, g) in groups.iter().enumerate() {
+            for (position, &i) in g.iter().enumerate() {
+                film_group
+                    .entry(self.0.edited.hero[i].asset_id.as_str())
+                    .or_insert(FilmGroupView {
+                        id: gid,
+                        position,
+                        size: g.len(),
+                    });
+            }
+        }
         move |id| {
             Some(StoryEntryView {
                 asset: AssetView::from(*by_id.get(id)?),
                 caption: self.0.edited.captions.get(id).cloned(),
                 in_hero: hero.contains(id),
                 in_reels: reels.contains(id),
+                film_group: film_group.get(id).copied(),
             })
         }
     }
@@ -1208,6 +1244,39 @@ mod tests {
         // serializes as null, never as an empty string.
         assert!(json.get("place").is_some());
         assert!(json["place"].is_null());
+    }
+
+    #[test]
+    fn story_shows_the_film_collages_the_renderer_plays() {
+        let (db, pid) = story_db(&["a", "b", "c"]);
+        let groups = |db: &Db| {
+            let view = StoryData::load(db, &pid).unwrap().view();
+            view.chapters[0]
+                .entries
+                .iter()
+                .map(|e| {
+                    assert_eq!(e.in_hero, e.film_group.is_some(), "{}", e.asset.id);
+                    (e.asset.id.clone(), e.film_group)
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        // Three plain stills of one day play as one collage, in order.
+        let g = groups(&db);
+        let (a, b, c) = (g["a"].unwrap(), g["b"].unwrap(), g["c"].unwrap());
+        assert_eq!((a.id, b.id, c.id), (a.id, a.id, a.id));
+        assert_eq!((a.position, b.position, c.position), (0, 1, 2));
+        assert_eq!(a.size, 3);
+        // A caption keeps its photo on its own, as the renderer does.
+        let edits = PlanEdits {
+            caption_overrides: [("b".to_string(), "Mia on the ferry".to_string())].into(),
+            ..Default::default()
+        };
+        db.save_plan_edits(&pid, &edits).unwrap();
+        let g = groups(&db);
+        let (a, b, c) = (g["a"].unwrap(), g["b"].unwrap(), g["c"].unwrap());
+        assert_eq!(b.size, 1);
+        assert_ne!(b.id, a.id);
+        assert_eq!((a.id, a.size, c.id, c.position), (a.id, 2, a.id, 1));
     }
 
     #[test]

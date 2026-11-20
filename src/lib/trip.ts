@@ -1,4 +1,4 @@
-import type { AssetView } from "./tauri";
+import type { AssetView, StoryEntryView } from "./tauri";
 
 /** Oldest first, undated last, id as the tie-break. */
 export function byTime(a: AssetView, b: AssetView): number {
@@ -57,4 +57,36 @@ export function kindLabel(a: { kind: string; isLivePhoto: boolean }): string {
 /** "1 file", "2,119 files". Regular plurals only. */
 export function countOf(n: number, noun: string): string {
   return `${n.toLocaleString()} ${noun}${n === 1 ? "" : "s"}`;
+}
+
+/** "a", "a and b", "a, b and c". */
+export function listOf(items: string[]): string {
+  if (items.length < 2) return items.join("");
+  return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+
+/**
+ * A day's picks as the Story grid shows them: one unit per pick, except that
+ * the photos of one film collage form a single unit at its first photo's
+ * place, in collage order.
+ */
+export function filmUnits(entries: StoryEntryView[]): StoryEntryView[][] {
+  const units: StoryEntryView[][] = [];
+  const collages = new Map<number, StoryEntryView[]>();
+  for (const e of entries) {
+    const g = e.filmGroup;
+    if (!g || g.size < 2) {
+      units.push([e]);
+      continue;
+    }
+    const unit = collages.get(g.id);
+    if (unit) {
+      unit.push(e);
+    } else {
+      collages.set(g.id, [e]);
+      units.push(collages.get(g.id) as StoryEntryView[]);
+    }
+  }
+  for (const unit of collages.values()) unit.sort((a, b) => (a.filmGroup?.position ?? 0) - (b.filmGroup?.position ?? 0));
+  return units;
 }

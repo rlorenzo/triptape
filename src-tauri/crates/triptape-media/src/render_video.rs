@@ -14,8 +14,8 @@ use crate::segment_cache::SegmentCache;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{
-    self, collage_hold_secs, has_caption, is_panorama, pano_coverage, pano_motion, GroupSlot,
-    MAX_CLIP_SECS, MAX_COLLAGE, MIN_SEGMENT_SECS,
+    self, collage_hold_secs, is_panorama, pano_coverage, pano_motion, GroupSlot, MAX_CLIP_SECS,
+    MAX_COLLAGE, MIN_SEGMENT_SECS,
 };
 use triptape_core::types::{Plan, PlanEntry, Rendition};
 
@@ -1843,13 +1843,10 @@ fn cached_segment(
 
 /// Whether an entry may join a collage: a still that is not a panorama
 /// (panoramas pan solo) and has no caption (a caption describes one photo,
-/// so a captioned still plays solo; same rule as the plan's timing model).
+/// so a captioned still plays solo; same rule as the plan's timing model
+/// and the Story editor, through [`plan::entry_collage_eligible`]).
 fn collage_eligible(e: &ResolvedEntry) -> bool {
-    plan::collage_eligible(
-        &e.entry.rendition,
-        e.aspect.is_some_and(is_panorama),
-        has_caption(e.caption.as_deref()),
-    )
+    plan::entry_collage_eligible(&e.entry.rendition, e.aspect, e.caption.as_deref())
 }
 
 /// Hero segments in playback order: each is one entry or a collage of
@@ -2572,6 +2569,7 @@ fn graph_segment_args(img: &Path, dur: f64, graph: String, out: &Path) -> Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use triptape_core::plan::has_caption;
 
     #[test]
     fn film_graph_chains_cuts_into_one_graph() {

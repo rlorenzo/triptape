@@ -222,6 +222,56 @@ pub fn collage_eligible(rendition: &Rendition, panorama: bool, captioned: bool) 
     matches!(rendition, Rendition::Still) && !panorama && !captioned
 }
 
+/// [`collage_eligible`] from what the renderer knows of an entry: its
+/// rendition, its display aspect (width / height, rotation applied; a
+/// panorama pans solo) and its caption. The renderer's resolved entries and
+/// the Story editor both decide through this, so the editor shows the
+/// collages the film will play.
+pub fn entry_collage_eligible(
+    rendition: &Rendition,
+    aspect: Option<f64>,
+    caption: Option<&str>,
+) -> bool {
+    collage_eligible(
+        rendition,
+        aspect.is_some_and(is_panorama),
+        has_caption(caption),
+    )
+}
+
+/// How the renderer groups `plan`'s hero when every source is on disk:
+/// [`collage_groups`] over `plan.hero` in playback order, each entry's
+/// chapter being the first of `plan.chapters` holding it, and its caption
+/// the plan's. `aspect_of` gives an asset's display aspect. The Story
+/// editor reads its collages from this.
+pub fn hero_collage_groups(
+    plan: &Plan,
+    aspect_of: impl Fn(&str) -> Option<f64>,
+) -> Vec<Vec<usize>> {
+    let mut chapter: HashMap<&str, usize> = HashMap::new();
+    for (i, c) in plan.chapters.iter().enumerate() {
+        for id in &c.asset_ids {
+            chapter.entry(id).or_insert(i);
+        }
+    }
+    let slots: Vec<GroupSlot<usize>> = plan
+        .hero
+        .iter()
+        .map(|e| GroupSlot {
+            chapter: chapter
+                .get(e.asset_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX),
+            eligible: entry_collage_eligible(
+                &e.rendition,
+                aspect_of(&e.asset_id),
+                plan.captions.get(&e.asset_id).map(String::as_str),
+            ),
+        })
+        .collect();
+    collage_groups(&slots)
+}
+
 /// How hero entries play: each group is one segment, a list of indices
 /// into `slots` in ascending (playback) order. A group of one plays solo; a
 /// longer group is a collage of eligible stills. Groups come back ordered
@@ -3777,6 +3827,57 @@ mod tests {
             trim_end: 3.0,
         };
         assert!(!collage_eligible(&motion, false, false));
+    }
+
+    #[test]
+    fn hero_collage_groups_read_chapters_captions_and_aspect_from_the_plan() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let plan = Plan {
+            plan_version: PLAN_VERSION,
+            schema_version: Plan::SCHEMA_VERSION,
+            hero: vec![
+                still_entry("a1"),
+                clip_entry("a2", 3.0),
+                still_entry("a3"),
+                still_entry("a4"),
+                still_entry("b1"),
+                still_entry("b2"),
+                still_entry("b3"),
+            ],
+            reel_selects: vec![],
+            chapters: vec![
+                Chapter {
+                    asset_ids: ids(&["a1", "a2", "a3", "a4"]),
+                    ..Default::default()
+                },
+                Chapter {
+                    asset_ids: ids(&["b1", "b2", "b3"]),
+                    ..Default::default()
+                },
+            ],
+            // A blank caption is no caption; a real one keeps b2 solo.
+            captions: [("a3", "  "), ("b2", "Mia on the ferry")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            map_polyline: vec![],
+            music: MusicPick {
+                track: "t".into(),
+                rationale: "r".into(),
+            },
+        };
+        // a4 is a panorama: solo. a1 and a3 join across the clip; b1 and
+        // b3 across the captioned b2; nothing joins across the chapters.
+        let pano = |id: &str| (id == "a4").then_some(4.0);
+        assert_eq!(
+            hero_collage_groups(&plan, pano),
+            vec![vec![0, 2], vec![1], vec![3], vec![4, 6], vec![5]]
+        );
+        // Without the panorama, a4 joins a1 and a3.
+        assert_eq!(hero_collage_groups(&plan, |_| None)[0], vec![0, 2, 3]);
+        assert!(entry_collage_eligible(&Rendition::Still, Some(1.5), None));
+        assert!(!entry_collage_eligible(&Rendition::Still, Some(4.0), None));
+        assert!(!entry_collage_eligible(&Rendition::Still, None, Some("x")));
     }
 
     #[test]

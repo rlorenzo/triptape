@@ -349,10 +349,23 @@ export async function exportKeepsake(cmd: ExportCmd, projectId: string, choices:
 
 // --- Story editor ---------------------------------------------------------
 
+/**
+ * The film segment a pick plays in (backend `FilmGroupView`): photos with the
+ * same `id` share one collage, shown at its first photo's place. `size` 1
+ * plays on its own. Both indices are 0-based.
+ */
+export interface FilmGroup {
+  id: number;
+  position: number;
+  size: number;
+}
+
 export interface StoryEntryView extends AssetView {
   caption?: string;
   inHero: boolean;
   inReels: boolean;
+  /** Set for film picks only. */
+  filmGroup?: FilmGroup;
 }
 
 export interface ChapterView {
@@ -385,8 +398,44 @@ function buildDemoStory(): StoryView {
       entries: items.map((a, i) => ({ ...a, inHero: i < 3, inReels: i === 0 }))
     };
   }).filter((c) => c.entries.length > 0);
-  return { chapters, excluded: [], heroCount: 9, reelCount: 3 };
+  // A captioned photo plays on its own, so day 2 shows a collage around it.
+  const captioned = chapters[1]?.entries[1];
+  if (captioned) captioned.caption = "Mia on the ferry";
+  const story: StoryView = { chapters, excluded: [], heroCount: 9, reelCount: 3 };
+  demoRegroup(story);
+  return story;
 }
+
+/**
+ * Browser preview stand-in for the backend's collage grouping: a day's film
+ * photos without a caption share collages of up to four (balanced, so five
+ * play as 3 + 2); videos, Live Photos and captioned photos play on their own.
+ */
+function demoRegroup(s: StoryView) {
+  let id = 0;
+  for (const ch of s.chapters) {
+    const film = ch.entries.filter((e) => e.inHero);
+    const joinable = film.filter((e) => e.kind === "photo" && !e.caption);
+    const groups = Math.ceil(joinable.length / 4);
+    for (const e of ch.entries) e.filmGroup = undefined;
+    for (const e of film) {
+      const at = joinable.indexOf(e);
+      if (at < 0 || joinable.length < 2) {
+        e.filmGroup = { id: id++, position: 0, size: 1 };
+      } else if (at === 0) {
+        // Split into `groups` runs whose sizes differ by at most one.
+        let start = 0;
+        for (let g = 0; g < groups; g++) {
+          const size = Math.ceil((joinable.length - start) / (groups - g));
+          joinable.slice(start, start + size).forEach((m, position) => (m.filmGroup = { id, position, size }));
+          id++;
+          start += size;
+        }
+      }
+    }
+  }
+}
+
 const demoStory: StoryView = buildDemoStory();
 
 export async function getStory(projectId: string): Promise<StoryView> {
@@ -402,6 +451,7 @@ export async function getAlternatives(projectId: string, assetId: string): Promi
 
 async function demoEdit(mutate: (s: StoryView) => void): Promise<StoryView> {
   mutate(demoStory);
+  demoRegroup(demoStory);
   return structuredClone(demoStory);
 }
 
