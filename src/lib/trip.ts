@@ -83,8 +83,9 @@ export function filmUnits(entries: StoryEntryView[]): StoryEntryView[][] {
     if (unit) {
       unit.push(e);
     } else {
-      collages.set(g.id, [e]);
-      units.push(collages.get(g.id) as StoryEntryView[]);
+      const fresh = [e];
+      collages.set(g.id, fresh);
+      units.push(fresh);
     }
   }
   for (const unit of collages.values()) unit.sort((a, b) => (a.filmGroup?.position ?? 0) - (b.filmGroup?.position ?? 0));

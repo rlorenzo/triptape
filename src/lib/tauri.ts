@@ -414,24 +414,15 @@ function buildDemoStory(): StoryView {
 function demoRegroup(s: StoryView) {
   let id = 0;
   for (const ch of s.chapters) {
-    const film = ch.entries.filter((e) => e.inHero);
-    const joinable = film.filter((e) => e.kind === "photo" && !e.caption);
+    for (const e of ch.entries) e.filmGroup = e.inHero ? { id: id++, position: 0, size: 1 } : undefined;
+    const joinable = ch.entries.filter((e) => e.inHero && e.kind === "photo" && !e.caption);
+    if (joinable.length < 2) continue;
+    // Split into runs of at most four whose sizes differ by at most one.
     const groups = Math.ceil(joinable.length / 4);
-    for (const e of ch.entries) e.filmGroup = undefined;
-    for (const e of film) {
-      const at = joinable.indexOf(e);
-      if (at < 0 || joinable.length < 2) {
-        e.filmGroup = { id: id++, position: 0, size: 1 };
-      } else if (at === 0) {
-        // Split into `groups` runs whose sizes differ by at most one.
-        let start = 0;
-        for (let g = 0; g < groups; g++) {
-          const size = Math.ceil((joinable.length - start) / (groups - g));
-          joinable.slice(start, start + size).forEach((m, position) => (m.filmGroup = { id, position, size }));
-          id++;
-          start += size;
-        }
-      }
+    for (let g = 0, start = 0; g < groups; g++, id++) {
+      const size = Math.ceil((joinable.length - start) / (groups - g));
+      joinable.slice(start, start + size).forEach((m, position) => (m.filmGroup = { id, position, size }));
+      start += size;
     }
   }
 }

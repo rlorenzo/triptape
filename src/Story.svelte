@@ -92,8 +92,7 @@
     const uses = ["book"];
     if (e.inHero) uses.unshift("film");
     if (e.inReels) uses.splice(uses.length - 1, 0, "reels");
-    if (uses.length === 1) return "In the book";
-    return `In the ${uses.slice(0, -1).join(", ")} and ${uses[uses.length - 1]}`;
+    return `In the ${listOf(uses)}`;
   }
 
   /** "12, 14 and 15", or "" while any frame number is unknown. */
@@ -111,8 +110,10 @@
   function filmPlay(e: StoryEntryView): string {
     const g = e.filmGroup;
     if (!g) return "";
-    if (g.size < 2) return e.caption ? "Plays on its own in the film, because it has a caption." : "Plays on its own in the film.";
-    const others = (day?.entries ?? []).filter((m) => m.id !== e.id && m.filmGroup?.id === g.id);
+    if (g.size < 2) {
+      return e.caption ? "Plays on its own in the film, because it has a caption." : "Plays on its own in the film.";
+    }
+    const others = (units.find((u) => u.includes(e)) ?? []).filter((m) => m !== e);
     const frames = frameList(others);
     return `Plays in the film in a collage of ${g.size}${frames ? `, with frame${others.length > 1 ? "s" : ""} ${frames}` : ""}.`;
   }
