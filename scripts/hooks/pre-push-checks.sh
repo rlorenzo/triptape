@@ -25,16 +25,17 @@ else
   echo "skip: deadwood 1.0.0 not installed (cargo install --locked deadwood-rs --version 1.0.0)"
 fi
 
-if cargo deny --version >/dev/null 2>&1; then
-  echo "==> cargo deny check"
-  cargo deny check
-else
-  echo "skip: cargo-deny not installed (brew install cargo-deny)"
-fi
+# Run `cargo <tool> <args>` if the cargo-<tool> subcommand is installed.
+optional_cargo() {
+  local tool=$1
+  shift
+  if cargo "$tool" --version >/dev/null 2>&1; then
+    echo "==> cargo $tool $*"
+    cargo "$tool" "$@"
+  else
+    echo "skip: cargo-$tool not installed (brew install cargo-$tool)"
+  fi
+}
 
-if cargo audit --version >/dev/null 2>&1; then
-  echo "==> cargo audit"
-  cargo audit
-else
-  echo "skip: cargo-audit not installed (brew install cargo-audit)"
-fi
+optional_cargo deny check
+optional_cargo audit

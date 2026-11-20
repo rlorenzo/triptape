@@ -8,4 +8,5 @@ if ! command -v pre-commit >/dev/null 2>&1; then
   exit 1
 fi
 
-pre-commit install --hook-type pre-commit --hook-type pre-push
+# Hook types come from default_install_hook_types in .pre-commit-config.yaml.
+pre-commit install
