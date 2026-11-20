@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import ErrorNote from "./lib/ErrorNote.svelte";
   import Thumb from "./lib/Thumb.svelte";
   import {
@@ -27,13 +28,16 @@
     getBookPresets,
     getExportEligibility,
     getInterruptedExport,
+    checkSources,
     pickFolder,
     playFilm,
+    relinkSources,
     revealExport,
     REELS_DISCLOSURE,
     type BookPreset,
     type Eligibility,
-    type ExportCmd
+    type ExportCmd,
+    type SourceCheck
   } from "./lib/tauri";
 
   type Keepsake = {
@@ -199,8 +203,20 @@
 
   $: job = $exportJob;
   $: busy = job.label !== null;
-  // Nothing can start until the chosen folder is usable again.
-  $: blocked = busy || folderUnavailable;
+
+  // The check before a run: originals that moved or changed wait on the
+  // owner's call in a sheet (Relink, make without them, or cancel).
+  let checking = false;
+  let sheet: { cmd: ExportCmd; check: SourceCheck } | null = null;
+  let sheetHeading: HTMLElement;
+  let relinking = false;
+  let relinkStatus = "";
+  let relinkError = "";
+  const SHOWN_NAMES = 8;
+
+  // Nothing can start until the chosen folder is usable again, or while
+  // the check or its sheet is waiting.
+  $: blocked = busy || folderUnavailable || checking || sheet !== null;
   $: percent = Math.round(job.progress * 100);
   $: hasPercent = job.progress > 0;
   $: summary = job.summary;
@@ -210,11 +226,72 @@
   // A photo from the trip to sit beside the finished film.
   $: poster = $assets.find((a) => a.highlight) ?? $assets[0];
 
-  function start(cmd: ExportCmd) {
-    if (!$project || folderUnavailable) return;
+  async function start(cmd: ExportCmd) {
+    if (!$project || blocked) return;
+    const projectId = $project.projectId;
     openError = "";
+    relinkStatus = "";
+    relinkError = "";
+    checking = true;
+    let check: SourceCheck | null = null;
+    try {
+      check = await checkSources(projectId, cmd);
+    } catch {
+      // The run checks again and skips what it can't read, with notes.
+    }
+    checking = false;
+    if ($project?.projectId !== projectId) return;
+    if (check && (check.missing.length > 0 || check.changed.length > 0)) {
+      sheet = { cmd, check };
+      await tick();
+      sheetHeading?.focus();
+      return;
+    }
+    run(cmd);
+  }
+
+  function run(cmd: ExportCmd) {
+    if (!$project) return;
+    sheet = null;
     interrupted = null;
     runExport(cmd, labelFor(cmd), $project.projectId);
+  }
+
+  function closeSheet() {
+    sheet = null;
+    relinkStatus = "";
+    relinkError = "";
+  }
+
+  async function relink() {
+    if (!sheet || !$project) return;
+    const { cmd } = sheet;
+    const projectId = $project.projectId;
+    relinkError = "";
+    relinkStatus = "";
+    try {
+      const folder = await pickFolder("Choose the folder where the photos are now");
+      if (!folder) return;
+      relinking = true;
+      const result = await relinkSources(projectId, folder);
+      const check = await checkSources(projectId, cmd);
+      if (!sheet || $project?.projectId !== projectId) return;
+      if (check.missing.length === 0 && check.changed.length === 0) {
+        run(cmd);
+        return;
+      }
+      sheet = { cmd, check };
+      // "Find them" goes away once nothing is missing: keep focus in the sheet.
+      tick().then(() => sheetHeading?.focus());
+      relinkStatus =
+        result.found === 0
+          ? "None of the missing files are in that folder. Try another folder, or make the keepsakes without them."
+          : `Found ${countOf(result.found, "file")}.${check.missing.length > 0 ? ` ${countOf(check.missing.length, "file")} still can't be found.` : ""}`;
+    } catch (e) {
+      relinkError = String(e);
+    } finally {
+      relinking = false;
+    }
   }
 
   function retry() {
@@ -293,6 +370,47 @@
           <button class="btn" disabled={!job.jobId} on:click={() => cancelJob(job.jobId)}>Cancel</button>
         </div>
       </section>
+    {/if}
+
+    {#if sheet}
+      {@const missing = sheet.check.missing}
+      {@const changed = sheet.check.changed}
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+      <section class="sheet" role="group" aria-labelledby="sheet-title" on:keydown={(e) => e.key === "Escape" && !relinking && closeSheet()}>
+        <h2 id="sheet-title" tabindex="-1" bind:this={sheetHeading}>Some photos have moved or changed</h2>
+        {#if missing.length > 0}
+          <p>{countOf(missing.length, "file")} {missing.length === 1 ? "isn't" : "aren't"} where {missing.length === 1 ? "it was" : "they were"} when you added the trip:</p>
+          <ul class="files">
+            {#each missing.slice(0, SHOWN_NAMES) as f (f.assetId)}<li>{f.name}</li>{/each}
+            {#if missing.length > SHOWN_NAMES}<li>and {missing.length - SHOWN_NAMES} more</li>{/if}
+          </ul>
+        {/if}
+        {#if changed.length > 0}
+          <p>{countOf(changed.length, "file")} changed since then, so {changed.length === 1 ? "it" : "they"} won't be used as {changed.length === 1 ? "it is" : "they are"}:</p>
+          <ul class="files">
+            {#each changed.slice(0, SHOWN_NAMES) as f (f.assetId)}<li>{f.name}</li>{/each}
+            {#if changed.length > SHOWN_NAMES}<li>and {changed.length - SHOWN_NAMES} more</li>{/if}
+          </ul>
+        {/if}
+        <p>
+          {#if missing.length > 0}
+            If you moved them, show TripTape the folder they're in now. Or make the keepsakes without these files.
+          {:else}
+            You can make the keepsakes without {changed.length === 1 ? "it" : "them"}.
+          {/if}
+        </p>
+        {#if relinkStatus}<p class="relink-status" role="status">{relinkStatus}</p>{/if}
+        {#if relinkError}<ErrorNote message="Couldn't look in that folder. Choose another folder." detail={relinkError} />{/if}
+        <div class="sheet-actions">
+          {#if missing.length > 0}
+            <button class="btn btn-primary" disabled={relinking} on:click={relink}>{relinking ? "Looking…" : "Find them…"}</button>
+          {/if}
+          <button class="btn" disabled={relinking} on:click={() => sheet && run(sheet.cmd)}>Make without them</button>
+          <button class="btn" disabled={relinking} on:click={closeSheet}>Cancel</button>
+        </div>
+      </section>
+    {:else if checking}
+      <p class="checking" role="status">Checking your photos…</p>
     {/if}
 
     {#if interrupted && !busy}
@@ -481,6 +599,53 @@
     color: var(--ink-2);
   }
 
+  .sheet {
+    max-width: 640px;
+    margin-bottom: 24px;
+    padding: 18px;
+    border: 1px solid var(--line);
+  }
+
+  .sheet h2 {
+    margin-bottom: 6px;
+  }
+
+  .sheet h2:focus {
+    outline: none;
+  }
+
+  .sheet p {
+    margin-bottom: 8px;
+  }
+
+  .files {
+    list-style: disc;
+    margin: 0 0 12px;
+    padding-left: 20px;
+    color: var(--ink-2);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+  }
+
+  .relink-status {
+    padding: 10px 14px;
+    border-radius: var(--radius);
+    background: var(--yellow-soft);
+  }
+
+  .sheet-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-top: 12px;
+  }
+
+  .checking {
+    margin-bottom: 24px;
+    color: var(--ink-2);
+  }
+
   .stop {
     display: flex;
     gap: 16px;
@@ -541,6 +706,7 @@
   }
 
   .book-notes {
+    list-style: disc;
     margin: 4px 0 0;
     padding-left: 20px;
     max-width: 65ch;

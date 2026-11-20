@@ -209,6 +209,53 @@ export interface Eligibility {
   book: KeepsakeEligibility;
 }
 
+/** One original that failed the check before a run; only its file name is known here. */
+export interface SourceProblem {
+  assetId: string;
+  name: string;
+}
+
+export interface SourceCheck {
+  missing: SourceProblem[];
+  changed: SourceProblem[];
+  checked: number;
+}
+
+const KEEPSAKE_OF: Record<ExportCmd, string> = {
+  export_video: "video",
+  export_reels: "reels",
+  export_book: "book",
+  export_all: "all"
+};
+
+// Browser preview of `?demo=missing`: Relink finds the missing files once.
+let demoRelinked = false;
+
+/** Check the originals an export will read: missing ones, and ones changed since the scan. */
+export async function checkSources(projectId: string, cmd: ExportCmd): Promise<SourceCheck> {
+  if (isTauri()) return invoke("check_sources", { projectId, keepsake: KEEPSAKE_OF[cmd] });
+  if (!demoScenario("missing")) return { missing: [], changed: [], checked: demoAssets.length };
+  const missing = demoRelinked ? [] : ["IMG_0412.HEIC", "IMG_0413.HEIC", "IMG_0420.MOV"];
+  return {
+    missing: missing.map((name, i) => ({ assetId: `demo_m${i}`, name })),
+    changed: [{ assetId: "demo_c0", name: "IMG_0398.JPG" }],
+    checked: demoAssets.length
+  };
+}
+
+export interface RelinkResult {
+  found: number;
+  notFound: number;
+}
+
+/** Look for the trip's missing originals in `folder` and use them where they are now. */
+export async function relinkSources(projectId: string, folder: string): Promise<RelinkResult> {
+  if (isTauri()) return invoke("relink_sources", { projectId, folder });
+  await new Promise((r) => setTimeout(r, 400));
+  demoRelinked = true;
+  return { found: 3, notFound: 0 };
+}
+
 /** Which keepsakes this trip can make, decided from its plan before any run. */
 export async function getExportEligibility(projectId: string): Promise<Eligibility> {
   if (isTauri()) return invoke("get_export_eligibility", { projectId });

@@ -526,6 +526,238 @@ pub fn parse_book_preset(id: Option<&str>) -> Result<BookPreset, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Source integrity before a render (PLAN.md Sec 8): which originals are
+// missing or changed, and Relink for the missing ones.
+// ---------------------------------------------------------------------------
+
+/// One original that failed the pre-render check. Only its file name crosses
+/// IPC, never its path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceProblem {
+    pub asset_id: String,
+    pub name: String,
+}
+
+/// What the pre-render check found for one export.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceCheckView {
+    pub missing: Vec<SourceProblem>,
+    pub changed: Vec<SourceProblem>,
+    /// Originals checked.
+    pub checked: usize,
+}
+
+/// The originals an export of `only` ("all" | "video" | "reels" | "book")
+/// reads, each with the snapshot `export::export_all` checks it against:
+/// film and reel picks against their plan entry, book photos (every still in
+/// the plan's chapters) against their asset row. One per asset, first wins.
+pub fn export_sources<'a>(
+    plan: &'a Plan,
+    assets: &'a [Asset],
+    only: &str,
+) -> Vec<(&'a Asset, PlanEntry)> {
+    let by_id: HashMap<&str, &Asset> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
+    let wanted = |k: &str| only == "all" || only == k;
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out = vec![];
+    let mut add = |a: &'a Asset, entry: PlanEntry| {
+        if seen.insert(a.id.as_str()) {
+            out.push((a, entry));
+        }
+    };
+    let picks = wanted("video")
+        .then_some(&plan.hero)
+        .into_iter()
+        .chain(wanted("reels").then_some(&plan.reel_selects))
+        .flatten();
+    for entry in picks {
+        if let Some(a) = by_id.get(entry.asset_id.as_str()) {
+            add(a, entry.clone());
+        }
+    }
+    if wanted("book") {
+        let in_chapters: HashSet<&str> = plan
+            .chapters
+            .iter()
+            .flat_map(|c| c.asset_ids.iter().map(String::as_str))
+            .collect();
+        for a in assets.iter().filter(|a| {
+            a.kind != AssetKind::Video
+                && (in_chapters.is_empty() || in_chapters.contains(a.id.as_str()))
+        }) {
+            add(a, row_snapshot(a));
+        }
+    }
+    out
+}
+
+/// An asset row as the snapshot the book checks its photos against.
+fn row_snapshot(a: &Asset) -> PlanEntry {
+    PlanEntry {
+        asset_id: a.id.clone(),
+        window: 0,
+        content_hash: a.content_hash.clone(),
+        size_bytes: a.size_bytes,
+        mtime: a.mtime,
+        rendition: triptape_core::types::Rendition::Still,
+    }
+}
+
+/// Size and whole-second mtime of a file, as the scanner records them.
+fn size_mtime(path: &Path) -> (Option<u64>, Option<i64>) {
+    let Ok(md) = std::fs::metadata(path) else {
+        return (None, None);
+    };
+    let mtime = md
+        .modified()
+        .ok()
+        .map(|m| match m.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs() as i64,
+            Err(e) => -(e.duration().as_secs() as i64),
+        });
+    (Some(md.len()), mtime)
+}
+
+/// The pre-render check the export itself runs, ahead of it: size and mtime
+/// first, the content hash only on a mismatch.
+pub fn check_sources(plan: &Plan, assets: &[Asset], only: &str) -> SourceCheckView {
+    use triptape_core::plan::{check_source_integrity, Integrity};
+    let mut view = SourceCheckView::default();
+    for (a, entry) in export_sources(plan, assets, only) {
+        view.checked += 1;
+        let (size, mtime) = size_mtime(&a.path);
+        let problem = || SourceProblem {
+            asset_id: a.id.clone(),
+            name: a
+                .path
+                .file_name()
+                .map_or_else(|| a.id.clone(), |n| n.to_string_lossy().into_owned()),
+        };
+        match check_source_integrity(&entry, &a.path, size, mtime, || {
+            triptape_core::hash::blake3_file(&a.path).ok()
+        }) {
+            Integrity::Ok => {}
+            Integrity::Missing { .. } => view.missing.push(problem()),
+            Integrity::Changed { .. } => view.changed.push(problem()),
+        }
+    }
+    view
+}
+
+/// Where a missing original now lives, found by Relink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relinked {
+    pub asset_id: String,
+    pub path: PathBuf,
+    /// The Live Photo's motion file, when it was missing too and was found.
+    pub companion: Option<PathBuf>,
+}
+
+/// Find each missing asset in `new_root`, whose media files are `files`.
+/// Candidates are the same relative path under `new_root` (as under the
+/// trip's `old_root`), then any file with the same name. A candidate counts
+/// only when its content hash matches the stored one; an asset never hashed
+/// needs exactly one same-name, same-size candidate, so a different photo
+/// is never swapped in.
+pub fn find_relinks(
+    missing: &[Asset],
+    old_root: &Path,
+    new_root: &Path,
+    files: &[PathBuf],
+) -> Vec<Relinked> {
+    let mut by_name: HashMap<&std::ffi::OsStr, Vec<&PathBuf>> = HashMap::new();
+    for f in files {
+        if let Some(name) = f.file_name() {
+            by_name.entry(name).or_default().push(f);
+        }
+    }
+    let same_place = |p: &Path| {
+        p.strip_prefix(old_root)
+            .ok()
+            .map(|rel| new_root.join(rel))
+            .filter(|c| c.is_file())
+    };
+    let mut out = vec![];
+    for a in missing {
+        let mut candidates: Vec<PathBuf> = same_place(&a.path).into_iter().collect();
+        if let Some(name) = a.path.file_name() {
+            for f in by_name.get(name).into_iter().flatten() {
+                if !candidates.contains(f) {
+                    candidates.push((*f).clone());
+                }
+            }
+        }
+        let found = match &a.content_hash {
+            Some(hash) => candidates
+                .into_iter()
+                .find(|c| triptape_core::hash::blake3_file(c).is_ok_and(|h| &h == hash)),
+            None => {
+                let mut same_size = candidates
+                    .into_iter()
+                    .filter(|c| size_mtime(c).0 == Some(a.size_bytes));
+                match (same_size.next(), same_size.next()) {
+                    (Some(only), None) => Some(only),
+                    _ => None,
+                }
+            }
+        };
+        let Some(path) = found else { continue };
+        // A Live Photo's motion file moves with its still.
+        let companion = a
+            .companion_path
+            .as_ref()
+            .filter(|c| !c.exists())
+            .and_then(|c| {
+                same_place(c).or_else(|| {
+                    let beside = path.with_file_name(c.file_name()?);
+                    beside.is_file().then_some(beside)
+                })
+            });
+        out.push(Relinked {
+            asset_id: a.id.clone(),
+            path,
+            companion,
+        });
+    }
+    out
+}
+
+/// Apply one Relink to its asset row: the new path, plus the file's current
+/// size and mtime so the next check passes on the fast path. Everything else
+/// on the row (hash, score, captions) is kept.
+pub fn relinked_asset(mut a: Asset, found: &Relinked) -> Asset {
+    a.path = found.path.clone();
+    if let Some(c) = &found.companion {
+        a.companion_path = Some(c.clone());
+    }
+    let (size, mtime) = size_mtime(&found.path);
+    a.size_bytes = size.unwrap_or(a.size_bytes);
+    a.mtime = mtime.unwrap_or(a.mtime);
+    a
+}
+
+/// Which keepsakes a check or export command covers.
+pub fn keepsake_scope(keepsake: &str) -> Result<&'static str, String> {
+    match keepsake {
+        "all" => Ok("all"),
+        "video" => Ok("video"),
+        "reels" => Ok("reels"),
+        "book" => Ok("book"),
+        _ => Err(format!("unknown keepsake {keepsake:?}")),
+    }
+}
+
+/// Outcome of a Relink, for the integrity sheet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelinkView {
+    pub found: usize,
+    pub not_found: usize,
+}
+
+// ---------------------------------------------------------------------------
 // Pure helpers (unit-tested without a Tauri runtime)
 // ---------------------------------------------------------------------------
 
@@ -1273,6 +1505,128 @@ mod tests {
             reason: "not selected (--only book)".into(),
         });
         assert_eq!(other.reason, "not selected (--only book)");
+    }
+
+    /// A trip whose originals live in `dir`: one photo per file name given.
+    fn trip_on_disk(dir: &Path, names: &[&str]) -> (Plan, Vec<Asset>) {
+        let assets: Vec<Asset> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let path = dir.join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, format!("photo {i}")).unwrap();
+                let mut a = Asset::new(format!("a{i}"), path.clone(), AssetKind::Photo);
+                a.taken_at = Some(1_714_557_600 + i as i64 * 300);
+                let (size, mtime) = size_mtime(&path);
+                a.size_bytes = size.unwrap();
+                a.mtime = mtime.unwrap();
+                a.content_hash = triptape_core::hash::blake3_file(&path).ok();
+                a
+            })
+            .collect();
+        let plan = plan_for(&assets);
+        (plan, assets)
+    }
+
+    #[test]
+    fn source_check_finds_missing_and_changed_originals() {
+        let dir = tempfile::tempdir().unwrap();
+        let (plan, assets) = trip_on_disk(dir.path(), &["a.jpg", "b.jpg", "c.jpg"]);
+        assert_eq!(check_sources(&plan, &assets, "all").missing, []);
+        std::fs::remove_file(dir.path().join("a.jpg")).unwrap();
+        std::fs::write(dir.path().join("b.jpg"), "a different photo").unwrap();
+        let view = check_sources(&plan, &assets, "all");
+        assert_eq!(view.checked, 3);
+        assert_eq!(
+            view.missing,
+            [SourceProblem {
+                asset_id: "a0".into(),
+                name: "a.jpg".into()
+            }]
+        );
+        assert_eq!(view.changed.len(), 1);
+        assert_eq!(view.changed[0].name, "b.jpg");
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["missing"][0]["assetId"], "a0");
+    }
+
+    #[test]
+    fn export_sources_follow_the_keepsake() {
+        let dir = tempfile::tempdir().unwrap();
+        let (plan, assets) = trip_on_disk(dir.path(), &["a.jpg", "b.jpg"]);
+        let all = export_sources(&plan, &assets, "all").len();
+        assert_eq!(all, 2);
+        assert!(export_sources(&plan, &assets, "book").len() <= all);
+        assert!(keepsake_scope("book").is_ok());
+        assert!(keepsake_scope("../x").is_err());
+    }
+
+    #[test]
+    fn relink_finds_moved_photos_by_path_or_name_and_hash() {
+        let old = tempfile::tempdir().unwrap();
+        let (_, assets) = trip_on_disk(old.path(), &["day1/a.jpg", "b.jpg", "c.jpg"]);
+        let new = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(new.path().join("day1")).unwrap();
+        // a: same relative path. b: renamed folder, same name. c: a different
+        // photo with the same name must not be linked.
+        std::fs::write(new.path().join("day1/a.jpg"), "photo 0").unwrap();
+        std::fs::create_dir_all(new.path().join("sorted")).unwrap();
+        std::fs::write(new.path().join("sorted/b.jpg"), "photo 1").unwrap();
+        std::fs::write(new.path().join("c.jpg"), "not the same photo").unwrap();
+        let files: Vec<PathBuf> = ["day1/a.jpg", "sorted/b.jpg", "c.jpg"]
+            .iter()
+            .map(|f| new.path().join(f))
+            .collect();
+        let found = find_relinks(&assets, old.path(), new.path(), &files);
+        assert_eq!(
+            found
+                .iter()
+                .map(|r| r.asset_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a0", "a1"]
+        );
+        assert_eq!(found[0].path, new.path().join("day1/a.jpg"));
+        assert_eq!(found[1].path, new.path().join("sorted/b.jpg"));
+        let moved = relinked_asset(assets[1].clone(), &found[1]);
+        assert_eq!(moved.path, new.path().join("sorted/b.jpg"));
+        assert_eq!(moved.content_hash, assets[1].content_hash);
+    }
+
+    #[test]
+    fn relink_without_a_hash_needs_one_same_size_match() {
+        let old = tempfile::tempdir().unwrap();
+        let (_, mut assets) = trip_on_disk(old.path(), &["a.jpg"]);
+        assets[0].content_hash = None;
+        let new = tempfile::tempdir().unwrap();
+        let one = new.path().join("x/a.jpg");
+        let two = new.path().join("y/a.jpg");
+        for f in [&one, &two] {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, "photo 0").unwrap();
+        }
+        // Two equal candidates: ambiguous, so nothing is linked.
+        assert!(find_relinks(&assets, old.path(), new.path(), &[one.clone(), two]).is_empty());
+        let found = find_relinks(&assets, old.path(), new.path(), std::slice::from_ref(&one));
+        assert_eq!(found[0].path, one);
+    }
+
+    #[test]
+    fn relink_brings_a_live_photo_motion_file_along() {
+        let old = tempfile::tempdir().unwrap();
+        let (_, mut assets) = trip_on_disk(old.path(), &["IMG_1.HEIC"]);
+        assets[0].kind = AssetKind::LivePhoto;
+        assets[0].companion_path = Some(old.path().join("IMG_1.MOV"));
+        let new = tempfile::tempdir().unwrap();
+        let still = new.path().join("moved/IMG_1.HEIC");
+        std::fs::create_dir_all(still.parent().unwrap()).unwrap();
+        std::fs::write(&still, "photo 0").unwrap();
+        std::fs::write(new.path().join("moved/IMG_1.MOV"), "motion").unwrap();
+        let found = find_relinks(&assets, old.path(), new.path(), &[still]);
+        assert_eq!(
+            found[0].companion.as_deref(),
+            Some(new.path().join("moved/IMG_1.MOV").as_path())
+        );
     }
 
     #[test]

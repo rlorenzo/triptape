@@ -13,10 +13,11 @@ use std::path::{Path, PathBuf};
 
 use tauri::{Emitter, Manager, State};
 use triptape_app::{
-    apply_live_photo_pairing, book_notes, book_presets, export_dir_in, export_eligibility,
-    fill_assets_parallel, finished_film, paginate, parse_book_preset, plain_skip,
-    resolve_export_parent, valid_job_kind, AppState, AssetView, BookPresetView, EligibilityView,
-    ExportSummary, JobView, ScanSummary, StoryData, StoryEntryView, StoryView,
+    apply_live_photo_pairing, book_notes, book_presets, check_sources as check_plan_sources,
+    export_dir_in, export_eligibility, fill_assets_parallel, find_relinks, finished_film,
+    keepsake_scope, paginate, parse_book_preset, plain_skip, relinked_asset, resolve_export_parent,
+    valid_job_kind, AppState, AssetView, BookPresetView, EligibilityView, ExportSummary, JobView,
+    RelinkView, ScanSummary, SourceCheckView, StoryData, StoryEntryView, StoryView,
 };
 use triptape_core::{
     cluster,
@@ -1417,6 +1418,77 @@ async fn get_export_eligibility(
     Ok(export_eligibility(&plan, &assets))
 }
 
+/// The pre-render source check for one export (`keepsake`: all, video,
+/// reels or book): which originals are missing or changed since the scan.
+#[tauri::command]
+async fn check_sources(
+    state: State<'_, AppState>,
+    project_id: String,
+    keepsake: String,
+) -> Result<SourceCheckView, String> {
+    let only = keepsake_scope(&keepsake)?;
+    let (plan, assets, _) = load_plan_assets(&state, &project_id)?;
+    // Changed files are hashed: keep that off the async executor.
+    tauri::async_runtime::spawn_blocking(move || check_plan_sources(&plan, &assets, only))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Relink: look for this trip's missing originals in `folder` (picked in the
+/// OS dialog) and point their asset rows at the files found there.
+#[tauri::command]
+async fn relink_sources(
+    app: tauri::AppHandle,
+    project_id: String,
+    folder: String,
+) -> Result<RelinkView, String> {
+    let new_root = PathBuf::from(&folder);
+    if !new_root.is_absolute() || !new_root.is_dir() {
+        return Err("That folder can't be opened. Choose another folder.".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let (plan, assets, _) = load_plan_assets(&state, &project_id)?;
+        let old_root = {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            db.get_project(&project_id)?
+                .map(|p| PathBuf::from(p.folder))
+                .unwrap_or_default()
+        };
+        let missing_ids: std::collections::HashSet<String> =
+            check_plan_sources(&plan, &assets, "all")
+                .missing
+                .into_iter()
+                .map(|p| p.asset_id)
+                .collect();
+        let missing: Vec<Asset> = assets
+            .into_iter()
+            .filter(|a| missing_ids.contains(&a.id))
+            .collect();
+        let files: Vec<PathBuf> = scan::scan_folder(&new_root)?
+            .files
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        let found = find_relinks(&missing, &old_root, &new_root, &files);
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.in_transaction(|db| {
+            for r in &found {
+                if let Some(a) = missing.iter().find(|a| a.id == r.asset_id) {
+                    db.upsert_asset(&project_id, &relinked_asset(a.clone(), r))?;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(RelinkView {
+            found: found.len(),
+            not_found: missing.len() - found.len(),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// The folder exports go into: `folder` checked as the owner's pick, or the
 /// default folder when `None`. The Export screen shows the result and
 /// rejects an unusable pick before any export starts.
@@ -1578,6 +1650,8 @@ fn main() {
             check_export_folder,
             get_export_eligibility,
             get_book_presets,
+            check_sources,
+            relink_sources,
             open_film,
             get_story,
             get_alternatives,
