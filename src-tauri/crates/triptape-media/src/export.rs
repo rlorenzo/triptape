@@ -668,7 +668,10 @@ fn export_inner(
                     .score
                     .as_ref()
                     .map_or(render_book::NEUTRAL_SCORE, |s| s.tech_quality() + s.bonus),
-                keep: plan.captions.contains_key(&a.id),
+                keep: plan
+                    .captions
+                    .get(&a.id)
+                    .is_some_and(|c| !c.trim().is_empty()),
             });
         }
         // Story order: keep db order (taken_at, id).

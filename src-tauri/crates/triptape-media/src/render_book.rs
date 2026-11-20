@@ -530,14 +530,17 @@ fn best_per_stretch(photos: &[BookPhoto], members: &[usize], quota: usize) -> Ve
     }
     (0..quota)
         .map(|j| {
-            let stretch = &members[j * n / quota..(j + 1) * n / quota];
-            let mut best = stretch[0];
-            for &i in &stretch[1..] {
-                if photos[i].score > photos[best].score {
-                    best = i;
-                }
-            }
-            best
+            members[j * n / quota..(j + 1) * n / quota]
+                .iter()
+                .copied()
+                .reduce(|best, i| {
+                    if photos[i].score > photos[best].score {
+                        i
+                    } else {
+                        best
+                    }
+                })
+                .expect("stretches are non-empty when quota < n")
         })
         .collect()
 }
