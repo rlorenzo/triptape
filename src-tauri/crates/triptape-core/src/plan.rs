@@ -199,6 +199,109 @@ pub fn collage_hold_secs(n: usize, still_secs: f64) -> f64 {
     still_secs * (0.75 + 0.25 * n.max(1) as f64)
 }
 
+/// Most other hero entries a collage may reach across: between its first
+/// and last member at most this many entries (clips, Live Photo motion,
+/// panoramas, captioned stills) play on their own. The collage plays at its
+/// first member's position, so no member moves earlier than this many
+/// segments (roughly 10-20 s of film), and never into another chapter.
+pub const COLLAGE_REACH: usize = 3;
+
+/// One hero entry, in playback order, as [`collage_groups`] sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupSlot<C> {
+    /// The entry's chapter; a collage never spans two chapters.
+    pub chapter: C,
+    /// Whether the entry may share a collage ([`collage_eligible`]).
+    pub eligible: bool,
+}
+
+/// Whether a hero entry may join a collage: a still that is not a panorama
+/// (panoramas pan solo) and has no caption (a caption describes one photo).
+/// The renderer and [`estimate_hero_secs`] both decide through this.
+pub fn collage_eligible(rendition: &Rendition, panorama: bool, captioned: bool) -> bool {
+    matches!(rendition, Rendition::Still) && !panorama && !captioned
+}
+
+/// How hero entries play: each group is one segment, a list of indices
+/// into `slots` in ascending (playback) order. A group of one plays solo; a
+/// longer group is a collage of eligible stills. Groups come back ordered
+/// by their first member, which is where the segment plays, and every
+/// index appears in exactly one group.
+///
+/// Eligible stills of one chapter are grouped even when other entries sit
+/// between them, as long as a group spans at most [`COLLAGE_REACH`] other
+/// entries and no entry of another chapter; those entries keep their own
+/// positions. Among the ways to split a chapter's stills into groups of at
+/// most [`MAX_COLLAGE`], the chosen one leaves the fewest stills solo, then
+/// moves stills across the fewest entries, then makes the fewest segments,
+/// then balances group sizes (five stills in a row play as 3 + 2, not 4 + 1).
+/// The planner's length estimate and the renderer both group through this,
+/// so the planned length matches the film.
+pub fn collage_groups<C: PartialEq>(slots: &[GroupSlot<C>]) -> Vec<Vec<usize>> {
+    // Runs of eligible stills in which each neighbouring pair could share a
+    // group; a run never crosses a chapter change.
+    let mut runs: Vec<Vec<usize>> = vec![];
+    let mut groups: Vec<Vec<usize>> = vec![];
+    for (i, s) in slots.iter().enumerate() {
+        if !s.eligible {
+            groups.push(vec![i]);
+            continue;
+        }
+        let joins = runs.last().and_then(|r| r.last()).is_some_and(|&p| {
+            i - p - 1 <= COLLAGE_REACH && slots[p..i].iter().all(|o| o.chapter == s.chapter)
+        });
+        match runs.last_mut() {
+            Some(r) if joins => r.push(i),
+            _ => runs.push(vec![i]),
+        }
+    }
+    for run in &runs {
+        groups.extend(split_run(run));
+    }
+    groups.sort_unstable_by_key(|g| g[0]);
+    groups
+}
+
+/// Best split of one run (ascending entry indices) into consecutive
+/// groups; see [`collage_groups`] for the order of preferences.
+fn split_run(run: &[usize]) -> Vec<Vec<usize>> {
+    // Cost of a split, compared in order: solo stills, entries crossed,
+    // segments, sum of squared sizes (lower is more balanced). On a full
+    // tie the larger group comes first (3 + 2, not 2 + 3).
+    type Cost = (usize, usize, usize, usize);
+    // best[j]: cheapest split of run[..j] and where its last group starts.
+    let mut best: Vec<Option<(Cost, usize)>> = vec![None; run.len() + 1];
+    best[0] = Some(((0, 0, 0, 0), 0));
+    for j in 1..=run.len() {
+        for start in (j.saturating_sub(MAX_COLLAGE)..j).rev() {
+            let n = j - start;
+            let crossed = run[j - 1] - run[start] + 1 - n;
+            let Some((b, _)) = best[start].filter(|_| crossed <= COLLAGE_REACH) else {
+                continue;
+            };
+            let cost = (
+                b.0 + usize::from(n == 1),
+                b.1 + crossed,
+                b.2 + 1,
+                b.3 + n * n,
+            );
+            if best[j].is_none_or(|(c, _)| cost < c) {
+                best[j] = Some((cost, start));
+            }
+        }
+    }
+    let mut out = vec![];
+    let mut j = run.len();
+    while j > 0 {
+        // A group of one is always allowed, so every prefix has a split.
+        let (_, start) = best[j].expect("every prefix splits");
+        out.push(run[start..j].to_vec());
+        j = start;
+    }
+    out.reverse();
+    out
+}
+
 /// How long the hero film should be.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum FilmLength {
@@ -286,8 +389,8 @@ enum Seg<'c> {
 }
 
 /// Estimated rendered seconds for hero entries in story order, as the
-/// renderer builds them: the fixed cards around the entries, consecutive
-/// same-chapter stills grouped into collages, clips padded to
+/// renderer builds them: the fixed cards around the entries, same-chapter
+/// stills grouped into collages by [`collage_groups`], clips padded to
 /// [`MIN_SEGMENT_SECS`], and every cut overlapped by the transition the
 /// renderer assigns it (opening and closing cut 0.7 s, chapter breaks and
 /// card cuts cycling 0.8/0.5/0.5 s, others ~0.54 s). Panoramas and
@@ -304,35 +407,24 @@ pub fn estimate_hero_secs<'e, 'c>(
         segs.push((Seg::Card, EST_MAP_SECS));
     }
     let first_hero = segs.len();
-    let mut run: Option<(&str, usize)> = None; // (chapter, stills in collage)
-    for e in entries {
-        let chapter = chapter_of(&e.asset_id);
-        let pano_secs = pano_secs_of(&e.asset_id);
-        match e.rendition {
-            // A panorama (with its own pan hold) or a captioned still is
-            // always solo, and breaks the run.
-            Rendition::Still if pano_secs.is_some() || captioned(&e.asset_id) => {
-                segs.push((Seg::Chapter(chapter), pano_secs.unwrap_or(EST_STILL_SECS)));
-                run = None;
-            }
-            Rendition::Still => match &mut run {
-                Some((c, n)) if *c == chapter && *n < MAX_COLLAGE => {
-                    // Growing a solo still into a collage, or a collage by one.
-                    if let Some(last) = segs.last_mut() {
-                        last.1 = collage_hold_secs(*n + 1, EST_STILL_SECS);
-                    }
-                    *n += 1;
-                }
-                _ => {
-                    segs.push((Seg::Chapter(chapter), EST_STILL_SECS));
-                    run = Some((chapter, 1));
-                }
-            },
-            Rendition::Motion { .. } | Rendition::Clip { .. } => {
-                segs.push((Seg::Chapter(chapter), solo_secs(e, &pano_secs_of)));
-                run = None;
-            }
-        }
+    let entries: Vec<&PlanEntry> = entries.into_iter().collect();
+    let slots: Vec<GroupSlot<&str>> = entries
+        .iter()
+        .map(|e| GroupSlot {
+            chapter: chapter_of(&e.asset_id),
+            eligible: collage_eligible(
+                &e.rendition,
+                pano_secs_of(&e.asset_id).is_some(),
+                captioned(&e.asset_id),
+            ),
+        })
+        .collect();
+    for g in collage_groups(&slots) {
+        let secs = match g.len() {
+            1 => solo_secs(entries[g[0]], &pano_secs_of),
+            n => collage_hold_secs(n, EST_STILL_SECS),
+        };
+        segs.push((Seg::Chapter(slots[g[0]].chapter), secs));
     }
     if segs.len() == first_hero {
         // No entries: the renderer refuses to build a film from cards alone.
@@ -2717,17 +2809,16 @@ mod tests {
         };
         let entries = [still("x1"), still("p"), still("x2"), still("x3")];
         let pano = |id: &str| (id == "p").then_some(8.0);
-        // x1 solo 4, pano breaks the run 8, x2+x3 collage of 2 (5.0) = 19.5 s
-        // plus title 2.5 = 19.5 + ... cuts 0.7 + 0.54 + 0.7 = 1.94 s.
+        // The pano stays solo with its 8 s hold; x1 reaches across it to
+        // collage with x2 and x3 (6 s) rather than play alone: title 2.5 +
+        // collage 6 + pano 8 = 16.5 s, cuts 0.7 + 0.7 = 1.4 s.
         let bare = HeroCards {
             route: false,
             route_stops: 0,
             route_secs: None,
             places: false,
         };
-        assert!(
-            (estimate_hero_secs(&entries, |_| "X", pano, |_| false, bare) - 17.56).abs() < 1e-9
-        );
+        assert!((estimate_hero_secs(&entries, |_| "X", pano, |_| false, bare) - 15.1).abs() < 1e-9);
     }
 
     #[test]
@@ -3611,5 +3702,183 @@ mod tests {
         old.hero.retain(|e| e.window == 0);
         let out = apply_edits(&old, &assets, &PlanEdits::default());
         assert_eq!(out.hero.len(), old.hero.len());
+    }
+
+    /// Slots from a compact spec: one char per entry, `s` an eligible
+    /// still, anything else an entry that plays solo; `|` starts the next
+    /// chapter.
+    fn slots(spec: &str) -> Vec<GroupSlot<usize>> {
+        let mut out = vec![];
+        for (chapter, part) in spec.split('|').enumerate() {
+            out.extend(part.chars().map(|c| GroupSlot {
+                chapter,
+                eligible: c == 's',
+            }));
+        }
+        out
+    }
+
+    fn groups_of(spec: &str) -> Vec<Vec<usize>> {
+        collage_groups(&slots(spec))
+    }
+
+    #[test]
+    fn lone_still_joins_its_chapter_mate_across_a_clip() {
+        // s c s: the stills share one collage at the first one's place,
+        // the clip keeps its own position after it.
+        assert_eq!(groups_of("scs"), vec![vec![0, 2], vec![1]]);
+        // Three stills with a clip among them make one collage rather
+        // than a pair and a lone still.
+        assert_eq!(groups_of("sscs"), vec![vec![0, 1, 3], vec![2]]);
+        // Two pairs either side of a clip stay two collages: nothing needs
+        // to move.
+        assert_eq!(groups_of("sscss"), vec![vec![0, 1], vec![2], vec![3, 4]]);
+    }
+
+    #[test]
+    fn collage_reach_is_bounded() {
+        let within = format!("s{}s", "c".repeat(COLLAGE_REACH));
+        let beyond = format!("s{}s", "c".repeat(COLLAGE_REACH + 1));
+        assert_eq!(groups_of(&within)[0], vec![0, COLLAGE_REACH + 1]);
+        assert!(groups_of(&beyond).iter().all(|g| g.len() == 1));
+        // The bound covers everything a group spans, not each hop: in
+        // s c c s c c s any two neighbours fit, all three do not.
+        let groups = groups_of("sccsccs");
+        assert_eq!(groups.iter().filter(|g| g.len() == 2).count(), 1);
+        assert!(groups.iter().all(|g| g.len() <= 2), "{groups:?}");
+    }
+
+    #[test]
+    fn collages_never_cross_a_chapter() {
+        assert!(groups_of("s|s").iter().all(|g| g.len() == 1));
+        assert_eq!(groups_of("ss|ss"), vec![vec![0, 1], vec![2, 3]]);
+        // An entry of another chapter between two stills also keeps them
+        // apart.
+        let mut v = slots("scs");
+        v[1].chapter = 7;
+        assert!(collage_groups(&v).iter().all(|g| g.len() == 1));
+    }
+
+    #[test]
+    fn ineligible_entries_play_solo_in_place() {
+        // Captioned stills, panoramas, clips and motion picks are
+        // ineligible: never grouped, never moved.
+        assert_eq!(groups_of("pcms"), vec![vec![0], vec![1], vec![2], vec![3]]);
+        assert!(collage_eligible(&Rendition::Still, false, false));
+        assert!(!collage_eligible(&Rendition::Still, true, false), "pano");
+        assert!(!collage_eligible(&Rendition::Still, false, true), "caption");
+        let clip = Rendition::Clip {
+            trim_start: 0.0,
+            trim_end: 3.0,
+        };
+        assert!(!collage_eligible(&clip, false, false));
+        let motion = Rendition::Motion {
+            trim_start: 0.0,
+            trim_end: 3.0,
+        };
+        assert!(!collage_eligible(&motion, false, false));
+    }
+
+    #[test]
+    fn collage_sizes_are_balanced() {
+        let lens =
+            |n: usize| -> Vec<usize> { groups_of(&"s".repeat(n)).iter().map(Vec::len).collect() };
+        assert_eq!(lens(1), [1]);
+        assert_eq!(lens(4), [4]);
+        assert_eq!(lens(5), [3, 2]);
+        assert_eq!(lens(6), [3, 3]);
+        assert_eq!(lens(7), [4, 3]);
+        assert_eq!(lens(8), [4, 4]);
+        assert_eq!(lens(9), [3, 3, 3]);
+        assert!(lens(13).iter().all(|&n| (2..=MAX_COLLAGE).contains(&n)));
+    }
+
+    #[test]
+    fn collage_groups_show_every_entry_once_and_avoid_lone_stills() {
+        let mut seed = 99u64;
+        let mut next = move |n: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) % n
+        };
+        for _ in 0..500 {
+            let len = 1 + next(40) as usize;
+            let mut chapter = 0;
+            let v: Vec<GroupSlot<usize>> = (0..len)
+                .map(|_| {
+                    chapter += usize::from(next(8) == 0);
+                    GroupSlot {
+                        chapter,
+                        eligible: next(3) != 0,
+                    }
+                })
+                .collect();
+            let groups = collage_groups(&v);
+            let mut seen: Vec<usize> = groups.iter().flatten().copied().collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..len).collect::<Vec<_>>(), "{groups:?}");
+            assert!(groups.windows(2).all(|w| w[0][0] < w[1][0]));
+            let group_of = |i: usize| groups.iter().find(|g| g.contains(&i)).unwrap();
+            let fits = |g: &[usize]| {
+                let (a, b) = (g[0], g[g.len() - 1]);
+                g.len() <= MAX_COLLAGE
+                    && b - a + 1 - g.len() <= COLLAGE_REACH
+                    && v[a..=b].iter().all(|s| s.chapter == v[a].chapter)
+            };
+            for g in &groups {
+                assert!(g.windows(2).all(|w| w[0] < w[1]), "chronological {g:?}");
+                if g.len() > 1 {
+                    assert!(g.iter().all(|&i| v[i].eligible), "{g:?}");
+                    assert!(fits(g), "{g:?}");
+                    continue;
+                }
+                let i = g[0];
+                if !v[i].eligible {
+                    continue;
+                }
+                // A still left alone cannot join the group of its nearest
+                // eligible neighbour on either side.
+                let prev = (0..i).rev().find(|&j| v[j].eligible);
+                let next = (i + 1..len).find(|&j| v[j].eligible);
+                for j in prev.into_iter().chain(next) {
+                    let mut merged = group_of(j).clone();
+                    merged.push(i);
+                    merged.sort_unstable();
+                    assert!(!fits(&merged), "{i} alone beside {j}: {groups:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn estimate_matches_regrouped_segments() {
+        let clip = PlanEntry {
+            rendition: Rendition::Clip {
+                trim_start: 0.0,
+                trim_end: 6.0,
+            },
+            ..still_entry("x2")
+        };
+        let entries = [
+            still_entry("x1"),
+            clip,
+            still_entry("x3"),
+            still_entry("y1"),
+        ];
+        let ch = |id: &str| if id.starts_with('x') { "X" } else { "Y" };
+        let bare = HeroCards {
+            route: false,
+            route_stops: 0,
+            route_secs: None,
+            places: false,
+        };
+        // Title 2.5, x1+x3 collage 5, clip 6, y1 solo 4 = 17.5 s; cuts
+        // opening 0.7, plain 0.54, closing 0.7 = 1.94 s.
+        let est = estimate_hero_secs(&entries, ch, |_| None, |_| false, bare);
+        assert!((est - 15.56).abs() < 1e-9, "{est}");
+        // Captioning x3 leaves x1 nobody to pair with: x1 solo 4, clip 6,
+        // x3 solo 4, y1 solo 4 + title 2.5 = 20.5 s; cuts 0.7 + 0.54 +
+        // 0.54 + 0.7 = 2.48 s.
+        let est = estimate_hero_secs(&entries, ch, |_| None, |id| id == "x3", bare);
+        assert!((est - 18.02).abs() < 1e-9, "{est}");
     }
 }
