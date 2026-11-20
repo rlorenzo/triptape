@@ -45,20 +45,55 @@ jobs:
         run: |
           npm ci
           npm run build
+      # The pinned FFmpeg, ffprobe and Typst the app bundles (G1). Downloads
+      # are cached by the script's hash, which holds every pin.
+      - uses: actions/cache@v4
+        with:
+          path: .sidecar-cache
+          key: sidecars-${{ runner.os }}-${{ hashFiles('scripts/fetch-sidecars') }}
+      - name: Rosetta 2 (the pinned macOS FFmpeg is an Intel build)
+        if: runner.os == 'macOS'
+        run: arch -x86_64 /usr/bin/true 2>/dev/null || sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+      # Bash scripts: force Git Bash on Windows (default shell is PowerShell).
+      # Verifies every SHA-256 and runs check-ffmpeg.sh on the sidecar.
+      - name: Fetch and check pinned sidecars
+        shell: bash
+        run: ./scripts/fetch-sidecars
+      # Scripts and some tests call the tools by name: put the sidecars first
+      # on PATH under their plain names, so nothing else can answer.
+      - name: Sidecars on PATH
+        shell: bash
+        run: |
+          target="$(rustc -vV | sed -n 's/^host: //p')"
+          exe=""; [ "$RUNNER_OS" = Windows ] && exe=.exe
+          dir="$RUNNER_TEMP/sidecars"
+          mkdir -p "$dir"
+          for t in ffmpeg ffprobe typst; do cp "src-tauri/binaries/$t-$target$exe" "$dir/$t$exe"; done
+          if command -v cygpath >/dev/null; then cygpath -w "$dir" >> "$GITHUB_PATH"; else echo "$dir" >> "$GITHUB_PATH"; fi
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
-        run: brew install ffmpeg typst exiftool
+        run: brew install exiftool
       - name: Install system deps (Windows)
         if: runner.os == 'Windows'
-        run: choco install ffmpeg typst exiftool -y --no-progress
-      - run: cargo test --workspace
-      # Bash scripts: force Git Bash on Windows (default shell is PowerShell).
-      - name: FFmpeg capability check
+        run: choco install exiftool -y --no-progress
+      - name: Tools on PATH are the sidecars
         shell: bash
-        run: ./scripts/check-ffmpeg.sh
-      - name: Fixture render smoke (tiny synthetic trip)
+        run: |
+          command -v ffmpeg ffprobe typst
+          ffmpeg -hide_banner -version | sed -n 1p | grep -F 9.0.2
+          ffprobe -hide_banner -version | sed -n 1p | grep -F 9.0.2
+          typst --version | grep -F 0.15.1
+      # TRIPTAPE_REQUIRE_SIDECAR: the sidecar capability test fails, rather
+      # than skips, if the resolver does not find the sidecar.
+      - run: cargo test --workspace
+        env:
+          TRIPTAPE_REQUIRE_SIDECAR: "1"
+      - name: FFmpeg capability check (sidecar)
+        shell: bash
+        run: ./scripts/check-ffmpeg.sh ffmpeg
+      - name: Fixture render smoke (tiny synthetic trip, sidecar FFmpeg)
         shell: bash
         run: |
           ./scripts/make-fixture.sh "$RUNNER_TEMP/fixture"
