@@ -98,15 +98,35 @@ pub struct BookPhoto {
     pub taken_at: Option<i64>,
     pub phash: Option<u64>,
     pub people_sig: Option<u64>,
+    /// Image embedding, when the local model made one: lets the repeat
+    /// test catch the same pose reframed, which pHash misses.
+    pub embedding: Option<triptape_core::embedding::Embedding>,
+    /// 1-based trip day (local date), numbered as the plan's chapters are.
+    /// Pages never mix two days, and each day's first page names it.
+    pub day: Option<u32>,
 }
 
 impl BookPhoto {
-    fn candidate(&self) -> pick::Candidate {
-        pick::Candidate {
+    /// Whether this photo repeats `other`: the same people at the same
+    /// moment ([`triptape_core::plan::same_moment_at`]). With embeddings,
+    /// the same scene in another framing counts too, as in the film's
+    /// photo picks.
+    fn repeats(&self, other: &BookPhoto) -> bool {
+        // Unknown people (no tags on this copy) match anyone: a folder can
+        // hold the same shot twice with tags on only one copy, and an
+        // untagged frame of a tagged burst is still that burst.
+        let same_people = match (self.people_sig, other.people_sig) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+        same_people && triptape_core::plan::same_moment_at(self.moment(), other.moment())
+    }
+
+    fn moment(&self) -> triptape_core::plan::Moment<'_> {
+        triptape_core::plan::Moment {
             taken_at: self.taken_at,
             phash: self.phash,
-            people_sig: self.people_sig,
-            score: self.score,
+            embedding: self.embedding.as_ref(),
         }
     }
 }
@@ -646,13 +666,42 @@ fn select_for_cap(photos: &[BookPhoto], keep: usize) -> (Vec<usize>, Vec<usize>)
         }
     }
     let sizes: Vec<usize> = groups.iter().map(|(_, m)| m.len()).collect();
+    let scene = scenes(photos);
     let mut sel = curated;
     for ((_, members), quota) in groups.iter().zip(chapter_quotas(&sizes, keep - sel.len())) {
-        let picks = best_per_stretch(photos, members, quota, &sel);
+        let picks = best_per_stretch(photos, &scene, members, quota, &sel);
         sel.extend(picks);
     }
     sel.sort_unstable();
     (sel, vec![])
+}
+
+/// A scene id per photo (`photos` in story order): a photo joins the scene
+/// of any earlier photo it [`BookPhoto::repeats`] within
+/// two minutes (the plan's same-moment window), else opens a new one. Linking
+/// through neighbours keeps a whole posing session together even when its
+/// first and last frames no longer look alike.
+fn scenes(photos: &[BookPhoto]) -> Vec<usize> {
+    const WINDOW_SECS: i64 = 120;
+    let mut scene: Vec<usize> = Vec::with_capacity(photos.len());
+    let mut next = 0;
+    for (i, p) in photos.iter().enumerate() {
+        let linked = (0..i)
+            .rev()
+            .take_while(|&j| match (photos[j].taken_at, p.taken_at) {
+                (Some(a), Some(b)) => (b - a).abs() <= WINDOW_SECS,
+                _ => false,
+            })
+            .find(|&j| photos[j].repeats(p));
+        scene.push(linked.map_or_else(
+            || {
+                next += 1;
+                next - 1
+            },
+            |j| scene[j],
+        ));
+    }
+    scene
 }
 
 /// Share `slots` among chapters of the given `sizes` (`slots` must not
@@ -703,14 +752,15 @@ fn best_scored(
 
 /// The best-scored photo of each of `quota` equal stretches of `members`
 /// (indices into `photos`, in story order); the earlier photo wins a tie.
-/// A photo that [`pick::repeats`] one in `chosen` (picked for the book
-/// already) or picked here waits, as in [`pick::pick_top`]: the stretch
+/// A photo whose [`scenes`] id matches one in `chosen` (picked for the
+/// book already) or picked here waits, as in [`pick::pick_top`]: the stretch
 /// takes its best photo that is a new scene, or the same view with other
 /// people. A stretch with only repeats leaves its slot to the chapter's
 /// best remaining new scene, and repeats fill only what nothing else can,
 /// so the quota is always met.
 fn best_per_stretch(
     photos: &[BookPhoto],
+    scene: &[usize],
     members: &[usize],
     quota: usize,
     chosen: &[usize],
@@ -719,20 +769,15 @@ fn best_per_stretch(
     if quota >= n {
         return members.to_vec();
     }
-    let candidates = |idx: &[usize]| -> Vec<pick::Candidate> {
-        idx.iter().map(|&i| photos[i].candidate()).collect()
-    };
-    let mut seen = candidates(chosen);
+    let mut seen: Vec<usize> = chosen.to_vec();
+    let fresh_scene = |seen: &[usize], i: usize| !seen.iter().any(|&p| scene[p] == scene[i]);
     let mut picked: Vec<usize> = vec![];
     for j in 0..quota {
         let stretch = &members[j * n / quota..(j + 1) * n / quota];
-        let fresh = stretch.iter().copied().filter(|&i| {
-            let c = photos[i].candidate();
-            !seen.iter().any(|p| pick::repeats(p, &c))
-        });
+        let fresh = stretch.iter().copied().filter(|&i| fresh_scene(&seen, i));
         if let Some(best) = best_scored(fresh, |i| photos[i].score) {
             picked.push(best);
-            seen.push(photos[best].candidate());
+            seen.push(best);
         }
     }
     // Leftover slots go to the rest of the chapter as `pick_top` ranks it:
@@ -746,13 +791,10 @@ fn best_per_stretch(
     while picked.len() < quota {
         let at = waiting
             .iter()
-            .position(|&i| {
-                let c = photos[i].candidate();
-                !seen.iter().any(|p| pick::repeats(p, &c))
-            })
+            .position(|&i| fresh_scene(&seen, i))
             .unwrap_or(0);
         let next = waiting.remove(at);
-        seen.push(photos[next].candidate());
+        seen.push(next);
         picked.push(next);
     }
     picked.sort_unstable();
@@ -1899,6 +1941,8 @@ mod tests {
             taken_at: None,
             phash: None,
             people_sig: None,
+            embedding: None,
+            day: None,
         }
     }
 
@@ -2405,6 +2449,36 @@ mod tests {
         // Fewer slots than chapters: the largest chapters keep theirs.
         let (sel, _) = select_for_cap(&photos, 2);
         assert_eq!(sel, [59, 89]);
+    }
+
+    #[test]
+    fn posing_session_is_one_scene() {
+        // A bench session: frames 30 s apart, each like its neighbour
+        // (pHash 8 apart) though the ends no longer look alike (pHash 24).
+        // One copy carries people tags, the rest none. Then a new scene.
+        let frame = |i: usize, t: i64, phash: u64, sig: Option<u64>| BookPhoto {
+            taken_at: Some(t),
+            phash: Some(phash),
+            people_sig: sig,
+            ..scored(i, 0, 0.5, false)
+        };
+        let photos = vec![
+            frame(0, 0, 0, None),
+            frame(1, 30, 0xff, Some(5)),
+            frame(2, 60, 0xffff, None),
+            frame(3, 90, 0xff_ffff, None),
+            frame(4, 3600, 0, None),
+        ];
+        assert!(!photos[0].repeats(&photos[3]), "ends differ");
+        assert_eq!(scenes(&photos), [0, 0, 0, 0, 1]);
+        // Two picks: one from the session, one from the next scene.
+        let sel = select_for_cap(&photos, 2).0;
+        assert_eq!(sel.len(), 2);
+        assert!(sel.contains(&4), "{sel:?}");
+        // Two different tagged groups in one place stay separate scenes.
+        let other = frame(2, 60, 0xffff, Some(9));
+        let photos = [photos[1].clone(), other];
+        assert_eq!(scenes(&photos), [0, 1]);
     }
 
     #[test]

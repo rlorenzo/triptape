@@ -233,7 +233,7 @@ fn attractions() -> &'static [Attraction] {
 /// known attraction is that close. The nearest wins: on the 2026 Japan to
 /// Singapore trip, a notability weight or a 1 km radius for the tail of the
 /// list changed none of the 72 chapter names.
-fn attraction_name(gps: (f64, f64)) -> Option<String> {
+pub fn attraction_name(gps: (f64, f64)) -> Option<String> {
     nearest_within(attractions(), |a| (a.lat, a.lon), gps, 2_000.0).map(|a| a.name.to_string())
 }
 

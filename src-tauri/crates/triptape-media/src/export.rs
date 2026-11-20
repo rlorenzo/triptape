@@ -628,6 +628,12 @@ fn export_inner(
         });
     } else {
         let chapter_of = book_chapter_of(plan);
+        // Day 1 is the earliest local date in the project, as the plan
+        // numbers its chapters.
+        let local_day = |a: &triptape_core::types::Asset| {
+            triptape_core::metadata::local_date(a.taken_at?, a.tz_offset_secs)
+        };
+        let trip_start = assets.iter().filter_map(local_day).min();
         let mut book_photos: Vec<BookPhoto> = vec![];
         for a in assets
             .iter()
@@ -655,12 +661,20 @@ fn export_inner(
                 path: a.path.clone(),
                 width: w,
                 height: h,
-                // The user's caption, else the chapter place.
-                caption: plan
-                    .captions
-                    .get(&a.id)
-                    .or_else(|| chapter.and_then(|i| plan.chapters[i].place.as_ref()))
-                    .cloned(),
+                // The user's caption, else the attraction the photo was
+                // taken at (Tokyo DisneySea says more than the itinerary's
+                // "Tokyo"), else the chapter place.
+                caption: plan.captions.get(&a.id).cloned().or_else(|| {
+                    let place = chapter.and_then(|i| plan.chapters[i].place.clone());
+                    a.gps
+                        .and_then(triptape_core::geo::attraction_name)
+                        .filter(|poi| place.as_deref() != Some(poi.as_str()))
+                        .or(place)
+                }),
+                day: match (local_day(a), trip_start) {
+                    (Some(d), Some(s)) => Some(((d - s).get_days() + 1).max(1) as u32),
+                    _ => None,
+                },
                 chapter,
                 // Unclamped, so a strong bonus still ranks above a weak one
                 // once `total` saturates.
@@ -675,6 +689,7 @@ fn export_inner(
                 taken_at: a.taken_at,
                 phash: a.phash,
                 people_sig: a.people_sig,
+                embedding: a.embedding.clone(),
             });
         }
         // Story order: keep db order (taken_at, id).
