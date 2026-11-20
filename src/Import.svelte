@@ -1,6 +1,6 @@
 <script lang="ts">
   import { project, assets, screen, consentGiven, giveConsent, simulateDemoIngestBackground } from "./lib/store";
-  import { scanFolder, loadAllAssets, isTauri, onProgress } from "./lib/tauri";
+  import { scanFolder, loadAllAssets, isTauri, onProgress, pickFolder } from "./lib/tauri";
   import { friendlyStep } from "./lib/trip";
   import ErrorNote from "./lib/ErrorNote.svelte";
   import ProgressBar from "./lib/ProgressBar.svelte";
@@ -113,9 +113,8 @@
     error = "";
     try {
       if (isTauri()) {
-        const { open } = await import("@tauri-apps/plugin-dialog");
-        const picked = await open({ directory: true, multiple: false, title: "Add a trip folder" });
-        if (!picked || Array.isArray(picked)) return;
+        const picked = await pickFolder("Add a trip folder");
+        if (!picked) return;
         folder = picked;
       } else if (!folder) {
         error = "Browser preview: type any folder name to load the demo trip.";

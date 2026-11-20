@@ -578,6 +578,8 @@ pub fn export_sources<'a>(
         }
     }
     if wanted("book") {
+        // The book's flow, as `export::in_book_flow` decides it: the plan's
+        // chapter members, or every still when the plan has no chapters.
         let in_chapters: HashSet<&str> = plan
             .chapters
             .iter()
@@ -593,7 +595,8 @@ pub fn export_sources<'a>(
     out
 }
 
-/// An asset row as the snapshot the book checks its photos against.
+/// An asset row as the snapshot the book checks its photos against (mirrors
+/// the private `export::asset_snapshot`).
 fn row_snapshot(a: &Asset) -> PlanEntry {
     PlanEntry {
         asset_id: a.id.clone(),
@@ -605,7 +608,8 @@ fn row_snapshot(a: &Asset) -> PlanEntry {
     }
 }
 
-/// Size and whole-second mtime of a file, as the scanner records them.
+/// Size and whole-second mtime of a file, as the scanner records them
+/// (mirrors the private `export::current_size_mtime`).
 fn size_mtime(path: &Path) -> (Option<u64>, Option<i64>) {
     let Ok(md) = std::fs::metadata(path) else {
         return (None, None);
@@ -689,19 +693,18 @@ pub fn find_relinks(
                 }
             }
         }
+        // A file of another size can't be this photo: skip it before hashing.
+        let mut same_size = candidates
+            .into_iter()
+            .filter(|c| size_mtime(c).0 == Some(a.size_bytes));
         let found = match &a.content_hash {
-            Some(hash) => candidates
-                .into_iter()
-                .find(|c| triptape_core::hash::blake3_file(c).is_ok_and(|h| &h == hash)),
-            None => {
-                let mut same_size = candidates
-                    .into_iter()
-                    .filter(|c| size_mtime(c).0 == Some(a.size_bytes));
-                match (same_size.next(), same_size.next()) {
-                    (Some(only), None) => Some(only),
-                    _ => None,
-                }
+            Some(hash) => {
+                same_size.find(|c| triptape_core::hash::blake3_file(c).is_ok_and(|h| &h == hash))
             }
+            None => match (same_size.next(), same_size.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            },
         };
         let Some(path) = found else { continue };
         // A Live Photo's motion file moves with its still.
@@ -736,6 +739,27 @@ pub fn relinked_asset(mut a: Asset, found: &Relinked) -> Asset {
     a.size_bytes = size.unwrap_or(a.size_bytes);
     a.mtime = mtime.unwrap_or(a.mtime);
     a
+}
+
+/// Carry relinked asset rows into the plan's film and reel picks, which the
+/// check and the export verify against their own snapshots: without this a
+/// relinked file with a new mtime fails as changed (or always re-hashes).
+/// Returns whether any entry changed.
+pub fn relink_plan(plan: &mut Plan, relinked: &[Asset]) -> bool {
+    let by_id: HashMap<&str, &Asset> = relinked.iter().map(|a| (a.id.as_str(), a)).collect();
+    let mut changed = false;
+    for entry in plan.hero.iter_mut().chain(plan.reel_selects.iter_mut()) {
+        let Some(a) = by_id.get(entry.asset_id.as_str()) else {
+            continue;
+        };
+        entry.size_bytes = a.size_bytes;
+        entry.mtime = a.mtime;
+        if entry.content_hash.is_none() {
+            entry.content_hash = a.content_hash.clone();
+        }
+        changed = true;
+    }
+    changed
 }
 
 /// Which keepsakes a check or export command covers.
@@ -1565,16 +1589,18 @@ mod tests {
     #[test]
     fn relink_finds_moved_photos_by_path_or_name_and_hash() {
         let old = tempfile::tempdir().unwrap();
-        let (_, assets) = trip_on_disk(old.path(), &["day1/a.jpg", "b.jpg", "c.jpg"]);
+        let (_, assets) = trip_on_disk(old.path(), &["day1/a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
         let new = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(new.path().join("day1")).unwrap();
         // a: same relative path. b: renamed folder, same name. c: a different
-        // photo with the same name must not be linked.
+        // photo with the same name must not be linked; nor d, a same-size one
+        // whose bytes differ (only the hash tells them apart).
         std::fs::write(new.path().join("day1/a.jpg"), "photo 0").unwrap();
         std::fs::create_dir_all(new.path().join("sorted")).unwrap();
         std::fs::write(new.path().join("sorted/b.jpg"), "photo 1").unwrap();
         std::fs::write(new.path().join("c.jpg"), "not the same photo").unwrap();
-        let files: Vec<PathBuf> = ["day1/a.jpg", "sorted/b.jpg", "c.jpg"]
+        std::fs::write(new.path().join("d.jpg"), "photo X").unwrap();
+        let files: Vec<PathBuf> = ["day1/a.jpg", "sorted/b.jpg", "c.jpg", "d.jpg"]
             .iter()
             .map(|f| new.path().join(f))
             .collect();
@@ -1609,6 +1635,41 @@ mod tests {
         assert!(find_relinks(&assets, old.path(), new.path(), &[one.clone(), two]).is_empty());
         let found = find_relinks(&assets, old.path(), new.path(), std::slice::from_ref(&one));
         assert_eq!(found[0].path, one);
+    }
+
+    #[test]
+    fn relink_updates_the_plan_picks_so_the_check_passes() {
+        let old = tempfile::tempdir().unwrap();
+        let (mut plan, mut assets) = trip_on_disk(old.path(), &["a.jpg"]);
+        // A pick planned before hashing, with a stale mtime once moved.
+        let pick = PlanEntry {
+            content_hash: None,
+            ..row_snapshot(&assets[0])
+        };
+        plan.hero = vec![pick.clone()];
+        plan.reel_selects = vec![pick];
+        assets[0].content_hash = None;
+        let new = tempfile::tempdir().unwrap();
+        let moved = new.path().join("a.jpg");
+        std::fs::write(&moved, "photo 0").unwrap();
+        let f = std::fs::File::options().write(true).open(&moved).unwrap();
+        f.set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000),
+        )
+        .unwrap();
+        let found = find_relinks(
+            &assets,
+            old.path(),
+            new.path(),
+            std::slice::from_ref(&moved),
+        );
+        let next = relinked_asset(assets[0].clone(), &found[0]);
+        assets[0] = next.clone();
+        assert_eq!(check_sources(&plan, &assets, "video").changed.len(), 1);
+        assert!(relink_plan(&mut plan, &[next]));
+        let view = check_sources(&plan, &assets, "all");
+        assert_eq!((view.missing.len(), view.changed.len()), (0, 0));
+        assert!(!relink_plan(&mut plan, &[]));
     }
 
     #[test]

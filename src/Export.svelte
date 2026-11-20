@@ -37,7 +37,8 @@
     type BookPreset,
     type Eligibility,
     type ExportCmd,
-    type SourceCheck
+    type SourceCheck,
+    type SourceProblem
   } from "./lib/tauri";
 
   type Keepsake = {
@@ -93,7 +94,9 @@
         // Only a preview of the run: without it, the cards stay on.
       });
   }
-  $: loadEligibility($project?.projectId);
+  // Keyed on the id alone, so other project updates don't reload anything.
+  $: currentId = $project?.projectId;
+  $: loadEligibility(currentId);
 
   const canMake = (k: Keepsake, e: Eligibility | null) => e?.[k.key].enabled ?? true;
   $: makeable = KEEPSAKES.filter((k) => canMake(k, eligibility));
@@ -158,7 +161,7 @@
         folderError = "TripTape can't save to this folder right now. Connect the drive it's on, or choose another folder.";
       });
   }
-  $: loadFolder($project?.projectId);
+  $: loadFolder(currentId);
 
   async function chooseFolder() {
     folderError = "";
@@ -194,7 +197,7 @@
         // Only a convenience: the keepsakes can still be made from the cards.
       });
   }
-  $: checkInterrupted($project?.projectId);
+  $: checkInterrupted(currentId);
 
   function dismissInterrupted() {
     interrupted = null;
@@ -241,13 +244,19 @@
     }
     checking = false;
     if ($project?.projectId !== projectId) return;
-    if (check && (check.missing.length > 0 || check.changed.length > 0)) {
-      sheet = { cmd, check };
-      await tick();
-      sheetHeading?.focus();
-      return;
+    runOrAsk(cmd, check);
+  }
+
+  // Run when every original checks out (or the check had no answer);
+  // otherwise open the sheet, focused. True when the run started.
+  function runOrAsk(cmd: ExportCmd, check: SourceCheck | null): boolean {
+    if (!check || (check.missing.length === 0 && check.changed.length === 0)) {
+      run(cmd);
+      return true;
     }
-    run(cmd);
+    sheet = { cmd, check };
+    tick().then(() => sheetHeading?.focus());
+    return false;
   }
 
   function run(cmd: ExportCmd) {
@@ -276,13 +285,8 @@
       const result = await relinkSources(projectId, folder);
       const check = await checkSources(projectId, cmd);
       if (!sheet || $project?.projectId !== projectId) return;
-      if (check.missing.length === 0 && check.changed.length === 0) {
-        run(cmd);
-        return;
-      }
-      sheet = { cmd, check };
-      // "Find them" goes away once nothing is missing: keep focus in the sheet.
-      tick().then(() => sheetHeading?.focus());
+      // Focus stays in the sheet: "Find them" goes away once nothing is missing.
+      if (runOrAsk(cmd, check)) return;
       relinkStatus =
         result.found === 0
           ? "None of the missing files are in that folder. Try another folder, or make the keepsakes without them."
@@ -307,6 +311,13 @@
     }
   }
 </script>
+
+{#snippet fileList(files: SourceProblem[])}
+  <ul class="files">
+    {#each files.slice(0, SHOWN_NAMES) as f (f.assetId)}<li>{f.name}</li>{/each}
+    {#if files.length > SHOWN_NAMES}<li>and {files.length - SHOWN_NAMES} more</li>{/if}
+  </ul>
+{/snippet}
 
 {#snippet rows()}
   {#each KEEPSAKES as k}
@@ -380,17 +391,11 @@
         <h2 id="sheet-title" tabindex="-1" bind:this={sheetHeading}>Some photos have moved or changed</h2>
         {#if missing.length > 0}
           <p>{countOf(missing.length, "file")} {missing.length === 1 ? "isn't" : "aren't"} where {missing.length === 1 ? "it was" : "they were"} when you added the trip:</p>
-          <ul class="files">
-            {#each missing.slice(0, SHOWN_NAMES) as f (f.assetId)}<li>{f.name}</li>{/each}
-            {#if missing.length > SHOWN_NAMES}<li>and {missing.length - SHOWN_NAMES} more</li>{/if}
-          </ul>
+          {@render fileList(missing)}
         {/if}
         {#if changed.length > 0}
           <p>{countOf(changed.length, "file")} changed since then, so {changed.length === 1 ? "it" : "they"} won't be used as {changed.length === 1 ? "it is" : "they are"}:</p>
-          <ul class="files">
-            {#each changed.slice(0, SHOWN_NAMES) as f (f.assetId)}<li>{f.name}</li>{/each}
-            {#if changed.length > SHOWN_NAMES}<li>and {changed.length - SHOWN_NAMES} more</li>{/if}
-          </ul>
+          {@render fileList(changed)}
         {/if}
         <p>
           {#if missing.length > 0}

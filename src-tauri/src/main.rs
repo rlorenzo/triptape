@@ -14,10 +14,11 @@ use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager, State};
 use triptape_app::{
     apply_live_photo_pairing, book_notes, book_presets, check_sources as check_plan_sources,
-    export_dir_in, export_eligibility, fill_assets_parallel, find_relinks, finished_film,
-    keepsake_scope, paginate, parse_book_preset, plain_skip, relinked_asset, resolve_export_parent,
-    valid_job_kind, AppState, AssetView, BookPresetView, EligibilityView, ExportSummary, JobView,
-    RelinkView, ScanSummary, SourceCheckView, StoryData, StoryEntryView, StoryView,
+    export_dir_in, export_eligibility, export_sources, fill_assets_parallel, find_relinks,
+    finished_film, keepsake_scope, paginate, parse_book_preset, plain_skip, relink_plan,
+    relinked_asset, resolve_export_parent, valid_job_kind, AppState, AssetView, BookPresetView,
+    EligibilityView, ExportSummary, JobView, RelinkView, ScanSummary, SourceCheckView, StoryData,
+    StoryEntryView, StoryView,
 };
 use triptape_core::{
     cluster,
@@ -1455,15 +1456,11 @@ async fn relink_sources(
                 .map(|p| PathBuf::from(p.folder))
                 .unwrap_or_default()
         };
-        let missing_ids: std::collections::HashSet<String> =
-            check_plan_sources(&plan, &assets, "all")
-                .missing
-                .into_iter()
-                .map(|p| p.asset_id)
-                .collect();
-        let missing: Vec<Asset> = assets
+        // Relink needs only the missing ones: a stat each, no hashing.
+        let missing: Vec<Asset> = export_sources(&plan, &assets, "all")
             .into_iter()
-            .filter(|a| missing_ids.contains(&a.id))
+            .filter(|(a, _)| !a.path.exists())
+            .map(|(a, _)| a.clone())
             .collect();
         let files: Vec<PathBuf> = scan::scan_folder(&new_root)?
             .files
@@ -1473,9 +1470,19 @@ async fn relink_sources(
         let found = find_relinks(&missing, &old_root, &new_root, &files);
         let db = state.db.lock().map_err(|e| e.to_string())?;
         db.in_transaction(|db| {
+            let mut updated = Vec::with_capacity(found.len());
             for r in &found {
                 if let Some(a) = missing.iter().find(|a| a.id == r.asset_id) {
-                    db.upsert_asset(&project_id, &relinked_asset(a.clone(), r))?;
+                    let next = relinked_asset(a.clone(), r);
+                    db.upsert_asset(&project_id, &next)?;
+                    updated.push(next);
+                }
+            }
+            // Film and reel picks are checked against the stored plan's
+            // snapshots, so those follow the relinked rows too.
+            if let Some(mut base) = db.latest_plan(Some(&project_id))? {
+                if relink_plan(&mut base, &updated) {
+                    db.insert_plan(&project_id, &base, "local")?;
                 }
             }
             Ok(())

@@ -305,11 +305,10 @@ export interface ExportChoices {
 export async function exportKeepsake(cmd: ExportCmd, projectId: string, choices: ExportChoices = {}): Promise<ExportSummary> {
   const withBook = cmd === "export_book" || cmd === "export_all";
   const withFilm = cmd === "export_video" || cmd === "export_all";
-  const destination = choices.destination ?? undefined;
   if (isTauri()) {
     return invoke(cmd, {
       projectId,
-      destination,
+      destination: choices.destination,
       ...(withBook ? { bookPages: choices.bookPages, bookPreset: choices.bookPreset } : {}),
       ...(withFilm ? { liveCollages: choices.liveCollages } : {})
     });
@@ -317,7 +316,7 @@ export async function exportKeepsake(cmd: ExportCmd, projectId: string, choices:
   await new Promise((r) => setTimeout(r, 600));
   return {
     jobId: "demo_job",
-    outDir: `${destination ?? DEMO_DEFAULT_FOLDER}/Demo Trip (demo_prj)`,
+    outDir: `${choices.destination ?? DEMO_DEFAULT_FOLDER}/Demo Trip (demo_prj)`,
     video: withFilm ? "hero.mp4" : undefined,
     reels: cmd === "export_reels" || cmd === "export_all" ? ["reel-01.mp4", "reel-02.mp4"] : [],
     bookPages: withBook && !demoScenario("thin") ? 24 : 0,
