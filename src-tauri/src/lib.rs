@@ -24,6 +24,7 @@ use triptape_core::osxphotos::OsxPhotosIndex;
 use triptape_core::scan::{ScannedFile, VIDEO_EXTS};
 use triptape_core::types::{distinct_assets, Asset, AssetKind, Chapter, Plan, PlanEntry};
 use triptape_media::export::Skipped;
+use triptape_media::render_book::{BookPreset, MAX_BOOK_PAGES};
 
 // ---------------------------------------------------------------------------
 // State
@@ -363,6 +364,44 @@ pub fn export_eligibility(plan: &Plan, assets: &[Asset]) -> EligibilityView {
         video: card(e.video != "disabled", e.video_reason, e.video != "full"),
         reels: card(e.reels > 0, e.reels_reason, e.reels == 0),
         book: card(e.book_enabled, e.book_reason, !e.book_enabled),
+    }
+}
+
+/// One book shape the owner can pick, with the page limits the field follows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookPresetView {
+    /// `P1` or `P2`, as the export commands take it.
+    pub id: &'static str,
+    pub name: &'static str,
+    pub min_pages: usize,
+    /// The page cap used when the owner doesn't set one.
+    pub default_pages: usize,
+    pub max_pages: usize,
+}
+
+/// The book shapes on offer (PLAN.md Sec 11: only two in v1), P1 first.
+pub fn book_presets() -> Vec<BookPresetView> {
+    [(BookPreset::P1, "P1"), (BookPreset::P2, "P2")]
+        .into_iter()
+        .map(|(preset, id)| {
+            let (min_pages, default_pages) = preset.page_range();
+            BookPresetView {
+                id,
+                name: preset.name(),
+                min_pages,
+                default_pages,
+                max_pages: MAX_BOOK_PAGES,
+            }
+        })
+        .collect()
+}
+
+/// The book shape an export asked for; omitted means P1 (Classic Square).
+pub fn parse_book_preset(id: Option<&str>) -> Result<BookPreset, String> {
+    match id {
+        None => Ok(BookPreset::P1),
+        Some(id) => BookPreset::from_flag(id).ok_or_else(|| format!("unknown book shape {id:?}")),
     }
 }
 
@@ -1038,6 +1077,29 @@ mod tests {
         let e = export_eligibility(&plan_for(&assets), &assets);
         assert!(e.book.enabled);
         assert!(e.book.reason.is_empty());
+    }
+
+    #[test]
+    fn book_presets_follow_the_renderer_and_default_to_p1() {
+        let presets = book_presets();
+        assert_eq!(
+            presets.iter().map(|p| p.id).collect::<Vec<_>>(),
+            ["P1", "P2"]
+        );
+        for p in &presets {
+            let preset = parse_book_preset(Some(p.id)).unwrap();
+            assert_eq!((p.min_pages, p.default_pages), preset.page_range());
+            assert_eq!(preset.page_cap(None).unwrap(), p.default_pages);
+            assert!(preset.page_cap(Some(p.max_pages)).is_ok());
+            assert!(preset.page_cap(Some(p.max_pages + 1)).is_err());
+            assert!(preset.page_cap(Some(p.min_pages - 1)).is_err());
+        }
+        assert_eq!(presets[1].default_pages, 80);
+        assert_eq!(parse_book_preset(None).unwrap(), BookPreset::P1);
+        assert_eq!(parse_book_preset(Some("p2")).unwrap(), BookPreset::P2);
+        assert!(parse_book_preset(Some("P3")).is_err());
+        let json = serde_json::to_value(&presets[0]).unwrap();
+        assert_eq!(json["defaultPages"], 60);
     }
 
     #[test]

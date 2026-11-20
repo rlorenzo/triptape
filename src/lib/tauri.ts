@@ -219,9 +219,34 @@ export async function getExportEligibility(projectId: string): Promise<Eligibili
   };
 }
 
+export type BookPresetId = "P1" | "P2";
+
+/** One book shape, with the page limits the pages field follows. */
+export interface BookPreset {
+  id: BookPresetId;
+  name: string;
+  minPages: number;
+  /** The page cap used when the owner doesn't set one. */
+  defaultPages: number;
+  maxPages: number;
+}
+
+/** Browser preview: the backend's two shapes, as `book_presets()` returns them. */
+export const DEMO_BOOK_PRESETS: BookPreset[] = [
+  { id: "P1", name: "Classic Square 12x12", minPages: 24, defaultPages: 60, maxPages: 400 },
+  { id: "P2", name: "Travel Landscape 11x8.5", minPages: 24, defaultPages: 80, maxPages: 400 }
+];
+
+export async function getBookPresets(): Promise<BookPreset[]> {
+  if (isTauri()) return invoke("get_book_presets");
+  return DEMO_BOOK_PRESETS;
+}
+
 export interface ExportChoices {
   /** Caps the book's pages (book and all only). */
   bookPages?: number;
+  /** The book's shape (book and all only); omitted means P1. */
+  bookPreset?: BookPresetId;
   /** Live Photo motion in the film's collages (film and all only; omitted means on). */
   liveCollages?: boolean;
   /** The folder the trip's export folder goes inside; omitted uses the default. */
@@ -236,7 +261,7 @@ export async function exportKeepsake(cmd: ExportCmd, projectId: string, choices:
     return invoke(cmd, {
       projectId,
       destination,
-      ...(withBook ? { bookPages: choices.bookPages } : {}),
+      ...(withBook ? { bookPages: choices.bookPages, bookPreset: choices.bookPreset } : {}),
       ...(withFilm ? { liveCollages: choices.liveCollages } : {})
     });
   }

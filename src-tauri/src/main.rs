@@ -13,9 +13,10 @@ use std::path::{Path, PathBuf};
 
 use tauri::{Emitter, Manager, State};
 use triptape_app::{
-    apply_live_photo_pairing, export_dir_in, export_eligibility, fill_assets_parallel,
-    finished_film, paginate, resolve_export_parent, valid_job_kind, AppState, AssetView,
-    EligibilityView, ExportSummary, JobView, ScanSummary, StoryData, StoryEntryView, StoryView,
+    apply_live_photo_pairing, book_presets, export_dir_in, export_eligibility,
+    fill_assets_parallel, finished_film, paginate, parse_book_preset, resolve_export_parent,
+    valid_job_kind, AppState, AssetView, BookPresetView, EligibilityView, ExportSummary, JobView,
+    ScanSummary, StoryData, StoryEntryView, StoryView,
 };
 use triptape_core::{
     cluster,
@@ -1064,6 +1065,8 @@ impl triptape_media::progress::ProgressSink for ExportProgress {
 #[derive(Debug, Default)]
 struct ExportChoices {
     book_pages: Option<usize>,
+    /// `P1` or `P2`; `None` is P1.
+    book_preset: Option<String>,
     live_collages: Option<bool>,
     /// Folder picked in the OS dialog; `None` uses the default folder.
     destination: Option<String>,
@@ -1073,6 +1076,7 @@ struct ExportChoices {
 #[derive(Debug)]
 struct ExportPlan {
     book_pages: Option<usize>,
+    book_preset: triptape_media::render_book::BookPreset,
     live_collages: bool,
     /// Folder the trip's own export folder goes inside.
     parent: PathBuf,
@@ -1081,11 +1085,13 @@ struct ExportPlan {
 impl ExportChoices {
     /// Fail on a bad choice before a job row exists or anything renders.
     fn validate(self) -> Result<ExportPlan, String> {
+        let book_preset = parse_book_preset(self.book_preset.as_deref())?;
         if let Some(n) = self.book_pages {
-            BOOK_PRESET.page_cap(Some(n))?;
+            book_preset.page_cap(Some(n))?;
         }
         Ok(ExportPlan {
             book_pages: self.book_pages,
+            book_preset,
             live_collages: live_collages_or_default(self.live_collages),
             parent: resolve_export_parent(self.destination.as_deref())?,
         })
@@ -1111,10 +1117,6 @@ async fn run_export(
 fn live_collages_or_default(live_collages: Option<bool>) -> bool {
     live_collages.unwrap_or(true)
 }
-
-/// The app's only book preset today (the CLI also offers P2).
-const BOOK_PRESET: triptape_media::render_book::BookPreset =
-    triptape_media::render_book::BookPreset::P1;
 
 /// Which keepsakes a job kind renders.
 fn keepsakes_of(kind: &str) -> &'static str {
@@ -1191,7 +1193,7 @@ fn export_blocking(
 
     let caps = triptape_media::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
     let opts = triptape_media::export::ExportOptions {
-        preset: BOOK_PRESET,
+        preset: choices.book_preset,
         book_max_pages: choices.book_pages,
         trip_name,
         typst_bin: "typst".to_string(),
@@ -1456,16 +1458,25 @@ async fn export_reels(
     run_export(app, project_id, "render-reels", choices).await
 }
 
-/// `book_pages` caps the book's counted pages; `None` keeps the preset default.
+/// The book shapes the Export screen offers, with their page limits.
+#[tauri::command]
+async fn get_book_presets() -> Vec<BookPresetView> {
+    book_presets()
+}
+
+/// `book_pages` caps the book's counted pages; `None` keeps the preset
+/// default. `book_preset` is `P1` (the default) or `P2`.
 #[tauri::command]
 async fn export_book(
     app: tauri::AppHandle,
     project_id: String,
     book_pages: Option<usize>,
+    book_preset: Option<String>,
     destination: Option<String>,
 ) -> Result<ExportSummary, String> {
     let choices = ExportChoices {
         book_pages,
+        book_preset,
         destination,
         ..Default::default()
     };
@@ -1478,11 +1489,13 @@ async fn export_all(
     app: tauri::AppHandle,
     project_id: String,
     book_pages: Option<usize>,
+    book_preset: Option<String>,
     live_collages: Option<bool>,
     destination: Option<String>,
 ) -> Result<ExportSummary, String> {
     let choices = ExportChoices {
         book_pages,
+        book_preset,
         live_collages,
         destination,
     };
@@ -1559,6 +1572,7 @@ fn main() {
             export_all,
             check_export_folder,
             get_export_eligibility,
+            get_book_presets,
             open_film,
             get_story,
             get_alternatives,
@@ -1593,6 +1607,10 @@ mod tests {
     fn export_choices_default_to_today_and_reject_bad_input() {
         let plan = ExportChoices::default().validate().unwrap();
         assert_eq!(plan.book_pages, None);
+        assert_eq!(
+            plan.book_preset,
+            triptape_media::render_book::BookPreset::P1
+        );
         assert!(plan.live_collages);
         assert_eq!(plan.parent, triptape_app::default_export_parent());
 
@@ -1600,12 +1618,22 @@ mod tests {
         let picked = ExportChoices {
             destination: Some(dir.path().to_string_lossy().into_owned()),
             book_pages: Some(111),
+            book_preset: Some("P2".into()),
             live_collages: Some(false),
         }
         .validate()
         .unwrap();
         assert_eq!(picked.parent, dir.path());
         assert_eq!(picked.book_pages, Some(111));
+        assert_eq!(
+            picked.book_preset,
+            triptape_media::render_book::BookPreset::P2
+        );
+        let bad_preset = ExportChoices {
+            book_preset: Some("P9".into()),
+            ..Default::default()
+        };
+        assert!(bad_preset.validate().is_err());
         assert!(!picked.live_collages);
 
         let bad_pages = ExportChoices {

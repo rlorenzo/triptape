@@ -6,6 +6,7 @@
     BOOK_PAGES_MAX,
     BOOK_PAGES_MIN,
     bookPages,
+    bookPreset,
     exportJob,
     frameNumbers,
     liveCollages,
@@ -22,12 +23,15 @@
     cancelJob,
     checkExportFolder,
     dismissInterruptedExport,
+    DEMO_BOOK_PRESETS,
+    getBookPresets,
     getExportEligibility,
     getInterruptedExport,
     pickFolder,
     playFilm,
     revealExport,
     REELS_DISCLOSURE,
+    type BookPreset,
     type Eligibility,
     type ExportCmd
   } from "./lib/tauri";
@@ -102,12 +106,30 @@
 
   let openError = "";
 
+  // Book shapes and their page limits come from the backend; the preview's
+  // copy of them stands in until they arrive.
+  let presets: BookPreset[] = DEMO_BOOK_PRESETS;
+  getBookPresets()
+    .then((p) => (presets = p))
+    .catch(() => {});
+  $: preset = presets.find((p) => p.id === $bookPreset) ?? presets[0];
+  $: pagesMin = preset?.minPages ?? BOOK_PAGES_MIN;
+  $: pagesMax = preset?.maxPages ?? BOOK_PAGES_MAX;
+
   // The field holds what was typed; only a valid count reaches the store.
   let pagesInput: number | null = $bookPages;
-  $: pagesInvalid = validBookPages(pagesInput) === null;
+  $: pagesInvalid = validBookPages(pagesInput, pagesMin, pagesMax) === null;
   function commitPages() {
-    const n = validBookPages(pagesInput);
+    const n = validBookPages(pagesInput, pagesMin, pagesMax);
     if (n !== null) bookPages.set(n);
+  }
+
+  // A new shape starts from its own page default.
+  function presetChanged() {
+    const chosen = presets.find((p) => p.id === $bookPreset);
+    if (!chosen) return;
+    pagesInput = chosen.defaultPages;
+    bookPages.set(chosen.defaultPages);
   }
 
   // Where the keepsakes go: the folder chosen for this trip, else the usual one.
@@ -362,13 +384,19 @@
       </div>
       {#if folderError}<ErrorNote message={folderError} />{/if}
       <div class="pages">
+        <label for="book-preset">Photo Book shape</label>
+        <select id="book-preset" disabled={busy} bind:value={$bookPreset} on:change={presetChanged}>
+          {#each presets as p}
+            <option value={p.id}>{p.name} in</option>
+          {/each}
+        </select>
         <label for="book-pages">Most pages in the Photo Book</label>
         <input
           id="book-pages"
           type="number"
           inputmode="numeric"
-          min={BOOK_PAGES_MIN}
-          max={BOOK_PAGES_MAX}
+          min={pagesMin}
+          max={pagesMax}
           step="1"
           disabled={busy}
           bind:value={pagesInput}
@@ -378,9 +406,10 @@
         />
         <p id="book-pages-hint" class:bad={pagesInvalid}>
           {#if pagesInvalid}
-            Choose a whole number from {BOOK_PAGES_MIN} to {BOOK_PAGES_MAX}. Using {$bookPages}.
+            Choose a whole number from {pagesMin} to {pagesMax}. Using {$bookPages}.
           {:else}
-            More pages fit more photos. Check your print service's limit: Shutterfly 111, Snapfish 150, Mixbook 400.
+            This shape starts at {preset?.defaultPages ?? $bookPages} pages. More pages fit more photos. Check your print service's limit: Shutterfly
+            111, Snapfish 150, Mixbook 400.
           {/if}
         </p>
       </div>
@@ -568,7 +597,8 @@
 
   .pages {
     display: grid;
-    grid-template-columns: auto 6em;
+    grid-template-columns: max-content max-content;
+    justify-content: start;
     gap: 4px 16px;
     align-items: center;
     padding: 0 0 16px;
@@ -578,10 +608,15 @@
     font-weight: 500;
   }
 
-  .pages input {
+  .pages input,
+  .pages select {
     font: inherit;
     padding: 4px 8px;
     border: 1px solid var(--line);
+  }
+
+  .pages input {
+    width: 6em;
   }
 
   .pages p {
