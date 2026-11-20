@@ -298,20 +298,15 @@ pub struct Toolchain {
 }
 
 impl Toolchain {
-    /// Resolve all three; each `Some` is an explicit override (a CLI flag).
-    pub fn resolve(ffmpeg: Option<&str>, ffprobe: Option<&str>, typst: Option<&str>) -> Self {
-        Self {
-            ffmpeg: resolve_tool(Tool::Ffmpeg, ffmpeg),
-            ffprobe: resolve_tool(Tool::Ffprobe, ffprobe),
-            typst: resolve_tool(Tool::Typst, typst),
-        }
-    }
-
     /// The process-wide toolchain (no flags; `TRIPTAPE_*` variables still
     /// apply), resolved once on first use.
     pub fn global() -> &'static Toolchain {
         static TOOLS: OnceLock<Toolchain> = OnceLock::new();
-        TOOLS.get_or_init(|| Toolchain::resolve(None, None, None))
+        TOOLS.get_or_init(|| Toolchain {
+            ffmpeg: resolve_tool(Tool::Ffmpeg, None),
+            ffprobe: resolve_tool(Tool::Ffprobe, None),
+            typst: resolve_tool(Tool::Typst, None),
+        })
     }
 
     /// One note per tool that is not the bundled or chosen one.

@@ -140,7 +140,7 @@ fn flag_or(flags: &HashMap<String, String>, k: &str, default: &str) -> String {
 /// The program to run for `tool`: its `--ffmpeg`/`--ffprobe`/`--typst` flag,
 /// then `TRIPTAPE_*`, the bundled sidecar beside this binary, then `PATH`.
 /// A `PATH` or missing tool is noted on stderr.
-fn tool(flags: &HashMap<String, String>, tool: Tool) -> String {
+fn tool_bin(flags: &HashMap<String, String>, tool: Tool) -> String {
     let resolved = resolve_tool(tool, flags.get(tool.name()).map(String::as_str));
     if let Some(note) = resolved.note() {
         eprintln!("note: {note}");
@@ -152,8 +152,8 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     let folder = need(flags, "folder");
     let db_path = need(flags, "db");
     let cache = need(flags, "cache");
-    let ffmpeg = tool(flags, Tool::Ffmpeg);
-    let ffprobe = tool(flags, Tool::Ffprobe);
+    let ffmpeg = tool_bin(flags, Tool::Ffmpeg);
+    let ffprobe = tool_bin(flags, Tool::Ffprobe);
     // Validate before any work so a bad value never yields a misleading exit 0.
     let allow_partial = match flag_or(flags, "allow-partial", "false").as_str() {
         "true" => true,
@@ -557,9 +557,9 @@ fn export_cmd(flags: &HashMap<String, String>) {
             .page_cap(Some(n))
             .unwrap_or_else(|e| die("--pages", e))
     });
-    let ffmpeg_bin = tool(flags, Tool::Ffmpeg);
-    let ffprobe_bin = tool(flags, Tool::Ffprobe);
-    let typst_bin = tool(flags, Tool::Typst);
+    let ffmpeg_bin = tool_bin(flags, Tool::Ffmpeg);
+    let ffprobe_bin = tool_bin(flags, Tool::Ffprobe);
+    let typst_bin = tool_bin(flags, Tool::Typst);
     let music = flags.get("music").map_or_else(Vec::new, |v| music_list(v));
     for m in &music {
         if !m.exists() {

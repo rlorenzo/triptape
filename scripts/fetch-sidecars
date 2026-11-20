@@ -102,6 +102,19 @@ sha256() {
   else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
 
+# verify <file> <sha256> <label>: delete <file> and exit 4 unless it matches.
+verify() {
+  local got
+  got="$(sha256 "$1")"
+  if [ "$got" != "$2" ]; then
+    rm -f "$1"
+    echo "FAIL: SHA-256 mismatch for $3" >&2
+    echo "  expected $2" >&2
+    echo "  got      $got" >&2
+    exit 4
+  fi
+}
+
 # fetch_archive <url> <sha256>: print the cached, verified archive path.
 # A cached copy that no longer matches is discarded and downloaded again.
 fetch_archive() {
@@ -114,15 +127,7 @@ fetch_archive() {
   rm -f "$path" "$path.part"
   echo "download: $url" >&2
   curl -fsSL --retry 3 --proto '=https' --proto-redir '=https' -o "$path.part" "$url"
-  local got
-  got="$(sha256 "$path.part")"
-  if [ "$got" != "$want" ]; then
-    rm -f "$path.part"
-    echo "FAIL: SHA-256 mismatch for $url" >&2
-    echo "  expected $want" >&2
-    echo "  got      $got" >&2
-    exit 4
-  fi
+  verify "$path.part" "$want" "$url"
   mv "$path.part" "$path"
   echo "$path"
 }
@@ -147,15 +152,7 @@ install_bin() {
     *.tar.xz) tar -xJOf "$archive" "$member" >"$tmp" ;;
     *) echo "unknown archive type: $archive" >&2; exit 2 ;;
   esac
-  local got
-  got="$(sha256 "$tmp")"
-  if [ "$got" != "$want" ]; then
-    rm -f "$tmp"
-    echo "FAIL: extracted $member does not match its pinned SHA-256" >&2
-    echo "  expected $want" >&2
-    echo "  got      $got" >&2
-    exit 4
-  fi
+  verify "$tmp" "$want" "extracted $member"
   chmod 755 "$tmp"
   mv -f "$tmp" "$dest"
   echo "installed: $dest (SHA-256 $want)"
