@@ -28,6 +28,7 @@
     getBookPresets,
     getExportEligibility,
     getInterruptedExport,
+    getToolNotes,
     checkSources,
     pickFolder,
     playFilm,
@@ -118,6 +119,12 @@
   let presets: BookPreset[] = DEMO_BOOK_PRESETS;
   getBookPresets()
     .then((p) => (presets = p))
+    .catch(() => {});
+
+  // Media tool warnings (none with the bundled tools).
+  let toolNotes: string[] = [];
+  getToolNotes()
+    .then((n) => (toolNotes = n))
     .catch(() => {});
   $: preset = presets.find((p) => p.id === $bookPreset) ?? presets[0];
   $: pagesMin = preset?.minPages ?? BOOK_PAGES_MIN;
@@ -498,6 +505,14 @@
     {/if}
 
     <section class="list" aria-label="Keepsakes">
+      {#if toolNotes.length}
+        <div class="tool-notes" role="status">
+          <p id="tool-notes-title" class="notes-title">Keepsakes may come out simpler on this computer</p>
+          <ul class="book-notes" aria-labelledby="tool-notes-title">
+            {#each toolNotes as note}<li>{note}</li>{/each}
+          </ul>
+        </div>
+      {/if}
       <div class="dest">
         <div class="dest-text">
           <span id="dest-label" class="dest-label">Save keepsakes in</span>
@@ -751,6 +766,14 @@
     align-items: center;
     justify-content: space-between;
     padding-bottom: 12px;
+  }
+
+  .tool-notes {
+    padding: 0 0 16px;
+  }
+
+  .tool-notes .notes-title {
+    margin-top: 0;
   }
 
   .dest {

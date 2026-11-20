@@ -1,10 +1,11 @@
 //! FFmpeg capability probe, process runner, and ffprobe verifier.
 //!
-//! The bundled/static FFmpeg varies per machine (system FFmpeg 9.0.2 here:
-//! `libx264`, `xfade`, `perspective`, `tonemap`, `loudnorm` present;
-//! `zscale`/`drawtext`/`vidstab`/libass absent). Every renderer probes
-//! once at startup and picks fallback filters accordingly, so exports
-//! degrade instead of failing.
+//! The pinned sidecar (`scripts/fetch-sidecars`) has every filter used here,
+//! but a dev run may fall back to a `PATH` FFmpeg that lacks some (plain
+//! Homebrew FFmpeg has no `zscale`, `drawtext`, `vidstab` or libass).
+//! Every renderer probes once at startup and picks fallback filters
+//! accordingly, so exports degrade instead of failing, and
+//! [`Capabilities::degradations`] tells the user what got worse.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -248,6 +249,33 @@ impl Capabilities {
     pub fn full_tonemap(&self) -> bool {
         self.tonemap && self.zscale
     }
+
+    /// What this FFmpeg will do worse than the pinned sidecar, in words for
+    /// the user. Empty for the sidecar. Renders still run with the fallbacks
+    /// each note names, so these warn rather than block.
+    pub fn degradations(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if !self.libx264 {
+            notes.push("This FFmpeg has no libx264 encoder, so videos can't be made.".to_string());
+        }
+        if !self.can_burn_captions() {
+            notes.push(
+                "Captions won't be burned into the film: this FFmpeg has no libass. They are saved beside it as a subtitle file instead.".to_string(),
+            );
+        }
+        if !self.full_tonemap() {
+            notes.push(
+                "HDR clips are converted with a simpler tone map: this FFmpeg has no zscale."
+                    .to_string(),
+            );
+        }
+        if !(self.vidstabdetect && self.vidstabtransform) {
+            notes.push(
+                "This FFmpeg has no vidstab, so shaky clips can't be stabilized.".to_string(),
+            );
+        }
+        notes
+    }
 }
 
 /// Escape `v` as a filter option value, then as a filtergraph element, so it
@@ -457,6 +485,16 @@ pub fn decode_still_to_png(
 /// sips/FFmpeg decode selection is shared, but orientation (if any) is left
 /// for the caller to apply in memory.
 fn decode_still_raw(ffmpeg_bin: &str, src: &Path) -> Result<DecodedStill, super::MediaError> {
+    decode_still_via(ffmpeg_bin, src, cfg!(target_os = "macos"))
+}
+
+/// The decode itself. `sips` false leaves FFmpeg as the only decoder: the
+/// one route Windows has, which tests also exercise on a Mac.
+fn decode_still_via(
+    ffmpeg_bin: &str,
+    src: &Path,
+    sips: bool,
+) -> Result<DecodedStill, super::MediaError> {
     let dir = tempfile::Builder::new()
         .prefix("triptape-still-")
         .tempdir()
@@ -494,7 +532,9 @@ fn decode_still_raw(ffmpeg_bin: &str, src: &Path) -> Result<DecodedStill, super:
         ))
     };
     #[cfg(target_os = "macos")]
-    let (decoded, via_sips) = {
+    let (decoded, via_sips) = if !sips {
+        (try_ffmpeg(), false)
+    } else {
         let heif = is_heif(src);
         // Order matters (side effects): the first decoder to succeed wins.
         if heif && try_sips() {
@@ -508,7 +548,10 @@ fn decode_still_raw(ffmpeg_bin: &str, src: &Path) -> Result<DecodedStill, super:
         }
     };
     #[cfg(not(target_os = "macos"))]
-    let (decoded, via_sips) = (try_ffmpeg(), false);
+    let (decoded, via_sips) = {
+        let _ = sips;
+        (try_ffmpeg(), false)
+    };
     if decoded {
         // sips writes stored pixels without applying EXIF orientation
         // (FFmpeg auto-rotates); the caller orients from here.
@@ -1016,6 +1059,21 @@ pub fn verify_video(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use triptape_core::process::{ToolSource, Toolchain};
+
+    /// The FFmpeg these tests run: resolved like the app's (sidecar beside
+    /// `target/<profile>/`, `TRIPTAPE_FFMPEG`, else `PATH`).
+    fn ff() -> &'static str {
+        &Toolchain::global().ffmpeg.bin
+    }
+
+    fn fp() -> &'static str {
+        &Toolchain::global().ffprobe.bin
+    }
+
+    fn tools_caps() -> Capabilities {
+        probe_capabilities(ff(), fp())
+    }
 
     /// Run `glide` over one synthetic still; returns its gray8 frames.
     fn glide_frames(caps: &Capabilities, frames: u32, variant: usize) -> Vec<Vec<u8>> {
@@ -1055,7 +1113,7 @@ mod tests {
     /// ignores, so run the real filter and compare pixels.
     #[test]
     fn glide_really_moves_every_variant() {
-        let caps = probe_capabilities("ffmpeg", "ffprobe");
+        let caps = tools_caps();
         if !caps.perspective {
             eprintln!("ffmpeg lacks perspective; skipping");
             return;
@@ -1257,13 +1315,15 @@ mod tests {
     /// pixels change at the bottom of the frame. Skips without libass.
     #[test]
     fn subtitles_burn_in_through_awkward_path() {
+        // The resolved FFmpeg (the sidecar has libass); a dev Mac without it
+        // can still run this through Homebrew's ffmpeg-full.
         let full = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg";
-        let bin = if Path::new(full).exists() {
+        let bin = if !tools_caps().can_burn_captions() && Path::new(full).exists() {
             full
         } else {
-            "ffmpeg"
+            ff()
         };
-        let caps = probe_capabilities(bin, "ffprobe");
+        let caps = probe_capabilities(bin, fp());
         if !caps.can_burn_captions() {
             eprintln!("no libass ffmpeg; skipping caption burn-in test");
             return;
@@ -1323,6 +1383,92 @@ mod tests {
         assert_eq!(bright(&run("null")), 0);
     }
 
+    /// The pinned sidecar has everything the renderers can use. Runs when the
+    /// resolved FFmpeg is the sidecar; with `TRIPTAPE_REQUIRE_SIDECAR` set
+    /// (CI) a missing sidecar fails instead of skipping.
+    #[test]
+    fn pinned_sidecar_has_every_capability() {
+        let tools = Toolchain::global();
+        if tools.ffmpeg.source != ToolSource::Sidecar {
+            assert!(
+                std::env::var_os("TRIPTAPE_REQUIRE_SIDECAR").is_none(),
+                "sidecar required, resolved {:?}",
+                tools.ffmpeg
+            );
+            eprintln!("no sidecar beside the test binary; skipping");
+            return;
+        }
+        assert_eq!(tools.ffprobe.source, ToolSource::Sidecar);
+        let caps = tools_caps();
+        assert!(caps.libx264 && caps.aac && caps.xfade && caps.perspective && caps.loudnorm);
+        assert!(caps.subtitles && caps.drawtext && caps.zscale);
+        assert!(caps.vidstabdetect && caps.vidstabtransform);
+        assert_eq!(caps.degradations(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn degradations_name_each_missing_piece() {
+        let none = Capabilities::default().degradations();
+        assert_eq!(none.len(), 4, "{none:?}");
+        assert!(none[1].contains("Captions"));
+        let full = Capabilities {
+            libx264: true,
+            subtitles: true,
+            tonemap: true,
+            zscale: true,
+            vidstabdetect: true,
+            vidstabtransform: true,
+            ..Default::default()
+        };
+        assert!(full.degradations().is_empty());
+    }
+
+    /// HEIC through FFmpeg alone, the only decoder Windows has: every
+    /// `.heic` in `TRIPTAPE_HEIC_DIR` (real iPhone files, including Dolby
+    /// Vision `tmap` gain-map ones) must decode upright at its full size.
+    /// On a Mac each result is compared with the ImageIO (`sips`) decode,
+    /// oriented the way renders orient it, so a sideways or cropped decode
+    /// fails. Ignored: the photos are private and stay out of the repo.
+    ///
+    /// `TRIPTAPE_HEIC_DIR=… cargo test -p triptape-media heic_decodes_without_sips -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs TRIPTAPE_HEIC_DIR with real iPhone HEIC files"]
+    fn heic_decodes_without_sips() {
+        let dir = std::env::var_os("TRIPTAPE_HEIC_DIR").expect("set TRIPTAPE_HEIC_DIR");
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| is_heif(p))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no .heic files");
+        eprintln!("ffmpeg: {:?}", Toolchain::global().ffmpeg);
+        let small = |p: &Path| {
+            image::open(p)
+                .unwrap()
+                .resize_exact(64, 64, image::imageops::FilterType::Triangle)
+                .to_luma8()
+                .into_raw()
+        };
+        for src in &files {
+            let via_ffmpeg = decode_still_via(ff(), src, false)
+                .unwrap_or_else(|e| panic!("{}: {e}", src.display()));
+            assert!(!via_ffmpeg.needs_orientation);
+            let (w, h) = image::image_dimensions(&via_ffmpeg.path).unwrap();
+            assert!(w.max(h) >= 1600, "{}: only {w}x{h}", src.display());
+            if !cfg!(target_os = "macos") {
+                eprintln!("{}: {w}x{h}", src.display());
+                continue;
+            }
+            let reference = decode_still_to_png(ff(), src).unwrap();
+            let want = image::image_dimensions(&reference.path).unwrap();
+            assert_eq!((w, h), want, "{}: size or orientation", src.display());
+            let diff = mean_diff(&small(&via_ffmpeg.path), &small(&reference.path));
+            eprintln!("{}: {w}x{h}, mean diff vs ImageIO {diff:.1}", src.display());
+            assert!(diff < 12.0, "{}: pixels differ ({diff:.1})", src.display());
+        }
+    }
+
     #[test]
     fn flag_matching_is_exact() {
         let filters = "Filters:\n .S tonemap V->V Conversion.\n ..C scale V->V Scale.\n";
@@ -1368,7 +1514,7 @@ mod tests {
     }
 
     fn has_ffmpeg() -> bool {
-        Command::new("ffmpeg").arg("-version").output().is_ok()
+        Command::new(ff()).arg("-version").output().is_ok()
     }
 
     fn assert_is_thumb(path: &Path, want: (u32, u32)) {
@@ -1418,7 +1564,7 @@ mod tests {
         let src = dir.path().join("rgba.png");
         image::RgbaImage::new(640, 480).save(&src).unwrap();
         let dst = dir.path().join("thumb").join("a.jpg");
-        render_thumb("ffmpeg", &src, AssetKind::Photo, &dst).unwrap();
+        render_thumb(ff(), &src, AssetKind::Photo, &dst).unwrap();
         assert_is_thumb(&dst, (320, 240));
     }
 
@@ -1435,7 +1581,7 @@ mod tests {
             .save_with_format(&src, image::ImageFormat::Png)
             .unwrap();
         let dst = dir.path().join("thumb").join("a.jpg");
-        render_thumb("ffmpeg", &src, AssetKind::Photo, &dst).unwrap();
+        render_thumb(ff(), &src, AssetKind::Photo, &dst).unwrap();
         assert_is_thumb(&dst, (320, 240));
     }
 
@@ -1455,7 +1601,7 @@ mod tests {
         let src = dir.path().join("portrait.jpg");
         std::fs::write(&src, [&jpeg[..2], &app1[..], &jpeg[2..]].concat()).unwrap();
         let dst = dir.path().join("thumb").join("a.jpg");
-        render_thumb("ffmpeg", &src, AssetKind::Photo, &dst).unwrap();
+        render_thumb(ff(), &src, AssetKind::Photo, &dst).unwrap();
         assert_is_thumb(&dst, (240, 320));
     }
 
@@ -1471,7 +1617,7 @@ mod tests {
         let dst = dir.path().join("thumb").join("a.jpg");
         std::thread::scope(|scope| {
             let workers: Vec<_> = (0..4)
-                .map(|_| scope.spawn(|| render_thumb("ffmpeg", &src, AssetKind::Photo, &dst)))
+                .map(|_| scope.spawn(|| render_thumb(ff(), &src, AssetKind::Photo, &dst)))
                 .collect();
             for worker in workers {
                 worker.join().unwrap().unwrap();
@@ -1488,14 +1634,14 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("clip.mp4");
-        let made = Command::new("ffmpeg")
+        let made = Command::new(ff())
             .args(["-v", "error", "-f", "lavfi", "-i", "testsrc2=s=640x360:d=1"])
             .arg(&src)
             .status()
             .unwrap();
         assert!(made.success());
         let dst = dir.path().join("thumb").join("a.jpg");
-        render_thumb("ffmpeg", &src, AssetKind::Video, &dst).unwrap();
+        render_thumb(ff(), &src, AssetKind::Video, &dst).unwrap();
         assert_is_thumb(&dst, (320, 180));
     }
 
