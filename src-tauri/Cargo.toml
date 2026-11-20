@@ -28,6 +28,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 triptape-core = { path = "crates/triptape-core" }
 triptape-media = { path = "crates/triptape-media" }
+triptape-ai-local = { path = "crates/triptape-ai-local" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -30,7 +30,9 @@
 use crate::cluster::{chapter_labels, cluster_assets, collapse_near_dupes, suppressed_ids};
 use crate::db::Db;
 use crate::plan::{apply_edits, build_plan_with_length, FilmLength, PlaceOverride, PlanEdits};
-use crate::score::{highlight_score, StorySignals, HIGHLIGHT_THRESHOLD, TECH_FLOOR, TECH_SPAN};
+use crate::score::{
+    highlight_score, StorySignals, HIGHLIGHT_THRESHOLD, SOFT_SHARPNESS, TECH_FLOOR, TECH_SPAN,
+};
 use crate::types::{Asset, Plan, Score};
 use std::collections::{BTreeMap, HashMap};
 
@@ -65,7 +67,7 @@ pub struct FeatureDef {
 /// The reweightable features, in fit order. Each feature's value is the
 /// score points it contributes at the default weights, so a multiplier
 /// scales that contribution directly.
-pub const FEATURES: [FeatureDef; 6] = [
+pub const FEATURES: [FeatureDef; 7] = [
     FeatureDef {
         name: "people",
         label: "people",
@@ -95,6 +97,12 @@ pub const FEATURES: [FeatureDef; 6] = [
         label: "lively motion",
         more: "livelier audio or movement",
         less: "calmer audio and movement",
+    },
+    FeatureDef {
+        name: "faces",
+        label: "faces and smiles",
+        more: "a smile or a clear face",
+        less: "no smile or clear face",
     },
     FeatureDef {
         name: "quality",
@@ -181,9 +189,14 @@ impl Weights {
 }
 
 /// Score points a set of story signals contributes, via the scorer itself
-/// so this never drifts from `score.rs`.
+/// so this never drifts from `score.rs`. Scored as a sharp frame, so the
+/// face signals (withheld from soft frames) are measured too.
 fn bonus_of(signals: StorySignals) -> f64 {
-    f64::from(highlight_score(&Score::default(), &signals, false).bonus)
+    let sharp = Score {
+        sharpness: 1.0,
+        ..Score::default()
+    };
+    f64::from(highlight_score(&sharp, &signals, false).bonus)
 }
 
 /// The story-score features of an asset: what its people, caption, kind,
@@ -195,12 +208,22 @@ pub fn features_of(a: &Asset, score: Option<&Score>) -> Features {
         .or(a.score.as_ref())
         .map_or(0.0, |sc| f64::from(sc.tech_quality() - TECH_FLOOR))
         .clamp(0.0, f64::from(TECH_SPAN));
+    // A soft frame earned no face bonus (`score::face_bonus`), so it has
+    // no face points either.
+    let soft = score
+        .or(a.score.as_ref())
+        .is_some_and(|sc| sc.sharpness < SOFT_SHARPNESS);
     // Each story feature's points: the scorer's bonus for that signal alone.
     let only = |set: &dyn Fn(&mut StorySignals)| {
         let mut x = StorySignals::default();
         set(&mut x);
         bonus_of(x)
     };
+    // Face points: what the face signals add on top of the tagged people.
+    let faces = only(&|x| {
+        x.people_count = s.people_count;
+        x.faces = s.faces;
+    }) - only(&|x| x.people_count = s.people_count);
     [
         ("people", only(&|x| x.people_count = s.people_count)),
         ("caption", only(&|x| x.has_caption = s.has_caption)),
@@ -213,6 +236,7 @@ pub fn features_of(a: &Asset, score: Option<&Score>) -> Features {
                 x.movement = s.movement;
             }),
         ),
+        ("faces", if soft { 0.0 } else { faces }),
         ("quality", quality),
     ]
     .into_iter()
@@ -635,6 +659,30 @@ mod tests {
     use crate::plan::build_plan;
     use crate::types::AssetKind;
     use std::path::PathBuf;
+
+    #[test]
+    fn face_feature_is_the_smile_bonus_and_zero_for_soft_frames() {
+        let mut a = Asset::new("a", PathBuf::from("/t/a.jpg"), AssetKind::Photo);
+        a.faces = Some(crate::types::FaceSignals {
+            count: 1,
+            largest: 0.4,
+            smile: Some(1.0),
+        });
+        let sharp = Score {
+            sharpness: 0.8,
+            ..Score::default()
+        };
+        let x = features_of(&a, Some(&sharp));
+        assert!((x["faces"] - f64::from(crate::score::SMILE_BONUS)).abs() < 1e-6);
+        assert_eq!(x.len(), FEATURES.len());
+        let soft = Score {
+            sharpness: 0.1,
+            ..Score::default()
+        };
+        assert_eq!(features_of(&a, Some(&soft))["faces"], 0.0);
+        a.faces = None;
+        assert_eq!(features_of(&a, Some(&sharp))["faces"], 0.0);
+    }
 
     fn feat(pairs: &[(&str, f64)]) -> Features {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()

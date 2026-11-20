@@ -6,6 +6,7 @@ pub mod asset_ref;
 pub mod clip_window;
 pub mod cluster;
 pub mod db;
+pub mod embedding;
 pub mod geo;
 pub mod hash;
 pub mod itinerary;

@@ -585,6 +585,7 @@ mod tests {
             reel_selects: vec![],
             chapters: vec![chapter("a"), chapter("b"), chapter("c")],
             captions: Default::default(),
+            collage: Default::default(),
             map_polyline: vec![(0.0, 0.0)],
             music: crate::types::MusicPick {
                 track: String::new(),

@@ -84,6 +84,32 @@ pub struct Asset {
     /// Local quality/story score, filled by background scoring after ingest.
     /// `None` until scored (or when scoring was skipped).
     pub score: Option<Score>,
+    /// Image embedding of a still (or Live Photo still) from the optional
+    /// local model: an extra "same scene" signal next to `phash`. `None`
+    /// when the model is not installed or the pixels could not be read.
+    /// Analysis data: never serialized (not in plans, exports or the
+    /// webview), only stored in the local database.
+    #[serde(skip)]
+    pub embedding: Option<crate::embedding::Embedding>,
+    /// Face and smile signals from the optional local models (thumbnail
+    /// analysis). `None` until analysed with the models installed. Counts
+    /// and scores only, never boxes; never serialized.
+    #[serde(skip)]
+    pub faces: Option<FaceSignals>,
+}
+
+/// What the optional face models found in one photo: only what scoring
+/// needs (no boxes, crops or identities).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FaceSignals {
+    /// Plausible faces detected. Not a people count: posters, statues and
+    /// dolls are faces to a detector too.
+    pub count: u32,
+    /// Largest face's side as a fraction of the picture's shorter side.
+    pub largest: f32,
+    /// Best size-weighted smile (0..1) among faces big enough to read;
+    /// `None` when none was.
+    pub smile: Option<f32>,
 }
 
 impl Asset {
@@ -125,8 +151,23 @@ impl Asset {
             people_sig: None,
             library_score: None,
             score: None,
+            embedding: None,
+            faces: None,
         }
     }
+}
+
+/// What background scoring derives from one asset's pixels, persisted
+/// together so a rescan of an unchanged file reuses all of it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Analysis {
+    pub score: Score,
+    /// Perceptual hash of the pixels scored; `None` when nothing decoded.
+    pub phash: Option<u64>,
+    /// See [`Asset::embedding`]; `None` without the model.
+    pub embedding: Option<crate::embedding::Embedding>,
+    /// See [`Asset::faces`]; `None` without the face models.
+    pub faces: Option<FaceSignals>,
 }
 
 /// How a Live Photo still+motion pair was matched.
@@ -203,6 +244,73 @@ pub struct Plan {
     /// Route polyline (lat, lon) with day markers.
     pub map_polyline: Vec<(f64, f64)>,
     pub music: MusicPick,
+    /// The user's collage overrides for the film, set only by
+    /// `plan::apply_edits` from the Story editor's edits. A stored plan never
+    /// carries any (and serializes as it always did).
+    #[serde(default, skip_serializing_if = "CollageEdits::is_empty")]
+    pub collage: CollageEdits,
+}
+
+/// How the user regrouped the film's collages, by asset id. Read by
+/// `plan::collage_slots`, the one place grouping inputs are built for the
+/// planner estimate, the renderer and the Story editor.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollageEdits {
+    /// Photos that play on their own ("Show on its own").
+    #[serde(default)]
+    pub solo: Vec<String>,
+    /// Photos joined into one collage, earlier one first. A link holds only
+    /// while the two are neighbouring collage photos of one chapter.
+    #[serde(default)]
+    pub joins: Vec<(String, String)>,
+}
+
+impl CollageEdits {
+    pub fn is_empty(&self) -> bool {
+        self.solo.is_empty() && self.joins.is_empty()
+    }
+
+    /// Whether the user set this photo to play on its own.
+    pub fn is_solo(&self, asset_id: &str) -> bool {
+        self.solo.iter().any(|id| id == asset_id)
+    }
+
+    /// Whether the user joined these two photos, in either order.
+    pub fn linked(&self, a: &str, b: &str) -> bool {
+        self.joins
+            .iter()
+            .any(|(x, y)| (x == a && y == b) || (x == b && y == a))
+    }
+
+    /// Play a film photo on its own, or put it back in the collages.
+    /// Setting it solo also drops its joins: they would contradict it.
+    pub fn set_solo(&mut self, asset_id: String, solo: bool) {
+        self.solo.retain(|id| *id != asset_id);
+        if solo {
+            self.unjoin(&asset_id);
+            self.solo.push(asset_id);
+        }
+    }
+
+    /// Join two neighbouring film photos (`first` plays earlier) into one
+    /// collage; neither stays solo.
+    pub fn join(&mut self, first: String, second: String) {
+        self.solo.retain(|id| *id != first && *id != second);
+        self.joins
+            .retain(|(a, b)| !(*a == first && *b == second || *a == second && *b == first));
+        self.joins.push((first, second));
+    }
+
+    /// Undo the user's joins of a photo ("Separate").
+    pub fn unjoin(&mut self, asset_id: &str) {
+        self.joins.retain(|(a, b)| a != asset_id && b != asset_id);
+    }
+
+    /// Keep only the overrides whose photos all satisfy `keep`.
+    pub fn retain_assets(&mut self, keep: impl Fn(&str) -> bool) {
+        self.solo.retain(|id| keep(id));
+        self.joins.retain(|(a, b)| keep(a) && keep(b));
+    }
 }
 
 impl PlanEntry {

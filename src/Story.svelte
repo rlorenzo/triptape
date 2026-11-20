@@ -6,14 +6,17 @@
   import {
     getAlternatives,
     getStory,
+    joinAssets,
     setAssetCaption,
     setAssetExcluded,
     setAssetIncluded,
+    setAssetSolo,
     setChapterPlace,
-    swapAsset
+    swapAsset,
+    unjoinAsset
   } from "./lib/tauri";
   import type { StoryEntryView, StoryView } from "./lib/tauri";
-  import { countOf, formatWhen, kindLabel } from "./lib/trip";
+  import { countOf, filmUnits, formatWhen, kindLabel, listOf } from "./lib/trip";
 
   let story: StoryView | null = null;
   let failure: { message: string; detail: string } | null = null;
@@ -39,6 +42,9 @@
   $: picks = chapters.reduce((sum, c) => sum + c.entries.length, 0);
   $: if (story) storyPicks.set(picks);
   $: selected = day?.entries.find((e) => e.id === selectedId) ?? null;
+  // A collage's photos sit together, so grid order can differ from the day's.
+  $: units = filmUnits(day?.entries ?? []);
+  $: gridOrder = units.flat();
 
   // Same number as the Library, so leaving a photo out never renumbers the rest.
   // Reads the store directly so the markup re-renders when numbers arrive.
@@ -54,7 +60,7 @@
   }
 
   function selectedIndex(): number {
-    return day?.entries.findIndex((e) => e.id === selectedId) ?? 0;
+    return gridOrder.findIndex((e) => e.id === selectedId);
   }
 
   function goToDay(i: number) {
@@ -89,8 +95,31 @@
     const uses = ["book"];
     if (e.inHero) uses.unshift("film");
     if (e.inReels) uses.splice(uses.length - 1, 0, "reels");
-    if (uses.length === 1) return "In the book";
-    return `In the ${uses.slice(0, -1).join(", ")} and ${uses[uses.length - 1]}`;
+    return `In the ${listOf(uses)}`;
+  }
+
+  /** "12, 14 and 15", or "" while any frame number is unknown. */
+  function frameList(members: StoryEntryView[]): string {
+    const numbers = members.map((m) => frameOf(m.id));
+    return numbers.every((n) => n !== undefined) ? listOf(numbers.map(String)) : "";
+  }
+
+  function collageLabel(members: StoryEntryView[]): string {
+    const frames = frameList(members);
+    return `Collage of ${members.length} in the film${frames ? `: frames ${frames}` : ""}`;
+  }
+
+  /** How the film plays the pick, for the photo panel. */
+  function filmPlay(e: StoryEntryView): string {
+    const g = e.filmGroup;
+    if (!g) return "";
+    if (g.size < 2) {
+      if (g.userSolo) return "Plays on its own in the film, as you chose.";
+      return e.caption ? "Plays on its own in the film, because it has a caption." : "Plays on its own in the film.";
+    }
+    const others = (units.find((u) => u.includes(e)) ?? []).filter((m) => m !== e);
+    const frames = frameList(others);
+    return `Plays in the film in a collage of ${g.size}${frames ? `, with frame${others.length > 1 ? "s" : ""} ${frames}` : ""}.`;
   }
 
   function frameAlt(e: StoryEntryView, frame: number | undefined): string {
@@ -268,15 +297,27 @@
       </div>
 
       <div class="work" class:has-selection={selected !== null}>
+        {#snippet frame(e: StoryEntryView)}
+          <button class="frame" class:on={selectedId === e.id} aria-pressed={selectedId === e.id} on:click={(ev) => select(e.id, ev.currentTarget)}>
+            <Thumb projectId={pid} assetId={e.id} kind={kindLabel(e)} alt={frameAlt(e, frameOf(e.id))} fit="contain" />
+            <span class="frame-line">
+              <span class="frame-no">{frameOf(e.id) ?? ""}</span>
+              <span class="frame-caption" class:none={!e.caption}>{e.caption || formatWhen(e.takenAt) || kindLabel(e)}</span>
+            </span>
+          </button>
+        {/snippet}
         <div class="index-grid">
-          {#each day.entries as e (e.id)}
-            <button class="frame" class:on={selectedId === e.id} aria-pressed={selectedId === e.id} on:click={(ev) => select(e.id, ev.currentTarget)}>
-              <Thumb projectId={pid} assetId={e.id} kind={kindLabel(e)} alt={frameAlt(e, frameOf(e.id))} fit="contain" />
-              <span class="frame-line">
-                <span class="frame-no">{frameOf(e.id) ?? ""}</span>
-                <span class="frame-caption" class:none={!e.caption}>{e.caption || formatWhen(e.takenAt) || kindLabel(e)}</span>
-              </span>
-            </button>
+          {#each units as unit (unit.length > 1 ? `collage:${unit[0].id}` : unit[0].id)}
+            {#if unit.length > 1}
+              <div class="collage" role="group" aria-label={collageLabel(unit)}>
+                <p class="collage-label" aria-hidden="true">Collage of {unit.length} <span>· plays as one shot in the film</span></p>
+                <div class="index-grid">
+                  {#each unit as e (e.id)}{@render frame(e)}{/each}
+                </div>
+              </div>
+            {:else}
+              {@render frame(unit[0])}
+            {/if}
           {/each}
         </div>
 
@@ -286,6 +327,7 @@
               <Thumb projectId={pid} assetId={selected.id} kind={kindLabel(selected)} alt={frameAlt(selected, frameOf(selected.id))} fit="full" />
               <p class="panel-title"><span class="frame-no">{frameOf(selected.id) ?? ""}</span> {kindLabel(selected)}{#if selected.durationSecs}, {selected.durationSecs.toFixed(0)}s{/if}</p>
               <p class="panel-meta">{[formatWhen(selected.takenAt), usedIn(selected)].filter(Boolean).join(" · ")}</p>
+              {#if selected.filmGroup}<p class="panel-meta">{filmPlay(selected)}</p>{:else if selected.inHero}<p class="panel-meta">Its file can't be found, so the film will skip it.</p>{/if}
 
               <label class="field-label" for="caption">Caption</label>
               <input
@@ -309,6 +351,33 @@
                 {/if}
                 <button class="btn btn-danger" disabled={busy} on:click={() => editSelected((id, from) => setAssetExcluded(id, from, true))}>Leave out</button>
               </div>
+
+              {#if selected.filmGroup}
+                {@const g = selected.filmGroup}
+                <div class="panel-actions">
+                  {#if g.size > 1 && g.userJoined}
+                    <button class="btn" disabled={busy} on:click={() => editSelected((id, from) => unjoinAsset(id, from))}>Separate</button>
+                  {:else if g.size > 1}
+                    <button class="btn" disabled={busy} on:click={() => editSelected((id, from) => setAssetSolo(id, from, true))}>Show on its own</button>
+                  {:else if g.userSolo}
+                    <button class="btn" disabled={busy} on:click={() => editSelected((id, from) => setAssetSolo(id, from, false))}>Put back in the collage</button>
+                  {:else}
+                    {#if g.joinPrev}
+                      {@const prev = g.joinPrev}
+                      <button class="btn" disabled={busy} on:click={() => editSelected((id, from) => joinAssets(id, prev, from))}>Join with previous</button>
+                    {/if}
+                    {#if g.joinNext || !g.joinPrev}
+                      {@const next = g.joinNext}
+                      <button
+                        class="btn"
+                        disabled={busy || !next}
+                        aria-describedby={next ? undefined : "join-hint"}
+                        on:click={() => next && editSelected((id, from) => joinAssets(id, from, next))}>Join with next</button>
+                    {/if}
+                  {/if}
+                </div>
+                {#if g.joinHint}<p id="join-hint" class="hint">{g.joinHint}</p>{/if}
+              {/if}
 
               {#if alternativesFor === selected.id}
                 <div class="alts" bind:this={alternativesEl}>
@@ -458,6 +527,25 @@
     grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
   }
 
+  /* A film collage: its photos joined on one wash block across the row,
+     named in a quiet line above them. */
+  .collage {
+    grid-column: 1 / -1;
+    padding: 8px 12px 12px;
+    background: var(--wash);
+  }
+
+  .collage-label {
+    margin-bottom: 8px;
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  .collage-label span {
+    color: var(--ink-2);
+    font-weight: 400;
+  }
+
   .left-out .index-grid {
     grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
   }
@@ -535,6 +623,11 @@
     flex-wrap: wrap;
     gap: 8px;
     margin-top: 12px;
+  }
+
+  .hint {
+    margin-top: 6px;
+    font-size: 13px;
   }
 
   .alts {
