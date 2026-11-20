@@ -285,39 +285,87 @@ pub fn entry_collage_eligible(
     )
 }
 
-/// How the renderer groups `plan`'s hero when every source is on disk:
-/// [`collage_groups`] over `plan.hero` in playback order, each entry's
-/// chapter being the first of `plan.chapters` holding it, its caption the
-/// plan's, and the user's overrides `plan.collage`. `aspect_of` gives an
-/// asset's display aspect. The Story editor reads its collages from this.
-pub fn hero_collage_groups(
-    plan: &Plan,
-    aspect_of: impl Fn(&str) -> Option<f64>,
-) -> Vec<Vec<usize>> {
-    let mut chapter: HashMap<&str, usize> = HashMap::new();
-    for (i, c) in plan.chapters.iter().enumerate() {
-        for id in &c.asset_ids {
-            chapter.entry(id).or_insert(i);
+/// A plan's hero as the renderer will group it, for showing and editing
+/// collages without rendering. Built from the edited plan: each entry's
+/// chapter is the first of `plan.chapters` holding it, its caption the
+/// plan's, and only entries whose source is `present` play (the export
+/// skips missing files before the renderer groups the rest).
+pub struct HeroGrouping {
+    /// Hero indices that play, in playback order.
+    pub playing: Vec<usize>,
+    /// Per hero index: chapter and whether it may share a collage.
+    chapter: Vec<usize>,
+    eligible: Vec<bool>,
+    ids: Vec<String>,
+}
+
+impl HeroGrouping {
+    /// `aspect_of` gives an asset's display aspect, `present` whether its
+    /// source is on disk.
+    pub fn new(
+        plan: &Plan,
+        aspect_of: impl Fn(&str) -> Option<f64>,
+        present: impl Fn(&str) -> bool,
+    ) -> Self {
+        let mut chapter_of: HashMap<&str, usize> = HashMap::new();
+        for (i, c) in plan.chapters.iter().enumerate() {
+            for id in &c.asset_ids {
+                chapter_of.entry(id).or_insert(i);
+            }
+        }
+        let hero = &plan.hero;
+        Self {
+            playing: (0..hero.len())
+                .filter(|&i| present(&hero[i].asset_id))
+                .collect(),
+            chapter: hero
+                .iter()
+                .map(|e| {
+                    chapter_of
+                        .get(e.asset_id.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX)
+                })
+                .collect(),
+            eligible: hero
+                .iter()
+                .map(|e| {
+                    entry_collage_eligible(
+                        &e.rendition,
+                        aspect_of(&e.asset_id),
+                        plan.captions.get(&e.asset_id).map(String::as_str),
+                    )
+                })
+                .collect(),
+            ids: hero.iter().map(|e| e.asset_id.clone()).collect(),
         }
     }
-    let slots = collage_slots(
-        plan.hero.iter().map(|e| {
-            (
-                e.asset_id.as_str(),
-                chapter
-                    .get(e.asset_id.as_str())
-                    .copied()
-                    .unwrap_or(usize::MAX),
-                entry_collage_eligible(
-                    &e.rendition,
-                    aspect_of(&e.asset_id),
-                    plan.captions.get(&e.asset_id).map(String::as_str),
-                ),
-            )
-        }),
-        &plan.collage,
-    );
-    collage_groups(&slots)
+
+    /// The hero entry's chapter (index into `plan.chapters`).
+    pub fn chapter(&self, hero_index: usize) -> usize {
+        self.chapter[hero_index]
+    }
+
+    /// Whether the hero entry may share a collage ([`entry_collage_eligible`]).
+    pub fn eligible(&self, hero_index: usize) -> bool {
+        self.eligible[hero_index]
+    }
+
+    /// The playing entries' segments under `collage` (normally the edited
+    /// plan's own `plan.collage`), as hero indices: [`collage_slots`] and
+    /// [`collage_groups`], exactly as the renderer calls them.
+    pub fn groups(&self, collage: &CollageEdits) -> Vec<Vec<usize>> {
+        let slots = collage_slots(
+            self.playing
+                .iter()
+                .map(|&i| (self.ids[i].as_str(), self.chapter[i], self.eligible[i])),
+            collage,
+        );
+        collage_groups(&slots)
+            .into_iter()
+            .map(|g| g.into_iter().map(|k| self.playing[k]).collect())
+            .collect()
+    }
 }
 
 /// How hero entries play: each group is one segment, a list of indices
@@ -4161,7 +4209,7 @@ mod tests {
     }
 
     #[test]
-    fn hero_collage_groups_read_chapters_captions_and_aspect_from_the_plan() {
+    fn hero_grouping_reads_chapters_captions_aspect_and_presence() {
         let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let plan = Plan {
             plan_version: PLAN_VERSION,
@@ -4201,12 +4249,26 @@ mod tests {
         // a4 is a panorama: solo. a1 and a3 join across the clip; b1 and
         // b3 across the captioned b2; nothing joins across the chapters.
         let pano = |id: &str| (id == "a4").then_some(4.0);
+        let all = |_: &str| true;
+        let none = CollageEdits::default();
         assert_eq!(
-            hero_collage_groups(&plan, pano),
+            HeroGrouping::new(&plan, pano, all).groups(&none),
             vec![vec![0, 2], vec![1], vec![3], vec![4, 6], vec![5]]
         );
         // Without the panorama, a4 joins a1 and a3.
-        assert_eq!(hero_collage_groups(&plan, |_| None)[0], vec![0, 2, 3]);
+        let plain = HeroGrouping::new(&plan, |_| None, all);
+        assert_eq!(plain.groups(&none)[0], vec![0, 2, 3]);
+        assert_eq!((plain.chapter(4), plain.eligible(5)), (1, false));
+        // A missing a3 does not play: a1 and a4 group without it.
+        let gone = HeroGrouping::new(&plan, |_| None, |id| id != "a3");
+        assert_eq!(gone.groups(&none)[0], vec![0, 3]);
+        assert!(gone.groups(&none).iter().all(|g| !g.contains(&2)));
+        // The user's edits regroup it.
+        let solo = CollageEdits {
+            solo: vec!["a3".into()],
+            ..Default::default()
+        };
+        assert_eq!(plain.groups(&solo)[0], vec![0, 3]);
         assert!(entry_collage_eligible(&Rendition::Still, Some(1.5), None));
         assert!(!entry_collage_eligible(&Rendition::Still, Some(4.0), None));
         assert!(!entry_collage_eligible(&Rendition::Still, None, Some("x")));

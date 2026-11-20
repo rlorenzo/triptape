@@ -6,11 +6,14 @@
   import {
     getAlternatives,
     getStory,
+    joinAssets,
     setAssetCaption,
     setAssetExcluded,
     setAssetIncluded,
+    setAssetSolo,
     setChapterPlace,
-    swapAsset
+    swapAsset,
+    unjoinAsset
   } from "./lib/tauri";
   import type { StoryEntryView, StoryView } from "./lib/tauri";
   import { countOf, filmUnits, formatWhen, kindLabel, listOf } from "./lib/trip";
@@ -111,6 +114,7 @@
     const g = e.filmGroup;
     if (!g) return "";
     if (g.size < 2) {
+      if (g.userSolo) return "Plays on its own in the film, as you chose.";
       return e.caption ? "Plays on its own in the film, because it has a caption." : "Plays on its own in the film.";
     }
     const others = (units.find((u) => u.includes(e)) ?? []).filter((m) => m !== e);
@@ -323,7 +327,7 @@
               <Thumb projectId={pid} assetId={selected.id} kind={kindLabel(selected)} alt={frameAlt(selected, frameOf(selected.id))} fit="full" />
               <p class="panel-title"><span class="frame-no">{frameOf(selected.id) ?? ""}</span> {kindLabel(selected)}{#if selected.durationSecs}, {selected.durationSecs.toFixed(0)}s{/if}</p>
               <p class="panel-meta">{[formatWhen(selected.takenAt), usedIn(selected)].filter(Boolean).join(" · ")}</p>
-              {#if selected.filmGroup}<p class="panel-meta">{filmPlay(selected)}</p>{/if}
+              {#if selected.filmGroup}<p class="panel-meta">{filmPlay(selected)}</p>{:else if selected.inHero}<p class="panel-meta">Its file can't be found, so the film will skip it.</p>{/if}
 
               <label class="field-label" for="caption">Caption</label>
               <input
@@ -347,6 +351,33 @@
                 {/if}
                 <button class="btn btn-danger" disabled={busy} on:click={() => editSelected((id, from) => setAssetExcluded(id, from, true))}>Leave out</button>
               </div>
+
+              {#if selected.filmGroup}
+                {@const g = selected.filmGroup}
+                <div class="panel-actions">
+                  {#if g.size > 1 && g.userJoined}
+                    <button class="btn" disabled={busy} on:click={() => editSelected((id, from) => unjoinAsset(id, from))}>Separate</button>
+                  {:else if g.size > 1}
+                    <button class="btn" disabled={busy} on:click={() => editSelected((id, from) => setAssetSolo(id, from, true))}>Show on its own</button>
+                  {:else if g.userSolo}
+                    <button class="btn" disabled={busy} on:click={() => editSelected((id, from) => setAssetSolo(id, from, false))}>Put back in the collage</button>
+                  {:else}
+                    {#if g.joinPrev}
+                      {@const prev = g.joinPrev}
+                      <button class="btn" disabled={busy} on:click={() => editSelected((id, from) => joinAssets(id, prev, from))}>Join with previous</button>
+                    {/if}
+                    {#if g.joinNext || !g.joinPrev}
+                      {@const next = g.joinNext}
+                      <button
+                        class="btn"
+                        disabled={busy || !next}
+                        aria-describedby={next ? undefined : "join-hint"}
+                        on:click={() => next && editSelected((id, from) => joinAssets(id, from, next))}>Join with next</button>
+                    {/if}
+                  {/if}
+                </div>
+                {#if g.joinHint}<p id="join-hint" class="hint">{g.joinHint}</p>{/if}
+              {/if}
 
               {#if alternativesFor === selected.id}
                 <div class="alts" bind:this={alternativesEl}>
@@ -592,6 +623,11 @@
     flex-wrap: wrap;
     gap: 8px;
     margin-top: 12px;
+  }
+
+  .hint {
+    margin-top: 6px;
+    font-size: 13px;
   }
 
   .alts {

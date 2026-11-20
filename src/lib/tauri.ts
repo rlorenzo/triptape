@@ -358,13 +358,22 @@ export interface FilmGroup {
   id: number;
   position: number;
   size: number;
+  /** The user chose "Show on its own". */
+  userSolo: boolean;
+  /** The user joined it to a photo of its collage. */
+  userJoined: boolean;
+  /** For a photo on its own: the neighbouring film photo it can join. */
+  joinPrev?: string;
+  joinNext?: string;
+  /** Why a photo on its own can't join either neighbour. */
+  joinHint?: string;
 }
 
 export interface StoryEntryView extends AssetView {
   caption?: string;
   inHero: boolean;
   inReels: boolean;
-  /** Set for film picks only. */
+  /** Set for film picks only, and not when the file is missing. */
   filmGroup?: FilmGroup;
 }
 
@@ -398,32 +407,80 @@ function buildDemoStory(): StoryView {
       entries: items.map((a, i) => ({ ...a, inHero: i < 3, inReels: i === 0 }))
     };
   }).filter((c) => c.entries.length > 0);
-  // A captioned photo plays on its own, so day 2 shows a collage around it.
+  // Day 2: a caption keeps the middle photo on its own, which leaves the two
+  // beside it apart too (until joined). Day 3: one photo was shown on its own.
   const captioned = chapters[1]?.entries[1];
   if (captioned) captioned.caption = "Mia on the ferry";
+  const shownAlone = chapters[2]?.entries[2];
+  if (shownAlone) demoCollage.solo.add(shownAlone.id);
   const story: StoryView = { chapters, excluded: [], heroCount: 9, reelCount: 3 };
   demoRegroup(story);
   return story;
 }
 
+// The browser preview's collage edits (backend `PlanEdits.solo` / `joins`).
+const demoCollage = { solo: new Set<string>(), joins: [] as [string, string][] };
+
+const DEMO_FULL = "The collage next to it is full (4 photos at most).";
+
+/** Why a demo film pick always plays on its own (backend `plays_alone_because`). */
+function demoAloneBecause(e: StoryEntryView): string | undefined {
+  if (e.kind === "video") return "Videos play on their own in the film.";
+  if (e.isLivePhoto) return "Live Photos that play their motion play on their own.";
+  if (e.caption) return "Photos with a caption play on their own, so the caption fits one photo. Clear the caption to join it.";
+  return undefined;
+}
+
 /**
- * Browser preview stand-in for the backend's collage grouping: a day's film
- * photos without a caption share collages of up to four (balanced, so five
- * play as 3 + 2); videos, Live Photos and captioned photos play on their own.
+ * Browser preview stand-in for the backend's collage grouping, simpler than
+ * the real one: a day's film photos without a caption join the photo right
+ * before them (the real rule reaches across up to three other shots), up to
+ * four a collage. "Show on its own" and joins apply as in the app.
  */
 function demoRegroup(s: StoryView) {
   let id = 0;
+  const linked = (a: string, b: string) => demoCollage.joins.some(([x, y]) => (x === a && y === b) || (x === b && y === a));
   for (const ch of s.chapters) {
-    for (const e of ch.entries) e.filmGroup = e.inHero ? { id: id++, position: 0, size: 1 } : undefined;
-    const joinable = ch.entries.filter((e) => e.inHero && e.kind === "photo" && !e.caption);
-    if (joinable.length < 2) continue;
-    // Split into runs of at most four whose sizes differ by at most one.
-    const groups = Math.ceil(joinable.length / 4);
-    for (let g = 0, start = 0; g < groups; g++, id++) {
-      const size = Math.ceil((joinable.length - start) / (groups - g));
-      joinable.slice(start, start + size).forEach((m, position) => (m.filmGroup = { id, position, size }));
-      start += size;
+    const film = ch.entries.filter((e) => e.inHero);
+    const joins = (e: StoryEntryView) => !demoAloneBecause(e) && !demoCollage.solo.has(e.id);
+    const groups: StoryEntryView[][] = [];
+    let last: StoryEntryView | undefined;
+    film.forEach((e, i) => {
+      const group = groups.find((g) => last && g.includes(last));
+      const adjacent = last !== undefined && film[i - 1] === last;
+      if (joins(e) && last && group && group.length < 4 && (adjacent || linked(last.id, e.id))) group.push(e);
+      else groups.push([e]);
+      if (joins(e)) last = e;
+    });
+    groups.sort((a, b) => film.indexOf(a[0]) - film.indexOf(b[0]));
+    for (const e of ch.entries) e.filmGroup = undefined;
+    for (const g of groups) {
+      g.forEach((e, position) => {
+        e.filmGroup = {
+          id,
+          position,
+          size: g.length,
+          userSolo: demoCollage.solo.has(e.id) && !demoAloneBecause(e),
+          userJoined: g.some((o) => o !== e && linked(o.id, e.id))
+        };
+      });
+      id++;
     }
+    const sizeOf = (e: StoryEntryView) => e.filmGroup?.size ?? 0;
+    film.forEach((e, i) => {
+      const g = e.filmGroup;
+      if (!g || g.size > 1 || g.userSolo) return;
+      const why = demoAloneBecause(e);
+      if (why) {
+        g.joinHint = why;
+        return;
+      }
+      const prev = film.slice(0, i).reverse().find(joins);
+      const next = film.slice(i + 1).find(joins);
+      if (prev && sizeOf(prev) < 4) g.joinPrev = prev.id;
+      if (next && sizeOf(next) < 4) g.joinNext = next.id;
+      if (!g.joinPrev && !g.joinNext) g.joinHint = prev || next ? DEMO_FULL : "No other film photo of this day can share a collage with it.";
+    });
   }
 }
 
@@ -501,6 +558,35 @@ export async function swapAsset(projectId: string, fromAssetId: string, toAssetI
         to.inReels = wasReels;
       }
     }
+  });
+}
+
+export async function setAssetSolo(projectId: string, assetId: string, solo: boolean): Promise<StoryView> {
+  if (isTauri()) return invoke("set_asset_solo", { projectId, assetId, solo });
+  return demoEdit(() => {
+    if (solo) {
+      demoCollage.solo.add(assetId);
+      demoCollage.joins = demoCollage.joins.filter((j) => !j.includes(assetId));
+    } else {
+      demoCollage.solo.delete(assetId);
+    }
+  });
+}
+
+/** Join `firstAssetId` with the film photo right after it, `secondAssetId`. */
+export async function joinAssets(projectId: string, firstAssetId: string, secondAssetId: string): Promise<StoryView> {
+  if (isTauri()) return invoke("join_assets", { projectId, firstAssetId, secondAssetId });
+  return demoEdit(() => {
+    demoCollage.solo.delete(firstAssetId);
+    demoCollage.solo.delete(secondAssetId);
+    demoCollage.joins.push([firstAssetId, secondAssetId]);
+  });
+}
+
+export async function unjoinAsset(projectId: string, assetId: string): Promise<StoryView> {
+  if (isTauri()) return invoke("unjoin_asset", { projectId, assetId });
+  return demoEdit(() => {
+    demoCollage.joins = demoCollage.joins.filter((j) => !j.includes(assetId));
   });
 }
 
