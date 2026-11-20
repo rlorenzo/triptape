@@ -411,6 +411,10 @@
     font-size: 13px;
   }
 
+  .pages p.bad {
+    color: var(--ink);
+  }
+
   .live {
     padding: 0 0 16px;
   }
@@ -426,10 +430,6 @@
     margin-left: 21px;
     color: var(--ink-2);
     font-size: 13px;
-  }
-
-  .pages p.bad {
-    color: var(--ink);
   }
 
   .row {

@@ -1,4 +1,4 @@
-import { derived, writable } from "svelte/store";
+import { derived, writable, type Writable } from "svelte/store";
 import { byTime, dayKey } from "./trip";
 import type { AssetView, ExportCmd, ExportSummary, ScanSummary } from "./tauri";
 
@@ -6,12 +6,26 @@ export type Screen = "import" | "library" | "story" | "export" | "settings";
 
 const CONSENT_KEY = "triptape-consent";
 
-function readConsent(): boolean {
+/** A saved setting, or null when unset or storage is unavailable (SSR / private mode). */
+function stored(key: string): string | null {
   try {
-    return localStorage.getItem(CONSENT_KEY) === "1";
+    return localStorage.getItem(key);
   } catch {
-    return false; // no storage (SSR / private mode)
+    return null;
   }
+}
+
+/** A store whose every value is saved under `key`, so the choice survives relaunches. */
+function remembered<T>(key: string, initial: T): Writable<T> {
+  const store = writable<T>(initial);
+  store.subscribe((value) => {
+    try {
+      localStorage.setItem(key, String(value));
+    } catch {
+      /* private mode: the choice lasts this session */
+    }
+  });
+  return store;
 }
 
 export const screen = writable<Screen>("import");
@@ -37,7 +51,7 @@ export const dayNumbers = derived(assetsByTime, ($sorted) => {
   return numbers;
 });
 
-export const consentGiven = writable<boolean>(readConsent());
+export const consentGiven = writable<boolean>(stored(CONSENT_KEY) === "1");
 
 /** Photo Book page cap bounds; the backend enforces the same range. */
 export const BOOK_PAGES_MIN = 24;
@@ -50,43 +64,16 @@ export function validBookPages(n: unknown): number | null {
   return typeof n === "number" && Number.isInteger(n) && n >= BOOK_PAGES_MIN && n <= BOOK_PAGES_MAX ? n : null;
 }
 
-function readBookPages(): number {
-  try {
-    return validBookPages(Number(localStorage.getItem(BOOK_PAGES_KEY))) ?? BOOK_PAGES_DEFAULT;
-  } catch {
-    return BOOK_PAGES_DEFAULT;
-  }
-}
-
 /** Most pages the Photo Book may use. Remembered across launches. */
-export const bookPages = writable<number>(readBookPages());
-bookPages.subscribe((n) => {
-  try {
-    localStorage.setItem(BOOK_PAGES_KEY, String(n));
-  } catch {
-    /* private mode: the choice lasts this session */
-  }
-});
+export const bookPages = remembered<number>(
+  BOOK_PAGES_KEY,
+  validBookPages(Number(stored(BOOK_PAGES_KEY))) ?? BOOK_PAGES_DEFAULT
+);
 
 const LIVE_COLLAGES_KEY = "triptape-live-collages";
 
-function readLiveCollages(): boolean {
-  try {
-    return localStorage.getItem(LIVE_COLLAGES_KEY) !== "false";
-  } catch {
-    return true;
-  }
-}
-
 /** Whether Live Photos move inside the film's collages. On unless turned off. */
-export const liveCollages = writable<boolean>(readLiveCollages());
-liveCollages.subscribe((on) => {
-  try {
-    localStorage.setItem(LIVE_COLLAGES_KEY, String(on));
-  } catch {
-    /* private mode: the choice lasts this session */
-  }
-});
+export const liveCollages = remembered<boolean>(LIVE_COLLAGES_KEY, stored(LIVE_COLLAGES_KEY) !== "false");
 
 /** Background ingest job (public surface of `job://progress` for kind `ingest`). */
 export interface IngestJobState {
