@@ -207,28 +207,34 @@ impl ResolvedTool {
 /// 2. The bundled sidecar next to the running executable. Tauri installs
 ///    `bundle.externalBin` there (`Contents/MacOS` in a macOS app, the
 ///    install folder on Windows), and its build script copies them into
-///    `target/<profile>/` for dev runs and the CLI. A test or bench binary
-///    in `target/<profile>/deps/` looks one level up.
-/// 3. `PATH`, as a development fallback; [`ResolvedTool::note`] says so.
+///    `target/<profile>/` for `cargo run` of the app and the CLI.
+/// 3. Debug builds only: the sidecar `scripts/fetch-sidecars` put in this
+///    source checkout's `src-tauri/binaries/`, so tests find it wherever
+///    cargo places their binaries.
+/// 4. `PATH`, as a development fallback; [`ResolvedTool::note`] says so.
 pub fn resolve_tool(tool: Tool, explicit: Option<&str>) -> ResolvedTool {
-    let exe_dir = std::env::current_exe()
+    let mut sidecars: Vec<PathBuf> = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf));
+        .and_then(|p| p.parent().map(|d| d.join(tool.file_name())))
+        .into_iter()
+        .collect();
+    sidecars.extend(source_tree_sidecar(tool));
     resolve_tool_in(
         tool,
         explicit,
         std::env::var_os(tool.env_var()),
-        exe_dir.as_deref(),
+        &sidecars,
         std::env::var_os("PATH").as_deref(),
     )
 }
 
-/// [`resolve_tool`] with its environment passed in, for tests.
+/// [`resolve_tool`] with its environment passed in; `sidecars` are the
+/// candidate files, in order.
 fn resolve_tool_in(
     tool: Tool,
     explicit: Option<&str>,
     env: Option<OsString>,
-    exe_dir: Option<&Path>,
+    sidecars: &[PathBuf],
     path: Option<&OsStr>,
 ) -> ResolvedTool {
     let resolved = |bin: String, source| ResolvedTool { tool, bin, source };
@@ -241,15 +247,17 @@ fn resolve_tool_in(
     {
         return resolved(bin, ToolSource::Override);
     }
-    let file = tool.file_name();
     // A non-UTF-8 install path cannot travel as a `String`; PATH then.
-    if let Some(bin) = exe_dir
-        .and_then(|d| sidecar_in(d, &file))
-        .and_then(|p| p.to_str().map(str::to_string))
+    if let Some(bin) = sidecars
+        .iter()
+        .filter(|p| p.is_file())
+        .find_map(|p| p.to_str())
     {
-        return resolved(bin, ToolSource::Sidecar);
+        return resolved(bin.to_string(), ToolSource::Sidecar);
     }
-    let source = if path.is_some_and(|p| on_path(p, &file)) {
+    let file = tool.file_name();
+    let on_path = path.is_some_and(|p| std::env::split_paths(p).any(|d| d.join(&file).is_file()));
+    let source = if on_path {
         ToolSource::Path
     } else {
         ToolSource::Missing
@@ -257,23 +265,28 @@ fn resolve_tool_in(
     resolved(tool.name().to_string(), source)
 }
 
-fn sidecar_in(exe_dir: &Path, file: &str) -> Option<PathBuf> {
-    let here = exe_dir.join(file);
-    if here.is_file() {
-        return Some(here);
+/// `src-tauri/binaries/<name>-<target triple>[.exe]` in the source checkout
+/// this crate was built from. Release builds never look there.
+fn source_tree_sidecar(tool: Tool) -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
     }
-    // Cargo puts test and bench binaries in `deps/`, one below the sidecars.
-    if exe_dir.file_name().is_some_and(|n| n == "deps") {
-        let up = exe_dir.parent()?.join(file);
-        if up.is_file() {
-            return Some(up);
-        }
-    }
-    None
-}
-
-fn on_path(path: &OsStr, file: &str) -> bool {
-    std::env::split_paths(path).any(|dir| dir.join(file).is_file())
+    let triple = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "aarch64-apple-darwin"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "x86_64-apple-darwin"
+    } else if cfg!(all(windows, target_arch = "x86_64", target_env = "msvc")) {
+        "x86_64-pc-windows-msvc"
+    } else {
+        return None;
+    };
+    // This crate is src-tauri/crates/triptape-core.
+    let src_tauri = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?.parent()?;
+    Some(src_tauri.join("binaries").join(format!(
+        "{}-{triple}{}",
+        tool.name(),
+        std::env::consts::EXE_SUFFIX
+    )))
 }
 
 /// FFmpeg, ffprobe and Typst, resolved together.
@@ -324,7 +337,7 @@ mod resolve_tests {
             Tool::Ffmpeg,
             explicit,
             env.map(OsString::from),
-            Some(exe),
+            &[exe.join(Tool::Ffmpeg.file_name())],
             Some(path.as_os_str()),
         )
     }
@@ -365,17 +378,30 @@ mod resolve_tests {
     }
 
     #[test]
-    fn a_test_binary_finds_the_sidecar_beside_deps() {
+    fn the_first_existing_sidecar_wins() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("debug");
-        let file = Tool::Typst.file_name();
-        touch(&target.join(&file));
-        let r = resolve_tool_in(Tool::Typst, None, None, Some(&target.join("deps")), None);
-        assert_eq!(r.source, ToolSource::Sidecar);
-        assert_eq!(Path::new(&r.bin), target.join(&file));
-        // Only `deps` looks up: any other folder keeps to itself.
-        let r = resolve_tool_in(Tool::Typst, None, None, Some(&target.join("other")), None);
-        assert_eq!(r.source, ToolSource::Missing);
+        let beside_exe = dir.path().join("app").join("typst");
+        let in_tree = dir.path().join("binaries").join("typst-triple");
+        touch(&in_tree);
+        let candidates = [beside_exe.clone(), in_tree.clone()];
+        let r = resolve_tool_in(Tool::Typst, None, None, &candidates, None);
+        assert_eq!(
+            (Path::new(&r.bin), r.source),
+            (in_tree.as_path(), ToolSource::Sidecar)
+        );
+        touch(&beside_exe);
+        let r = resolve_tool_in(Tool::Typst, None, None, &candidates, None);
+        assert_eq!(Path::new(&r.bin), beside_exe);
+    }
+
+    #[test]
+    fn debug_builds_know_the_source_tree_sidecar() {
+        let Some(p) = source_tree_sidecar(Tool::Ffprobe) else {
+            return; // a target with no pinned sidecar
+        };
+        assert!(p.parent().unwrap().ends_with("src-tauri/binaries"), "{p:?}");
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("ffprobe-") && name.ends_with(std::env::consts::EXE_SUFFIX));
     }
 
     #[test]

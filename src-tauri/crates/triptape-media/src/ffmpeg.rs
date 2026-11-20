@@ -250,10 +250,19 @@ impl Capabilities {
         self.tonemap && self.zscale
     }
 
+    /// False when the probe got no answer at all (missing binary, or one
+    /// that cannot start): every FFmpeg has the `scale` filter.
+    pub fn ran(&self) -> bool {
+        self.scale
+    }
+
     /// What this FFmpeg will do worse than the pinned sidecar, in words for
     /// the user. Empty for the sidecar. Renders still run with the fallbacks
     /// each note names, so these warn rather than block.
     pub fn degradations(&self) -> Vec<String> {
+        if !self.ran() {
+            return vec!["FFmpeg could not run, so videos and reels can't be made.".to_string()];
+        }
         let mut notes = Vec::new();
         if !self.libx264 {
             notes.push("This FFmpeg has no libx264 encoder, so videos can't be made.".to_string());
@@ -1061,8 +1070,8 @@ mod tests {
     use super::*;
     use triptape_core::process::{ToolSource, Toolchain};
 
-    /// The FFmpeg these tests run: resolved like the app's (sidecar beside
-    /// `target/<profile>/`, `TRIPTAPE_FFMPEG`, else `PATH`).
+    /// The FFmpeg these tests run, resolved like the app's: `TRIPTAPE_FFMPEG`,
+    /// then the fetched sidecar in `src-tauri/binaries/`, else `PATH`.
     fn ff() -> &'static str {
         &Toolchain::global().ffmpeg.bin
     }
@@ -1408,10 +1417,18 @@ mod tests {
 
     #[test]
     fn degradations_name_each_missing_piece() {
-        let none = Capabilities::default().degradations();
-        assert_eq!(none.len(), 4, "{none:?}");
-        assert!(none[1].contains("Captions"));
+        let dead = Capabilities::default().degradations();
+        assert_eq!(dead.len(), 1, "{dead:?}");
+        assert!(dead[0].contains("could not run"));
+        let bare = Capabilities {
+            scale: true,
+            ..Default::default()
+        }
+        .degradations();
+        assert_eq!(bare.len(), 4, "{bare:?}");
+        assert!(bare[1].contains("Captions"));
         let full = Capabilities {
+            scale: true,
             libx264: true,
             subtitles: true,
             tonemap: true,

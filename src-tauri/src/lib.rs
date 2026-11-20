@@ -55,12 +55,20 @@ pub fn tool_status() -> ToolStatusView {
         .get_or_init(|| {
             let t = tools();
             let mut notes = t.notes();
-            // A missing FFmpeg is already one note; its probe would add four.
+            // A missing FFmpeg is already one note.
             if t.ffmpeg.source != ToolSource::Missing {
-                notes.extend(
-                    triptape_media::ffmpeg::probe_capabilities(&t.ffmpeg.bin, &t.ffprobe.bin)
-                        .degradations(),
-                );
+                let caps =
+                    triptape_media::ffmpeg::probe_capabilities(&t.ffmpeg.bin, &t.ffprobe.bin);
+                notes.extend(caps.degradations());
+                // The pinned macOS FFmpeg is an Intel build (docs/ffmpeg-build.md).
+                if !caps.ran()
+                    && t.ffmpeg.source == ToolSource::Sidecar
+                    && cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                {
+                    notes.push(
+                        "This Mac needs Rosetta 2 to run it: in Terminal, run softwareupdate --install-rosetta.".to_string(),
+                    );
+                }
             }
             ToolStatusView { notes }
         })
