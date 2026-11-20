@@ -24,6 +24,30 @@ start until G2 has a recorded outcome.
   inputs → `/tmp/spike-render.mp4`, ffprobe-verified 1920x1080 h264+aac
   5.5 s. No-GPU baseline + Windows + phone-playback checks still open.
   → G1 **not passed** (sidecar unpinned, cross-OS unverified).
+- G1 update (R2, 2026-11-20, `feat/self-contained-app`): sidecars pinned
+  (FFmpeg 9.0.2 from evermeet.cx on macOS, GPG-verified; gyan.dev
+  essentials 9.0.2 on Windows, checksum-verified; Typst 0.15.1). Details and
+  hashes: `docs/ffmpeg-build.md`.
+  - macOS, arm64 dev Mac, the Intel sidecar under Rosetta 2:
+    `scripts/check-ffmpeg.sh` PASS with no gaps (`zscale`, `drawtext`,
+    `vidstab`, `subtitles`/`ass` all present). `scripts/make-fixture.sh` +
+    `scripts/spike-render.sh` with the sidecar and no FFmpeg on `PATH`:
+    PASS, 1920x1080 h264+aac 5.5 s. `cargo test --workspace` with `PATH`
+    stripped of Homebrew and `TRIPTAPE_REQUIRE_SIDECAR=1`: all pass, the
+    sidecar capability test and the libass caption burn-in test ran against
+    the sidecar. A CLI export of a fixture trip with a captioned photo
+    burned the caption into the 1080p film (frame inspected). HEIC with
+    `sips` disabled (the Windows route): nine iPhone photos, six of them
+    Dolby Vision `tmap` gain-map files, decoded upright at full size,
+    mean pixel difference from ImageIO under 1/255. libx264 1080p30
+    `-preset medium` encode: 4.1 s for 10 s of video under Rosetta, 2.3 s
+    with native Homebrew FFmpeg on the same Mac.
+  - macOS x86_64: same binaries, not run on an Intel Mac. Pending.
+  - Windows x64: **pending CI** (fetch, `check-ffmpeg.sh`, tests and
+    fixture render against the sidecar are wired into `.github/workflows/ci.yml`).
+  - Still open: no-GPU baseline machine, playback in QuickTime, WMP and a
+    phone, and the Apple silicon decision (native build vs Rosetta).
+  → G1 **not passed** yet (Windows and playback evidence outstanding).
 - G2: not run (needs vendor designer pass + physical proof). Open.
 - G3: not run (basemap unbuilt). Open.
 - G4: not run (models unpinned; ledger still `(none pinned yet)`). Open.
