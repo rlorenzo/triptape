@@ -6,7 +6,7 @@
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
-//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--itinerary itinerary.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--itinerary itinerary.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
 //! triptape cache stats|clear [--segment-cache DIR]
 //! ```
@@ -549,6 +549,17 @@ fn export_cmd(flags: &HashMap<String, String>) {
     let out = need(flags, "out");
     let preset = BookPreset::from_flag(&flag_or(flags, "preset", "P1"))
         .unwrap_or_else(|| die("preset", "want P1|P2"));
+    // Book page cap (vendors differ: Shutterfly 111, Snapfish 150, Mixbook
+    // 400); omitted keeps the preset default. Checked before any rendering.
+    let book_max_pages = flags.get("pages").map(|v| {
+        let n: usize = v
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| die("--pages", "want a whole number of pages"));
+        preset
+            .page_cap(Some(n))
+            .unwrap_or_else(|e| die("--pages", e))
+    });
     let ffmpeg_bin = flag_or(flags, "ffmpeg", "ffmpeg");
     let ffprobe_bin = flag_or(flags, "ffprobe", "ffprobe");
     let typst_bin = flag_or(flags, "typst", "typst");
@@ -640,6 +651,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
         &out,
         &ExportOptions {
             preset,
+            book_max_pages,
             trip_name,
             typst_bin,
             music_paths: music,

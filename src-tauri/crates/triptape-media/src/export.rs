@@ -19,6 +19,8 @@ use triptape_core::types::{distinct_assets, AssetKind, Plan, PlanEntry, Renditio
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
     pub preset: render_book::BookPreset,
+    /// Book page cap; `None` keeps the preset's default max.
+    pub book_max_pages: Option<usize>,
     pub trip_name: String,
     pub typst_bin: String,
     /// Music playlist in order (crossfaded); empty uses the bundled theme.
@@ -657,6 +659,7 @@ fn export_inner(
                 trip_name: opts.trip_name.clone(),
                 typst_bin: opts.typst_bin.clone(),
                 ffmpeg_bin: caps.ffmpeg_bin.clone(),
+                max_pages: opts.book_max_pages,
                 progress: opts.progress.clone(),
             },
         ) {
@@ -821,6 +824,7 @@ mod tests {
             &out,
             &ExportOptions {
                 preset: render_book::BookPreset::P1,
+                book_max_pages: None,
                 trip_name: "Trip".into(),
                 typst_bin: "typst".into(),
                 music_paths: vec![],
@@ -867,6 +871,7 @@ mod tests {
         let out = t.path().join("out");
         let opts = ExportOptions {
             preset: render_book::BookPreset::P1,
+            book_max_pages: None,
             trip_name: "t".into(),
             typst_bin: "typst".into(),
             music_paths: Vec::new(),

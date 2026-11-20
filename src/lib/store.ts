@@ -39,6 +39,35 @@ export const dayNumbers = derived(assetsByTime, ($sorted) => {
 
 export const consentGiven = writable<boolean>(readConsent());
 
+/** Photo Book page cap bounds; the backend enforces the same range. */
+export const BOOK_PAGES_MIN = 24;
+export const BOOK_PAGES_MAX = 400;
+const BOOK_PAGES_DEFAULT = 60;
+const BOOK_PAGES_KEY = "triptape-book-pages";
+
+/** A whole page count inside the allowed range, else null. */
+export function validBookPages(n: unknown): number | null {
+  return typeof n === "number" && Number.isInteger(n) && n >= BOOK_PAGES_MIN && n <= BOOK_PAGES_MAX ? n : null;
+}
+
+function readBookPages(): number {
+  try {
+    return validBookPages(Number(localStorage.getItem(BOOK_PAGES_KEY))) ?? BOOK_PAGES_DEFAULT;
+  } catch {
+    return BOOK_PAGES_DEFAULT;
+  }
+}
+
+/** Most pages the Photo Book may use. Remembered across launches. */
+export const bookPages = writable<number>(readBookPages());
+bookPages.subscribe((n) => {
+  try {
+    localStorage.setItem(BOOK_PAGES_KEY, String(n));
+  } catch {
+    /* private mode: the choice lasts this session */
+  }
+});
+
 /** Background ingest job (public surface of `job://progress` for kind `ingest`). */
 export interface IngestJobState {
   id: string;

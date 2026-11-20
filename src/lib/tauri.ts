@@ -160,11 +160,14 @@ export async function dismissInterruptedExport(projectId: string): Promise<void>
 
 export type ExportCmd = "export_video" | "export_reels" | "export_book" | "export_all";
 
+/** `bookPages` caps the book's pages; the film and reels exports ignore it. */
 export async function exportKeepsake(
   cmd: ExportCmd,
-  projectId: string
+  projectId: string,
+  bookPages?: number
 ): Promise<ExportSummary> {
-  if (isTauri()) return invoke(cmd, { projectId });
+  const withBook = cmd === "export_book" || cmd === "export_all";
+  if (isTauri()) return invoke(cmd, withBook ? { projectId, bookPages } : { projectId });
   await new Promise((r) => setTimeout(r, 600));
   return {
     jobId: "demo_job",

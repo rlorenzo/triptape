@@ -1,7 +1,17 @@
 <script lang="ts">
   import ErrorNote from "./lib/ErrorNote.svelte";
   import Thumb from "./lib/Thumb.svelte";
-  import { assets, exportJob, frameNumbers, project, screen } from "./lib/store";
+  import {
+    assets,
+    BOOK_PAGES_MAX,
+    BOOK_PAGES_MIN,
+    bookPages,
+    exportJob,
+    frameNumbers,
+    project,
+    screen,
+    validBookPages
+  } from "./lib/store";
   import ProgressBar from "./lib/ProgressBar.svelte";
   import { countOf, friendlyStep } from "./lib/trip";
   import { runExport, wasAttempted } from "./lib/exporter";
@@ -25,6 +35,14 @@
   }
 
   let openError = "";
+
+  // The field holds what was typed; only a valid count reaches the store.
+  let pagesInput: number | null = $bookPages;
+  $: pagesInvalid = validBookPages(pagesInput) === null;
+  function commitPages() {
+    const n = validBookPages(pagesInput);
+    if (n !== null) bookPages.set(n);
+  }
 
   // An export that stopped when the app closed, waiting on the user's call.
   let interrupted: ExportCmd | null = null;
@@ -199,6 +217,29 @@
     {/if}
 
     <section class="list" aria-label="Keepsakes">
+      <div class="pages">
+        <label for="book-pages">Most pages in the Photo Book</label>
+        <input
+          id="book-pages"
+          type="number"
+          inputmode="numeric"
+          min={BOOK_PAGES_MIN}
+          max={BOOK_PAGES_MAX}
+          step="1"
+          disabled={busy}
+          bind:value={pagesInput}
+          on:change={commitPages}
+          aria-describedby="book-pages-hint"
+          aria-invalid={pagesInvalid}
+        />
+        <p id="book-pages-hint" class:bad={pagesInvalid}>
+          {#if pagesInvalid}
+            Choose a whole number from {BOOK_PAGES_MIN} to {BOOK_PAGES_MAX}. Using {$bookPages}.
+          {:else}
+            More pages fit more photos. Check your print service's limit: Shutterfly 111, Snapfish 150, Mixbook 400.
+          {/if}
+        </p>
+      </div>
       {#if madeSomething}
         <div class="again">
           <h2>Changed the story? Make them again.</h2>
@@ -336,6 +377,34 @@
     align-items: center;
     justify-content: space-between;
     padding-bottom: 12px;
+  }
+
+  .pages {
+    display: grid;
+    grid-template-columns: auto 6em;
+    gap: 4px 16px;
+    align-items: center;
+    padding: 0 0 16px;
+  }
+
+  .pages label {
+    font-weight: 500;
+  }
+
+  .pages input {
+    font: inherit;
+    padding: 4px 8px;
+    border: 1px solid var(--line);
+  }
+
+  .pages p {
+    grid-column: 1 / -1;
+    color: var(--ink-2);
+    font-size: 13px;
+  }
+
+  .pages p.bad {
+    color: var(--ink);
   }
 
   .row {

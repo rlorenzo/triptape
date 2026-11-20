@@ -1,5 +1,5 @@
 import { get } from "svelte/store";
-import { exportJob, IDLE_EXPORT, project, type ExportJobState } from "./store";
+import { bookPages, exportJob, IDLE_EXPORT, project, validBookPages, type ExportJobState } from "./store";
 import { exportKeepsake, type ExportCmd, type ExportSummary, type ProgressEvent } from "./tauri";
 
 const key = (projectId: string) => `triptape-export-${projectId}`;
@@ -58,7 +58,8 @@ export async function runExport(cmd: ExportCmd, label: string, projectId: string
   if (jobs.get(projectId)?.label) return;
   record(projectId, { ...IDLE_EXPORT, cmd, label });
   try {
-    const summary = mergeSummary(savedExport(projectId), await exportKeepsake(cmd, projectId));
+    const pages = validBookPages(get(bookPages)) ?? undefined;
+    const summary = mergeSummary(savedExport(projectId), await exportKeepsake(cmd, projectId, pages));
     saveExport(projectId, summary);
     record(projectId, { ...IDLE_EXPORT, cmd, summary });
   } catch (e) {
