@@ -288,12 +288,12 @@ fn looks_alike(a: &Asset, b: &Asset) -> bool {
 /// retake by embedding, captured within [`DUPE_WINDOW_SECS`] and, when
 /// both have GPS, [`DUPE_RADIUS_METERS`]) with union-find; groups merge
 /// only when every cross pair is the same moment, so a whole group stays
-/// within the window and radius. The best
-/// shot is the highest `total` score (ties → first in story order).
-/// Byte-identical files (same content hash) always collapse, clips
-/// included. Otherwise videos never collapse: their pHash is only the poster frame, so two
-/// clips (or a clip and a photo) opening on the same view can still hold
-/// different footage.
+/// within the window and radius. The best shot is the highest `total`
+/// score (ties → first in story order). Byte-identical files (same
+/// content hash) always collapse, clips included. Otherwise videos never
+/// collapse: their pHash is only the poster frame, so two clips (or a
+/// clip and a photo) opening on the same view can still hold different
+/// footage.
 pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) -> Vec<DupeGroup> {
     let n = assets.len();
     let mut parent: Vec<usize> = (0..n).collect();
@@ -304,6 +304,12 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
         }
         x
     }
+    /// Join root `from` into root `into`, moving its member list along.
+    fn union(p: &mut [usize], members: &mut [Vec<usize>], into: usize, from: usize) {
+        p[from] = into;
+        let moved = std::mem::take(&mut members[from]);
+        members[into].extend(moved);
+    }
     let alike = |x: usize, y: usize| looks_alike(&assets[x], &assets[y]);
     let mut members: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
     // Byte-identical files are one item whatever their kind: the same
@@ -312,9 +318,7 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
     for twins in identical_files(assets) {
         let root = twins[0];
         for &t in &twins[1..] {
-            parent[t] = root;
-            let moved = std::mem::take(&mut members[t]);
-            members[root].extend(moved);
+            union(&mut parent, &mut members, root, t);
         }
     }
     for i in 0..n {
@@ -335,9 +339,7 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
                         .all(|&y| same_moment(&assets[x], &assets[y]) && alike(x, y))
                 })
             {
-                parent[rj] = ri;
-                let moved = std::mem::take(&mut members[rj]);
-                members[ri].extend(moved);
+                union(&mut parent, &mut members, ri, rj);
             }
         }
     }
