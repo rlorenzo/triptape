@@ -1068,6 +1068,10 @@ mod tests {
             swaps: vec![("a2".into(), "a3".into())],
             place_overrides: [("a1".to_string(), "Our Hotel".to_string())].into(),
             caption_overrides: [("a3".to_string(), "Sunset".to_string())].into(),
+            collage: crate::types::CollageEdits {
+                solo: vec!["a4".into()],
+                joins: vec![("a5".into(), "a6".into())],
+            },
         };
         assert!(db.get_plan_edits(&p.id).unwrap().is_empty());
         db.save_plan_edits(&p.id, &edits).unwrap();
@@ -1602,6 +1606,7 @@ mod tests {
             reel_selects: vec![],
             chapters: vec![],
             captions: Default::default(),
+            collage: Default::default(),
             map_polyline: vec![],
             music: crate::types::MusicPick {
                 track: "t".into(),

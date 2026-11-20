@@ -650,7 +650,7 @@ The hackathon submission is done, including the demo video. The goal is now a re
 
 - Ingest in the app and CLI: folder walk, hashing, EXIF and video metadata, Live Photo pairing, clustering, heuristic scoring, and a saved plan. First-run consent sheet.
 - Three keepsakes: Trip Video, Reels Pack, and Photo Book, all from one plan, with offline place names and a route card.
-- Story editing: rename a place, edit a caption, leave a photo out and put it back, swap a photo. Edits persist.
+- Story editing: rename a place, edit a caption, leave a photo out and put it back, swap a photo, see which film photos play together as a collage, show one on its own or join two neighbours. Edits persist.
 - Export screen with progress and reveal-in-folder, and a Reels share disclosure.
 
 ### 23.2 Where the code falls short of this plan

@@ -1418,6 +1418,57 @@ async fn swap_asset(
     })
 }
 
+/// Play a film photo on its own ("Show on its own"), or put it back in the
+/// collages ("Put back in the collage"). Setting it solo drops its joins.
+#[tauri::command]
+async fn set_asset_solo(
+    state: State<'_, AppState>,
+    project_id: String,
+    asset_id: String,
+    solo: bool,
+) -> Result<StoryView, String> {
+    AppState::check_id(&asset_id)?;
+    state.require_project(&project_id)?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    if solo {
+        StoryData::load(&db, &project_id)?.check_solo(&asset_id)?;
+    }
+    save_edits(&db, &project_id, |edits| {
+        edits.collage.set_solo(asset_id, solo)
+    })
+}
+
+/// Join a film photo playing on its own with the next collage photo of its
+/// day ("Join with next"; "Join with previous" passes the earlier photo
+/// first), even past the automatic reach.
+#[tauri::command]
+async fn join_assets(
+    state: State<'_, AppState>,
+    project_id: String,
+    first_asset_id: String,
+    second_asset_id: String,
+) -> Result<StoryView, String> {
+    AppState::check_id(&first_asset_id)?;
+    AppState::check_id(&second_asset_id)?;
+    state.require_project(&project_id)?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    StoryData::load(&db, &project_id)?.check_join(&first_asset_id, &second_asset_id)?;
+    save_edits(&db, &project_id, |edits| {
+        edits.collage.join(first_asset_id, second_asset_id)
+    })
+}
+
+/// Undo the user's joins of a photo ("Separate").
+#[tauri::command]
+async fn unjoin_asset(
+    state: State<'_, AppState>,
+    project_id: String,
+    asset_id: String,
+) -> Result<StoryView, String> {
+    AppState::check_id(&asset_id)?;
+    with_edits(&state, &project_id, |edits| edits.collage.unjoin(&asset_id))
+}
+
 /// Editor thumbnail: generated once per source version into the app cache dir,
 /// returned as a path the webview loads over `asset://` (scoped to that dir).
 /// Originals are never exposed. Returns None when no frame can be made,
@@ -1719,6 +1770,9 @@ fn main() {
             set_asset_excluded,
             set_asset_included,
             swap_asset,
+            set_asset_solo,
+            join_assets,
+            unjoin_asset,
             get_thumbnail
         ])
         .build(tauri::generate_context!())

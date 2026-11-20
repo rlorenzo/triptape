@@ -14,10 +14,10 @@ use crate::segment_cache::SegmentCache;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{
-    self, collage_hold_secs, has_caption, is_panorama, pano_coverage, pano_motion, GroupSlot,
-    MAX_CLIP_SECS, MAX_COLLAGE, MIN_SEGMENT_SECS,
+    self, collage_hold_secs, is_panorama, pano_coverage, pano_motion, MAX_CLIP_SECS, MAX_COLLAGE,
+    MIN_SEGMENT_SECS,
 };
-use triptape_core::types::{Plan, PlanEntry, Rendition};
+use triptape_core::types::{CollageEdits, Plan, PlanEntry, Rendition};
 
 /// Crossfade applied at the cut *into* a segment (PLAN.md Sec 9, 6-pack).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -662,7 +662,7 @@ pub fn render_hero_video(
     let groups: Vec<Vec<&ResolvedEntry>> = if opts.short_mode {
         selected.into_iter().map(|r| vec![r]).collect()
     } else {
-        hero_groups(&selected, chapter_of)
+        hero_groups(&selected, chapter_of, &plan.collage)
     };
     // Segment renders are independent unless a short-mode budget couples
     // them (each one's cap and freeze-pad depend on what earlier ones left),
@@ -1843,29 +1843,31 @@ fn cached_segment(
 
 /// Whether an entry may join a collage: a still that is not a panorama
 /// (panoramas pan solo) and has no caption (a caption describes one photo,
-/// so a captioned still plays solo; same rule as the plan's timing model).
+/// so a captioned still plays solo; same rule as the plan's timing model
+/// and the Story editor, through [`plan::entry_plays_alone`]).
 fn collage_eligible(e: &ResolvedEntry) -> bool {
-    plan::collage_eligible(
-        &e.entry.rendition,
-        e.aspect.is_some_and(is_panorama),
-        has_caption(e.caption.as_deref()),
-    )
+    plan::entry_plays_alone(&e.entry.rendition, e.aspect, e.caption.as_deref()).is_none()
 }
 
 /// Hero segments in playback order: each is one entry or a collage of
-/// same-chapter stills, as [`plan::collage_groups`] decides (the plan's
-/// length estimate groups the same way).
+/// same-chapter stills, as [`plan::collage_groups`] decides under the
+/// user's `collage` overrides (the plan's length estimate and the Story
+/// editor group the same way).
 fn hero_groups<'a, C: PartialEq>(
     entries: &[&'a ResolvedEntry],
     chapter_of: impl Fn(&str) -> C,
+    collage: &CollageEdits,
 ) -> Vec<Vec<&'a ResolvedEntry>> {
-    let slots: Vec<GroupSlot<C>> = entries
-        .iter()
-        .map(|r| GroupSlot {
-            chapter: chapter_of(&r.entry.asset_id),
-            eligible: collage_eligible(r),
-        })
-        .collect();
+    let slots = plan::collage_slots(
+        entries.iter().map(|r| {
+            (
+                r.entry.asset_id.as_str(),
+                chapter_of(&r.entry.asset_id),
+                collage_eligible(r),
+            )
+        }),
+        collage,
+    );
     plan::collage_groups(&slots)
         .into_iter()
         .map(|g| g.into_iter().map(|i| entries[i]).collect())
@@ -2572,6 +2574,7 @@ fn graph_segment_args(img: &Path, dur: f64, graph: String, out: &Path) -> Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use triptape_core::plan::has_caption;
 
     #[test]
     fn film_graph_chains_cuts_into_one_graph() {
@@ -2772,10 +2775,11 @@ mod tests {
                     })
                     .collect();
                 let refs: Vec<&ResolvedEntry> = resolved.iter().collect();
-                let groups: Vec<Vec<&PlanEntry>> = hero_groups(&refs, chapter_of)
-                    .into_iter()
-                    .map(|g| g.into_iter().map(|r| &r.entry).collect())
-                    .collect();
+                let groups: Vec<Vec<&PlanEntry>> =
+                    hero_groups(&refs, chapter_of, &CollageEdits::default())
+                        .into_iter()
+                        .map(|g| g.into_iter().map(|r| &r.entry).collect())
+                        .collect();
                 // (asset id, duration, kind) as in the renderer's `segs`.
                 let mut segs: Vec<(String, f64, &str)> =
                     vec![("title".into(), opts.title_secs, "title")];
@@ -3794,6 +3798,7 @@ mod tests {
                 },
             ],
             captions,
+            collage: Default::default(),
             map_polyline: vec![],
             music: triptape_core::types::MusicPick {
                 track: "bundled".into(),
@@ -4019,6 +4024,7 @@ mod tests {
                 ..Default::default()
             }],
             captions: HashMap::new(),
+            collage: Default::default(),
             map_polyline: vec![(35.0, 135.0), (35.1, 135.1)],
             music: triptape_core::types::MusicPick {
                 track: "bundled".into(),
@@ -4151,6 +4157,7 @@ mod tests {
                 ..Default::default()
             }],
             captions: HashMap::new(),
+            collage: Default::default(),
             map_polyline: vec![],
             music: triptape_core::types::MusicPick {
                 track: "bundled".into(),
@@ -4243,6 +4250,7 @@ mod tests {
                 ..Default::default()
             }],
             captions: HashMap::new(),
+            collage: Default::default(),
             map_polyline: vec![],
             music: triptape_core::types::MusicPick {
                 track: "bundled".into(),
@@ -4363,6 +4371,7 @@ mod tests {
                 ),
             ],
             captions: HashMap::new(),
+            collage: Default::default(),
             map_polyline: vec![(35.0, 135.7), (34.7, 135.5), (35.6, 139.7), (1.35, 103.8)],
             music: MusicPick {
                 track: "bundled".into(),
@@ -4514,6 +4523,7 @@ mod tests {
             reel_selects: vec![],
             chapters,
             captions: HashMap::new(),
+            collage: Default::default(),
             map_polyline: vec![],
             music: triptape_core::types::MusicPick {
                 track: "bundled".into(),
@@ -4641,6 +4651,64 @@ mod tests {
             .unwrap();
         let (third, _, _) = run("c", &entries);
         assert_eq!((third.hits, third.misses), (3, 1), "{third:?}");
+    }
+
+    /// A collage the user split ("Show on its own") is a new grouping: the
+    /// collage's members re-render as their own segments instead of reusing
+    /// the cached collage, while the other groups stay cached, and the
+    /// film plays them apart.
+    #[test]
+    fn segment_cache_rerenders_a_collage_the_user_split() {
+        use crate::segment_cache::{SegmentCache, SegmentCacheConfig};
+        let Some(caps) = parallel_caps() else {
+            eprintln!("ffmpeg caps insufficient; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (plan, entries) = parallel_fixture(dir.path());
+        let cfg = SegmentCacheConfig::roomy(dir.path().join("cache"));
+        let run = |name: &str, plan: &Plan| {
+            let work = dir.path().join(name).join(".work");
+            let cache = SegmentCache::open(&cfg, "ffmpeg test".into(), &work).unwrap();
+            let caps = Capabilities {
+                segment_cache: Some(cache.clone()),
+                ..caps.clone()
+            };
+            let out = dir.path().join(format!("{name}.mp4"));
+            let v = render_hero_video(&caps, plan, &entries, None, &work, &out, &parallel_opts(2))
+                .expect("render");
+            let edl: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&v.edl_path).unwrap()).unwrap();
+            (cache.stats(), edl["segments"].clone())
+        };
+        let (first, edl1) = run("a", &plan);
+        assert_eq!(first.misses, 4, "{first:?}");
+        assert_eq!(
+            edl1[2]["collage_asset_ids"],
+            serde_json::json!(["a1", "a2"])
+        );
+        // Groups: a0 solo (captioned), a1+a2 collage, a3 solo (captioned),
+        // a4 solo. Setting a2 solo splits the collage.
+        let split = Plan {
+            collage: CollageEdits {
+                solo: vec!["a2".into()],
+                joins: vec![],
+            },
+            ..plan.clone()
+        };
+        let (second, edl2) = run("b", &split);
+        let ids: Vec<&str> = edl2
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["asset_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["title", "a0", "a1", "a2", "a3", "a4"], "{edl2}");
+        assert!(edl2[2].get("collage_asset_ids").is_none_or(|v| v.is_null()));
+        // a1 and a2 are new segments; at most the shot after them changes
+        // its glide; a0 and a4 come from the cache.
+        assert!((2..=3).contains(&second.misses), "{second:?}");
+        assert!(second.hits >= 2, "{second:?}");
     }
 
     /// Inserting a shot must not change the recipe (so the cache key) of
