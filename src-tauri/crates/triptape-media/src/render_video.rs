@@ -14,8 +14,8 @@ use crate::segment_cache::SegmentCache;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{
-    collage_hold_secs, has_caption, is_panorama, pano_coverage, pano_motion, MAX_CLIP_SECS,
-    MAX_COLLAGE, MIN_SEGMENT_SECS,
+    self, collage_hold_secs, has_caption, is_panorama, pano_coverage, pano_motion, GroupSlot,
+    MAX_CLIP_SECS, MAX_COLLAGE, MIN_SEGMENT_SECS,
 };
 use triptape_core::types::{Plan, PlanEntry, Rendition};
 
@@ -629,10 +629,9 @@ pub fn render_hero_video(
     } else {
         f64::INFINITY
     };
-    // Group consecutive same-chapter stills into collages of up to four,
-    // so a day shows several photos at once instead of a single pick.
-    // Clips and Live Photo motion always stay solo.
-    let mut groups: Vec<Vec<&ResolvedEntry>> = vec![];
+    // Group same-chapter stills into collages of up to four, so a day
+    // shows several photos at once instead of a single pick. Clips, Live
+    // Photo motion, panoramas and captioned stills stay solo.
     let mut collage_members: HashMap<String, Vec<String>> = HashMap::new();
     let selected: Vec<&ResolvedEntry> = if opts.short_mode {
         let slots = (budget / still_secs).floor().max(1.0) as usize;
@@ -659,20 +658,12 @@ pub fn render_hero_video(
     } else {
         resolved.iter().collect()
     };
-    for r in selected {
-        match groups.last_mut() {
-            Some(g)
-                if !opts.short_mode
-                    && g.len() < MAX_COLLAGE
-                    && collage_eligible(r)
-                    && collage_eligible(g[0])
-                    && chapter_of(&g[0].entry.asset_id) == chapter_of(&r.entry.asset_id) =>
-            {
-                g.push(r);
-            }
-            _ => groups.push(vec![r]),
-        }
-    }
+    // The short variant spreads single picks across the trip instead.
+    let groups: Vec<Vec<&ResolvedEntry>> = if opts.short_mode {
+        selected.into_iter().map(|r| vec![r]).collect()
+    } else {
+        hero_groups(&selected, chapter_of)
+    };
     // Segment renders are independent unless a short-mode budget couples
     // them (each one's cap and freeze-pad depend on what earlier ones left),
     // so full mode fans out over `jobs` workers and short mode stays
@@ -1854,9 +1845,31 @@ fn cached_segment(
 /// (panoramas pan solo) and has no caption (a caption describes one photo,
 /// so a captioned still plays solo; same rule as the plan's timing model).
 fn collage_eligible(e: &ResolvedEntry) -> bool {
-    matches!(e.entry.rendition, Rendition::Still)
-        && !e.aspect.is_some_and(is_panorama)
-        && !has_caption(e.caption.as_deref())
+    plan::collage_eligible(
+        &e.entry.rendition,
+        e.aspect.is_some_and(is_panorama),
+        has_caption(e.caption.as_deref()),
+    )
+}
+
+/// Hero segments in playback order: each is one entry or a collage of
+/// same-chapter stills, as [`plan::collage_groups`] decides (the plan's
+/// length estimate groups the same way).
+fn hero_groups<'a>(
+    entries: &[&'a ResolvedEntry],
+    chapter_of: impl Fn(&str) -> usize,
+) -> Vec<Vec<&'a ResolvedEntry>> {
+    let slots: Vec<GroupSlot<usize>> = entries
+        .iter()
+        .map(|r| GroupSlot {
+            chapter: chapter_of(&r.entry.asset_id),
+            eligible: collage_eligible(r),
+        })
+        .collect();
+    plan::collage_groups(&slots)
+        .into_iter()
+        .map(|g| g.into_iter().map(|i| entries[i]).collect())
+        .collect()
 }
 
 /// Under this width / height a photo counts as a portrait, which the
@@ -2749,25 +2762,21 @@ mod tests {
                     places: true,
                 },
             ] {
-                // -- renderer replay: groups of consecutive same-chapter stills.
-                let mut groups: Vec<Vec<&PlanEntry>> = vec![];
-                for e in &entries {
-                    let is_still = |e: &PlanEntry| {
-                        matches!(e.rendition, Rendition::Still)
-                            && !has_caption(captions.get(&e.asset_id).map(String::as_str))
-                    };
-                    match groups.last_mut() {
-                        Some(g)
-                            if g.len() < MAX_COLLAGE
-                                && is_still(e)
-                                && is_still(g[0])
-                                && chapter_of(&g[0].asset_id) == chapter_of(&e.asset_id) =>
-                        {
-                            g.push(e)
-                        }
-                        _ => groups.push(vec![e]),
-                    }
-                }
+                // -- renderer replay: the renderer's own grouping.
+                let resolved: Vec<ResolvedEntry> = entries
+                    .iter()
+                    .map(|e| ResolvedEntry {
+                        entry: e.clone(),
+                        caption: captions.get(&e.asset_id).cloned(),
+                        ..card_entry(&e.asset_id, Path::new("x.jpg"))
+                    })
+                    .collect();
+                let refs: Vec<&ResolvedEntry> = resolved.iter().collect();
+                let groups: Vec<Vec<&PlanEntry>> =
+                    hero_groups(&refs, |id| id[1..3].parse::<usize>().unwrap())
+                        .into_iter()
+                        .map(|g| g.into_iter().map(|r| &r.entry).collect())
+                        .collect();
                 // (asset id, duration, kind) as in the renderer's `segs`.
                 let mut segs: Vec<(String, f64, &str)> =
                     vec![("title".into(), opts.title_secs, "title")];
@@ -4513,6 +4522,61 @@ mod tests {
             },
         };
         (plan, entries)
+    }
+
+    /// Two stills of one day with a clip between them encode as one
+    /// collage at the first still's place, the clip still playing after it.
+    #[test]
+    fn stills_collage_across_a_clip_and_encode() {
+        let Some(caps) = parallel_caps() else {
+            eprintln!("ffmpeg caps insufficient; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("clip.mp4");
+        let made = std::process::Command::new(&caps.ffmpeg_bin)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=size=320x180:rate=30:duration=3")
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=3"])
+            .args(["-shortest", "-c:v", "libx264", "-c:a", "aac"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let (mut plan, all) = parallel_fixture(dir.path());
+        // a1 and a2 are uncaptioned stills of day 1; put the clip between.
+        let entries = vec![all[1].clone(), clip_entry("c", clip, 2.5), all[2].clone()];
+        plan.chapters = vec![triptape_core::types::Chapter {
+            title: "Day 1".into(),
+            asset_ids: vec!["a1".into(), "c".into(), "a2".into()],
+            ..Default::default()
+        }];
+        let out = dir.path().join("hero.mp4");
+        let v = render_hero_video(
+            &caps,
+            &plan,
+            &entries,
+            None,
+            &dir.path().join("work"),
+            &out,
+            &parallel_opts(2),
+        )
+        .expect("render");
+        let edl: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&v.edl_path).unwrap()).unwrap();
+        let segs = edl["segments"].as_array().unwrap();
+        let ids: Vec<&str> = segs
+            .iter()
+            .map(|s| s["asset_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["title", "a1", "c"], "{segs:?}");
+        assert_eq!(
+            segs[1]["collage_asset_ids"],
+            serde_json::json!(["a1", "a2"])
+        );
+        assert_eq!(segs[2]["kind"], "clip");
+        let info = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &out).unwrap();
+        assert!(info.has_video && info.duration_secs > 2.0, "{info:?}");
     }
 
     fn parallel_caps() -> Option<Capabilities> {
