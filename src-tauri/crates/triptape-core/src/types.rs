@@ -120,11 +120,17 @@ impl Asset {
         if w <= 0.0 || h <= 0.0 {
             return None;
         }
-        Some(if matches!(self.rotation_deg, 90 | 270) {
+        Some(if self.rotation_swaps_axes() {
             h / w
         } else {
             w / h
         })
+    }
+
+    /// Whether the EXIF rotation (90/270) displays the stored width as the
+    /// height: a portrait shot stored sideways.
+    pub fn rotation_swaps_axes(&self) -> bool {
+        matches!(self.rotation_deg, 90 | 270)
     }
 
     pub fn new(id: impl Into<String>, path: PathBuf, kind: AssetKind) -> Self {

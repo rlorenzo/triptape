@@ -13,7 +13,8 @@ use crate::resolution::Resolution;
 use crate::segment_cache::{SegmentCache, SegmentCacheConfig};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use triptape_core::plan::{check_source_integrity, plan_eligibility, Integrity};
+use triptape_core::itinerary::asset_day;
+use triptape_core::plan::{check_source_integrity, plan_eligibility, trip_day, Integrity};
 use triptape_core::types::{distinct_assets, AssetKind, Plan, PlanEntry, Rendition};
 
 #[derive(Debug, Clone)]
@@ -154,6 +155,23 @@ fn book_chapter_of(plan: &Plan) -> HashMap<&str, usize> {
         .enumerate()
         .flat_map(|(i, c)| c.asset_ids.iter().map(move |id| (id.as_str(), i)))
         .collect()
+}
+
+/// A book photo's caption: the user's, else the attraction it was taken at
+/// (Tokyo DisneySea says more than the itinerary's "Tokyo"), else its
+/// chapter's place.
+fn book_caption(
+    plan: &Plan,
+    chapter: Option<usize>,
+    a: &triptape_core::types::Asset,
+) -> Option<String> {
+    plan.captions.get(&a.id).cloned().or_else(|| {
+        let place = chapter.and_then(|i| plan.chapters[i].place.clone());
+        a.gps
+            .and_then(triptape_core::geo::attraction_name)
+            .filter(|poi| place.as_deref() != Some(poi.as_str()))
+            .or(place)
+    })
 }
 
 /// Whether the book may use this asset. The plan's chapters hold near-dupe
@@ -630,10 +648,7 @@ fn export_inner(
         let chapter_of = book_chapter_of(plan);
         // Day 1 is the earliest local date in the project, as the plan
         // numbers its chapters.
-        let local_day = |a: &triptape_core::types::Asset| {
-            triptape_core::metadata::local_date(a.taken_at?, a.tz_offset_secs)
-        };
-        let trip_start = assets.iter().filter_map(local_day).min();
+        let trip_start = assets.iter().filter_map(asset_day).min();
         let mut book_photos: Vec<BookPhoto> = vec![];
         for a in assets
             .iter()
@@ -657,7 +672,7 @@ fn export_inner(
             };
             // As displayed: a portrait shot stored sideways (EXIF rotation
             // 90/270) must not lay out or pick the spread as a landscape.
-            let (w, h) = if matches!(a.rotation_deg, 90 | 270) {
+            let (w, h) = if a.rotation_swaps_axes() {
                 (h, w)
             } else {
                 (w, h)
@@ -668,20 +683,8 @@ fn export_inner(
                 path: a.path.clone(),
                 width: w,
                 height: h,
-                // The user's caption, else the attraction the photo was
-                // taken at (Tokyo DisneySea says more than the itinerary's
-                // "Tokyo"), else the chapter place.
-                caption: plan.captions.get(&a.id).cloned().or_else(|| {
-                    let place = chapter.and_then(|i| plan.chapters[i].place.clone());
-                    a.gps
-                        .and_then(triptape_core::geo::attraction_name)
-                        .filter(|poi| place.as_deref() != Some(poi.as_str()))
-                        .or(place)
-                }),
-                day: match (local_day(a), trip_start) {
-                    (Some(d), Some(s)) => Some(((d - s).get_days() + 1).max(1) as u32),
-                    _ => None,
-                },
+                caption: book_caption(plan, chapter, a),
+                day: asset_day(a).zip(trip_start).map(|(d, s)| trip_day(d, s)),
                 chapter,
                 // Unclamped, so a strong bonus still ranks above a weak one
                 // once `total` saturates.
@@ -890,6 +893,40 @@ mod tests {
         assert!(in_book_flow(&chapter_of, "a"));
         assert!(!in_book_flow(&chapter_of, "dupe"));
         assert!(!in_book_flow(&chapter_of, "cut"));
+    }
+
+    #[test]
+    fn book_captions_prefer_user_text_then_attraction_then_place() {
+        use triptape_core::types::{Asset, Chapter};
+        let mut plan = empty_plan();
+        plan.chapters = vec![Chapter {
+            title: "Tokyo".into(),
+            asset_ids: vec!["a".into()],
+            place: Some("Tokyo".into()),
+            day_index: None,
+            date_label: None,
+        }];
+        let mut a = Asset::new("a", "a.jpg".into(), AssetKind::Photo);
+        // No GPS: the chapter place.
+        assert_eq!(book_caption(&plan, Some(0), &a).as_deref(), Some("Tokyo"));
+        // Inside Tokyo DisneySea: the attraction beats the city.
+        a.gps = Some((35.6267, 139.8881));
+        assert_eq!(
+            book_caption(&plan, Some(0), &a).as_deref(),
+            Some("Tokyo DisneySea")
+        );
+        // An attraction that is the chapter place already is not repeated.
+        plan.chapters[0].place = Some("Tokyo DisneySea".into());
+        assert_eq!(
+            book_caption(&plan, Some(0), &a).as_deref(),
+            Some("Tokyo DisneySea")
+        );
+        // The user's caption always wins.
+        plan.captions.insert("a".into(), "Rain all day".into());
+        assert_eq!(
+            book_caption(&plan, Some(0), &a).as_deref(),
+            Some("Rain all day")
+        );
     }
 
     #[test]
