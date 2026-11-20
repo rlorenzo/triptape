@@ -4653,6 +4653,64 @@ mod tests {
         assert_eq!((third.hits, third.misses), (3, 1), "{third:?}");
     }
 
+    /// A collage the user split ("Show on its own") is a new grouping: the
+    /// collage's members re-render as their own segments instead of reusing
+    /// the cached collage, while the other groups stay cached, and the
+    /// film plays them apart.
+    #[test]
+    fn segment_cache_rerenders_a_collage_the_user_split() {
+        use crate::segment_cache::{SegmentCache, SegmentCacheConfig};
+        let Some(caps) = parallel_caps() else {
+            eprintln!("ffmpeg caps insufficient; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (plan, entries) = parallel_fixture(dir.path());
+        let cfg = SegmentCacheConfig::roomy(dir.path().join("cache"));
+        let run = |name: &str, plan: &Plan| {
+            let work = dir.path().join(name).join(".work");
+            let cache = SegmentCache::open(&cfg, "ffmpeg test".into(), &work).unwrap();
+            let caps = Capabilities {
+                segment_cache: Some(cache.clone()),
+                ..caps.clone()
+            };
+            let out = dir.path().join(format!("{name}.mp4"));
+            let v = render_hero_video(&caps, plan, &entries, None, &work, &out, &parallel_opts(2))
+                .expect("render");
+            let edl: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&v.edl_path).unwrap()).unwrap();
+            (cache.stats(), edl["segments"].clone())
+        };
+        let (first, edl1) = run("a", &plan);
+        assert_eq!(first.misses, 4, "{first:?}");
+        assert_eq!(
+            edl1[2]["collage_asset_ids"],
+            serde_json::json!(["a1", "a2"])
+        );
+        // Groups: a0 solo (captioned), a1+a2 collage, a3 solo (captioned),
+        // a4 solo. Setting a2 solo splits the collage.
+        let split = Plan {
+            collage: CollageEdits {
+                solo: vec!["a2".into()],
+                joins: vec![],
+            },
+            ..plan.clone()
+        };
+        let (second, edl2) = run("b", &split);
+        let ids: Vec<&str> = edl2
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["asset_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["title", "a0", "a1", "a2", "a3", "a4"], "{edl2}");
+        assert!(edl2[2].get("collage_asset_ids").is_none_or(|v| v.is_null()));
+        // a1 and a2 are new segments; at most the shot after them changes
+        // its glide; a0 and a4 come from the cache.
+        assert!((2..=3).contains(&second.misses), "{second:?}");
+        assert!(second.hits >= 2, "{second:?}");
+    }
+
     /// Inserting a shot must not change the recipe (so the cache key) of
     /// any still segment except possibly the one right after it.
     #[test]
