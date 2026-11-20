@@ -159,17 +159,14 @@ pub fn log(level: &str, message: &str) {
 
 /// The time now, in UTC, as the log writes it.
 pub fn now() -> String {
-    jiff::Timestamp::now()
-        .round(jiff::Unit::Second)
-        .map_or_else(|_| jiff::Timestamp::now().to_string(), |t| t.to_string())
+    let t = jiff::Timestamp::now();
+    jiff::Timestamp::from_second(t.as_second())
+        .unwrap_or(t)
+        .to_string()
 }
 
 pub fn info(message: &str) {
     log("info", message);
-}
-
-pub fn warn(message: &str) {
-    log("warn", message);
 }
 
 pub fn error(message: &str) {
@@ -181,9 +178,7 @@ pub fn error(message: &str) {
 pub fn add_secrets<'a>(texts: impl IntoIterator<Item = &'a str>) {
     if let Some(logger) = LOGGER.get() {
         if let Ok(mut r) = logger.redactor.lock() {
-            for t in texts {
-                r.add_secret(t);
-            }
+            r.add_secrets(texts);
         }
     }
 }
@@ -194,6 +189,20 @@ pub fn redact(text: &str) -> String {
         .get()
         .and_then(|l| l.redactor.lock().ok().map(|r| r.redact(text)))
         .unwrap_or_else(|| Redactor::default().redact(text))
+}
+
+/// Redact every line of `lines` under one lock (for diagnostic reports).
+pub fn redact_all(lines: &[String]) -> Vec<String> {
+    let fallback;
+    let guard = LOGGER.get().and_then(|l| l.redactor.lock().ok());
+    let r = match &guard {
+        Some(g) => &**g,
+        None => {
+            fallback = Redactor::default();
+            &fallback
+        }
+    };
+    lines.iter().map(|l| r.redact(l)).collect()
 }
 
 /// The last `n` log lines (already redacted when written).
@@ -226,6 +235,19 @@ mod tests {
         assert_eq!(tail[0], "line 35 ........");
         // The tail crosses into the rolled file when the current one is short.
         assert_eq!(log.tail(9).first().unwrap(), "line 31 ........");
+    }
+
+    #[test]
+    fn now_is_whole_seconds_utc() {
+        let t = now();
+        assert!(t.ends_with('Z') && !t.contains('.'), "{t}");
+    }
+
+    #[test]
+    fn redact_all_without_a_logger_still_redacts() {
+        let out = redact_all(&["at 35.31920, 139.55220".to_string()]);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].contains("139.55220"), "{}", out[0]);
     }
 
     #[test]

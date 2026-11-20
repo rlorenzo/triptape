@@ -192,7 +192,7 @@ pub struct CacheInfo {
     pub default_segment_cap_bytes: u64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ClearResult {
     pub removed: u64,
@@ -229,11 +229,7 @@ pub async fn get_cache_info(
         }
         let seg = segment_dir()
             .map(|d| segment_cache::disk_stats(&d))
-            .unwrap_or(segment_cache::DiskStats {
-                entries: 0,
-                bytes: 0,
-                live_leases: 0,
-            });
+            .unwrap_or_default();
         CacheInfo {
             thumbnail_bytes,
             thumbnail_files,
@@ -268,11 +264,7 @@ pub async fn set_segment_cache_cap(
 pub async fn clear_thumbnail_cache(app: tauri::AppHandle) -> Result<ClearResult, String> {
     let root = cache_root(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let mut total = ClearResult {
-            removed: 0,
-            freed_bytes: 0,
-            kept: 0,
-        };
+        let mut total = ClearResult::default();
         for d in THUMB_DIRS {
             let r = clear_dir_within(&root.join(d), &root)?;
             total.removed += r.removed;
@@ -296,11 +288,7 @@ pub async fn clear_segment_cache(app: tauri::AppHandle) -> Result<ClearResult, S
     tauri::async_runtime::spawn_blocking(move || {
         let dir = segment_dir()?;
         if !dir.exists() {
-            return Ok(ClearResult {
-                removed: 0,
-                freed_bytes: 0,
-                kept: 0,
-            });
+            return Ok(ClearResult::default());
         }
         check_within(&dir, &root)?;
         let r = segment_cache::clear(&dir);
@@ -357,11 +345,7 @@ pub fn check_within(dir: &Path, root: &Path) -> Result<PathBuf, String> {
 /// Empty `dir` (which must be inside `root`), keeping `dir` itself. Links
 /// inside are removed as links; what they point to is never touched.
 pub fn clear_dir_within(dir: &Path, root: &Path) -> Result<ClearResult, String> {
-    let mut r = ClearResult {
-        removed: 0,
-        freed_bytes: 0,
-        kept: 0,
-    };
+    let mut r = ClearResult::default();
     if std::fs::symlink_metadata(dir).is_err() {
         return Ok(r);
     }
@@ -552,10 +536,10 @@ pub fn log_export_start(
 }
 
 /// Log how an export ended, with the error text (redacted) when it failed.
-pub fn log_export_end<T>(job: &triptape_core::types::Job, rendered: &Result<T, String>) {
-    match rendered {
-        Ok(_) => applog::info(&format!("export {} {}: {:?}", job.id, job.kind, job.state)),
-        Err(e) => applog::error(&format!(
+pub fn log_export_end(job: &triptape_core::types::Job, error: Option<&str>) {
+    match error {
+        None => applog::info(&format!("export {} {}: {:?}", job.id, job.kind, job.state)),
+        Some(e) => applog::error(&format!(
             "export {} {}: {:?} at {}: {e}",
             job.id,
             job.kind,
@@ -657,10 +641,10 @@ pub fn diagnostic_report(version: &str, cache: &CacheInfo) -> String {
     line("");
     let tail = applog::tail(REPORT_LOG_LINES);
     line(&format!("Last {} log lines:", tail.len()));
-    for l in tail {
-        // Already redacted when written; again in case a secret was
-        // registered after the line was.
-        line(&applog::redact(&l));
+    // Already redacted when written; again in case a secret was
+    // registered after the line was.
+    for l in applog::redact_all(&tail) {
+        line(&l);
     }
     out
 }

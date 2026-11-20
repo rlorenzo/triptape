@@ -537,11 +537,14 @@ fn plan_cmd(flags: &HashMap<String, String>) {
 
 /// The app's saved settings (home on maps, segment cache limit), which
 /// apply when the matching flag is not given. `TRIPTAPE_SETTINGS` points
-/// elsewhere; a missing file means the defaults.
-fn saved_settings() -> Settings {
-    Settings::default_path()
-        .map(|p| Settings::load(&p))
-        .unwrap_or_default()
+/// elsewhere; a missing file means the defaults. Read once per run.
+fn saved_settings() -> &'static Settings {
+    static SAVED: std::sync::OnceLock<Settings> = std::sync::OnceLock::new();
+    SAVED.get_or_init(|| {
+        Settings::default_path()
+            .map(|p| Settings::load(&p))
+            .unwrap_or_default()
+    })
 }
 
 /// Fuzz `route` near home: `--home LAT,LON`, else the home saved in the

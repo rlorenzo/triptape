@@ -1249,7 +1249,7 @@ fn export_blocking(
         .ok_or_else(|| "job vanished".to_string())?;
     drop(db);
     emit(app, &done);
-    triptape_app::settings::log_export_end(&done, &rendered);
+    triptape_app::settings::log_export_end(&done, rendered.as_ref().err().map(String::as_str));
     if done.state == JobState::Cancelled {
         return Err("export cancelled".to_string());
     }

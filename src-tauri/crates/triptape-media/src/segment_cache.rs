@@ -73,7 +73,10 @@ const ORPHAN_GRACE: Duration = Duration::from_secs(3600);
 /// Where the cache goes when nothing is configured: the platform cache dir
 /// (`~/Library/Caches` on macOS) under the app identifier.
 pub fn default_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("app.triptape.desktop").join("segments"))
+    dirs::cache_dir().map(|d| {
+        d.join(triptape_core::settings::APP_IDENTIFIER)
+            .join("segments")
+    })
 }
 
 /// Cache location and size policy for one export.

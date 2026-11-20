@@ -110,11 +110,20 @@
   let cleared: Partial<Record<CacheKind, string>> = {};
   const CAPS = [5, 10, 20, 50, 100];
   let capChoice = "default";
+  // A limit set in settings.json or by the CLI can be any size: list it too,
+  // so the menu never shows blank.
+  $: capOptions = [
+    ...new Set([
+      ...CAPS.filter((c) => c * GB !== cache?.defaultSegmentCapBytes),
+      ...(capChoice === "default" ? [] : [Number(capChoice)]),
+    ]),
+  ].sort((a, b) => a - b);
 
   async function loadCache() {
     try {
       cache = await getCacheInfo();
-      capChoice = cache.segmentCapBytes === null ? "default" : String(cache.segmentCapBytes / GB);
+      const capBytes = cache.segmentCapBytes;
+      capChoice = capBytes === null || capBytes === cache.defaultSegmentCapBytes ? "default" : String(capBytes / GB);
     } catch (e) {
       cacheError = failed("Couldn't read the cache sizes.", e);
     }
@@ -123,8 +132,8 @@
   async function changeCap() {
     cacheError = null;
     try {
-      await setSegmentCacheCap(capChoice === "default" ? null : Number(capChoice) * GB);
-      await loadCache();
+      const cap = await setSegmentCacheCap(capChoice === "default" ? null : Number(capChoice) * GB);
+      if (cache) cache = { ...cache, segmentCapBytes: cap };
     } catch (e) {
       cacheError = failed("Couldn't change the limit. Try again.", e);
     }
@@ -197,18 +206,14 @@
   let licenses: LicenseInfo[] = [];
   let licenseError: Failure | null = null;
 
-  onMount(async () => {
-    try {
-      showHome(await getPrivacySettings());
-    } catch (e) {
-      homeError = failed("Couldn't read your settings.", e);
-    }
-    await loadCache();
-    try {
-      licenses = await getLicenses();
-    } catch (e) {
-      licenseError = failed("Couldn't read the licences.", e);
-    }
+  // The three loads are independent: none waits for another.
+  onMount(() => {
+    getPrivacySettings().then(showHome, (e) => (homeError = failed("Couldn't read your settings.", e)));
+    void loadCache();
+    getLicenses().then(
+      (l) => (licenses = l),
+      (e) => (licenseError = failed("Couldn't read the licences.", e))
+    );
   });
 </script>
 
@@ -298,12 +303,14 @@
         {
           kind: "thumbnails" as CacheKind,
           title: "Thumbnails",
+          bytes: cache.thumbnailBytes,
           what: `${size(cache.thumbnailBytes)} in ${cache.thumbnailFiles.toLocaleString()} files`,
           empty: cache.thumbnailFiles === 0
         },
         {
           kind: "segments" as CacheKind,
           title: "Film pieces",
+          bytes: cache.segmentBytes,
           what: `${size(cache.segmentBytes)} in ${cache.segmentEntries.toLocaleString()} pieces${cache.segmentInUse > 0 ? ", in use by an export" : ""}`,
           empty: cache.segmentEntries === 0
         }
@@ -318,7 +325,7 @@
             </div>
             {#if confirming === row.kind}
               <div class="confirm" role="group" aria-labelledby={`${row.kind}-title`}>
-                <span>Clear {size(row.kind === "thumbnails" ? cache.thumbnailBytes : cache.segmentBytes)}?</span>
+                <span>Clear {size(row.bytes)}?</span>
                 <button id={`confirm-${row.kind}`} class="btn btn-danger" on:click={() => doClear(row.kind)}>Clear</button>
                 <button class="btn" on:click={() => cancelClear(row.kind)}>Keep</button>
               </div>
@@ -340,8 +347,8 @@
         <label class="field-label" for="segment-cap">Most space for film pieces</label>
         <select id="segment-cap" bind:value={capChoice} on:change={changeCap} aria-describedby="cap-hint">
           <option value="default">{size(cache.defaultSegmentCapBytes)} (standard)</option>
-          {#each CAPS.filter((c) => c * GB !== cache?.defaultSegmentCapBytes) as gb}
-            <option value={String(gb)}>{gb} GB</option>
+          {#each capOptions as gb}
+            <option value={String(gb)}>{CAPS.includes(gb) ? `${gb} GB` : size(gb * GB)}</option>
           {/each}
         </select>
         <p id="cap-hint" class="hint">Older pieces go first once an export finishes. TripTape also leaves free space on the disk.</p>

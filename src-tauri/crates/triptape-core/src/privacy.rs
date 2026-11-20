@@ -82,7 +82,7 @@ const PLAIN_PARTS: &[&str] = &[
     "caches",
     "application support",
     "logs",
-    "app.triptape.desktop",
+    crate::settings::APP_IDENTIFIER,
     "triptape",
     "triptape.app",
     "contents",
@@ -215,13 +215,22 @@ impl Redactor {
     /// Matching ignores case. Very short strings are ignored: they would
     /// blank out ordinary words.
     pub fn add_secret(&mut self, text: &str) {
-        let t = text.trim();
-        if t.chars().count() < 3 || self.secrets.iter().any(|s| s.eq_ignore_ascii_case(t)) {
-            return;
+        self.add_secrets([text]);
+    }
+
+    /// [`Self::add_secret`] for many texts, re-sorting once at the end.
+    pub fn add_secrets<'a>(&mut self, texts: impl IntoIterator<Item = &'a str>) {
+        let before = self.secrets.len();
+        for text in texts {
+            let t = text.trim();
+            if t.chars().count() >= 3 && !self.secrets.iter().any(|s| s.eq_ignore_ascii_case(t)) {
+                self.secrets.push(t.to_string());
+            }
         }
-        self.secrets.push(t.to_string());
-        self.secrets
-            .sort_by_key(|s| std::cmp::Reverse(s.chars().count()));
+        if self.secrets.len() != before {
+            self.secrets
+                .sort_by_key(|s| std::cmp::Reverse(s.chars().count()));
+        }
     }
 
     /// `<kind:8 hex>` for `name`, stable for this salt.
@@ -240,9 +249,13 @@ impl Redactor {
             .chars()
             .map(|c| if c.is_control() { ' ' } else { c })
             .collect();
-        let no_secrets = self.redact_secrets(&one_line);
-        let no_paths = self.redact_paths(&no_secrets);
-        let no_names = self.redact_bare_names(&no_paths);
+        // Paths first: every folder in them is hashed anyway, and a secret
+        // swapped to `<text>` inside a path (a trip folder named after the
+        // place, the owner's name in the home folder) would otherwise end
+        // the path early and leave the folders after it in clear.
+        let no_paths = self.redact_paths(&one_line);
+        let no_secrets = self.redact_secrets(&no_paths);
+        let no_names = self.redact_bare_names(&no_secrets);
         redact_gps(&no_names)
     }
 
@@ -266,20 +279,27 @@ impl Redactor {
                     ' ' | '"' | '\'' | '(' | '[' | '=' | ':' | ',' | '`' | '/'
                 );
             // The home folder itself, not a longer name starting the same way.
-            let at_home = home.as_ref().is_some_and(|h| {
-                chars[i..].starts_with(h)
-                    && chars
-                        .get(i + h.len())
-                        .is_none_or(|c| !c.is_alphanumeric() && !matches!(c, '_' | '-' | '.'))
-            });
+            let home_len = home
+                .as_ref()
+                .filter(|h| {
+                    chars[i..].starts_with(h)
+                        && chars
+                            .get(i + h.len())
+                            .is_none_or(|c| !c.is_alphanumeric() && !matches!(c, '_' | '-' | '.'))
+                })
+                .map_or(0, Vec::len);
+            let at_home = home_len > 0;
             if !(at_home || (boundary && starts_path(&chars[i..]))) {
                 out.push(chars[i]);
                 i += 1;
                 continue;
             }
-            let mut end = path_end(&chars, i);
+            // The home folder is always whole, even with a space in it
+            // (`/Users/Jane Doe`), so the path is scanned from its end.
+            let min_end = i + home_len.max(1);
+            let mut end = path_end(&chars, i + home_len);
             // Sentence punctuation after a path stays outside it.
-            while end > i + 1 && matches!(chars[end - 1], '.' | ')' | ']' | ' ') {
+            while end > min_end && matches!(chars[end - 1], '.' | ')' | ']' | ' ') {
                 end -= 1;
             }
             let path: String = chars[i..end].iter().collect();
@@ -391,21 +411,32 @@ fn media_ext(name: &str) -> Option<String> {
 }
 
 fn replace_ignore_case(text: &str, needle: &str, with: &str) -> String {
-    let lower_text = text.to_lowercase();
-    let lower_needle = needle.to_lowercase();
-    // Lowercasing can change byte lengths outside ASCII; then fall back to
-    // an exact match rather than slicing at a wrong offset.
-    if lower_text.len() != text.len() || lower_needle.len() != needle.len() {
-        return text.replace(needle, with);
+    // Compare character by character: lowercasing can change byte lengths
+    // outside ASCII, so offsets into a lowercased copy do not map back.
+    let needle: Vec<String> = needle.chars().map(|c| c.to_lowercase().collect()).collect();
+    if needle.is_empty() {
+        return text.to_string();
     }
+    let chars: Vec<(char, String)> = text
+        .chars()
+        .map(|c| (c, c.to_lowercase().collect()))
+        .collect();
     let mut out = String::with_capacity(text.len());
-    let mut at = 0;
-    while let Some(pos) = lower_text[at..].find(&lower_needle) {
-        out.push_str(&text[at..at + pos]);
-        out.push_str(with);
-        at += pos + needle.len();
+    let mut i = 0;
+    while i < chars.len() {
+        let hit = chars.len() - i >= needle.len()
+            && chars[i..i + needle.len()]
+                .iter()
+                .zip(&needle)
+                .all(|((_, lc), ln)| lc == ln);
+        if hit {
+            out.push_str(with);
+            i += needle.len();
+        } else {
+            out.push(chars[i].0);
+            i += 1;
+        }
     }
-    out.push_str(&text[at..]);
     out
 }
 
@@ -553,6 +584,60 @@ mod tests {
         r.add_secret("Grandma's 80th at the lake");
         r.add_secret("Alice Example");
         r
+    }
+
+    #[test]
+    fn home_with_a_space_is_replaced_whole() {
+        let r = Redactor::new(Some(std::path::Path::new("/Users/Jane Doe")), "salt");
+        assert_eq!(
+            r.redact("/Users/Jane Doe: permission denied"),
+            "~: permission denied"
+        );
+        assert_eq!(r.redact("cd /Users/Jane Doe"), "cd ~");
+        let line = r.redact("open /Users/Jane Doe/Trips/IMG_1.HEIC failed");
+        assert!(line.starts_with("open ~/<dir:"), "{line}");
+        assert!(!line.contains("Jane") && !line.contains("Trips"), "{line}");
+    }
+
+    #[test]
+    fn a_secret_inside_a_path_does_not_end_it() {
+        let mut r = Redactor::new(Some(std::path::Path::new("/Users/jane")), "salt");
+        r.add_secrets(["Kyoto", "jane"]);
+        let line =
+            r.redact("read /Users/jane/Pictures/Kyoto/PrivateSubfolder/IMG_0001.HEIC in Kyoto");
+        for leak in ["jane", "Kyoto", "PrivateSubfolder", "IMG_0001"] {
+            assert!(!line.contains(leak), "{leak} in {line}");
+        }
+        assert!(line.starts_with("read ~/"), "{line}");
+        assert!(line.ends_with(".heic in <text>"), "{line}");
+    }
+
+    #[test]
+    fn secrets_match_case_across_unicode_without_panicking() {
+        assert_eq!(
+            replace_ignore_case("STRAẞE and straße", "straße", "<t>"),
+            "<t> and <t>"
+        );
+        // Lowercasing grows `İ` and shrinks the Kelvin sign: no byte offsets.
+        assert_eq!(
+            replace_ignore_case("\u{212A}İ Kyoto", "kyoto", "<t>"),
+            "\u{212A}İ <t>"
+        );
+        assert_eq!(replace_ignore_case("ÅNGSTRÖM", "ångström", "<t>"), "<t>");
+    }
+
+    #[test]
+    fn batch_secrets_dedup_and_replace_the_longest_whole() {
+        let mut r = Redactor::default();
+        r.add_secrets(["Kyoto", "kyoto", "  ", "ab", "Kyoto Station at dawn"]);
+        assert_eq!(r.secrets, ["Kyoto Station at dawn", "Kyoto"]);
+        assert_eq!(
+            r.redact("caption KYOTO station at dawn, then kyoto"),
+            "caption <text>, then <text>"
+        );
+        // Nothing new: the list is left as it was.
+        r.add_secrets(["KYOTO"]);
+        assert_eq!(r.secrets.len(), 2);
     }
 
     #[test]
