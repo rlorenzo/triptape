@@ -318,7 +318,7 @@ pub fn preflight(
         issues.push(PreflightIssue {
             level: "block",
             page: None,
-            message: format!("{counted} pages over the {max}-page preset cap; remove photos"),
+            message: format!("{counted} pages over the {max}-page cap set for this export; remove photos or raise the cap"),
         });
     }
     for (page, v) in placements {
