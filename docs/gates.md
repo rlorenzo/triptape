@@ -56,3 +56,34 @@ start until G2 has a recorded outcome.
   → `/tmp/book-spike/proof.pdf` (4 pp) + 4 JPEGs, ffprobe-asserted
   3000x2400 each, via `scripts/spike-book.sh`.
 - `cargo build --workspace` PASS; `cargo test --workspace` 24/24 PASS.
+
+## G4 evidence: local models wired (2026-11-20, dev machine only)
+
+Measured on the Apple M-series / 24 GB dev Mac, **not** the G4 baseline
+(8 GB, 2019 4-core, no dGPU, Windows), so G4 stays open. Trip: `Japan to
+Singapore 2026` (4,913 files, 2,931 assets, 2,883 stills), CLI
+`triptape scan`, CPU EP, ONNX Runtime 1.31.1 loaded from a local copy via
+`TRIPTAPE_ORT_LIB` (the release download pin is blocked, see
+`THIRD_PARTY_MODELS.md`).
+
+- Stage 1, DINOv2-small int8 embeddings on the 320 px thumbnails, 4 scoring
+  workers sharing 2 sessions: 186 ms per inference per session (about
+  87 ms/photo of added wall time). Stills pass 53 s -> 303 s; whole warm
+  scan 142 s -> 459 s; peak RSS 0.68 GB -> 1.35 GB (4 sessions reached
+  1.85 GB, over the 1.5 GB ceiling, hence `MAX_SESSIONS = 2`). Embeddings
+  stored as 384-byte int8 BLOBs (about 1.1 MB for this trip).
+- Cosine distribution: random pairs median 0.12 (p95 0.36); same-minute pairs
+  median 0.79; pHash near-duplicates median 0.97. Contact sheets showed
+  0.6-0.85 is "same place", so thresholds are 0.90 for the 2-minute
+  same-moment check and 0.95 for near-duplicate collapse.
+- Near-duplicate collapse: pHash only 1,145 groups / 1,538 suppressed; with
+  embeddings 1,149 / 1,542. With the spike's 0.6 it was 951 / 1,722.
+- Stage 2, YuNet + FER+ on the same thumbnails (all three models, same
+  machine, warm cache): DINOv2 127 ms/run, YuNet 7.4 ms/photo, FER+ 0.7 ms
+  per readable face (942 faces). Stills pass 53 s -> 214 s (about 56 ms/photo
+  added for all three models); whole warm scan 142 s -> 357 s; peak RSS
+  1.41 GB. 1,872 of 2,883 stills have a plausible face (posters and statues
+  included, hence no people count from it), 742 have a face of 40 px or more
+  to read, 421 earn "smiling" and 369 untagged ones "face in frame". Top 50
+  stills by score: 11 moved in (all "smiling"; four group selfies checked by
+  eye, all smiling), 11 moved out.

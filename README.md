@@ -47,6 +47,21 @@ cargo run -p triptape-media --bin triptape -- edit --db trip.db --exclude IMG_04
 cargo run -p triptape-media --bin triptape -- edit --db trip.db --solo IMG_0899.HEIC --join IMG_1870.HEIC IMG_7072.HEIC --list
 ```
 
+Optional local models (nothing is downloaded by the app or the build):
+
+```sh
+./scripts/fetch-models   # pinned + SHA-256-verified, into the app data dir's models/
+```
+
+With them installed, scans add an on-device image embedding per photo (so a
+retake in another framing counts as a near-duplicate alongside pHash) and
+face / smile signals that give a small, bounded score bonus ("smiling").
+Without them (or with any file missing) TripTape prints one line saying what
+is missing and behaves exactly as before. The CLI takes `--models DIR`; both
+the CLI and the app honour `TRIPTAPE_MODELS_DIR` and `TRIPTAPE_ORT_LIB` (the
+ONNX Runtime 1.31 library, whose download pin is still blocked: see
+[THIRD_PARTY_MODELS.md](THIRD_PARTY_MODELS.md)).
+
 Desktop app: `cargo run -p triptape-app` (Tauri v2 shell + Svelte frontend).
 IPC: `scan_folder` / `get_assets` / `start_job` / `cancel_job` /
 `export_video` / `export_reels` / `export_book`; progress over

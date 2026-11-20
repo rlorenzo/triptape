@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use tauri::{Emitter, Manager, State};
+use triptape_ai_local::local::{LocalModels, ModelPaths};
 use triptape_app::{
     apply_live_photo_pairing, book_notes, book_presets, check_sources as check_plan_sources,
     export_dir_in, export_eligibility, export_sources, fill_assets_parallel, find_relinks,
@@ -86,22 +87,22 @@ const HASH_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// hold stays short while decode/ffmpeg work stays lock-free.
 const SCORE_FLUSH_FILES: usize = 25;
 
-/// One asset's background scoring result.
-#[derive(Debug, Clone, PartialEq)]
-struct Scored {
-    score: Score,
-    /// Perceptual hash of the pixels scored (thumbnail or poster frame);
-    /// `None` when nothing decoded.
-    phash: Option<u64>,
-}
-
 /// A queued hash write: (asset id, path, size, mtime, digest). The source
 /// fingerprint travels with every write so a superseding rescan's recycled
 /// ids can never receive another job's hash.
 type PendingHash = (String, String, u64, i64, Option<String>);
-/// A queued score write: (asset id, path, size, mtime, score, phash).
+/// A queued score write: (asset id, path, size, mtime, analysis).
 /// Same recycled-id fence as [`PendingHash`].
-type PendingScore = (String, String, u64, i64, Score, Option<u64>);
+type PendingScore = (String, String, u64, i64, Analysis);
+
+/// Where the optional local models live: `TRIPTAPE_MODELS_DIR`, else the
+/// app data dir's `models/` (what `scripts/fetch-models` installs into).
+fn model_paths(app: &tauri::AppHandle) -> Option<ModelPaths> {
+    ModelPaths::from_env(
+        None,
+        app.path().app_data_dir().ok().map(|d| d.join("models")),
+    )
+}
 
 /// Score and fingerprint one asset for the background ingest pass,
 /// mirroring the CLI (`triptape-media`'s `triptape` binary) constants.
@@ -114,10 +115,11 @@ type PendingScore = (String, String, u64, i64, Score, Option<u64>);
 /// stills get the CLI neutral fallback. The pHash comes from the same
 /// pixels, so HEIC stills, Live Photos and videos get one too. Videos
 /// score by the quality of their best playback window (plus people and
-/// caption signals) and keep that window. Pure per-file work: never fails,
+/// caption signals) and keep that window. Stills and Live Photos also go
+/// through whatever optional local `models` loaded
+/// ([`LocalModels::analyze_still`]). Pure per-file work: never fails,
 /// never touches the Db.
-fn score_asset_with_cache(cache_dir: &Path, a: &Asset) -> Scored {
-    let signals = score::StorySignals::for_asset(a);
+fn score_asset_with_cache(cache_dir: &Path, a: &Asset, models: &LocalModels) -> Analysis {
     let thumb = proxies::source_cache_key(&a.id, &a.path)
         .ok()
         .map(|key| proxies::cache_path(cache_dir, "thumb", &key, ".jpg"))
@@ -135,15 +137,16 @@ fn score_asset_with_cache(cache_dir: &Path, a: &Asset) -> Scored {
                 d,
             )
         });
-        return Scored {
-            score: analysis.score(&signals),
+        return Analysis {
+            score: analysis.score(&score::StorySignals::for_asset(a)),
             phash: thumb.as_ref().map(hash::average_hash_from_image),
+            embedding: None,
+            faces: None,
         };
     }
-    let pixels = thumb.or_else(|| hash::open_image(&a.path));
-    Scored {
-        score: score::score_still_or_fallback(pixels.as_ref(), &signals),
-        phash: pixels.as_ref().map(hash::average_hash_from_image),
+    match thumb {
+        Some(t) => models.analyze_still(a, Some(&t), false),
+        None => models.analyze_still(a, hash::open_image(&a.path).as_ref(), true),
     }
 }
 
@@ -163,13 +166,14 @@ const SCORE_WORKERS_MAX: usize = 4;
 fn score_assets_parallel(
     cache_dir: &Path,
     assets: &[Asset],
+    models: &LocalModels,
     workers: usize,
-    mut on_score: impl FnMut(&Asset, Scored, usize, usize),
+    mut on_score: impl FnMut(&Asset, Analysis, usize, usize),
 ) {
     triptape_core::parallel::for_each_parallel(
         assets,
         workers,
-        |a| score_asset_with_cache(cache_dir, a),
+        |a| score_asset_with_cache(cache_dir, a, models),
         |idx, score, done, total| on_score(&assets[idx], score, done, total),
     );
 }
@@ -323,27 +327,49 @@ fn background_hash_job(
         // --- Scoring ------------------------------------------------------
         // Decode/ffmpeg work runs lock-free; persists flush in short
         // batches like the hashes. Assets that already carry a persisted
-        // score (restored projects) are skipped but still feed the plan.
+        // score (restored projects) are skipped but still feed the plan,
+        // unless an optional local model is installed whose output they
+        // still lack. Without models this is the pHash-only path.
         let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
-        let unscored: Vec<Asset> = lock()?
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(SCORE_WORKERS_MAX)
+            .min(SCORE_WORKERS_MAX);
+        // Models load only when an asset could use them: a session costs
+        // hundreds of MB, and most jobs on a restored project score nothing.
+        let paths = model_paths(app);
+        let installed = paths
+            .as_ref()
+            .map(ModelPaths::installed)
+            .unwrap_or_default();
+        let mut unscored: Vec<Asset> = lock()?
             .list_assets(project_id)?
             .into_iter()
-            .filter(|a| a.score.is_none())
+            .filter(|a| a.score.is_none() || installed.owe(a))
             .collect();
+        let models = if unscored.is_empty() {
+            LocalModels::none()
+        } else {
+            LocalModels::load(paths.as_ref(), workers)
+        };
+        for note in models.notes() {
+            eprintln!("{note}");
+        }
+        // Drop the ones owed only by a model that then failed to load.
+        unscored.retain(|a| a.score.is_none() || models.wants(a));
         let score_total = unscored.len();
         if score_total > 0 {
-            // (id, path, size, mtime, score, phash): same recycled-id fence
-            // as the hash flush (see
-            // `update_asset_scoring_if_source_matches`).
+            // (id, path, size, mtime, analysis): same recycled-id fence as
+            // the hash flush (see `update_asset_scoring_if_source_matches`).
             let flush_scores = |pending: &mut Vec<PendingScore>| -> Result<(), String> {
                 if pending.is_empty() {
                     return Ok(());
                 }
                 let db = lock()?;
                 db.in_transaction(|db| {
-                    for (id, path, size, mtime, s, phash) in pending.iter() {
+                    for (id, path, size, mtime, analysis) in pending.iter() {
                         db.update_asset_scoring_if_source_matches(
-                            id, path, *size, *mtime, s, *phash,
+                            id, path, *size, *mtime, analysis,
                         )?;
                     }
                     Ok::<(), String>(())
@@ -355,36 +381,37 @@ fn background_hash_job(
             // Decode/score work fans out over worker threads; persists and
             // progress stay on this thread via the completion callback,
             // which fires once per scored asset in completion order.
-            let workers = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(SCORE_WORKERS_MAX)
-                .min(SCORE_WORKERS_MAX);
-            score_assets_parallel(&cache_dir, &unscored, workers, |a, s, done, total| {
-                pending_scores.push((
-                    a.id.clone(),
-                    a.path.to_string_lossy().into_owned(),
-                    a.size_bytes,
-                    a.mtime,
-                    s.score,
-                    s.phash,
-                ));
-                // A failed flush keeps its batch; the final flush retries it.
-                if pending_scores.len() >= SCORE_FLUSH_FILES {
-                    let _ = flush_scores(&mut pending_scores);
-                }
-                let candidate = (BACKGROUND_HASH_CEILING_PROGRESS
-                    + (done as f32 / total as f32)
-                        * (BACKGROUND_CEILING_PROGRESS - BACKGROUND_HASH_CEILING_PROGRESS))
-                    .max(last_progress);
-                last_progress = candidate;
-                let step = scan::score_step_label(done, total);
-                if last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL || done == total {
-                    if let Ok(db) = lock() {
-                        report_ingest(app, &db, job_id, candidate, &step);
+            score_assets_parallel(
+                &cache_dir,
+                &unscored,
+                &models,
+                workers,
+                |a, s, done, total| {
+                    pending_scores.push((
+                        a.id.clone(),
+                        a.path.to_string_lossy().into_owned(),
+                        a.size_bytes,
+                        a.mtime,
+                        s,
+                    ));
+                    // A failed flush keeps its batch; the final flush retries it.
+                    if pending_scores.len() >= SCORE_FLUSH_FILES {
+                        let _ = flush_scores(&mut pending_scores);
                     }
-                    last_emit = std::time::Instant::now();
-                }
-            });
+                    let candidate = (BACKGROUND_HASH_CEILING_PROGRESS
+                        + (done as f32 / total as f32)
+                            * (BACKGROUND_CEILING_PROGRESS - BACKGROUND_HASH_CEILING_PROGRESS))
+                        .max(last_progress);
+                    last_progress = candidate;
+                    let step = scan::score_step_label(done, total);
+                    if last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL || done == total {
+                        if let Ok(db) = lock() {
+                            report_ingest(app, &db, job_id, candidate, &step);
+                        }
+                        last_emit = std::time::Instant::now();
+                    }
+                },
+            );
             flush_scores(&mut pending_scores)?;
         }
         if let Ok(db) = lock() {
@@ -824,7 +851,13 @@ async fn restore_latest_project(
             .filter(|a| a.content_hash.is_none())
             .map(|a| (a.id.clone(), a.path.clone(), a.size_bytes, a.mtime))
             .collect();
-        let needs_scoring = assets.iter().any(|a| a.score.is_none());
+        // Stills missing a model output need another pass only when that
+        // model is installed (otherwise there is nothing to add).
+        let installed = model_paths(&app)
+            .as_ref()
+            .map(ModelPaths::installed)
+            .unwrap_or_default();
+        let needs_scoring = assets.iter().any(|a| a.score.is_none() || installed.owe(a));
         let files_seen = assets.len();
         let cache = db.hash_reuse_cache()?;
         (
@@ -1845,11 +1878,17 @@ mod tests {
         let run = |workers: usize| {
             let mut out = vec![];
             let mut dones = vec![];
-            score_assets_parallel(&cache, &assets, workers, |a, s, done, total| {
-                assert_eq!(total, assets.len());
-                out.push((a.id.clone(), s));
-                dones.push(done);
-            });
+            score_assets_parallel(
+                &cache,
+                &assets,
+                &LocalModels::none(),
+                workers,
+                |a, s, done, total| {
+                    assert_eq!(total, assets.len());
+                    out.push((a.id.clone(), s));
+                    dones.push(done);
+                },
+            );
             assert_eq!(dones, (1..=assets.len()).collect::<Vec<_>>());
             out.sort_by(|a, b| a.0.cmp(&b.0));
             out

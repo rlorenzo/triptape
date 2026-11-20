@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Fetch the pinned local models (and, once pinned, the ONNX Runtime shared
+# library) for TripTape's optional on-device analysis. Nothing in the app or
+# the build downloads these: without them TripTape behaves exactly as before
+# (pHash-only near-duplicates, no face or smile signals).
+#
+# Every file is pinned by a URL that names an immutable commit/revision and by
+# its SHA-256, verified before install. A mismatch is a hard stop: report it,
+# never "update the hash". Pins, licences and the owner's decision are in
+# THIRD_PARTY_MODELS.md; measurements in docs/spikes/face-embedding-models.md.
+#
+# Usage: ./scripts/fetch-models [out-dir]
+#   default out-dir: the app data dir's `models/` (what the app and the CLI
+#   read when neither --models nor TRIPTAPE_MODELS_DIR is set):
+#     macOS   ~/Library/Application Support/app.triptape.desktop/models
+#     Windows %APPDATA%/app.triptape.desktop/models
+#     Linux   ${XDG_DATA_HOME:-~/.local/share}/app.triptape.desktop/models
+set -euo pipefail
+
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+APP_ID="app.triptape.desktop"
+
+case "$OS" in
+  Darwin) DATA_DIR="$HOME/Library/Application Support" ;;
+  MINGW*|MSYS*|CYGWIN*) DATA_DIR="${APPDATA:?APPDATA not set}" ;;
+  *) DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}" ;;
+esac
+OUT="${1:-$DATA_DIR/$APP_ID/models}"
+
+# name | url (immutable revision) | sha256 | bytes
+MODELS=(
+  "dinov2-small-int8.onnx|https://huggingface.co/onnx-community/dinov2-small/resolve/8b1f705a3a7f6f062f6bdd21986c1583d3ef105d/onnx/model_int8.onnx|dfce54a839b491f395c516350ebb4a78f947e9170a6beac0f2bc5638e0f09d61|24446700"
+  "face_detection_yunet_2026may.onnx|https://media.githubusercontent.com/media/opencv/opencv_zoo/48b10fa505aeb51fbd127fc60a5c660040e823b7/models/face_detection_yunet/face_detection_yunet_2026may.onnx|ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0|229738"
+  "emotion-ferplus-8.onnx|https://media.githubusercontent.com/media/onnx/models/c5cae0f1942c8d7727372c7b1f6b485aa39e4421/validated/vision/body_analysis/emotion_ferplus/model/emotion-ferplus-8.onnx|a2a2ba6a335a3b29c21acb6272f962bd3d47f84952aaffa03b60986e04efa61c|35040571"
+)
+
+# ONNX Runtime 1.31.1 (MIT), Microsoft's GitHub release. The full SHA-256 of
+# each archive must be copied from the release's published digests. As of
+# 2026-11-20 the release page answers 404, so these stay placeholders and
+# the runtime step is BLOCKED (models still install). Spike notes only had
+# truncated digests: osx-arm64 2e1344a1...6d6f, win-x64 5869e26b...4b2c.
+ORT_VERSION="1.31.1"
+ORT_BASE="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}"
+ORT_SHA256_Darwin_arm64="<FILL: sha256 of onnxruntime-osx-arm64-${ORT_VERSION}.tgz>"
+ORT_SHA256_Windows_x64="<FILL: sha256 of onnxruntime-win-x64-${ORT_VERSION}.zip>"
+ORT_SHA256_Linux_x64="<FILL: sha256 of onnxruntime-linux-x64-${ORT_VERSION}.tgz>"
+
+sha256_of() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1
+  else sha256sum "$1" | cut -d' ' -f1; fi
+}
+
+mkdir -p "$OUT"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+
+for entry in "${MODELS[@]}"; do
+  IFS='|' read -r name url want bytes <<<"$entry"
+  dst="$OUT/$name"
+  if [ -f "$dst" ] && [ "$(sha256_of "$dst")" = "$want" ]; then
+    echo "ok (already installed): $name"
+    continue
+  fi
+  echo "fetching $name ($bytes bytes)"
+  curl -fsSL --retry 2 -o "$TMP/$name" "$url"
+  got="$(sha256_of "$TMP/$name")"
+  if [ "$got" != "$want" ]; then
+    echo "CHECKSUM MISMATCH for $name: want $want, got $got" >&2
+    echo "Hard stop. Do not edit the pin; report it." >&2
+    exit 4
+  fi
+  mv "$TMP/$name" "$dst"
+  echo "ok: $name"
+done
+
+case "$OS-$ARCH" in
+  Darwin-arm64) ORT_PKG="onnxruntime-osx-arm64-${ORT_VERSION}.tgz"; ORT_WANT="$ORT_SHA256_Darwin_arm64" ;;
+  MINGW*-x86_64|MSYS*-x86_64|CYGWIN*-x86_64) ORT_PKG="onnxruntime-win-x64-${ORT_VERSION}.zip"; ORT_WANT="$ORT_SHA256_Windows_x64" ;;
+  Linux-x86_64) ORT_PKG="onnxruntime-linux-x64-${ORT_VERSION}.tgz"; ORT_WANT="$ORT_SHA256_Linux_x64" ;;
+  *) echo "no pinned ONNX Runtime for $OS-$ARCH; set TRIPTAPE_ORT_LIB to a local 1.31.x library" >&2; exit 2 ;;
+esac
+
+if [[ "$ORT_WANT" == "<FILL"* ]]; then
+  echo "BLOCKED: no pinned SHA-256 for $ORT_PKG yet (release unavailable when pinned)." >&2
+  echo "Models are installed in: $OUT" >&2
+  echo "Until the runtime is pinned, point TRIPTAPE_ORT_LIB at an ONNX Runtime" >&2
+  echo "${ORT_VERSION} shared library you already trust, or fill the pin above" >&2
+  echo "from the release's published digest and re-run. URL: $ORT_BASE/$ORT_PKG" >&2
+  exit 3
+fi
+
+curl -fsSL --retry 2 -o "$TMP/$ORT_PKG" "$ORT_BASE/$ORT_PKG"
+got="$(sha256_of "$TMP/$ORT_PKG")"
+if [ "$got" != "$ORT_WANT" ]; then
+  echo "CHECKSUM MISMATCH for $ORT_PKG: want $ORT_WANT, got $got" >&2
+  exit 4
+fi
+mkdir -p "$TMP/ort" "$OUT/onnxruntime"
+case "$ORT_PKG" in
+  *.tgz) tar -xzf "$TMP/$ORT_PKG" -C "$TMP/ort" ;;
+  *.zip) unzip -q "$TMP/$ORT_PKG" -d "$TMP/ort" ;;
+esac
+# Only the shared library is needed (lib/ on macOS/Linux, lib/*.dll on Windows).
+cp -R "$TMP/ort/"*/lib/. "$OUT/onnxruntime/"
+cp "$TMP/ort/"*/LICENSE "$OUT/onnxruntime/LICENSE" 2>/dev/null || true
+echo "ok: ONNX Runtime ${ORT_VERSION} -> $OUT/onnxruntime"

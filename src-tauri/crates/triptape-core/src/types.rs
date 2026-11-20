@@ -84,6 +84,32 @@ pub struct Asset {
     /// Local quality/story score, filled by background scoring after ingest.
     /// `None` until scored (or when scoring was skipped).
     pub score: Option<Score>,
+    /// Image embedding of a still (or Live Photo still) from the optional
+    /// local model: an extra "same scene" signal next to `phash`. `None`
+    /// when the model is not installed or the pixels could not be read.
+    /// Analysis data: never serialized (not in plans, exports or the
+    /// webview), only stored in the local database.
+    #[serde(skip)]
+    pub embedding: Option<crate::embedding::Embedding>,
+    /// Face and smile signals from the optional local models (thumbnail
+    /// analysis). `None` until analysed with the models installed. Counts
+    /// and scores only, never boxes; never serialized.
+    #[serde(skip)]
+    pub faces: Option<FaceSignals>,
+}
+
+/// What the optional face models found in one photo: only what scoring
+/// needs (no boxes, crops or identities).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FaceSignals {
+    /// Plausible faces detected. Not a people count: posters, statues and
+    /// dolls are faces to a detector too.
+    pub count: u32,
+    /// Largest face's side as a fraction of the picture's shorter side.
+    pub largest: f32,
+    /// Best size-weighted smile (0..1) among faces big enough to read;
+    /// `None` when none was.
+    pub smile: Option<f32>,
 }
 
 impl Asset {
@@ -125,8 +151,23 @@ impl Asset {
             people_sig: None,
             library_score: None,
             score: None,
+            embedding: None,
+            faces: None,
         }
     }
+}
+
+/// What background scoring derives from one asset's pixels, persisted
+/// together so a rescan of an unchanged file reuses all of it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Analysis {
+    pub score: Score,
+    /// Perceptual hash of the pixels scored; `None` when nothing decoded.
+    pub phash: Option<u64>,
+    /// See [`Asset::embedding`]; `None` without the model.
+    pub embedding: Option<crate::embedding::Embedding>,
+    /// See [`Asset::faces`]; `None` without the face models.
+    pub faces: Option<FaceSignals>,
 }
 
 /// How a Live Photo still+motion pair was matched.
