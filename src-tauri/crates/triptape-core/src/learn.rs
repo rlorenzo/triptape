@@ -223,8 +223,6 @@ pub fn features_of(a: &Asset, score: Option<&Score>) -> Features {
     let faces = only(&|x| {
         x.people_count = s.people_count;
         x.faces = s.faces;
-        x.face_size = s.face_size;
-        x.smile = s.smile;
     }) - only(&|x| x.people_count = s.people_count);
     [
         ("people", only(&|x| x.people_count = s.people_count)),

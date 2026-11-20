@@ -116,11 +116,10 @@ fn model_paths(app: &tauri::AppHandle) -> Option<ModelPaths> {
 /// pixels, so HEIC stills, Live Photos and videos get one too. Videos
 /// score by the quality of their best playback window (plus people and
 /// caption signals) and keep that window. Stills and Live Photos also go
-/// through whatever optional local `models` loaded (image embedding), on
-/// the same thumbnail. Pure per-file work: never fails, never touches the
-/// Db.
+/// through whatever optional local `models` loaded
+/// ([`LocalModels::analyze_still`]). Pure per-file work: never fails,
+/// never touches the Db.
 fn score_asset_with_cache(cache_dir: &Path, a: &Asset, models: &LocalModels) -> Analysis {
-    let signals = score::StorySignals::for_asset(a);
     let thumb = proxies::source_cache_key(&a.id, &a.path)
         .ok()
         .map(|key| proxies::cache_path(cache_dir, "thumb", &key, ".jpg"))
@@ -139,23 +138,15 @@ fn score_asset_with_cache(cache_dir: &Path, a: &Asset, models: &LocalModels) -> 
             )
         });
         return Analysis {
-            score: analysis.score(&signals),
+            score: analysis.score(&score::StorySignals::for_asset(a)),
             phash: thumb.as_ref().map(hash::average_hash_from_image),
             embedding: None,
             faces: None,
         };
     }
-    let pixels = thumb.or_else(|| hash::open_image(&a.path));
-    let found = pixels
-        .as_ref()
-        .map(|p| models.analyze(p))
-        .unwrap_or_default();
-    let signals = signals.with_faces(found.faces);
-    Analysis {
-        score: score::score_still_or_fallback(pixels.as_ref(), &signals),
-        phash: pixels.as_ref().map(hash::average_hash_from_image),
-        embedding: found.embedding,
-        faces: found.faces,
+    match thumb {
+        Some(t) => models.analyze_still(a, Some(&t), false),
+        None => models.analyze_still(a, hash::open_image(&a.path).as_ref(), true),
     }
 }
 
@@ -344,15 +335,28 @@ fn background_hash_job(
             .map(|n| n.get())
             .unwrap_or(SCORE_WORKERS_MAX)
             .min(SCORE_WORKERS_MAX);
-        let models = LocalModels::load(model_paths(app).as_ref(), workers);
+        // Models load only when an asset could use them: a session costs
+        // hundreds of MB, and most jobs on a restored project score nothing.
+        let paths = model_paths(app);
+        let installed = paths
+            .as_ref()
+            .map(ModelPaths::installed)
+            .unwrap_or_default();
+        let mut unscored: Vec<Asset> = lock()?
+            .list_assets(project_id)?
+            .into_iter()
+            .filter(|a| a.score.is_none() || installed.owe(a))
+            .collect();
+        let models = if unscored.is_empty() {
+            LocalModels::none()
+        } else {
+            LocalModels::load(paths.as_ref(), workers)
+        };
         for note in models.notes() {
             eprintln!("{note}");
         }
-        let unscored: Vec<Asset> = lock()?
-            .list_assets(project_id)?
-            .into_iter()
-            .filter(|a| a.score.is_none() || models.wants(a))
-            .collect();
+        // Drop the ones owed only by a model that then failed to load.
+        unscored.retain(|a| a.score.is_none() || models.wants(a));
         let score_total = unscored.len();
         if score_total > 0 {
             // (id, path, size, mtime, analysis): same recycled-id fence as
@@ -847,15 +851,13 @@ async fn restore_latest_project(
             .filter(|a| a.content_hash.is_none())
             .map(|a| (a.id.clone(), a.path.clone(), a.size_bytes, a.mtime))
             .collect();
-        // Stills without an embedding need another pass only when the
-        // optional models are installed (otherwise there is nothing to add).
-        let models_installed = LocalModels::installed(model_paths(&app).as_ref());
-        let needs_scoring = assets.iter().any(|a| {
-            a.score.is_none()
-                || (models_installed
-                    && a.kind != AssetKind::Video
-                    && (a.embedding.is_none() || a.faces.is_none()))
-        });
+        // Stills missing a model output need another pass only when that
+        // model is installed (otherwise there is nothing to add).
+        let installed = model_paths(&app)
+            .as_ref()
+            .map(ModelPaths::installed)
+            .unwrap_or_default();
+        let needs_scoring = assets.iter().any(|a| a.score.is_none() || installed.owe(a));
         let files_seen = assets.len();
         let cache = db.hash_reuse_cache()?;
         (

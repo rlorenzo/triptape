@@ -562,37 +562,13 @@ enum StillPixels {
     Nothing,
 }
 
-/// Score one still from `source` and fingerprint it (pHash from the same
-/// pixels), plus whatever the optional local `models` add. The models see
-/// a small upright copy, never the full-resolution frame: thumbnails are
-/// already upright and small; a decoded original is shrunk to thumbnail
-/// size and turned by its EXIF rotation. Pure per-file work.
+/// Score and fingerprint one still from `source`
+/// ([`LocalModels::analyze_still`]).
 fn analyze_still(a: &Asset, source: &StillPixels, models: &LocalModels) -> Analysis {
-    let pixels = match source {
-        StillPixels::Original => hash::open_image(&a.path),
-        StillPixels::Thumb(p) => hash::open_image(p),
-        StillPixels::Nothing => None,
-    };
-    let found = match (&pixels, source) {
-        (Some(p), StillPixels::Original) if models.any() => {
-            let small = p.thumbnail(proxies::THUMB_LONG_EDGE, proxies::THUMB_LONG_EDGE);
-            let upright = match a.rotation_deg {
-                90 => small.rotate90(),
-                180 => small.rotate180(),
-                270 => small.rotate270(),
-                _ => small,
-            };
-            models.analyze(&upright)
-        }
-        (Some(p), _) => models.analyze(p),
-        (None, _) => Default::default(),
-    };
-    let signals = score::StorySignals::for_asset(a).with_faces(found.faces);
-    Analysis {
-        score: score::score_still_or_fallback(pixels.as_ref(), &signals),
-        phash: pixels.as_ref().map(hash::average_hash_from_image),
-        embedding: found.embedding,
-        faces: found.faces,
+    match source {
+        StillPixels::Original => models.analyze_still(a, hash::open_image(&a.path).as_ref(), true),
+        StillPixels::Thumb(p) => models.analyze_still(a, hash::open_image(p).as_ref(), false),
+        StillPixels::Nothing => models.analyze_still(a, None, false),
     }
 }
 

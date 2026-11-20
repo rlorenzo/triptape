@@ -23,7 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use triptape_core::embedding::Embedding;
-use triptape_core::types::FaceSignals;
+use triptape_core::types::{Analysis, Asset, AssetKind, FaceSignals};
+use triptape_core::{hash, proxies, score};
 
 use crate::faces;
 use crate::{EmbedResult, Embedder, ModelStatus};
@@ -86,6 +87,34 @@ impl ModelPaths {
     /// [`ModelPaths::resolve`] with the process environment.
     pub fn from_env(explicit: Option<&Path>, default_dir: Option<PathBuf>) -> Option<Self> {
         Self::resolve(explicit, default_dir, |k| std::env::var(k).ok())
+    }
+
+    /// Which capabilities have their files installed: a cheap check that
+    /// loads nothing, so a reopened project knows whether analysis it lacks
+    /// could run at all.
+    pub fn installed(&self) -> Capabilities {
+        let has = |f: &str| self.dir.join(f).is_file();
+        let runtime = self.runtime.is_file();
+        Capabilities {
+            embedding: runtime && has(DINO_FILE),
+            faces: runtime && has(YUNET_FILE) && has(FERPLUS_FILE),
+        }
+    }
+}
+
+/// Which optional model outputs are available (installed or loaded).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    pub embedding: bool,
+    pub faces: bool,
+}
+
+impl Capabilities {
+    /// Whether `a` (a still or Live Photo still) still lacks an output
+    /// these capabilities would add: rescans skip assets that have it all.
+    pub fn owe(self, a: &Asset) -> bool {
+        a.kind != AssetKind::Video
+            && ((self.embedding && a.embedding.is_none()) || (self.faces && a.faces.is_none()))
     }
 }
 
@@ -370,21 +399,21 @@ impl LocalModels {
             };
         };
         let mut out = Self::default();
-        let missing: Vec<&str> = [DINO_FILE, YUNET_FILE, FERPLUS_FILE]
-            .into_iter()
-            .filter(|f| !paths.dir.join(f).is_file())
-            .collect();
-        for f in &missing {
-            let off = if *f == DINO_FILE {
-                DUPES_OFF
-            } else {
-                FACES_OFF
-            };
+        let missing: Vec<&str> = [
+            (DINO_FILE, DUPES_OFF),
+            (YUNET_FILE, FACES_OFF),
+            (FERPLUS_FILE, FACES_OFF),
+        ]
+        .into_iter()
+        .filter(|(f, _)| !paths.dir.join(f).is_file())
+        .map(|(f, off)| {
             out.notes.push(format!(
                 "local models: {f} not found in {}; {off} ({FETCH_HINT})",
                 paths.dir.display()
             ));
-        }
+            f
+        })
+        .collect();
         if missing.len() == 3 {
             return out;
         }
@@ -421,17 +450,6 @@ impl LocalModels {
         out
     }
 
-    /// Cheap check (no loading) that the runtime and at least one model
-    /// file are present, so a reopened project knows whether analysis it
-    /// lacks could run at all.
-    pub fn installed(paths: Option<&ModelPaths>) -> bool {
-        paths.is_some_and(|p| {
-            p.runtime.is_file()
-                && (p.dir.join(DINO_FILE).is_file()
-                    || (p.dir.join(YUNET_FILE).is_file() && p.dir.join(FERPLUS_FILE).is_file()))
-        })
-    }
-
     /// One line per missing or failed piece, for the CLI / app log.
     pub fn notes(&self) -> &[String] {
         &self.notes
@@ -459,12 +477,18 @@ impl LocalModels {
         self.embedder.is_some() || self.faces.is_some()
     }
 
-    /// Whether `a` (a still or Live Photo still) still lacks something the
-    /// loaded models would add: rescans skip assets that have it all.
-    pub fn wants(&self, a: &triptape_core::types::Asset) -> bool {
-        a.kind != triptape_core::types::AssetKind::Video
-            && ((self.embedder.is_some() && a.embedding.is_none())
-                || (self.faces.is_some() && a.faces.is_none()))
+    /// What loaded (a subset of what [`ModelPaths::installed`] found).
+    pub fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            embedding: self.embedder.is_some(),
+            faces: self.faces.is_some(),
+        }
+    }
+
+    /// Whether `a` still lacks something the loaded models would add
+    /// ([`Capabilities::owe`]).
+    pub fn wants(&self, a: &Asset) -> bool {
+        self.capabilities().owe(a)
     }
 
     /// Run the loaded models on a decoded, upright thumbnail.
@@ -480,6 +504,40 @@ impl LocalModels {
                 .and_then(|e| e.embed_rgb(&rgb).ok())
                 .and_then(|v| Embedding::from_f32(&v)),
             faces: self.faces.as_ref().and_then(|f| f.analyze(&rgb).ok()),
+        }
+    }
+
+    /// Score one still and fingerprint it (pHash from the same `pixels`),
+    /// plus whatever the loaded models add. The models see a small upright
+    /// copy, never the full-resolution frame: cached thumbnails already
+    /// are; pass `original` when `pixels` is the decoded source file, which
+    /// is then shrunk to thumbnail size and turned by its EXIF rotation.
+    /// `None` pixels get the neutral fallback score. Pure per-file work.
+    pub fn analyze_still(
+        &self,
+        a: &Asset,
+        pixels: Option<&DynamicImage>,
+        original: bool,
+    ) -> Analysis {
+        let found = match pixels {
+            Some(p) if original && self.any() => {
+                let small = p.thumbnail(proxies::THUMB_LONG_EDGE, proxies::THUMB_LONG_EDGE);
+                self.analyze(&match a.rotation_deg {
+                    90 => small.rotate90(),
+                    180 => small.rotate180(),
+                    270 => small.rotate270(),
+                    _ => small,
+                })
+            }
+            Some(p) => self.analyze(p),
+            None => PhotoAnalysis::default(),
+        };
+        let signals = score::StorySignals::for_asset(a).with_faces(found.faces);
+        Analysis {
+            score: score::score_still_or_fallback(pixels, &signals),
+            phash: pixels.map(hash::average_hash_from_image),
+            embedding: found.embedding,
+            faces: found.faces,
         }
     }
 }
@@ -530,13 +588,79 @@ mod tests {
         assert!(m.notes()[0].contains("fetch-models"));
         let img = DynamicImage::new_rgb8(8, 8);
         assert_eq!(m.analyze(&img), PhotoAnalysis::default());
-        let a = triptape_core::types::Asset::new(
-            "a",
-            "/t/a.jpg".into(),
-            triptape_core::types::AssetKind::Photo,
-        );
+        let a = Asset::new("a", "/t/a.jpg".into(), AssetKind::Photo);
         assert!(!m.wants(&a), "nothing to add without models");
         assert_eq!(LocalModels::load(None, 1).notes().len(), 1);
+    }
+
+    #[test]
+    fn capabilities_owe_only_what_is_installed_and_missing() {
+        let mut a = Asset::new("a", "/t/a.jpg".into(), AssetKind::Photo);
+        let embed_only = Capabilities {
+            embedding: true,
+            faces: false,
+        };
+        assert!(embed_only.owe(&a));
+        a.embedding = Embedding::from_f32(&[1.0, 0.0]);
+        // Faces missing, but their models are not installed: nothing owed.
+        assert!(!embed_only.owe(&a));
+        let both = Capabilities {
+            embedding: true,
+            faces: true,
+        };
+        assert!(both.owe(&a));
+        a.faces = Some(FaceSignals::default());
+        assert!(!both.owe(&a));
+        let video = Asset::new("v", "/t/v.mov".into(), AssetKind::Video);
+        assert!(!both.owe(&video), "videos get no model output");
+        assert!(!Capabilities::default().owe(&video));
+    }
+
+    #[test]
+    fn installed_needs_the_runtime_and_each_capability_s_files() {
+        let dir = std::env::temp_dir().join(format!("triptape-installed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = ModelPaths {
+            runtime: dir.join("libort"),
+            dir: dir.clone(),
+        };
+        let touch = |f: &str| std::fs::write(dir.join(f), b"").unwrap();
+        touch(DINO_FILE);
+        touch(YUNET_FILE);
+        assert_eq!(paths.installed(), Capabilities::default(), "no runtime");
+        touch("libort");
+        assert_eq!(
+            paths.installed(),
+            Capabilities {
+                embedding: true,
+                faces: false
+            },
+            "faces need both YuNet and FER+"
+        );
+        touch(FERPLUS_FILE);
+        assert_eq!(
+            paths.installed(),
+            Capabilities {
+                embedding: true,
+                faces: true
+            }
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn analyze_still_without_models_scores_and_hashes_the_pixels() {
+        let m = LocalModels::none();
+        let a = Asset::new("a", "/t/a.jpg".into(), AssetKind::Photo);
+        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(64, 48, |x, y| {
+            image::Rgb([(x * 4) as u8, (y * 5) as u8, 90])
+        }));
+        let got = m.analyze_still(&a, Some(&img), true);
+        assert_eq!(got.phash, Some(hash::average_hash_from_image(&img)));
+        assert_eq!((got.embedding, got.faces), (None, None));
+        let none = m.analyze_still(&a, None, false);
+        assert_eq!(none.phash, None);
+        assert_eq!(none.score.total, score::fallback_score().total);
     }
 
     #[test]

@@ -192,13 +192,9 @@ pub struct StorySignals {
     pub movement: f32,
     /// 0..1 GPS novelty (rare place for this trip).
     pub gps_novelty: f32,
-    /// Plausible faces the optional local detector found (not a people
-    /// count: posters and statues count too). 0 = none or not analysed.
-    pub faces: u32,
-    /// Largest face as a fraction of the shorter side (0..1).
-    pub face_size: f32,
-    /// Best size-weighted smile (0..1); 0 when no face was big enough.
-    pub smile: f32,
+    /// What the optional local face models found; the default (no faces)
+    /// when none or not analysed.
+    pub faces: crate::types::FaceSignals,
 }
 
 impl StorySignals {
@@ -206,15 +202,12 @@ impl StorySignals {
     /// people tag count, caption, kind and (for clips) GPS.
     pub fn for_asset(a: &crate::types::Asset) -> Self {
         let is_clip = a.kind == crate::types::AssetKind::Video;
-        let faces = a.faces.unwrap_or_default();
         Self {
             people_count: a.people_count.unwrap_or(0),
             has_caption: a.user_caption.is_some(),
             is_clip,
             gps_novelty: if is_clip && a.gps.is_some() { 0.6 } else { 0.0 },
-            faces: faces.count,
-            face_size: faces.largest,
-            smile: faces.smile.unwrap_or(0.0),
+            faces: a.faces.unwrap_or_default(),
             ..Default::default()
         }
     }
@@ -225,9 +218,7 @@ impl StorySignals {
     /// output, before it is stored on the asset); `None` leaves them as is.
     pub fn with_faces(mut self, faces: Option<crate::types::FaceSignals>) -> Self {
         if let Some(f) = faces {
-            self.faces = f.count;
-            self.face_size = f.largest;
-            self.smile = f.smile.unwrap_or(0.0);
+            self.faces = f;
         }
         self
     }
@@ -247,13 +238,15 @@ pub fn people_bonus(n: u32) -> f32 {
 /// Tagged people already earn the stronger [`people_bonus`], so an untagged
 /// face never adds on top of it. Nothing for a soft frame (`sharp` false).
 pub fn face_bonus(signals: &StorySignals, sharp: bool) -> (f32, Option<&'static str>) {
-    if !sharp || signals.faces == 0 {
+    let faces = &signals.faces;
+    if !sharp || faces.count == 0 {
         return (0.0, None);
     }
-    if signals.smile >= SMILE_MIN {
-        return (SMILE_BONUS * signals.smile.min(1.0), Some("smiling"));
+    let smile = faces.smile.unwrap_or(0.0);
+    if smile >= SMILE_MIN {
+        return (SMILE_BONUS * smile.min(1.0), Some("smiling"));
     }
-    if signals.people_count == 0 && signals.face_size >= FACE_MIN_SIZE {
+    if signals.people_count == 0 && faces.largest >= FACE_MIN_SIZE {
         return (FACE_BONUS, Some("face in frame"));
     }
     (0.0, None)
@@ -461,12 +454,9 @@ mod tests {
     fn signals_read_stored_face_columns() {
         let mut a =
             crate::types::Asset::new("a", "/t/a.jpg".into(), crate::types::AssetKind::Photo);
-        assert_eq!(StorySignals::for_asset(&a).faces, 0);
+        assert_eq!(StorySignals::for_asset(&a).faces, Default::default());
         a.faces = Some(faces(3, 0.25, Some(0.8)));
-        let s = StorySignals::for_asset(&a);
-        assert_eq!((s.faces, s.face_size, s.smile), (3, 0.25, 0.8));
-        a.faces = Some(faces(2, 0.1, None));
-        assert_eq!(StorySignals::for_asset(&a).smile, 0.0);
+        assert_eq!(StorySignals::for_asset(&a).faces, faces(3, 0.25, Some(0.8)));
     }
 
     fn stats(mean: f32, var: f32, edge: f32) -> FrameStats {

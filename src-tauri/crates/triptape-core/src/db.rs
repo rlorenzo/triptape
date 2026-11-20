@@ -190,6 +190,29 @@ pub struct EditedPlan {
 
 /// Add `assets.<column>` with type `ddl` unless the table already has it
 /// (forward migration for DBs created before the column existed).
+/// [`FaceSignals`] as its (`face_count`, `face_size`, `smile`) columns;
+/// all NULL when not analysed.
+fn face_columns(f: Option<FaceSignals>) -> (Option<i64>, Option<f64>, Option<f64>) {
+    (
+        f.map(|f| i64::from(f.count)),
+        f.map(|f| f64::from(f.largest)),
+        f.and_then(|f| f.smile).map(f64::from),
+    )
+}
+
+/// The inverse of [`face_columns`] at `first` (the `face_count` index):
+/// `None` when `face_count` is NULL (not analysed).
+fn face_signals_at(r: &Row, first: usize) -> rusqlite::Result<Option<FaceSignals>> {
+    let Some(count) = r.get::<_, Option<i64>>(first)? else {
+        return Ok(None);
+    };
+    Ok(Some(FaceSignals {
+        count: u32::try_from(count).unwrap_or(0),
+        largest: r.get::<_, Option<f64>>(first + 1)?.unwrap_or(0.0) as f32,
+        smile: r.get::<_, Option<f64>>(first + 2)?.map(|s| s as f32),
+    }))
+}
+
 fn add_column_if_missing(conn: &Connection, column: &str, ddl: &str) -> Result<(), String> {
     let present = conn
         .query_row(
@@ -313,6 +336,7 @@ impl Db {
             None => None,
         };
         let score_json = a.score.as_ref().and_then(|s| serde_json::to_string(s).ok());
+        let (face_count, face_size, smile) = face_columns(a.faces);
         self.conn.prepare_cached(
             "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,people_count,people_sig,library_score,score_json,embedding,face_count,face_size,smile)
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -329,8 +353,7 @@ impl Db {
                 a.rotation_deg as i64, conf, a.user_caption, a.people_count.map(i64::from),
                 a.people_sig.map(|s| s as i64), a.library_score.map(f64::from), score_json,
                 a.embedding.as_ref().map(Embedding::to_blob),
-                a.faces.map(|f| i64::from(f.count)), a.faces.map(|f| f64::from(f.largest)),
-                a.faces.and_then(|f| f.smile).map(f64::from),
+                face_count, face_size, smile,
             ]),
         ).map_err(|e| e.to_string())?;
         Ok(())
@@ -465,7 +488,7 @@ impl Db {
             .conn
             .prepare_cached("UPDATE assets SET score_json=?1, phash=COALESCE(?2, phash), embedding=COALESCE(?3, embedding), face_count=COALESCE(?8, face_count), face_size=CASE WHEN ?8 IS NULL THEN face_size ELSE ?9 END, smile=CASE WHEN ?8 IS NULL THEN smile ELSE ?10 END WHERE id=?4 AND path=?5 AND size_bytes=?6 AND mtime=?7")
             .and_then(|mut st| {
-                let f = analysis.faces;
+                let (face_count, face_size, smile) = face_columns(analysis.faces);
                 st.execute(params![
                     json,
                     analysis.phash.map(|h| h as i64),
@@ -474,9 +497,9 @@ impl Db {
                     path,
                     size_bytes as i64,
                     mtime,
-                    f.map(|f| i64::from(f.count)),
-                    f.map(|f| f64::from(f.largest)),
-                    f.and_then(|f| f.smile).map(f64::from),
+                    face_count,
+                    face_size,
+                    smile,
                 ])
             })
             .map_err(|e| e.to_string())?;
@@ -555,11 +578,7 @@ impl Db {
                         .get::<_, Option<Vec<u8>>>(23)?
                         .as_deref()
                         .and_then(Embedding::from_blob),
-                    faces: r.get::<_, Option<i64>>(24)?.map(|n| FaceSignals {
-                        count: u32::try_from(n).unwrap_or(0),
-                        largest: r.get::<_, Option<f64>>(25).ok().flatten().unwrap_or(0.0) as f32,
-                        smile: r.get::<_, Option<f64>>(26).ok().flatten().map(|s| s as f32),
-                    }),
+                    faces: face_signals_at(r, 24)?,
                 })
             })
             .map_err(|e| e.to_string())?;

@@ -270,8 +270,12 @@ fn same_moment(a: &Asset, b: &Asset) -> bool {
 /// least [`crate::embedding::NEAR_DUPE_COSINE`] alike. Missing embeddings
 /// leave the pHash rule as it was. The people check keeps "the same view
 /// with someone else in it" apart, as the best-of pick does.
-fn looks_alike(a: &Asset, b: &Asset, pa: Option<u64>, pb: Option<u64>) -> bool {
-    matches!((pa, pb), (Some(p), Some(q)) if is_near_dupe(p, q))
+/// Videos never look alike (see [`collapse_near_dupes`]).
+fn looks_alike(a: &Asset, b: &Asset) -> bool {
+    if a.kind == AssetKind::Video || b.kind == AssetKind::Video {
+        return false;
+    }
+    matches!((a.phash, b.phash), (Some(p), Some(q)) if is_near_dupe(p, q))
         || (a.people_sig == b.people_sig
             && crate::embedding::alike(
                 a.embedding.as_ref(),
@@ -282,8 +286,9 @@ fn looks_alike(a: &Asset, b: &Asset, pa: Option<u64>, pb: Option<u64>) -> bool {
 
 /// Collapse near-dupes ([`looks_alike`]: pHash distance ≤ threshold or a
 /// retake by embedding, captured within [`DUPE_WINDOW_SECS`] and, when
-/// both have GPS, [`DUPE_RADIUS_METERS`]) with union-find; groups merge only when every cross pair is the same
-/// moment, so a whole group stays within the window and radius. The best
+/// both have GPS, [`DUPE_RADIUS_METERS`]) with union-find; groups merge
+/// only when every cross pair is the same moment, so a whole group stays
+/// within the window and radius. The best
 /// shot is the highest `total` score (ties → first in story order).
 /// Videos never collapse: their pHash is only the poster frame, so two
 /// clips (or a clip and a photo) opening on the same view can still hold
@@ -298,19 +303,13 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
         }
         x
     }
-    let phashes: Vec<Option<u64>> = assets
-        .iter()
-        .map(|a| a.phash.filter(|_| a.kind != AssetKind::Video))
-        .collect();
-    let alike = |x: usize, y: usize| {
-        assets[x].kind != AssetKind::Video
-            && assets[y].kind != AssetKind::Video
-            && looks_alike(&assets[x], &assets[y], phashes[x], phashes[y])
-    };
+    let alike = |x: usize, y: usize| looks_alike(&assets[x], &assets[y]);
     let mut members: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
     for i in 0..n {
         for j in (i + 1)..n {
-            if !alike(i, j) {
+            // The cheap time/place test gates the (embedding) look test;
+            // complete linkage below requires it for (i, j) anyway.
+            if !same_moment(&assets[i], &assets[j]) || !alike(i, j) {
                 continue;
             }
             let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
