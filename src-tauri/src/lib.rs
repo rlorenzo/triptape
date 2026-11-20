@@ -369,12 +369,11 @@ pub fn fill_foreground_metadata(a: &mut Asset, library: Option<&OsxPhotosIndex>,
         a.time_guessed = ct.time_guessed;
     } else {
         let exif = metadata::read_image_exif(&a.path);
-        let ct = metadata::resolve_capture_time(exif.taken_at, a.mtime);
-        a.taken_at = Some(ct.unix_secs);
-        a.time_guessed = ct.time_guessed;
-        a.tz_offset_secs = exif.tz_offset_secs;
+        // EXIF capture time/GPS first; an osxphotos-exported edit without
+        // its own falls back to the library's, then to mtime.
+        let lib = library.and_then(|l| l.get(&a.path));
+        metadata::fill_photo_capture(a, &exif, lib);
         story(a, Some(&exif));
-        a.gps = exif.gps;
         a.rotation_deg = exif
             .orientation
             .map(metadata::orientation_to_degrees)

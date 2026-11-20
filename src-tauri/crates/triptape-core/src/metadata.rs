@@ -132,7 +132,7 @@ impl FfprobeOutput {
     }
 }
 
-fn valid_lat_lon(lat: f64, lon: f64) -> Option<(f64, f64)> {
+pub(crate) fn valid_lat_lon(lat: f64, lon: f64) -> Option<(f64, f64)> {
     ((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)).then_some((lat, lon))
 }
 
@@ -206,6 +206,50 @@ pub fn resolve_capture_time(exif_secs: Option<i64>, mtime_secs: i64) -> CaptureT
             time_guessed: true,
         },
     }
+}
+
+/// Fill a still's capture time, UTC offset and GPS on `a`. The file's own
+/// EXIF wins; when it has no capture time (osxphotos-exported edits carry
+/// none) the photo library's date and offset (`library`) come next, and
+/// only then file mtime with `time_guessed`. GPS likewise falls back to
+/// the library only when the file has none.
+pub fn fill_photo_capture(
+    a: &mut crate::types::Asset,
+    exif: &ImageExif,
+    library: Option<&crate::osxphotos::LibraryEntry>,
+) {
+    let (taken_at, tz_offset_secs) = match (exif.taken_at, library.and_then(|l| l.taken_at)) {
+        (Some(t), _) => (Some(t), exif.tz_offset_secs),
+        (None, Some(t)) => (Some(t), library.and_then(|l| l.tz_offset_secs)),
+        (None, None) => (None, exif.tz_offset_secs),
+    };
+    let ct = resolve_capture_time(taken_at, a.mtime);
+    a.taken_at = Some(ct.unix_secs);
+    a.time_guessed = ct.time_guessed;
+    a.tz_offset_secs = tz_offset_secs;
+    a.gps = exif.gps.or_else(|| library.and_then(|l| l.gps));
+}
+
+/// Parse an ISO 8601 / RFC 3339 instant with a UTC offset (as osxphotos
+/// writes: `2026-10-27T10:05:38.928000+08:00`) to unix seconds (floored)
+/// and the offset in seconds east of UTC. `None` without an offset.
+pub fn parse_iso_instant(s: &str) -> Option<(i64, i32)> {
+    let s = s.trim();
+    let ts = s.parse::<jiff::Timestamp>().ok()?;
+    // The offset is whatever follows the time: `Z`, or the last sign past
+    // the date (dates themselves contain `-`).
+    let offset = if s.ends_with(['Z', 'z']) {
+        0
+    } else {
+        let cut = s
+            .char_indices()
+            .skip(10)
+            .filter(|(_, c)| matches!(c, '+' | '-'))
+            .last()?
+            .0;
+        parse_tz_offset(&s[cut..])?
+    };
+    Some((unix_floor(ts), offset))
 }
 
 /// Run ffprobe and parse its JSON. `ffprobe_bin` allows tests to stub it.
@@ -1497,6 +1541,7 @@ mod tests {
             description: Some("  Library   words ".into()),
             persons: vec!["Cy".into(), "Di".into(), "_UNKNOWN_".into()],
             overall: Some(0.3),
+            ..Default::default()
         };
         // Sidecar people win; the library supplies the missing caption and
         // its score.
@@ -1545,5 +1590,85 @@ mod tests {
         let data = xmp("<Iptc4xmpExt:PersonInImage><rdf:Bag><rdf:li>Bo</rdf:li>\
                         <rdf:li>Ann</rdf:li></rdf:Bag></Iptc4xmpExt:PersonInImage>");
         assert_eq!(xmp_people(&data), Some(ab));
+    }
+
+    #[test]
+    fn iso_instants_parse_with_fraction_and_offset() {
+        // 2026-10-27T02:05:38.928Z, floored to the second.
+        assert_eq!(
+            parse_iso_instant("2026-10-27T10:05:38.928000+08:00"),
+            Some((1_793_066_738, 8 * 3600))
+        );
+        assert_eq!(
+            parse_iso_instant("2026-10-26T21:05:38.5-05:00"),
+            Some((1_793_066_738, -5 * 3600))
+        );
+        assert_eq!(
+            parse_iso_instant("2026-10-27T02:05:38Z"),
+            Some((1_793_066_738, 0))
+        );
+        assert_eq!(
+            parse_iso_instant("2026-10-27T07:35:38+05:30"),
+            Some((1_793_066_738, 5 * 3600 + 1800))
+        );
+        // Floor, not truncate: half a second before the epoch is -1.
+        assert_eq!(
+            parse_iso_instant("1969-12-31T23:59:59.500+00:00"),
+            Some((-1, 0))
+        );
+        assert_eq!(parse_iso_instant("2026-10-27T10:05:38"), None);
+        assert_eq!(parse_iso_instant(""), None);
+    }
+
+    #[test]
+    fn photo_capture_prefers_exif_then_library_then_mtime() {
+        use crate::osxphotos::LibraryEntry;
+        use crate::types::{Asset, AssetKind};
+        let lib = LibraryEntry {
+            taken_at: Some(1_793_066_738),
+            tz_offset_secs: Some(8 * 3600),
+            gps: Some((1.29, 103.85)),
+            ..Default::default()
+        };
+        let fresh = || {
+            let mut a = Asset::new("a", "/t/IMG_1_edited.heic".into(), AssetKind::Photo);
+            a.mtime = 2_000_000_000;
+            a
+        };
+        // No EXIF date: the library's date, offset and place, not mtime.
+        let mut a = fresh();
+        fill_photo_capture(&mut a, &ImageExif::default(), Some(&lib));
+        assert_eq!(a.taken_at, Some(1_793_066_738));
+        assert!(!a.time_guessed);
+        assert_eq!(a.tz_offset_secs, Some(8 * 3600));
+        assert_eq!(a.gps, Some((1.29, 103.85)));
+        // EXIF wins for each field it has.
+        let exif = ImageExif {
+            taken_at: Some(1_700_000_000),
+            tz_offset_secs: Some(9 * 3600),
+            gps: Some((35.0, 139.0)),
+            ..Default::default()
+        };
+        let mut a = fresh();
+        fill_photo_capture(&mut a, &exif, Some(&lib));
+        assert_eq!(a.taken_at, Some(1_700_000_000));
+        assert_eq!(a.tz_offset_secs, Some(9 * 3600));
+        assert_eq!(a.gps, Some((35.0, 139.0)));
+        // EXIF date without GPS: the library fills only the place.
+        let dated = ImageExif {
+            taken_at: Some(1_700_000_000),
+            ..Default::default()
+        };
+        let mut a = fresh();
+        fill_photo_capture(&mut a, &dated, Some(&lib));
+        assert_eq!(a.taken_at, Some(1_700_000_000));
+        assert_eq!(a.tz_offset_secs, None);
+        assert_eq!(a.gps, Some((1.29, 103.85)));
+        // Nothing anywhere: mtime, guessed.
+        let mut a = fresh();
+        fill_photo_capture(&mut a, &ImageExif::default(), None);
+        assert_eq!(a.taken_at, Some(2_000_000_000));
+        assert!(a.time_guessed);
+        assert_eq!(a.gps, None);
     }
 }

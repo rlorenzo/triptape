@@ -1,7 +1,7 @@
 //! Story fields from an `osxphotos export` folder's own bookkeeping
 //! database (`.osxphotos_export.db`), for exports written without XMP
-//! sidecars: the user's caption, who is tagged, and Apple's aesthetic
-//! score, keyed by the exported file's path.
+//! sidecars: the user's caption, who is tagged, Apple's aesthetic score,
+//! and capture date/offset/place, keyed by the exported file's path.
 //!
 //! The database belongs to the user's export folder: it is opened strictly
 //! read-only and immutable, so SQLite never writes a journal, `-wal` or
@@ -30,6 +30,12 @@ pub struct LibraryEntry {
     pub persons: Vec<String>,
     /// Apple's overall aesthetic score (`score.overall`, roughly -1..1).
     pub overall: Option<f32>,
+    /// Capture instant (`date`), unix seconds, floored.
+    pub taken_at: Option<i64>,
+    /// UTC offset at capture (from `date`), seconds east of UTC.
+    pub tz_offset_secs: Option<i32>,
+    /// `(latitude, longitude)` when both are known and in range.
+    pub gps: Option<(f64, f64)>,
 }
 
 impl std::fmt::Debug for LibraryEntry {
@@ -38,6 +44,9 @@ impl std::fmt::Debug for LibraryEntry {
             .field("description", &self.description.is_some())
             .field("persons", &self.persons.len())
             .field("overall", &self.overall)
+            .field("taken_at", &self.taken_at)
+            .field("tz_offset_secs", &self.tz_offset_secs)
+            .field("gps", &self.gps.is_some())
             .finish()
     }
 }
@@ -200,10 +209,22 @@ fn parse_photoinfo(json: &str) -> Option<LibraryEntry> {
         .and_then(|o| o.as_f64())
         .filter(|o| o.is_finite())
         .map(|o| o as f32);
+    let (taken_at, tz_offset_secs) = v
+        .get("date")
+        .and_then(|d| d.as_str())
+        .and_then(crate::metadata::parse_iso_instant)
+        .map_or((None, None), |(t, o)| (Some(t), Some(o)));
+    let coord = |k: &str| v.get(k).and_then(|c| c.as_f64()).filter(|c| c.is_finite());
+    let gps = coord("latitude")
+        .zip(coord("longitude"))
+        .and_then(|(lat, lon)| crate::metadata::valid_lat_lon(lat, lon));
     Some(LibraryEntry {
         description,
         persons,
         overall,
+        taken_at,
+        tz_offset_secs,
+        gps,
     })
 }
 
@@ -253,7 +274,7 @@ mod tests {
                 (
                     "IMG_1.HEIC",
                     "u1",
-                    r#"{"description":"Dinner by the river","persons":["Ann","_UNKNOWN_"],"score":{"overall":0.42}}"#,
+                    r#"{"description":"Dinner by the river","persons":["Ann","_UNKNOWN_"],"score":{"overall":0.42},"date":"2026-10-27T10:05:38.928000+08:00","latitude":1.29,"longitude":103.85}"#,
                 ),
                 ("IMG_1 (1).mov", "u1", "{}"),
                 (
@@ -269,6 +290,9 @@ mod tests {
         let still = idx.get(&folder.join("IMG_1.HEIC")).unwrap();
         assert_eq!(still.description.as_deref(), Some("Dinner by the river"));
         assert_eq!(still.overall, Some(0.42));
+        assert_eq!(still.taken_at, Some(1_793_066_738));
+        assert_eq!(still.tz_offset_secs, Some(8 * 3600));
+        assert_eq!(still.gps, Some((1.29, 103.85)));
         assert_eq!(still.people().map(|p| p.count()), Some(2));
         // Same uuid: the motion half maps to the same library entry; the
         // lookup is case-insensitive.
