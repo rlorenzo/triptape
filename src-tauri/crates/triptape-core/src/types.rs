@@ -228,6 +228,48 @@ impl CollageEdits {
     pub fn is_empty(&self) -> bool {
         self.solo.is_empty() && self.joins.is_empty()
     }
+
+    /// Whether the user set this photo to play on its own.
+    pub fn is_solo(&self, asset_id: &str) -> bool {
+        self.solo.iter().any(|id| id == asset_id)
+    }
+
+    /// Whether the user joined these two photos, in either order.
+    pub fn linked(&self, a: &str, b: &str) -> bool {
+        self.joins
+            .iter()
+            .any(|(x, y)| (x == a && y == b) || (x == b && y == a))
+    }
+
+    /// Play a film photo on its own, or put it back in the collages.
+    /// Setting it solo also drops its joins: they would contradict it.
+    pub fn set_solo(&mut self, asset_id: String, solo: bool) {
+        self.solo.retain(|id| *id != asset_id);
+        if solo {
+            self.unjoin(&asset_id);
+            self.solo.push(asset_id);
+        }
+    }
+
+    /// Join two neighbouring film photos (`first` plays earlier) into one
+    /// collage; neither stays solo.
+    pub fn join(&mut self, first: String, second: String) {
+        self.solo.retain(|id| *id != first && *id != second);
+        self.joins
+            .retain(|(a, b)| !(*a == first && *b == second || *a == second && *b == first));
+        self.joins.push((first, second));
+    }
+
+    /// Undo the user's joins of a photo ("Separate").
+    pub fn unjoin(&mut self, asset_id: &str) {
+        self.joins.retain(|(a, b)| a != asset_id && b != asset_id);
+    }
+
+    /// Keep only the overrides whose photos all satisfy `keep`.
+    pub fn retain_assets(&mut self, keep: impl Fn(&str) -> bool) {
+        self.solo.retain(|id| keep(id));
+        self.joins.retain(|(a, b)| keep(a) && keep(b));
+    }
 }
 
 impl PlanEntry {

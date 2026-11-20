@@ -21,12 +21,10 @@ use serde::Serialize;
 use triptape_core::db::{Db, EditedPlan};
 use triptape_core::metadata;
 use triptape_core::osxphotos::OsxPhotosIndex;
-use triptape_core::plan::{self, HeroGrouping};
+use triptape_core::plan::{HeroGrouping, JoinBlock, PlaysAlone};
 use triptape_core::process::{ToolSource, Toolchain};
 use triptape_core::scan::{ScannedFile, VIDEO_EXTS};
-use triptape_core::types::{
-    distinct_assets, Asset, AssetKind, Chapter, Plan, PlanEntry, Rendition,
-};
+use triptape_core::types::{distinct_assets, Asset, AssetKind, Chapter, Plan, PlanEntry};
 use triptape_media::export::Skipped;
 use triptape_media::render_book::{BookPreset, MAX_BOOK_PAGES};
 
@@ -274,26 +272,22 @@ const NOT_IN_CHAPTER: &str = "asset is not in any chapter";
 const NO_NEIGHBOUR: &str = "No other film photo of this day can share a collage with it.";
 const COLLAGE_FULL: &str = "The collage next to it is full (4 photos at most).";
 
-/// Why a film pick always plays on its own, whatever the user's collage
-/// edits: the renderer's own reasons ([`plan::entry_collage_eligible`]).
-fn plays_alone_because(
-    plan: &Plan,
-    hero_index: usize,
-    by_id: &HashMap<&str, &Asset>,
-) -> Option<&'static str> {
-    let e = &plan.hero[hero_index];
-    let caption = plan.captions.get(&e.asset_id).map(String::as_str);
-    match e.rendition {
-        Rendition::Clip { .. } => Some("Videos play on their own in the film."),
-        Rendition::Motion { .. } => Some("Live Photos that play their motion play on their own."),
-        Rendition::Still if plan::has_caption(caption) => {
-            Some("Photos with a caption play on their own, so the caption fits one photo. Clear the caption to join it.")
+/// The Story editor's words for why a film pick always plays on its own.
+fn plays_alone_text(why: PlaysAlone) -> &'static str {
+    match why {
+        PlaysAlone::Clip => "Videos play on their own in the film.",
+        PlaysAlone::Motion => "Live Photos that play their motion play on their own.",
+        PlaysAlone::Caption => {
+            "Photos with a caption play on their own, so the caption fits one photo. Clear the caption to join it."
         }
-        Rendition::Still => {
-            let aspect = by_id.get(e.asset_id.as_str()).and_then(|a| a.display_aspect());
-            (!plan::entry_collage_eligible(&e.rendition, aspect, caption))
-                .then_some("Panoramas play on their own, panning across.")
-        }
+        PlaysAlone::Panorama => "Panoramas play on their own, panning across.",
+    }
+}
+
+fn join_block_text(why: JoinBlock) -> &'static str {
+    match why {
+        JoinBlock::NoNeighbour => NO_NEIGHBOUR,
+        JoinBlock::Full => COLLAGE_FULL,
     }
 }
 
@@ -304,7 +298,12 @@ impl StoryData {
             .ok_or_else(|| "no plan for project yet — scan first".to_string())
     }
 
-    fn entry_builder(&self) -> impl Fn(&str) -> Option<StoryEntryView> + '_ {
+    /// Builds an asset's entry view; `film_groups` from [`Self::film_groups`],
+    /// or empty where the film's collages don't matter.
+    fn entry_builder(
+        &self,
+        film_groups: HashMap<String, FilmGroupView>,
+    ) -> impl Fn(&str) -> Option<StoryEntryView> + '_ {
         fn ids(picks: &[PlanEntry]) -> HashSet<&str> {
             picks.iter().map(|e| e.asset_id.as_str()).collect()
         }
@@ -312,7 +311,6 @@ impl StoryData {
             self.0.assets.iter().map(|a| (a.id.as_str(), a)).collect();
         let hero = ids(&self.0.edited.hero);
         let reels = ids(&self.0.edited.reel_selects);
-        let film_groups = self.film_groups(&by_id);
         move |id| {
             Some(StoryEntryView {
                 asset: AssetView::from(*by_id.get(id)?),
@@ -325,88 +323,44 @@ impl StoryData {
     }
 
     /// Every playing film pick's segment and collage edits, by asset id.
-    fn film_groups(&self, by_id: &HashMap<&str, &Asset>) -> HashMap<String, FilmGroupView> {
+    fn film_groups(&self) -> HashMap<String, FilmGroupView> {
         let plan = &self.0.edited;
-        let grouping = HeroGrouping::new(
-            plan,
-            |id| by_id.get(id).and_then(|a| a.display_aspect()),
-            |id| by_id.get(id).is_some_and(|a| a.path.exists()),
-        );
-        let groups = grouping.groups(&plan.collage);
+        let collage = &plan.collage;
+        let grouping = HeroGrouping::from_assets(plan, &self.0.assets);
         let id_of = |i: usize| plan.hero[i].asset_id.as_str();
-        let user_solo =
-            |i: usize| grouping.eligible(i) && plan.collage.solo.iter().any(|s| s == id_of(i));
-        // The neighbouring photo `i` could join (`step` -1 or 1), if a join
-        // would put them in one collage: the nearest playing collage photo of
-        // its chapter, as `plan::collage_slots` links them.
-        let at = |i: usize| grouping.playing.iter().position(|&k| k == i);
-        let neighbour = |i: usize, back: bool| -> Result<String, &'static str> {
-            let pos = at(i).ok_or(NO_NEIGHBOUR)?;
-            let mut rest: Box<dyn Iterator<Item = &usize>> = if back {
-                Box::new(grouping.playing[..pos].iter().rev())
-            } else {
-                Box::new(grouping.playing[pos + 1..].iter())
-            };
-            let k = *rest
-                .find(|&&k| {
-                    grouping.chapter(k) != grouping.chapter(i)
-                        || (grouping.eligible(k) && !user_solo(k))
-                })
-                .filter(|&&k| grouping.chapter(k) == grouping.chapter(i))
-                .ok_or(NO_NEIGHBOUR)?;
-            let (a, b) = if back { (k, i) } else { (i, k) };
-            let mut joined = plan.collage.clone();
-            joined
-                .joins
-                .push((id_of(a).to_string(), id_of(b).to_string()));
-            grouping
-                .groups(&joined)
-                .iter()
-                .any(|g| g.contains(&a) && g.contains(&b))
-                .then(|| id_of(k).to_string())
-                .ok_or(COLLAGE_FULL)
-        };
+        let user_solo = |i: usize| grouping.plays_alone(i).is_none() && collage.is_solo(id_of(i));
         let mut out = HashMap::new();
-        for (gid, g) in groups.iter().enumerate() {
+        for (gid, g) in grouping.groups(collage).iter().enumerate() {
             for (position, &i) in g.iter().enumerate() {
                 // An asset's first hero entry names its segment: only clips
                 // have several (one per window), and they play on their own.
                 if out.contains_key(id_of(i)) {
                     continue;
                 }
-                let joined_to = |o: usize| {
-                    plan.collage.joins.iter().any(|(a, b)| {
-                        (a == id_of(i) && b == id_of(o)) || (a == id_of(o) && b == id_of(i))
-                    })
-                };
                 let mut view = FilmGroupView {
                     id: gid,
                     position,
                     size: g.len(),
                     user_solo: user_solo(i),
-                    user_joined: g.iter().any(|&o| o != i && joined_to(o)),
+                    user_joined: g
+                        .iter()
+                        .any(|&o| o != i && collage.linked(id_of(i), id_of(o))),
                     join_prev: None,
                     join_next: None,
                     join_hint: None,
                 };
                 if g.len() == 1 && !view.user_solo {
-                    if let Some(why) = plays_alone_because(plan, i, by_id) {
-                        view.join_hint = Some(why.to_string());
+                    if let Some(why) = grouping.plays_alone(i) {
+                        view.join_hint = Some(plays_alone_text(why).to_string());
                     } else {
-                        let (prev, next) = (neighbour(i, true), neighbour(i, false));
-                        view.join_hint = match (&prev, &next) {
-                            (Err(a), Err(b)) => Some(
-                                if *a == COLLAGE_FULL || *b == COLLAGE_FULL {
-                                    COLLAGE_FULL
-                                } else {
-                                    NO_NEIGHBOUR
-                                }
-                                .to_string(),
-                            ),
-                            _ => None,
-                        };
-                        view.join_prev = prev.ok();
-                        view.join_next = next.ok();
+                        let prev = grouping.join_partner(collage, i, true);
+                        let next = grouping.join_partner(collage, i, false);
+                        if let (Err(a), Err(b)) = (prev, next) {
+                            let why = if a == JoinBlock::Full { a } else { b };
+                            view.join_hint = Some(join_block_text(why).to_string());
+                        }
+                        view.join_prev = prev.ok().map(|k| id_of(k).to_string());
+                        view.join_next = next.ok().map(|k| id_of(k).to_string());
                     }
                 }
                 out.insert(id_of(i).to_string(), view);
@@ -418,9 +372,7 @@ impl StoryData {
     /// A join the Story editor offers: a photo playing on its own joins
     /// the collage photo right before it (`first`) or after it (`second`).
     pub fn check_join(&self, first: &str, second: &str) -> Result<(), String> {
-        let by_id: HashMap<&str, &Asset> =
-            self.0.assets.iter().map(|a| (a.id.as_str(), a)).collect();
-        let groups = self.film_groups(&by_id);
+        let groups = self.film_groups();
         let offered = groups
             .get(first)
             .is_some_and(|g| g.join_next.as_deref() == Some(second))
@@ -448,7 +400,7 @@ impl StoryData {
     }
 
     pub fn view(&self) -> StoryView {
-        let entry = self.entry_builder();
+        let entry = self.entry_builder(self.film_groups());
         // Keys come from the pristine plan so excluding a chapter's first
         // asset doesn't orphan its place rename.
         let mut key_of: HashMap<&str, &str> = HashMap::new();
@@ -500,7 +452,8 @@ impl StoryData {
             .base
             .chapter_of(asset_id)
             .ok_or_else(|| NOT_IN_CHAPTER.to_string())?;
-        let entry = self.entry_builder();
+        // Swap candidates: their film collages are not shown.
+        let entry = self.entry_builder(HashMap::new());
         Ok(chapter
             .asset_ids
             .iter()
@@ -1443,7 +1396,7 @@ mod tests {
         assert_eq!((c.id, a.size, c.position), (a.id, 2, 1));
         // "Show on its own" splits the collage; a is left alone with no
         // collage photo beside it to join.
-        edits.set_solo("c".into(), true);
+        edits.collage.set_solo("c".into(), true);
         db.save_plan_edits(&pid, &edits).unwrap();
         let g = film_groups(&db, &pid);
         let (a, c) = (group(&g, "a"), group(&g, "c"));
@@ -1451,7 +1404,7 @@ mod tests {
         assert_eq!(a.size, 1);
         assert_eq!(a.join_hint.as_deref(), Some(NO_NEIGHBOUR));
         // "Put back in the collage" undoes it.
-        edits.set_solo("c".into(), false);
+        edits.collage.set_solo("c".into(), false);
         db.save_plan_edits(&pid, &edits).unwrap();
         assert_eq!(group(&film_groups(&db, &pid), "c").size, 2);
         let story = StoryData::load(&db, &pid).unwrap();
@@ -1486,14 +1439,14 @@ mod tests {
         assert!(story.check_join("f", "a").is_err(), "first plays first");
         assert!(story.check_join("b", "c").unwrap_err().contains("caption"));
 
-        edits.join("a".into(), "f".into());
+        edits.collage.join("a".into(), "f".into());
         db.save_plan_edits(&pid, &edits).unwrap();
         let g = film_groups(&db, &pid);
         let (a, f) = (group(&g, "a"), group(&g, "f"));
         assert_eq!((a.size, f.id, f.position), (2, a.id, 1));
         assert!(a.user_joined && f.user_joined);
         // "Separate" undoes it.
-        edits.unjoin("f");
+        edits.collage.unjoin("f");
         db.save_plan_edits(&pid, &edits).unwrap();
         assert_eq!(group(&film_groups(&db, &pid), "a").size, 1);
     }

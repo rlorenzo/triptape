@@ -42,3 +42,46 @@ segment-cache commits. Status: CLEAN, 0 of 5 cycles.
 - The refinement step and the closing summary did not run: the editor agent
   (claude) hit its usage limit before it started. Nothing was staged, so
   this branch carries no edits from this pass.
+
+
+## Third pass (after rebase onto main, 2026-11-20)
+
+# Agent Review Summary: Story Collage Groups
+
+## Overview
+
+The original branch added "Show on its own", "Join with next/previous" and "Separate" collage edits across the planner, renderer, CLI, Tauri backend and Story UI. The review loop made one refinement pass before the first review. That pass changed no behaviour. It reorganised the backend so that the planner, the CLI and the Story editor read collage rules from one place instead of each keeping its own copy. The reviewer then found no issues at any severity.
+
+## Improvements Made
+
+- **Collage edits became their own type.** `solo` and `joins` used to be loose fields on the plan edits. They now sit in one collage-edits value with its own helpers: `is_solo`, `linked`, `set_solo`, `join`, `unjoin`, `retain_assets`. Code that had been doing its own "is this photo solo?" and "are these two joined?" scans now calls the helpers. Serde `flatten` keeps the stored JSON identical (`solo` and `joins` stay top-level), and a new test confirms that existing saved edits still load and save in the same shape.
+- **"Why does this play alone?" has one answer.** A typed `PlaysAlone` reason (clip, Live Photo motion, caption, panorama) now comes from the same function the renderer uses to decide collage eligibility. Before this pass, the Story editor re-derived those reasons in its own `match`, which could have drifted from the renderer's rules. The editor now maps the shared reason to its UI text.
+- **The join-neighbour search moved into the planner.** The Tauri layer had about 30 lines of closure logic to find the photo a pick could join and to check whether the target collage was already full. That logic is now `HeroGrouping::join_partner`, which returns a typed `JoinBlock` (no neighbour, or full). Moving it into core let tests cover it directly: never crossing a chapter, skipping solo photos, and only applying to playing entries. The trial join now uses the real `join` operation, which also clears any solo flag, so the "can join" check matches what the user's click actually does.
+- **One "solo" signal instead of two.** The internal grouping slot used to carry `eligible` and `solo` as separate flags, and every consumer had to check both. A user-solo photo now arrives as ineligible, which removes the second flag and the `!s.solo` checks that went with it. The property tests were updated to match.
+- **Less duplicated setup.** `HeroGrouping::from_assets` replaces three copies of the same aspect and file-on-disk lookup closures. A shared `chapter_index` helper replaces two copies of the chapter-mapping loop.
+- **Less repeated work.** The CLI `edit` command no longer rebuilds the edited plan once per solo photo and once per join check. It builds the plan once and applies trial joins to that plan's collage, which is safe because collage edits never change which photos are in the film. The CLI also stopped computing groupings just to get the length estimate, and swap-candidate views in the Story editor no longer compute film collage groups they never show.
+
+## Created Files
+
+None. `agent-code-review.md` is the reviewer's report, not a project change.
+
+## Remaining Items
+
+None. The final review found no High, Medium or Low issues.
+
+## Files Changed
+
+- `src-tauri/crates/triptape-core/src/db.rs`
+- `src-tauri/crates/triptape-core/src/plan.rs`
+- `src-tauri/crates/triptape-core/src/types.rs`
+- `src-tauri/crates/triptape-media/src/bin/triptape.rs`
+- `src-tauri/crates/triptape-media/src/render_video.rs`
+- `src-tauri/src/lib.rs`
+- `src-tauri/src/main.rs`
+
+## Metrics
+
+- Review cycles: 0 (one refinement pass, then a clean initial review)
+- Duration: 8m 43s
+- Final issue counts: High 0, Medium 0, Low 0
+- Final status: CLEAN

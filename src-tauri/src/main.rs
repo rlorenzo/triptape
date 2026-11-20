@@ -1400,7 +1400,9 @@ async fn set_asset_solo(
     if solo {
         StoryData::load(&db, &project_id)?.check_solo(&asset_id)?;
     }
-    save_edits(&db, &project_id, |edits| edits.set_solo(asset_id, solo))
+    save_edits(&db, &project_id, |edits| {
+        edits.collage.set_solo(asset_id, solo)
+    })
 }
 
 /// Join a film photo playing on its own with the next collage photo of its
@@ -1419,7 +1421,7 @@ async fn join_assets(
     let db = state.db.lock().map_err(|e| e.to_string())?;
     StoryData::load(&db, &project_id)?.check_join(&first_asset_id, &second_asset_id)?;
     save_edits(&db, &project_id, |edits| {
-        edits.join(first_asset_id, second_asset_id)
+        edits.collage.join(first_asset_id, second_asset_id)
     })
 }
 
@@ -1431,7 +1433,7 @@ async fn unjoin_asset(
     asset_id: String,
 ) -> Result<StoryView, String> {
     AppState::check_id(&asset_id)?;
-    with_edits(&state, &project_id, |edits| edits.unjoin(&asset_id))
+    with_edits(&state, &project_id, |edits| edits.collage.unjoin(&asset_id))
 }
 
 /// Editor thumbnail: generated once per source version into the app cache dir,

@@ -213,12 +213,11 @@ pub const COLLAGE_REACH: usize = 3;
 pub struct GroupSlot<C> {
     /// The entry's chapter; a collage never spans two chapters.
     pub chapter: C,
-    /// Whether the entry may share a collage ([`collage_eligible`]).
+    /// Whether the entry may share a collage: [`collage_eligible`] and not
+    /// set to play on its own by the user.
     pub eligible: bool,
-    /// The user asked for this photo on its own: it joins no collage.
-    pub solo: bool,
     /// The user joined this photo to the previous collage photo (the
-    /// nearest earlier slot that is eligible and not `solo`), however many
+    /// nearest earlier eligible slot), however many
     /// entries lie between them. Honoured within one chapter, and while the
     /// photos joined this way in a row number at most [`MAX_COLLAGE`].
     pub join_prev: bool,
@@ -226,8 +225,9 @@ pub struct GroupSlot<C> {
 
 /// Grouping slots for hero entries in playback order, given as
 /// `(asset id, chapter, eligible)`, with the user's collage `edits`
-/// applied: a `solo` photo plays on its own, and a `joins` link between a
-/// photo and the previous collage photo sets its `join_prev`. Links between
+/// applied: a `solo` photo arrives ineligible, so it plays on its own, and a
+/// `joins` link between a photo and the previous collage photo sets its
+/// `join_prev`. Links between
 /// photos that are no longer neighbouring collage photos (one was removed,
 /// captioned or set solo, or a photo now sits between them) do nothing,
 /// like a swap whose asset is gone. The planner estimate, the renderer and
@@ -236,53 +236,91 @@ pub fn collage_slots<'a, C>(
     entries: impl IntoIterator<Item = (&'a str, C, bool)>,
     edits: &CollageEdits,
 ) -> Vec<GroupSlot<C>> {
-    let linked = |a: &str, b: &str| {
-        edits
-            .joins
-            .iter()
-            .any(|(x, y)| (x == a && y == b) || (x == b && y == a))
-    };
     let mut prev: Option<&str> = None;
     entries
         .into_iter()
         .map(|(id, chapter, eligible)| {
-            let solo = eligible && edits.solo.iter().any(|s| s == id);
-            let join_prev = eligible && !solo && prev.is_some_and(|p| linked(p, id));
-            if eligible && !solo {
+            let eligible = eligible && !edits.is_solo(id);
+            let join_prev = eligible && prev.is_some_and(|p| edits.linked(p, id));
+            if eligible {
                 prev = Some(id);
             }
             GroupSlot {
                 chapter,
                 eligible,
-                solo,
                 join_prev,
             }
         })
         .collect()
 }
 
-/// Whether a hero entry may join a collage: a still that is not a panorama
-/// (panoramas pan solo) and has no caption (a caption describes one photo).
-/// The renderer and [`estimate_hero_secs`] both decide through this.
-pub fn collage_eligible(rendition: &Rendition, panorama: bool, captioned: bool) -> bool {
-    matches!(rendition, Rendition::Still) && !panorama && !captioned
+/// Why a hero entry always plays on its own, whatever the user's collage
+/// edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaysAlone {
+    /// A video clip.
+    Clip,
+    /// A Live Photo playing its motion.
+    Motion,
+    /// A still with a caption: a caption describes one photo.
+    Caption,
+    /// A panorama: it pans solo.
+    Panorama,
 }
 
-/// [`collage_eligible`] from what the renderer knows of an entry: its
-/// rendition, its display aspect (width / height, rotation applied; a
-/// panorama pans solo) and its caption. The renderer's resolved entries and
-/// the Story editor both decide through this, so the editor shows the
-/// collages the film will play.
-pub fn entry_collage_eligible(
+/// Why a hero entry may not join a collage, if it may not: only a still
+/// that is not a panorama and has no caption may.
+pub fn plays_alone(rendition: &Rendition, panorama: bool, captioned: bool) -> Option<PlaysAlone> {
+    match rendition {
+        Rendition::Clip { .. } => Some(PlaysAlone::Clip),
+        Rendition::Motion { .. } => Some(PlaysAlone::Motion),
+        Rendition::Still if captioned => Some(PlaysAlone::Caption),
+        Rendition::Still if panorama => Some(PlaysAlone::Panorama),
+        Rendition::Still => None,
+    }
+}
+
+/// Whether a hero entry may join a collage ([`plays_alone`] gives none).
+/// The renderer and [`estimate_hero_secs`] both decide through this.
+pub fn collage_eligible(rendition: &Rendition, panorama: bool, captioned: bool) -> bool {
+    plays_alone(rendition, panorama, captioned).is_none()
+}
+
+/// [`plays_alone`] from what the renderer knows of an entry: its
+/// rendition, its display aspect (width / height, rotation applied) and its
+/// caption. The renderer's resolved entries and the Story editor both
+/// decide through this, so the editor shows the collages the film will play.
+pub fn entry_plays_alone(
     rendition: &Rendition,
     aspect: Option<f64>,
     caption: Option<&str>,
-) -> bool {
-    collage_eligible(
+) -> Option<PlaysAlone> {
+    plays_alone(
         rendition,
         aspect.is_some_and(is_panorama),
         has_caption(caption),
     )
+}
+
+/// Each asset's chapter in `plan`: the first of `plan.chapters` holding it.
+fn chapter_index(plan: &Plan) -> HashMap<&str, usize> {
+    let mut out: HashMap<&str, usize> = HashMap::new();
+    for (i, c) in plan.chapters.iter().enumerate() {
+        for id in &c.asset_ids {
+            out.entry(id).or_insert(i);
+        }
+    }
+    out
+}
+
+/// Why a photo playing on its own can't join a neighbour
+/// ([`HeroGrouping::join_partner`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinBlock {
+    /// No other collage photo of its chapter on that side.
+    NoNeighbour,
+    /// The neighbour's collage holds [`MAX_COLLAGE`] photos already.
+    Full,
 }
 
 /// A plan's hero as the renderer will group it, for showing and editing
@@ -293,13 +331,24 @@ pub fn entry_collage_eligible(
 pub struct HeroGrouping {
     /// Hero indices that play, in playback order.
     pub playing: Vec<usize>,
-    /// Per hero index: chapter and whether it may share a collage.
+    /// Per hero index: chapter and why it plays alone, if it must.
     chapter: Vec<usize>,
-    eligible: Vec<bool>,
+    alone: Vec<Option<PlaysAlone>>,
     ids: Vec<String>,
 }
 
 impl HeroGrouping {
+    /// Grouping of `plan` (normally an edited plan) over its project's
+    /// `assets`: their display aspects, and whether each source is on disk.
+    pub fn from_assets(plan: &Plan, assets: &[Asset]) -> Self {
+        let by_id: HashMap<&str, &Asset> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
+        Self::new(
+            plan,
+            |id| by_id.get(id).and_then(|a| a.display_aspect()),
+            |id| by_id.get(id).is_some_and(|a| a.path.exists()),
+        )
+    }
+
     /// `aspect_of` gives an asset's display aspect, `present` whether its
     /// source is on disk.
     pub fn new(
@@ -307,12 +356,7 @@ impl HeroGrouping {
         aspect_of: impl Fn(&str) -> Option<f64>,
         present: impl Fn(&str) -> bool,
     ) -> Self {
-        let mut chapter_of: HashMap<&str, usize> = HashMap::new();
-        for (i, c) in plan.chapters.iter().enumerate() {
-            for id in &c.asset_ids {
-                chapter_of.entry(id).or_insert(i);
-            }
-        }
+        let chapter_of = chapter_index(plan);
         let hero = &plan.hero;
         Self {
             playing: (0..hero.len())
@@ -327,10 +371,10 @@ impl HeroGrouping {
                         .unwrap_or(usize::MAX)
                 })
                 .collect(),
-            eligible: hero
+            alone: hero
                 .iter()
                 .map(|e| {
-                    entry_collage_eligible(
+                    entry_plays_alone(
                         &e.rendition,
                         aspect_of(&e.asset_id),
                         plan.captions.get(&e.asset_id).map(String::as_str),
@@ -346,9 +390,49 @@ impl HeroGrouping {
         self.chapter[hero_index]
     }
 
-    /// Whether the hero entry may share a collage ([`entry_collage_eligible`]).
-    pub fn eligible(&self, hero_index: usize) -> bool {
-        self.eligible[hero_index]
+    /// Why the hero entry always plays on its own ([`entry_plays_alone`]),
+    /// if it does.
+    pub fn plays_alone(&self, hero_index: usize) -> Option<PlaysAlone> {
+        self.alone[hero_index]
+    }
+
+    /// Whether the hero entry may share a collage under `collage`: no
+    /// [`PlaysAlone`] reason and not set solo by the user.
+    fn collage_photo(&self, hero_index: usize, collage: &CollageEdits) -> bool {
+        self.alone[hero_index].is_none() && !collage.is_solo(&self.ids[hero_index])
+    }
+
+    /// The neighbouring collage photo hero entry `i` could join, before it
+    /// (`back`) or after it: the nearest playing collage photo of its
+    /// chapter, as [`collage_slots`] links them, if joining them under
+    /// `collage` puts the two in one collage.
+    pub fn join_partner(
+        &self,
+        collage: &CollageEdits,
+        i: usize,
+        back: bool,
+    ) -> Result<usize, JoinBlock> {
+        let pos = self
+            .playing
+            .binary_search(&i)
+            .map_err(|_| JoinBlock::NoNeighbour)?;
+        let in_chapter = |k: &&usize| self.chapter[**k] == self.chapter[i];
+        let mut side: Box<dyn Iterator<Item = &usize>> = if back {
+            Box::new(self.playing[..pos].iter().rev().take_while(in_chapter))
+        } else {
+            Box::new(self.playing[pos + 1..].iter().take_while(in_chapter))
+        };
+        let k = *side
+            .find(|&&k| self.collage_photo(k, collage))
+            .ok_or(JoinBlock::NoNeighbour)?;
+        let (a, b) = if back { (k, i) } else { (i, k) };
+        let mut joined = collage.clone();
+        joined.join(self.ids[a].clone(), self.ids[b].clone());
+        self.groups(&joined)
+            .iter()
+            .any(|g| g.contains(&a) && g.contains(&b))
+            .then_some(k)
+            .ok_or(JoinBlock::Full)
     }
 
     /// The playing entries' segments under `collage` (normally the edited
@@ -356,9 +440,13 @@ impl HeroGrouping {
     /// [`collage_groups`], exactly as the renderer calls them.
     pub fn groups(&self, collage: &CollageEdits) -> Vec<Vec<usize>> {
         let slots = collage_slots(
-            self.playing
-                .iter()
-                .map(|&i| (self.ids[i].as_str(), self.chapter[i], self.eligible[i])),
+            self.playing.iter().map(|&i| {
+                (
+                    self.ids[i].as_str(),
+                    self.chapter[i],
+                    self.alone[i].is_none(),
+                )
+            }),
             collage,
         );
         collage_groups(&slots)
@@ -382,8 +470,8 @@ impl HeroGrouping {
 /// moves stills across the fewest entries, then makes the fewest segments,
 /// then balances group sizes (five stills in a row play as 3 + 2, not 4 + 1).
 ///
-/// The user's overrides come first: a `solo` slot plays on its own like an
-/// ineligible one, and a `join_prev` link keeps its photo in the previous
+/// The user's overrides come first: a photo set solo arrives ineligible
+/// (see [`collage_slots`]), and a `join_prev` link keeps its photo in the previous
 /// collage photo's group even beyond the reach (entries it crosses do not
 /// count against the reach); links still never cross a chapter, and a row
 /// of linked photos longer than [`MAX_COLLAGE`] drops the links past it.
@@ -398,7 +486,7 @@ pub fn collage_groups<C: PartialEq>(slots: &[GroupSlot<C>]) -> Vec<Vec<usize>> {
     // Photos in the current row of linked photos.
     let mut linked_row = 0;
     for (i, s) in slots.iter().enumerate() {
-        if !s.eligible || s.solo {
+        if !s.eligible {
             groups.push(vec![i]);
             continue;
         }
@@ -586,12 +674,7 @@ pub fn estimate_hero_secs<'e, 'c>(
 /// planner budgets with: route and places cards from the plan, panorama
 /// holds from `assets`, the plan's captions and its collage overrides.
 pub fn estimate_plan_secs(plan: &Plan, assets: &[Asset]) -> f64 {
-    let mut chapter: HashMap<&str, usize> = HashMap::new();
-    for (i, c) in plan.chapters.iter().enumerate() {
-        for id in &c.asset_ids {
-            chapter.entry(id).or_insert(i);
-        }
-    }
+    let chapter = chapter_index(plan);
     // Chapter labels only need to tell chapters apart.
     let labels: Vec<String> = (0..=plan.chapters.len()).map(|i| i.to_string()).collect();
     let pano: HashMap<&str, f64> = assets
@@ -916,15 +999,11 @@ pub struct PlanEdits {
     /// Asset id -> user caption (beats the caption embedded in the file).
     #[serde(default)]
     pub caption_overrides: BTreeMap<String, String>,
-    /// Film photos the user set to play on their own ("Show on its own"),
-    /// oldest first. See [`collage_slots`].
-    #[serde(default)]
-    pub solo: Vec<String>,
-    /// Film photos the user joined into one collage ("Join with next"), as
-    /// (earlier, later) neighbouring collage photos, oldest first. See
-    /// [`collage_slots`].
-    #[serde(default)]
-    pub joins: Vec<(String, String)>,
+    /// Film photos the user set to play on their own ("Show on its own")
+    /// or joined into one collage ("Join with next"), oldest first. Stored
+    /// flat (`solo`, `joins`) beside the other edits. See [`collage_slots`].
+    #[serde(flatten)]
+    pub collage: CollageEdits,
 }
 
 impl PlanEdits {
@@ -934,32 +1013,7 @@ impl PlanEdits {
             && self.swaps.is_empty()
             && self.place_overrides.is_empty()
             && self.caption_overrides.is_empty()
-            && self.solo.is_empty()
-            && self.joins.is_empty()
-    }
-
-    /// Play a film photo on its own, or put it back in the collages.
-    /// Setting it solo also drops its joins: they would contradict it.
-    pub fn set_solo(&mut self, asset_id: String, solo: bool) {
-        self.solo.retain(|id| *id != asset_id);
-        if solo {
-            self.joins.retain(|(a, b)| *a != asset_id && *b != asset_id);
-            self.solo.push(asset_id);
-        }
-    }
-
-    /// Join two neighbouring film photos (`first` plays earlier) into one
-    /// collage; neither stays solo.
-    pub fn join(&mut self, first: String, second: String) {
-        self.solo.retain(|id| *id != first && *id != second);
-        self.joins
-            .retain(|(a, b)| !(*a == first && *b == second || *a == second && *b == first));
-        self.joins.push((first, second));
-    }
-
-    /// Undo the user's joins of a photo ("Separate").
-    pub fn unjoin(&mut self, asset_id: &str) {
-        self.joins.retain(|(a, b)| a != asset_id && b != asset_id);
+            && self.collage.is_empty()
     }
 
     /// Set or (when blank) clear the place label for a chapter.
@@ -1152,16 +1206,9 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
 
     // Collage overrides ride along for the grouping (`collage_slots`),
     // which ignores any that no longer fit the film.
-    let alive = |id: &String| in_plan.contains(id.as_str()) && !dead.contains(id.as_str());
-    out.collage = CollageEdits {
-        solo: edits.solo.iter().filter(|id| alive(id)).cloned().collect(),
-        joins: edits
-            .joins
-            .iter()
-            .filter(|(a, b)| alive(a) && alive(b))
-            .cloned()
-            .collect(),
-    };
+    out.collage = edits.collage.clone();
+    out.collage
+        .retain_assets(|id| in_plan.contains(id) && !dead.contains(id));
     out
 }
 
@@ -3985,16 +4032,15 @@ mod tests {
     }
 
     /// Slots from a compact spec: one char per entry, `s` an eligible
-    /// still, `o` one the user set solo, `j` one the user joined to the
-    /// previous collage photo, anything else an entry that plays solo; `|`
-    /// starts the next chapter.
+    /// still, `j` one the user joined to the previous collage photo,
+    /// anything else (`o`: one the user set solo) an entry that plays solo;
+    /// `|` starts the next chapter.
     fn slots(spec: &str) -> Vec<GroupSlot<usize>> {
         let mut out = vec![];
         for (chapter, part) in spec.split('|').enumerate() {
             out.extend(part.chars().map(|c| GroupSlot {
                 chapter,
-                eligible: matches!(c, 's' | 'o' | 'j'),
-                solo: c == 'o',
+                eligible: matches!(c, 's' | 'j'),
                 join_prev: c == 'j',
             }));
         }
@@ -4041,19 +4087,19 @@ mod tests {
             ("e", 0, true),
         ];
         let s = collage_slots(entries, &edits);
-        let flags: Vec<(bool, bool)> = s.iter().map(|g| (g.solo, g.join_prev)).collect();
+        let flags: Vec<(bool, bool)> = s.iter().map(|g| (g.eligible, g.join_prev)).collect();
         // b is solo, so a and c are neighbours and their link holds; a solo
         // clip means nothing; d now sits between c and e, so that link
         // waits until d is gone.
         assert_eq!(
             flags,
             [
+                (true, false),
+                (false, false),
+                (true, true),
                 (false, false),
                 (true, false),
-                (false, true),
-                (false, false),
-                (false, false),
-                (false, false)
+                (true, false)
             ]
         );
         let s = collage_slots(entries.into_iter().filter(|e| e.0 != "d"), &edits);
@@ -4064,14 +4110,21 @@ mod tests {
     fn collage_edits_load_from_older_edits_and_reach_the_edited_plan() {
         // Edits saved before collage edits existed still load.
         let old: PlanEdits = serde_json::from_str(r#"{"excluded":["x"]}"#).unwrap();
-        assert!(old.solo.is_empty() && old.joins.is_empty());
+        assert!(old.collage.is_empty());
+        // ...and collage edits store flat beside the others, as they always have.
+        let flat: PlanEdits =
+            serde_json::from_str(r#"{"solo":["s"],"joins":[["a","b"]]}"#).unwrap();
+        assert_eq!(flat.collage.solo, ["s"]);
+        let json = serde_json::to_value(&flat).unwrap();
+        assert_eq!(json["joins"], serde_json::json!([["a", "b"]]));
+        assert!(json.get("collage").is_none());
 
-        let mut e = PlanEdits::default();
+        let mut e = CollageEdits::default();
         e.join("a".into(), "b".into());
         e.set_solo("c".into(), true);
         e.join("c".into(), "d".into());
         assert_eq!(e.joins.len(), 2);
-        assert!(e.solo.is_empty(), "joining puts c back in the collages");
+        assert!(!e.is_solo("c"), "joining puts c back in the collages");
         e.set_solo("a".into(), true);
         assert_eq!(
             e.joins,
@@ -4092,8 +4145,10 @@ mod tests {
         assert!(base.collage.is_empty());
         let edits = PlanEdits {
             excluded: vec!["c".into()],
-            solo: vec!["a".into(), "c".into(), "gone".into()],
-            joins: vec![("a".into(), "b".into()), ("b".into(), "c".into())],
+            collage: CollageEdits {
+                solo: vec!["a".into(), "c".into(), "gone".into()],
+                joins: vec![("a".into(), "b".into()), ("b".into(), "c".into())],
+            },
             ..Default::default()
         };
         let out = apply_edits(&base, &assets, &edits);
@@ -4138,11 +4193,9 @@ mod tests {
             let v: Vec<GroupSlot<usize>> = (0..len)
                 .map(|_| {
                     chapter += usize::from(next(8) == 0);
-                    let eligible = next(3) != 0;
                     GroupSlot {
                         chapter,
-                        eligible,
-                        solo: eligible && next(6) == 0,
+                        eligible: next(3) != 0,
                         join_prev: next(3) == 0,
                     }
                 })
@@ -4153,7 +4206,7 @@ mod tests {
             assert_eq!(seen, (0..len).collect::<Vec<_>>(), "{groups:?}");
             assert!(groups.windows(2).all(|w| w[0][0] < w[1][0]));
             let group_of = |i: usize| groups.iter().position(|g| g.contains(&i)).unwrap();
-            let photo = |i: usize| v[i].eligible && !v[i].solo;
+            let photo = |i: usize| v[i].eligible;
             for g in &groups {
                 assert!(g.windows(2).all(|w| w[0] < w[1]), "chronological {g:?}");
                 if g.len() > 1 {
@@ -4295,7 +4348,10 @@ mod tests {
         // Without the panorama, a4 joins a1 and a3.
         let plain = HeroGrouping::new(&plan, |_| None, all);
         assert_eq!(plain.groups(&none)[0], vec![0, 2, 3]);
-        assert_eq!((plain.chapter(4), plain.eligible(5)), (1, false));
+        assert_eq!(
+            (plain.chapter(4), plain.plays_alone(5)),
+            (1, Some(PlaysAlone::Caption))
+        );
         // A missing a3 does not play: a1 and a4 group without it.
         let gone = HeroGrouping::new(&plan, |_| None, |id| id != "a3");
         assert_eq!(gone.groups(&none)[0], vec![0, 3]);
@@ -4306,9 +4362,36 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(plain.groups(&solo)[0], vec![0, 3]);
-        assert!(entry_collage_eligible(&Rendition::Still, Some(1.5), None));
-        assert!(!entry_collage_eligible(&Rendition::Still, Some(4.0), None));
-        assert!(!entry_collage_eligible(&Rendition::Still, None, Some("x")));
+        assert_eq!(entry_plays_alone(&Rendition::Still, Some(1.5), None), None);
+        assert_eq!(
+            entry_plays_alone(&Rendition::Still, Some(4.0), None),
+            Some(PlaysAlone::Panorama)
+        );
+        assert_eq!(
+            entry_plays_alone(&Rendition::Still, Some(4.0), Some("x")),
+            Some(PlaysAlone::Caption)
+        );
+        assert_eq!(plain.plays_alone(1), Some(PlaysAlone::Clip));
+        // Join partners: the nearest collage photo of the chapter, never
+        // across a chapter, and only for a playing entry.
+        assert_eq!(
+            plain.join_partner(&none, 4, true),
+            Err(JoinBlock::NoNeighbour)
+        );
+        assert_eq!(plain.join_partner(&none, 4, false), Ok(6));
+        assert_eq!(
+            gone.join_partner(&none, 2, true),
+            Err(JoinBlock::NoNeighbour)
+        );
+        let a1_solo = CollageEdits {
+            solo: vec!["a1".into()],
+            ..Default::default()
+        };
+        assert_eq!(plain.join_partner(&a1_solo, 0, false), Ok(2));
+        assert_eq!(
+            plain.join_partner(&a1_solo, 2, true),
+            Err(JoinBlock::NoNeighbour)
+        );
     }
 
     #[test]
@@ -4341,7 +4424,6 @@ mod tests {
                     GroupSlot {
                         chapter,
                         eligible: next(3) != 0,
-                        solo: false,
                         join_prev: false,
                     }
                 })

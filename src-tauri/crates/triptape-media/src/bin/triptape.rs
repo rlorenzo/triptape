@@ -893,35 +893,27 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
         edits.place_overrides.len(),
         edits.caption_overrides.len()
     );
-    println!("on their own: {}", edits.solo.len());
-    for id in &edits.solo {
+    let collage = &edits.collage;
+    println!("on their own: {}", collage.solo.len());
+    for id in &collage.solo {
         println!("  {}", show(id));
     }
-    println!("joins: {}", edits.joins.len());
-    for (a, b) in &edits.joins {
+    println!("joins: {}", collage.joins.len());
+    for (a, b) in &collage.joins {
         println!("  {} + {}", show(a), show(b));
     }
 }
 
 /// How the edited film groups, as the renderer will (missing files left
-/// out): `(groups as hero indices, estimated seconds)`.
-fn film_grouping(plan: &Plan, assets: &[Asset]) -> (Vec<Vec<usize>>, f64) {
-    let by_id: HashMap<&str, &Asset> = assets.iter().map(|x| (x.id.as_str(), x)).collect();
-    let grouping = planmod::HeroGrouping::new(
-        plan,
-        |id| by_id.get(id).and_then(|a| a.display_aspect()),
-        |id| by_id.get(id).is_some_and(|a| a.path.exists()),
-    );
-    (
-        grouping.groups(&plan.collage),
-        planmod::estimate_plan_secs(plan, assets),
-    )
+/// out), as hero indices.
+fn film_groups(plan: &Plan, assets: &[Asset]) -> Vec<Vec<usize>> {
+    planmod::HeroGrouping::from_assets(plan, assets).groups(&plan.collage)
 }
 
 /// Print the film's collages and estimated length.
-fn print_film(plan: &Plan, assets: &[Asset], was_secs: Option<f64>) {
-    let by_id: HashMap<&str, &Asset> = assets.iter().map(|x| (x.id.as_str(), x)).collect();
-    let (groups, secs) = film_grouping(plan, assets);
+fn print_film(plan: &Plan, assets: &[Asset], by_id: &HashMap<&str, &Asset>, was_secs: Option<f64>) {
+    let groups = film_groups(plan, assets);
+    let secs = planmod::estimate_plan_secs(plan, assets);
     let collages: Vec<&Vec<usize>> = groups.iter().filter(|g| g.len() > 1).collect();
     let was = was_secs.map_or_else(String::new, |w| format!(" (was {w:.1} s)"));
     println!(
@@ -952,11 +944,11 @@ fn edit_cmd(args: &[String]) {
         .unwrap_or_else(|e| die("plan", e))
         .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
     let by_id: HashMap<&str, &Asset> = ep.assets.iter().map(|x| (x.id.as_str(), x)).collect();
-    let resolve = |refs: &[String]| -> Vec<&Asset> {
-        refs.iter()
-            .map(|q| asset_ref::resolve_asset(&ep.assets, q).unwrap_or_else(|e| die("edit", e)))
-            .collect()
+    let resolve_one = |q: &str| -> &Asset {
+        asset_ref::resolve_asset(&ep.assets, q).unwrap_or_else(|e| die("edit", e))
     };
+    let resolve =
+        |refs: &[String]| -> Vec<&Asset> { refs.iter().map(|q| resolve_one(q)).collect() };
     // Resolve everything first so a bad reference changes nothing.
     let includes = resolve(&a.include);
     if let Some(asset) = includes
@@ -969,6 +961,8 @@ fn edit_cmd(args: &[String]) {
         );
     }
     type Setter = fn(&mut PlanEdits, String, bool);
+    let set_solo: Setter = |e, id, on| e.collage.set_solo(id, on);
+    let solos = resolve(&a.solo);
     // Un-dos first, then removals, then pins.
     let ops: [(Vec<&Asset>, &str, Setter, bool); 6] = [
         (
@@ -991,17 +985,14 @@ fn edit_cmd(args: &[String]) {
         ),
         (includes, "include", PlanEdits::set_included, true),
         // Collage edits after the picks they apply to.
-        (resolve(&a.unsolo), "unsolo", PlanEdits::set_solo, false),
-        (resolve(&a.solo), "solo", PlanEdits::set_solo, true),
+        (resolve(&a.unsolo), "unsolo", set_solo, false),
+        (solos.clone(), "solo", set_solo, true),
     ];
     let unjoins = resolve(&a.unjoin);
     let joins: Vec<(&Asset, &Asset)> = a
         .join
         .iter()
-        .map(|(x, y)| {
-            let both = resolve(&[x.clone(), y.clone()]);
-            (both[0], both[1])
-        })
+        .map(|(x, y)| (resolve_one(x), resolve_one(y)))
         .collect();
     let changed = ops.iter().any(|(assets, ..)| !assets.is_empty())
         || !unjoins.is_empty()
@@ -1020,19 +1011,20 @@ fn edit_cmd(args: &[String]) {
         }
     }
     for asset in &unjoins {
-        edits.unjoin(&asset.id);
+        edits.collage.unjoin(&asset.id);
         println!("unjoin: {}", asset_label(asset));
     }
     // Each solo photo must be in the film; each join must leave the two in
     // one collage of the film (neighbouring collage photos of one day).
+    // Collage edits never change which photos are in the film.
     let edited = |edits: &PlanEdits| planmod::apply_edits(&ep.base, &ep.assets, edits);
-    for asset in &ops[5].0 {
-        if !edited(&edits).hero.iter().any(|e| e.asset_id == asset.id) {
+    let mut plan = edited(&edits);
+    for asset in &solos {
+        if !plan.hero.iter().any(|e| e.asset_id == asset.id) {
             die("edit", format!("{} is not in the film", asset_label(asset)));
         }
     }
     for (x, y) in &joins {
-        let plan = edited(&edits);
         let at = |a: &Asset| {
             plan.hero
                 .iter()
@@ -1040,14 +1032,12 @@ fn edit_cmd(args: &[String]) {
                 .unwrap_or_else(|| die("edit", format!("{} is not in the film", asset_label(a))))
         };
         let (first, second) = if at(x) <= at(y) { (x, y) } else { (y, x) };
-        edits.join(first.id.clone(), second.id.clone());
-        let plan = edited(&edits);
-        let (groups, _) = film_grouping(&plan, &ep.assets);
-        let pos = |a: &Asset| plan.hero.iter().position(|e| e.asset_id == a.id);
-        let together = groups.iter().any(|g| {
-            pos(first).is_some_and(|i| g.contains(&i))
-                && pos(second).is_some_and(|i| g.contains(&i))
-        });
+        let (i, j) = (at(first), at(second));
+        edits.collage.join(first.id.clone(), second.id.clone());
+        plan.collage.join(first.id.clone(), second.id.clone());
+        let together = film_groups(&plan, &ep.assets)
+            .iter()
+            .any(|g| g.contains(&i) && g.contains(&j));
         if !together {
             die(
                 "edit",
@@ -1062,14 +1052,13 @@ fn edit_cmd(args: &[String]) {
         }
         println!("join: {} + {}", asset_label(first), asset_label(second));
     }
-    let was_secs = changed.then(|| film_grouping(&ep.edited, &ep.assets).1);
+    let was_secs = changed.then(|| planmod::estimate_plan_secs(&ep.edited, &ep.assets));
     if changed {
         db.save_plan_edits(&ep.project_id, &edits)
             .unwrap_or_else(|e| die("save edits", e));
     }
     print_edits(&edits, &by_id);
-    let plan = edited(&edits);
-    print_film(&plan, &ep.assets, was_secs);
+    print_film(&plan, &ep.assets, &by_id, was_secs);
     if !changed {
         return;
     }

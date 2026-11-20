@@ -1844,9 +1844,9 @@ fn cached_segment(
 /// Whether an entry may join a collage: a still that is not a panorama
 /// (panoramas pan solo) and has no caption (a caption describes one photo,
 /// so a captioned still plays solo; same rule as the plan's timing model
-/// and the Story editor, through [`plan::entry_collage_eligible`]).
+/// and the Story editor, through [`plan::entry_plays_alone`]).
 fn collage_eligible(e: &ResolvedEntry) -> bool {
-    plan::entry_collage_eligible(&e.entry.rendition, e.aspect, e.caption.as_deref())
+    plan::entry_plays_alone(&e.entry.rendition, e.aspect, e.caption.as_deref()).is_none()
 }
 
 /// Hero segments in playback order: each is one entry or a collage of
