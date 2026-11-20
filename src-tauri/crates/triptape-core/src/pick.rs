@@ -1,21 +1,14 @@
 //! Best-of pick: the top N photos of a trip, without near-repeats.
 //!
 //! Photos are taken best score first. A photo that repeats a scene already
-//! picked (shot within [`SAME_SCENE_SECS`] and looking alike, or within
-//! [`BURST_SECS`]) waits, unless it shows different people: the same view
-//! with someone else in it is a different keepsake. Waiting photos only fill
-//! the slots left once every distinct scene is in.
+//! picked (the same moment as the film's planner judges it: a burst, or
+//! close in time and looking alike) waits, unless it shows different
+//! people: the same view with someone else in it is a different keepsake.
+//! Waiting photos only fill the slots left once every distinct scene is in.
 
-use crate::hash::phash_distance;
+use crate::plan::{has_caption, same_moment_at};
 use crate::types::{Asset, AssetKind};
 use std::collections::{HashMap, HashSet};
-
-/// Two alike-looking photos this close in time are one scene.
-pub const SAME_SCENE_SECS: i64 = 120;
-/// Photos this close in time are one burst, whatever they look like.
-pub const BURST_SECS: i64 = 5;
-/// Perceptual-hash distance at or under which two photos look alike.
-pub const SAME_SCENE_PHASH_DISTANCE: u32 = 14;
 
 /// What the pick needs to know about one photo.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -31,20 +24,7 @@ pub struct Candidate {
 
 /// True when `a` and `b` repeat one scene with the same people in it.
 pub fn repeats(a: &Candidate, b: &Candidate) -> bool {
-    if a.people_sig != b.people_sig {
-        return false;
-    }
-    let (Some(ta), Some(tb)) = (a.taken_at, b.taken_at) else {
-        return false;
-    };
-    let dt = (ta - tb).abs();
-    if dt <= BURST_SECS {
-        return true;
-    }
-    let (Some(p), Some(q)) = (a.phash, b.phash) else {
-        return false;
-    };
-    dt <= SAME_SCENE_SECS && phash_distance(p, q) <= SAME_SCENE_PHASH_DISTANCE
+    a.people_sig == b.people_sig && same_moment_at((a.taken_at, a.phash), (b.taken_at, b.phash))
 }
 
 /// Indices of the `count` best candidates, ascending (the input's order).
@@ -99,7 +79,7 @@ pub fn photo_score(a: &Asset) -> f32 {
         .as_ref()
         .map_or(0.5, |s| (s.tech_quality() + s.bonus).clamp(0.0, 1.5));
     let library = a.library_score.map_or(0.0, |l| l.clamp(0.0, 1.0));
-    let curated = if a.user_caption.is_some() {
+    let curated = if has_caption(a.user_caption.as_deref()) {
         CURATED_BONUS
     } else {
         0.0
@@ -109,7 +89,10 @@ pub fn photo_score(a: &Asset) -> f32 {
 
 /// How much a copy of a photo carries: its caption first, then people tags.
 fn richness(a: &Asset) -> (bool, bool) {
-    (a.user_caption.is_some(), a.people_sig.is_some())
+    (
+        has_caption(a.user_caption.as_deref()),
+        a.people_sig.is_some(),
+    )
 }
 
 /// The `count` best photos of `assets`, in the order given (story order
@@ -122,19 +105,22 @@ pub fn pick_photos<'a>(
     excluded: &HashSet<&str>,
     count: usize,
 ) -> Vec<&'a Asset> {
-    let usable = |a: &&Asset| {
-        a.kind != AssetKind::Video
-            && !excluded.contains(a.id.as_str())
-            && match (a.width, a.height) {
-                (Some(w), Some(h)) => u64::from(w) * u64::from(h) >= MIN_PIXELS,
-                _ => true,
-            }
-    };
+    let usable: Vec<&Asset> = assets
+        .iter()
+        .filter(|a| {
+            a.kind != AssetKind::Video
+                && !excluded.contains(a.id.as_str())
+                && match (a.width, a.height) {
+                    (Some(w), Some(h)) => u64::from(w) * u64::from(h) >= MIN_PIXELS,
+                    _ => true,
+                }
+        })
+        .collect();
     // One photo per content hash: the copy that carries the most (a photo
     // library can hold the same file twice, with the caption and people
     // tags on only one of them).
     let mut keeper: HashMap<&str, &Asset> = HashMap::new();
-    for a in assets.iter().filter(usable) {
+    for &a in &usable {
         if let Some(h) = a.content_hash.as_deref() {
             let kept = keeper.entry(h).or_insert(a);
             if richness(a) > richness(kept) {
@@ -142,9 +128,8 @@ pub fn pick_photos<'a>(
             }
         }
     }
-    let pool: Vec<&Asset> = assets
-        .iter()
-        .filter(usable)
+    let pool: Vec<&Asset> = usable
+        .into_iter()
         .filter(|a| {
             a.content_hash
                 .as_deref()
@@ -219,6 +204,16 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_caption_earns_no_curated_bonus() {
+        let mut blank = photo("blank", 1000, "h-blank");
+        blank.user_caption = Some("   ".to_string());
+        assert_eq!(
+            photo_score(&blank),
+            photo_score(&photo("bare", 1000, "h-bare"))
+        );
+    }
+
+    #[test]
     fn of_identical_copies_the_captioned_or_tagged_one_is_kept() {
         let mut tagged = photo("tagged", 1000, "h-1");
         tagged.people_sig = Some(7);
@@ -235,6 +230,20 @@ mod tests {
             .map(|a| a.id.as_str())
             .collect();
         assert_eq!(ids, ["tagged", "captioned"]);
+    }
+
+    #[test]
+    fn unhashed_and_unsized_photos_still_count() {
+        let mut unhashed = photo("unhashed", 1000, "");
+        unhashed.content_hash = None;
+        let mut no_size = photo("unsized", 9000, "h-u");
+        (no_size.width, no_size.height) = (None, None);
+        let assets = [unhashed, no_size];
+        let ids: Vec<&str> = pick_photos(&assets, &HashSet::new(), 10)
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(ids, ["unhashed", "unsized"]);
     }
 
     fn c(taken_at: i64, phash: u64, people_sig: Option<u64>, score: f32) -> Candidate {

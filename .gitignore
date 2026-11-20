@@ -40,3 +40,6 @@ exports/
 .env
 .env.*
 !.env.example
+
+# Browser-automation session logs and screenshots
+.playwright-mcp/
