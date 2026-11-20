@@ -84,6 +84,13 @@ pub struct Asset {
     /// Local quality/story score, filled by background scoring after ingest.
     /// `None` until scored (or when scoring was skipped).
     pub score: Option<Score>,
+    /// Image embedding of a still (or Live Photo still) from the optional
+    /// local model: an extra "same scene" signal next to `phash`. `None`
+    /// when the model is not installed or the pixels could not be read.
+    /// Analysis data: never serialized (not in plans, exports or the
+    /// webview), only stored in the local database.
+    #[serde(skip)]
+    pub embedding: Option<crate::embedding::Embedding>,
 }
 
 impl Asset {
@@ -125,8 +132,20 @@ impl Asset {
             people_sig: None,
             library_score: None,
             score: None,
+            embedding: None,
         }
     }
+}
+
+/// What background scoring derives from one asset's pixels, persisted
+/// together so a rescan of an unchanged file reuses all of it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Analysis {
+    pub score: Score,
+    /// Perceptual hash of the pixels scored; `None` when nothing decoded.
+    pub phash: Option<u64>,
+    /// See [`Asset::embedding`]; `None` without the model.
+    pub embedding: Option<crate::embedding::Embedding>,
 }
 
 /// How a Live Photo still+motion pair was matched.

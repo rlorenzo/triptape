@@ -8,6 +8,7 @@
 
 use crate::clip_window::MAX_WINDOW_SECS;
 use crate::cluster::{gps_outliers, story_key, story_order};
+use crate::embedding::{same_scene, Embedding};
 use crate::types::{
     distinct_assets, Asset, AssetKind, Chapter, MusicPick, Plan, PlanEntry, Rendition, Score,
 };
@@ -1272,27 +1273,54 @@ fn place_sibling_windows<'a>(
     *hero = kept;
 }
 
-/// Whether `a` and `b` show the same moment: a burst (within
-/// [`SAME_MOMENT_BURST_SECS`]), or close in time
-/// ([`SAME_MOMENT_SECS`]) with similar pixels.
-fn same_moment(a: &Asset, b: &Asset) -> bool {
-    same_moment_at((a.taken_at, a.phash), (b.taken_at, b.phash))
+/// What "same moment" needs to know about one shot, borrowed from an
+/// [`Asset`] or a lighter caller-side record (the best-of pick).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Moment<'a> {
+    /// Capture time (unix seconds); unknown never matches.
+    pub taken_at: Option<i64>,
+    pub phash: Option<u64>,
+    /// Image embedding, when the local model produced one.
+    pub embedding: Option<&'a Embedding>,
 }
 
-/// [`same_moment`] on bare `(taken_at, phash)` pairs, for callers that
-/// carry less than a whole [`Asset`] (the best-of pick).
-pub(crate) fn same_moment_at(a: (Option<i64>, Option<u64>), b: (Option<i64>, Option<u64>)) -> bool {
-    let (Some(ta), Some(tb)) = (a.0, b.0) else {
+impl<'a> Moment<'a> {
+    pub fn of(a: &'a Asset) -> Self {
+        Self {
+            taken_at: a.taken_at,
+            phash: a.phash,
+            embedding: a.embedding.as_ref(),
+        }
+    }
+}
+
+/// Whether `a` and `b` show the same moment; see [`same_moment_at`].
+fn same_moment(a: &Asset, b: &Asset) -> bool {
+    same_moment_at(Moment::of(a), Moment::of(b))
+}
+
+/// Whether two shots show the same moment: a burst (within
+/// [`SAME_MOMENT_BURST_SECS`]), or close in time ([`SAME_MOMENT_SECS`])
+/// and the same scene: similar pixels (pHash) or, when both carry an
+/// embedding, the same scene in another framing
+/// ([`crate::embedding::SAME_SCENE_COSINE`]). Without embeddings this is
+/// the pHash-only rule.
+pub fn same_moment_at(a: Moment, b: Moment) -> bool {
+    let (Some(ta), Some(tb)) = (a.taken_at, b.taken_at) else {
         return false;
     };
     let dt = (ta - tb).abs();
     if dt <= SAME_MOMENT_BURST_SECS {
         return true;
     }
-    let (Some(p), Some(q)) = (a.1, b.1) else {
+    if dt > SAME_MOMENT_SECS {
         return false;
-    };
-    dt <= SAME_MOMENT_SECS && crate::hash::phash_distance(p, q) <= SAME_MOMENT_PHASH_DISTANCE
+    }
+    let pixels_alike = matches!(
+        (a.phash, b.phash),
+        (Some(p), Some(q)) if crate::hash::phash_distance(p, q) <= SAME_MOMENT_PHASH_DISTANCE
+    );
+    pixels_alike || same_scene(a.embedding, b.embedding)
 }
 
 /// Mid-rank percentile (0..1) of `v` in an ascending `sorted` slice.
@@ -3280,6 +3308,45 @@ mod tests {
         let mut undated = shot("g", 1_000, Some(0));
         undated.taken_at = None;
         assert!(!same_moment(&base, &undated));
+    }
+
+    #[test]
+    fn same_moment_decision_table_with_embeddings() {
+        let scene = Embedding::from_f32(&[1.0, 0.0, 0.0]).unwrap();
+        let reframed = Embedding::from_f32(&[0.9, 0.3, 0.1]).unwrap(); // cos ~0.95
+        let elsewhere = Embedding::from_f32(&[0.1, 0.2, 1.0]).unwrap(); // cos ~0.1
+        fn m(t: i64, phash: u64, e: Option<&Embedding>) -> Moment<'_> {
+            Moment {
+                taken_at: Some(t),
+                phash: Some(phash),
+                embedding: e,
+            }
+        }
+        let (scene, reframed, elsewhere) = (&scene, &reframed, &elsewhere);
+        let near = SAME_MOMENT_SECS;
+        let base = m(0, 0, Some(scene));
+        // Near pHash: same moment with or without embeddings.
+        assert!(same_moment_at(base, m(near, 0, Some(elsewhere))));
+        assert!(same_moment_at(m(0, 0, None), m(near, 0, None)));
+        // Far pHash but the same scene by embedding: caught.
+        assert!(same_moment_at(base, m(near, u64::MAX, Some(reframed))));
+        // Far pHash and another scene: distinct.
+        assert!(!same_moment_at(base, m(near, u64::MAX, Some(elsewhere))));
+        // Same scene but outside the time window: distinct (window unchanged).
+        assert!(!same_moment_at(base, m(near + 1, u64::MAX, Some(reframed))));
+        assert!(!same_moment_at(base, m(near + 1, 0, Some(scene))));
+        // A missing embedding on either side falls back to pHash only.
+        assert!(!same_moment_at(
+            m(0, 0, None),
+            m(near, u64::MAX, Some(reframed))
+        ));
+        assert!(!same_moment_at(base, m(near, u64::MAX, None)));
+        // Unknown time never matches, whatever the pixels.
+        let undated = Moment {
+            taken_at: None,
+            ..m(0, 0, Some(scene))
+        };
+        assert!(!same_moment_at(base, undated));
     }
 
     #[test]

@@ -12,8 +12,12 @@
 //! - Tier budget ceilings from PLAN.md Section 13 live here as constants
 //!   ([`CORE_TIER_MAX_DISK_MB`], [`CORE_TIER_MAX_PEAK_RAM_MB`],
 //!   [`CORE_TIER_SCORE_1000_PHOTOS_SECS`], [`OPTIONAL_TIER_MAX_DISK_MB`]).
-//!   Every model slot is NOT PINNED; see `THIRD_PARTY_MODELS.md` for the
-//!   ledger and per-model blockers.
+//! - [`local`] runs the pinned optional models (ONNX Runtime, loaded at run
+//!   time from files `scripts/fetch-models` installs) and hands core plain
+//!   data. Without those files it loads nothing and callers keep the
+//!   heuristic behaviour. See `THIRD_PARTY_MODELS.md` for pins and blockers.
+
+pub mod local;
 
 use triptape_core::types::{Asset, AssetKind, MusicPick};
 

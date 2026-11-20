@@ -1,0 +1,512 @@
+//! Optional on-device models run through ONNX Runtime (CPU execution
+//! provider only).
+//!
+//! Nothing here is bundled or downloaded by the app or the build:
+//! `scripts/fetch-models` installs the pinned files (see
+//! `THIRD_PARTY_MODELS.md`) into a models directory, and [`LocalModels::load`]
+//! picks up whatever is there. Anything missing (the runtime library or a
+//! model file) leaves that capability off and yields one note saying what is
+//! missing and how to get it; callers then behave exactly as without models.
+//!
+//! Lookup order for the models directory: an explicit path (CLI `--models`),
+//! then `TRIPTAPE_MODELS_DIR`, then the caller's default (the app data dir's
+//! `models/`). The runtime library is `TRIPTAPE_ORT_LIB` when set, else
+//! `<models dir>/onnxruntime/<platform library name>`.
+//!
+//! Privacy: inputs are decoded thumbnails, outputs are plain numbers handed
+//! to `triptape-core`. Nothing is logged per photo.
+
+use image::{imageops::FilterType, DynamicImage, RgbImage};
+use ort::session::Session;
+use ort::value::Tensor;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
+use triptape_core::embedding::Embedding;
+
+use crate::{EmbedResult, Embedder, ModelStatus};
+
+/// Env var naming the models directory.
+pub const MODELS_DIR_ENV: &str = "TRIPTAPE_MODELS_DIR";
+/// Env var naming the ONNX Runtime shared library (absolute path).
+pub const ORT_LIB_ENV: &str = "TRIPTAPE_ORT_LIB";
+/// DINOv2-small int8 (`onnx-community/dinov2-small@8b1f705a3a`).
+pub const DINO_FILE: &str = "dinov2-small-int8.onnx";
+/// How to get the files, for the "missing" notes.
+const FETCH_HINT: &str = "run scripts/fetch-models";
+
+/// Platform file name of the ONNX Runtime shared library.
+pub fn ort_library_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
+    }
+}
+
+/// Where the runtime and the model files are looked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPaths {
+    pub dir: PathBuf,
+    pub runtime: PathBuf,
+}
+
+impl ModelPaths {
+    /// Resolve the lookup order in the module docs. `explicit` is a CLI
+    /// flag, `default_dir` the caller's default; `env` reads variables
+    /// (injected so tests need not touch the process environment).
+    pub fn resolve(
+        explicit: Option<&Path>,
+        default_dir: Option<PathBuf>,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Option<Self> {
+        let dir = explicit
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                env(MODELS_DIR_ENV)
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+            })
+            .or(default_dir)?;
+        let runtime = env(ORT_LIB_ENV)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| dir.join("onnxruntime").join(ort_library_name()));
+        Some(Self { dir, runtime })
+    }
+
+    /// [`ModelPaths::resolve`] with the process environment.
+    pub fn from_env(explicit: Option<&Path>, default_dir: Option<PathBuf>) -> Option<Self> {
+        Self::resolve(explicit, default_dir, |k| std::env::var(k).ok())
+    }
+}
+
+/// The process-wide ONNX Runtime environment. The library can be loaded
+/// only once per process, so the first outcome sticks.
+static ORT_ENV: OnceLock<Result<ort::environment::Environment, String>> = OnceLock::new();
+
+fn ort_env(lib: &Path) -> Result<&'static ort::environment::Environment, String> {
+    ORT_ENV
+        .get_or_init(|| {
+            if !lib.is_file() {
+                return Err(format!(
+                    "ONNX Runtime library not found at {}",
+                    lib.display()
+                ));
+            }
+            ort::init_from(lib)
+                .map_err(|e| format!("ONNX Runtime at {} failed to load: {e}", lib.display()))?
+                .with_name("triptape")
+                .build()
+                .map_err(|e| format!("ONNX Runtime failed to start: {e}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+/// Most sessions kept per model. Each DINOv2 session costs about 290 MB of
+/// peak RSS (measured: 4 sessions took a scan from 0.68 to 1.85 GB, over the
+/// 1.5 GB core-tier ceiling), so workers beyond this share sessions.
+pub const MAX_SESSIONS: usize = 2;
+
+/// A few sessions of one model, so parallel scoring workers do not queue
+/// on a single one (`Session::run` needs `&mut`). Each session runs
+/// single-threaded: the spike measured 2 intra-op threads barely beating 1,
+/// so parallelism comes from the workers.
+struct SessionPool {
+    sessions: Vec<Mutex<Session>>,
+    next: AtomicUsize,
+    /// Runs and summed wall time inside them (for per-photo cost reports).
+    runs: AtomicU64,
+    nanos: AtomicU64,
+}
+
+impl SessionPool {
+    fn load(env: &ort::environment::Environment, file: &Path, n: usize) -> Result<Self, String> {
+        let one = || -> Result<Session, String> {
+            Session::builder(env)
+                .and_then(|b| b.with_intra_threads(1).map_err(Into::into))
+                .and_then(|b| b.with_inter_threads(1).map_err(Into::into))
+                .and_then(|mut b| b.commit_from_file(file))
+                .map_err(|e| format!("{}: {e}", file.display()))
+        };
+        let sessions = (0..n.clamp(1, MAX_SESSIONS))
+            .map(|_| one().map(Mutex::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            sessions,
+            next: AtomicUsize::new(0),
+            runs: AtomicU64::new(0),
+            nanos: AtomicU64::new(0),
+        })
+    }
+
+    /// (runs, mean milliseconds per run) so far.
+    fn timing(&self) -> (u64, f64) {
+        let runs = self.runs.load(Ordering::Relaxed);
+        let nanos = self.nanos.load(Ordering::Relaxed);
+        (
+            runs,
+            if runs == 0 {
+                0.0
+            } else {
+                nanos as f64 / runs as f64 / 1e6
+            },
+        )
+    }
+
+    fn timed<T>(&self, s: &mut Session, f: impl FnOnce(&mut Session) -> T) -> T {
+        let t = std::time::Instant::now();
+        let out = f(s);
+        self.runs.fetch_add(1, Ordering::Relaxed);
+        self.nanos
+            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        out
+    }
+
+    /// Run `f` on a free session (or wait for the next one in turn).
+    fn with<T>(&self, f: impl FnOnce(&mut Session) -> T) -> T {
+        for s in &self.sessions {
+            if let Ok(mut s) = s.try_lock() {
+                return self.timed(&mut s, f);
+            }
+        }
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.sessions.len();
+        let mut s = self.sessions[i]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.timed(&mut s, f)
+    }
+}
+
+/// One model output: (shape, data).
+type Output = (Vec<i64>, Vec<f32>);
+
+/// Run a single-input model on an `f32` NCHW tensor; every output as
+/// (shape, data).
+fn run_f32(s: &mut Session, shape: [i64; 4], data: Vec<f32>) -> Result<Vec<Output>, String> {
+    let name = s.inputs()[0].name().to_string();
+    let t = Tensor::from_array((shape, data)).map_err(|e| e.to_string())?;
+    let out = s
+        .run(vec![(
+            std::borrow::Cow::Owned(name),
+            ort::session::SessionInputValue::from(t),
+        )])
+        .map_err(|e| e.to_string())?;
+    let mut v = Vec::new();
+    for (_, o) in out.iter() {
+        let (sh, d) = o.try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+        v.push((sh.iter().copied().collect(), d.to_vec()));
+    }
+    Ok(v)
+}
+
+// -- DINOv2 embedding -------------------------------------------------------
+
+/// ImageNet mean / std, the DINOv2 preprocessing.
+const IMAGENET: ([f32; 3], [f32; 3]) = ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]);
+const DINO_SIDE: u32 = 224;
+/// Shortest side before the centre crop (the 256 -> 224 ImageNet recipe the
+/// spike measured with).
+const DINO_SHORT: u32 = 256;
+
+/// Resize the shortest side to [`DINO_SHORT`], centre-crop 224x224,
+/// normalise, NCHW.
+pub fn dino_input(img: &RgbImage) -> Vec<f32> {
+    let (w, h) = (img.width().max(1) as f32, img.height().max(1) as f32);
+    let s = DINO_SHORT as f32 / w.min(h);
+    let nw = ((w * s).round() as u32).max(DINO_SIDE);
+    let nh = ((h * s).round() as u32).max(DINO_SIDE);
+    let r = image::imageops::resize(img, nw, nh, FilterType::CatmullRom);
+    let crop = image::imageops::crop_imm(
+        &r,
+        (nw - DINO_SIDE) / 2,
+        (nh - DINO_SIDE) / 2,
+        DINO_SIDE,
+        DINO_SIDE,
+    )
+    .to_image();
+    let plane = (DINO_SIDE * DINO_SIDE) as usize;
+    let mut d = vec![0f32; 3 * plane];
+    for (x, y, p) in crop.enumerate_pixels() {
+        let i = (y * DINO_SIDE + x) as usize;
+        for c in 0..3 {
+            d[c * plane + i] = (f32::from(p[c]) / 255.0 - IMAGENET.0[c]) / IMAGENET.1[c];
+        }
+    }
+    d
+}
+
+/// Pool DINOv2's `last_hidden_state` (`[1, tokens, dim]`, CLS first) into
+/// one vector: CLS plus the mean patch token, L2-normalised (the spike's
+/// pooling, which its thresholds were measured with). `None` on a shape it
+/// does not expect.
+pub fn dino_pool(shape: &[i64], data: &[f32]) -> Option<Vec<f32>> {
+    let [1, tokens, dim] = *shape else {
+        return None;
+    };
+    let (tokens, dim) = (usize::try_from(tokens).ok()?, usize::try_from(dim).ok()?);
+    if tokens < 2 || dim == 0 || data.len() != tokens * dim {
+        return None;
+    }
+    let mut e = data[..dim].to_vec();
+    let patches = (tokens - 1) as f32;
+    for t in 1..tokens {
+        for (k, v) in e.iter_mut().enumerate() {
+            *v += data[t * dim + k] / patches;
+        }
+    }
+    let n = e.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if !(n.is_finite() && n > 0.0) {
+        return None;
+    }
+    e.iter_mut().for_each(|x| *x /= n);
+    Some(e)
+}
+
+/// DINOv2-small image embedder (the [`Embedder`] seam).
+pub struct DinoEmbedder {
+    pool: SessionPool,
+}
+
+impl DinoEmbedder {
+    fn embed_rgb(&self, img: &RgbImage) -> Result<Vec<f32>, String> {
+        let input = dino_input(img);
+        let side = i64::from(DINO_SIDE);
+        let out = self.pool.with(|s| run_f32(s, [1, 3, side, side], input))?;
+        let (shape, data) = out.first().ok_or("no output")?;
+        dino_pool(shape, data).ok_or_else(|| format!("unexpected output shape {shape:?}"))
+    }
+}
+
+impl Embedder for DinoEmbedder {
+    fn embed(&self, rgb: &[u8], width: u32, height: u32) -> EmbedResult {
+        let embedding = RgbImage::from_raw(width, height, rgb.to_vec())
+            .and_then(|img| self.embed_rgb(&img).ok());
+        EmbedResult {
+            embedding,
+            status: ModelStatus::Ready,
+        }
+    }
+}
+
+// -- The loaded set -----------------------------------------------------------
+
+/// What the optional models derive from one photo, as plain data for core.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PhotoAnalysis {
+    pub embedding: Option<Embedding>,
+}
+
+/// The optional local models that loaded. Every capability is `None` when
+/// its files are missing, in which case callers keep their old behaviour.
+#[derive(Default)]
+pub struct LocalModels {
+    embedder: Option<DinoEmbedder>,
+    notes: Vec<String>,
+}
+
+impl LocalModels {
+    /// No models (the default without a models directory).
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Load whatever is installed under `paths`, with `sessions` sessions
+    /// per model (the number of parallel scoring workers, capped at
+    /// [`MAX_SESSIONS`]). Never
+    /// fails: missing pieces become [`LocalModels::notes`].
+    pub fn load(paths: Option<&ModelPaths>, sessions: usize) -> Self {
+        let Some(paths) = paths else {
+            return Self {
+                notes: vec![format!(
+                    "local models: no models directory; near-duplicates use pHash only ({FETCH_HINT})"
+                )],
+                ..Self::default()
+            };
+        };
+        let dino = paths.dir.join(DINO_FILE);
+        if !dino.is_file() {
+            return Self {
+                notes: vec![format!(
+                    "local models: {DINO_FILE} not found in {}; near-duplicates use pHash only ({FETCH_HINT})",
+                    paths.dir.display()
+                )],
+                ..Self::default()
+            };
+        }
+        let env = match ort_env(&paths.runtime) {
+            Ok(env) => env,
+            Err(e) => {
+                return Self {
+                    notes: vec![format!(
+                        "local models: {e}; near-duplicates use pHash only ({FETCH_HINT}, or set {ORT_LIB_ENV})"
+                    )],
+                    ..Self::default()
+                }
+            }
+        };
+        let mut out = Self::default();
+        match SessionPool::load(env, &dino, sessions) {
+            Ok(pool) => out.embedder = Some(DinoEmbedder { pool }),
+            Err(e) => out.notes.push(format!(
+                "local models: {DINO_FILE} failed to load ({e}); near-duplicates use pHash only"
+            )),
+        }
+        out
+    }
+
+    /// Cheap check (no loading) that the runtime and at least one model
+    /// file are present, so a reopened project knows whether analysis it
+    /// lacks could run at all.
+    pub fn installed(paths: Option<&ModelPaths>) -> bool {
+        paths.is_some_and(|p| p.runtime.is_file() && p.dir.join(DINO_FILE).is_file())
+    }
+
+    /// One line per missing or failed piece, for the CLI / app log.
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+
+    /// Per loaded model: (name, runs, mean ms per run, preprocessing
+    /// excluded). For the CLI's cost line.
+    pub fn timings(&self) -> Vec<(&'static str, u64, f64)> {
+        let mut out = vec![];
+        if let Some(e) = &self.embedder {
+            let (n, ms) = e.pool.timing();
+            out.push(("dinov2-small", n, ms));
+        }
+        out
+    }
+
+    /// Whether image embeddings are available.
+    pub fn has_embedder(&self) -> bool {
+        self.embedder.is_some()
+    }
+
+    /// Whether `a` (a still or Live Photo still) still lacks something the
+    /// loaded models would add: rescans skip assets that have it all.
+    pub fn wants(&self, a: &triptape_core::types::Asset) -> bool {
+        a.kind != triptape_core::types::AssetKind::Video
+            && self.embedder.is_some()
+            && a.embedding.is_none()
+    }
+
+    /// Run the loaded models on a decoded, upright thumbnail.
+    pub fn analyze(&self, img: &DynamicImage) -> PhotoAnalysis {
+        let Some(embedder) = &self.embedder else {
+            return PhotoAnalysis::default();
+        };
+        let rgb = img.to_rgb8();
+        PhotoAnalysis {
+            embedding: embedder
+                .embed_rgb(&rgb)
+                .ok()
+                .and_then(|v| Embedding::from_f32(&v)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_resolve_flag_then_env_then_default() {
+        let env = |k: &str| match k {
+            MODELS_DIR_ENV => Some("/env/models".to_string()),
+            _ => None,
+        };
+        let none = |_: &str| None;
+        let flag = ModelPaths::resolve(Some(Path::new("/flag")), Some("/def".into()), env).unwrap();
+        assert_eq!(flag.dir, PathBuf::from("/flag"));
+        assert_eq!(
+            flag.runtime,
+            PathBuf::from("/flag/onnxruntime").join(ort_library_name())
+        );
+        let from_env = ModelPaths::resolve(None, Some("/def".into()), env).unwrap();
+        assert_eq!(from_env.dir, PathBuf::from("/env/models"));
+        let default = ModelPaths::resolve(None, Some("/def".into()), none).unwrap();
+        assert_eq!(default.dir, PathBuf::from("/def"));
+        assert_eq!(ModelPaths::resolve(None, None, none), None);
+        let lib = |k: &str| (k == ORT_LIB_ENV).then(|| "/opt/ort/lib.so".to_string());
+        assert_eq!(
+            ModelPaths::resolve(None, Some("/def".into()), lib)
+                .unwrap()
+                .runtime,
+            PathBuf::from("/opt/ort/lib.so")
+        );
+    }
+
+    #[test]
+    fn missing_models_leave_everything_off_with_one_note() {
+        let dir = std::env::temp_dir().join("triptape-no-models-here");
+        let paths = ModelPaths {
+            runtime: dir.join("nope"),
+            dir,
+        };
+        let m = LocalModels::load(Some(&paths), 2);
+        assert!(!m.has_embedder());
+        assert_eq!(m.notes().len(), 1);
+        assert!(m.notes()[0].contains(DINO_FILE), "{:?}", m.notes());
+        assert!(m.notes()[0].contains("fetch-models"));
+        let img = DynamicImage::new_rgb8(8, 8);
+        assert_eq!(m.analyze(&img), PhotoAnalysis::default());
+        let a = triptape_core::types::Asset::new(
+            "a",
+            "/t/a.jpg".into(),
+            triptape_core::types::AssetKind::Photo,
+        );
+        assert!(!m.wants(&a), "nothing to add without models");
+        assert_eq!(LocalModels::load(None, 1).notes().len(), 1);
+    }
+
+    #[test]
+    fn dino_input_is_normalised_nchw_224() {
+        let img = RgbImage::from_pixel(320, 240, image::Rgb([124, 116, 104]));
+        let d = dino_input(&img);
+        assert_eq!(d.len(), 3 * 224 * 224);
+        // ImageNet-mean grey normalises to about zero in every channel.
+        assert!(
+            d.iter().all(|v| v.abs() < 0.02),
+            "max {:?}",
+            d.iter().fold(0f32, |m, v| m.max(v.abs()))
+        );
+    }
+
+    #[test]
+    fn dino_pool_adds_cls_to_mean_patch_and_normalises() {
+        // 1 CLS + 2 patches, dim 2.
+        let data = [1.0, 0.0, 0.0, 2.0, 0.0, 0.0];
+        let e = dino_pool(&[1, 3, 2], &data).unwrap();
+        // CLS (1,0) + mean patch (0,1) = (1,1) -> unit.
+        assert!((e[0] - e[1]).abs() < 1e-6 && (e[0] - 0.70710677).abs() < 1e-6);
+        assert_eq!(dino_pool(&[1, 1, 2], &[1.0, 0.0]), None, "no patches");
+        assert_eq!(dino_pool(&[3, 2], &data), None, "wrong rank");
+        assert_eq!(dino_pool(&[1, 3, 2], &data[..4]), None, "short data");
+        assert_eq!(dino_pool(&[1, 3, 2], &[0.0; 6]), None, "zero vector");
+    }
+
+    /// Needs the real files: `TRIPTAPE_MODELS_DIR` (and `TRIPTAPE_ORT_LIB`
+    /// unless the runtime is installed beside the models).
+    #[test]
+    #[ignore = "needs scripts/fetch-models and an ONNX Runtime library"]
+    fn real_dino_embeds_a_picture_and_itself_alike() {
+        let paths = ModelPaths::from_env(None, None).expect("set TRIPTAPE_MODELS_DIR");
+        let m = LocalModels::load(Some(&paths), 1);
+        assert!(m.has_embedder(), "{:?}", m.notes());
+        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(320, 240, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+        }));
+        let a = m.analyze(&img).embedding.unwrap();
+        let b = m.analyze(&img.fliph()).embedding.unwrap();
+        assert_eq!(a.len(), 384);
+        assert!(a.cosine(&a).unwrap() > 0.999);
+        assert!(
+            a.cosine(&b).unwrap() > 0.5,
+            "a mirrored picture is the same scene"
+        );
+    }
+}

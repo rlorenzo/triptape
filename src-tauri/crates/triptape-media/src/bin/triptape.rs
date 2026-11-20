@@ -2,7 +2,7 @@
 //! `export` all eligible keepsakes (hero film, reels pack, photo book).
 //!
 //! ```sh
-//! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m]
+//! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m] [--models DIR]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
@@ -19,6 +19,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
+use triptape_ai_local::local::{LocalModels, ModelPaths};
 use triptape_core::plan::PlanEdits;
 use triptape_core::{
     asset_ref, cluster,
@@ -174,6 +175,19 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         }
     };
 
+    // Optional local models (`scripts/fetch-models`): `--models DIR`, else
+    // TRIPTAPE_MODELS_DIR, else the app data dir's `models/`. Missing files
+    // print one line each and leave the scan exactly as without models.
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().min(4));
+    let model_paths = ModelPaths::from_env(
+        flags.get("models").map(Path::new),
+        dirs::data_dir().map(|d| d.join("app.triptape.desktop").join("models")),
+    );
+    let models = LocalModels::load(model_paths.as_ref(), workers);
+    for note in models.notes() {
+        eprintln!("{note}");
+    }
+
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
     let name = folder
         .file_name()
@@ -249,6 +263,8 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     let mut final_assets: Vec<Asset> = vec![];
     let mut scores: HashMap<String, Score> = HashMap::new();
     let mut thumbs = 0usize;
+    // Stills score in a parallel pass below, from these pixel sources.
+    let mut still_sources: Vec<(usize, StillPixels)> = vec![];
     for mut a in assets {
         if motion_halves.contains(a.path.as_path()) {
             continue;
@@ -276,10 +292,55 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         // Every asset gets a perceptual hash from the pixels the scan
         // already has (decoded photo) or the thumbnail/poster it makes
         // (HEIC, Live Photos, videos), so near-dupes collapse everywhere.
-        let (score, phash) = score_asset(&a, img.as_ref(), &cache, &ffmpeg, &mut thumbs);
-        a.phash = a.phash.or(phash);
-        scores.insert(a.id.clone(), score);
+        if a.kind == AssetKind::Video {
+            let poster =
+                make_thumb(&a, &cache, &ffmpeg, &mut thumbs).and_then(|p| hash::open_image(&p));
+            a.phash = a
+                .phash
+                .or(poster.as_ref().map(hash::average_hash_from_image));
+            let signals = score::StorySignals::for_asset(&a);
+            scores.insert(a.id.clone(), score::score_video(None, &signals));
+        } else {
+            let source = match img {
+                Some(_) => StillPixels::Original,
+                None => make_thumb(&a, &cache, &ffmpeg, &mut thumbs)
+                    .map_or(StillPixels::Nothing, StillPixels::Thumb),
+            };
+            still_sources.push((final_assets.len(), source));
+        }
         final_assets.push(a);
+    }
+
+    // Score stills in parallel from the same pixels as before (the decoded
+    // photo, or its thumbnail), adding the optional model outputs.
+    let started = std::time::Instant::now();
+    let mut stills_done: Vec<(
+        usize,
+        Option<u64>,
+        Option<triptape_core::embedding::Embedding>,
+    )> = vec![];
+    triptape_core::parallel::for_each_parallel(
+        &still_sources,
+        workers,
+        |(idx, source)| analyze_still(&final_assets[*idx], source, &models),
+        |i, analysis, _, _| {
+            let idx = still_sources[i].0;
+            let a = &final_assets[idx];
+            scores.insert(a.id.clone(), analysis.score);
+            stills_done.push((idx, analysis.phash, analysis.embedding));
+        },
+    );
+    for (idx, phash, embedding) in stills_done.drain(..) {
+        let a = &mut final_assets[idx];
+        a.phash = a.phash.or(phash);
+        a.embedding = embedding;
+    }
+    let embedded = final_assets
+        .iter()
+        .filter(|a| a.embedding.is_some())
+        .count();
+    for (name, runs, ms) in models.timings() {
+        println!("model {name}: {runs} runs, {ms:.1} ms/run");
     }
 
     // Best playback window per video, analysed in parallel (ffmpeg-bound).
@@ -403,7 +464,17 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     println!("pairs: {}", pairing.pairs.len());
     println!("assets: {}", final_assets.len());
     println!("clusters: {}", clusters.len());
+    println!(
+        "near-dupes: {} groups, {} suppressed",
+        groups.iter().filter(|g| g.members.len() > 1).count(),
+        suppressed.len()
+    );
     println!("thumbs: {thumbs} proxies: {proxies_n}");
+    println!(
+        "stills: {} scored in {:.1}s, embeddings: {embedded}",
+        still_sources.len(),
+        started.elapsed().as_secs_f64()
+    );
     println!("hero: {} reels: {}", p.hero.len(), p.reel_selects.len());
     println!(
         "plan: {plan_id} video={} reels={} book={}",
@@ -461,40 +532,58 @@ fn fill_photo(
     }
 }
 
-/// Score one asset and fingerprint it. Stills score on `img` (already
-/// decoded) or, failing that, a cached FFmpeg thumbnail (counted in
-/// `thumbs`); videos get a poster-frame thumbnail the same way and a
-/// provisional score (their real one follows clip analysis). The returned
-/// pHash comes from the pixels used for scoring, so HEIC stills, Live
-/// Photos and videos get one too; `None` when nothing could be decoded.
-fn score_asset(
-    a: &Asset,
-    img: Option<&image::DynamicImage>,
-    cache: &Path,
-    ffmpeg: &str,
-    thumbs: &mut usize,
-) -> (Score, Option<u64>) {
-    let signals = score::StorySignals::for_asset(a);
-    let mut thumb = || {
-        let h = a.content_hash.as_deref()?;
-        let dst = proxies::cache_path(cache, "thumb", h, ".jpg");
-        proxies::run_ffmpeg(ffmpeg, &proxies::thumb_args(&a.path, &dst), &dst).ok()?;
-        *thumbs += 1;
-        image::open(&dst).ok()
+/// Make (or reuse) the cached FFmpeg thumbnail of `a`, counted in
+/// `thumbs`: the scoring pixels of an undecodable still (HEIC, Live Photo)
+/// and a video's poster frame. `None` without a content hash or on failure.
+fn make_thumb(a: &Asset, cache: &Path, ffmpeg: &str, thumbs: &mut usize) -> Option<PathBuf> {
+    let h = a.content_hash.as_deref()?;
+    let dst = proxies::cache_path(cache, "thumb", h, ".jpg");
+    proxies::run_ffmpeg(ffmpeg, &proxies::thumb_args(&a.path, &dst), &dst).ok()?;
+    *thumbs += 1;
+    Some(dst)
+}
+
+/// Where a still's scoring pixels come from.
+enum StillPixels {
+    /// The photo itself decodes (JPEG, PNG, ...).
+    Original,
+    /// Its cached FFmpeg thumbnail (HEIC, Live Photo stills).
+    Thumb(PathBuf),
+    /// Nothing decodable: neutral fallback score.
+    Nothing,
+}
+
+/// Score one still from `source` and fingerprint it (pHash from the same
+/// pixels), plus whatever the optional local `models` add. The models see
+/// a small upright copy, never the full-resolution frame: thumbnails are
+/// already upright and small; a decoded original is shrunk to thumbnail
+/// size and turned by its EXIF rotation. Pure per-file work.
+fn analyze_still(a: &Asset, source: &StillPixels, models: &LocalModels) -> Analysis {
+    let pixels = match source {
+        StillPixels::Original => hash::open_image(&a.path),
+        StillPixels::Thumb(p) => hash::open_image(p),
+        StillPixels::Nothing => None,
     };
-    let owned;
-    let pixels = match img {
-        Some(img) => Some(img),
-        None => {
-            owned = thumb();
-            owned.as_ref()
+    let found = match (&pixels, source) {
+        (Some(p), StillPixels::Original) if models.has_embedder() => {
+            let small = p.thumbnail(proxies::THUMB_LONG_EDGE, proxies::THUMB_LONG_EDGE);
+            let upright = match a.rotation_deg {
+                90 => small.rotate90(),
+                180 => small.rotate180(),
+                270 => small.rotate270(),
+                _ => small,
+            };
+            models.analyze(&upright)
         }
+        (Some(p), _) => models.analyze(p),
+        (None, _) => Default::default(),
     };
-    let phash = pixels.map(hash::average_hash_from_image);
-    if a.kind == AssetKind::Video {
-        return (score::score_video(None, &signals), phash);
+    let signals = score::StorySignals::for_asset(a);
+    Analysis {
+        score: score::score_still_or_fallback(pixels.as_ref(), &signals),
+        phash: pixels.as_ref().map(hash::average_hash_from_image),
+        embedding: found.embedding,
     }
-    (score::score_still_or_fallback(pixels, &signals), phash)
 }
 
 /// `--itinerary <json>`: the owner's itinerary, which relabels chapters

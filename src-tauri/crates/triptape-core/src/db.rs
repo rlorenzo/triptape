@@ -4,7 +4,10 @@
 //! Single-writer model: one [`Db`] handle, WAL mode, idempotent
 //! `CREATE ... IF NOT EXISTS` schema. One row per Live Photo pair in `assets`.
 
-use crate::types::{Asset, AssetKind, Cluster, Job, JobState, PairingConfidence, Plan, Score};
+use crate::embedding::Embedding;
+use crate::types::{
+    Analysis, Asset, AssetKind, Cluster, Job, JobState, PairingConfidence, Plan, Score,
+};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -68,7 +71,8 @@ CREATE TABLE IF NOT EXISTS assets (
     library_score REAL,
     thumb_path TEXT,
     proxy_path TEXT,
-    score_json TEXT
+    score_json TEXT,
+    embedding BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_assets_project ON assets(project_id);
 CREATE TABLE IF NOT EXISTS clusters (
@@ -218,13 +222,14 @@ impl Db {
             .map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         // Migrations for DBs created before capture timezones, embedded
-        // user captions, people counts/signatures and library scores were
-        // stored.
+        // user captions, people counts/signatures, library scores and image
+        // embeddings were stored.
         add_column_if_missing(&conn, "tz_offset", "INTEGER")?;
         add_column_if_missing(&conn, "user_caption", "TEXT")?;
         add_column_if_missing(&conn, "people_count", "INTEGER")?;
         add_column_if_missing(&conn, "people_sig", "INTEGER")?;
         add_column_if_missing(&conn, "library_score", "REAL")?;
+        add_column_if_missing(&conn, "embedding", "BLOB")?;
         Ok(Self { conn })
     }
 
@@ -303,9 +308,9 @@ impl Db {
         };
         let score_json = a.score.as_ref().and_then(|s| serde_json::to_string(s).ok());
         self.conn.prepare_cached(
-            "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,people_count,people_sig,library_score,score_json)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,path=excluded.path,companion_path=excluded.companion_path,kind=excluded.kind,size_bytes=excluded.size_bytes,mtime=excluded.mtime,content_hash=excluded.content_hash,phash=excluded.phash,width=excluded.width,height=excluded.height,duration_secs=excluded.duration_secs,taken_at=excluded.taken_at,tz_offset=excluded.tz_offset,time_guessed=excluded.time_guessed,lat=excluded.lat,lon=excluded.lon,rotation_deg=excluded.rotation_deg,pair_confidence=excluded.pair_confidence,user_caption=excluded.user_caption,people_count=excluded.people_count,people_sig=excluded.people_sig,library_score=excluded.library_score,score_json=excluded.score_json",
+            "INSERT INTO assets (id,project_id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,people_count,people_sig,library_score,score_json,embedding)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id,path=excluded.path,companion_path=excluded.companion_path,kind=excluded.kind,size_bytes=excluded.size_bytes,mtime=excluded.mtime,content_hash=excluded.content_hash,phash=excluded.phash,width=excluded.width,height=excluded.height,duration_secs=excluded.duration_secs,taken_at=excluded.taken_at,tz_offset=excluded.tz_offset,time_guessed=excluded.time_guessed,lat=excluded.lat,lon=excluded.lon,rotation_deg=excluded.rotation_deg,pair_confidence=excluded.pair_confidence,user_caption=excluded.user_caption,people_count=excluded.people_count,people_sig=excluded.people_sig,library_score=excluded.library_score,score_json=excluded.score_json,embedding=excluded.embedding",
         ).and_then(|mut st| st.execute(params![
                 a.id, project_id,
                 a.path.to_string_lossy().to_string(),
@@ -317,6 +322,7 @@ impl Db {
                 a.gps.map(|g| g.0), a.gps.map(|g| g.1),
                 a.rotation_deg as i64, conf, a.user_caption, a.people_count.map(i64::from),
                 a.people_sig.map(|s| s as i64), a.library_score.map(f64::from), score_json,
+                a.embedding.as_ref().map(Embedding::to_blob),
             ]),
         ).map_err(|e| e.to_string())?;
         Ok(())
@@ -324,7 +330,7 @@ impl Db {
 
     /// Refresh-path upsert: recomputed foreground metadata overwrites the
     /// stored row, but analysis columns the foreground never produces
-    /// (`content_hash`, `phash`, `score_json`) survive — but only when the
+    /// (`content_hash`, `phash`, `score_json`, `embedding`) survive — but only when the
     /// file itself is unchanged (`size_bytes` + `mtime` match). A changed
     /// file falls through to the full upsert, whose empty analysis columns
     /// force a rehash (the reuse cache keys on the new fingerprint) and a
@@ -431,27 +437,28 @@ impl Db {
         Ok(())
     }
 
-    /// Record one asset's score and perceptual hash only when the row still
-    /// describes the same source file. Same recycled-id hazard as
-    /// [`Db::update_asset_hash_if_source_matches`]: a late score flush from
-    /// a superseded job must not land on another file's row.
+    /// Record one asset's [`Analysis`] (score, perceptual hash, embedding)
+    /// only when the row still describes the same source file. Same
+    /// recycled-id hazard as [`Db::update_asset_hash_if_source_matches`]: a
+    /// late score flush from a superseded job must not land on another
+    /// file's row. A `None` hash or embedding keeps what is stored.
     pub fn update_asset_scoring_if_source_matches(
         &self,
         asset_id: &str,
         path: &str,
         size_bytes: u64,
         mtime: i64,
-        score: &Score,
-        phash: Option<u64>,
+        analysis: &Analysis,
     ) -> Result<bool, String> {
-        let json = serde_json::to_string(score).map_err(|e| e.to_string())?;
+        let json = serde_json::to_string(&analysis.score).map_err(|e| e.to_string())?;
         let changed = self
             .conn
-            .prepare_cached("UPDATE assets SET score_json=?1, phash=COALESCE(?2, phash) WHERE id=?3 AND path=?4 AND size_bytes=?5 AND mtime=?6")
+            .prepare_cached("UPDATE assets SET score_json=?1, phash=COALESCE(?2, phash), embedding=COALESCE(?3, embedding) WHERE id=?4 AND path=?5 AND size_bytes=?6 AND mtime=?7")
             .and_then(|mut st| {
                 st.execute(params![
                     json,
-                    phash.map(|h| h as i64),
+                    analysis.phash.map(|h| h as i64),
+                    analysis.embedding.as_ref().map(Embedding::to_blob),
                     asset_id,
                     path,
                     size_bytes as i64,
@@ -487,7 +494,7 @@ impl Db {
         let mut st = self
             .conn
             .prepare(
-                "SELECT id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,score_json,people_count,people_sig,library_score FROM assets WHERE project_id=?1 ORDER BY taken_at NULLS LAST, id",
+                "SELECT id,path,companion_path,kind,size_bytes,mtime,content_hash,phash,width,height,duration_secs,taken_at,tz_offset,time_guessed,lat,lon,rotation_deg,pair_confidence,user_caption,score_json,people_count,people_sig,library_score,embedding FROM assets WHERE project_id=?1 ORDER BY taken_at NULLS LAST, id",
             )
             .map_err(|e| e.to_string())?;
         let rows = st
@@ -530,6 +537,10 @@ impl Db {
                     people_sig: r.get::<_, Option<i64>>(21)?.map(|s| s as u64),
                     library_score: r.get::<_, Option<f64>>(22)?.map(|s| s as f32),
                     score,
+                    embedding: r
+                        .get::<_, Option<Vec<u8>>>(23)?
+                        .as_deref()
+                        .and_then(Embedding::from_blob),
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -1187,8 +1198,10 @@ mod tests {
                 "/t/a1.jpg",
                 10,
                 100,
-                &crate::types::Score::default(),
-                Some(3)
+                &Analysis {
+                    phash: Some(3),
+                    ..Default::default()
+                }
             )
             .unwrap());
         let got = &db.list_assets(&p.id).unwrap()[0];
@@ -1206,8 +1219,10 @@ mod tests {
                 "/t/a1.jpg",
                 11,
                 100,
-                &crate::types::Score::default(),
-                Some(4)
+                &Analysis {
+                    phash: Some(4),
+                    ..Default::default()
+                }
             )
             .unwrap());
         assert!(!db
@@ -1217,6 +1232,76 @@ mod tests {
         assert_eq!(got.content_hash.as_deref(), Some("h"));
         assert_eq!(got.phash, Some(3));
         assert_eq!(got.score.as_ref().map(|s| s.total), Some(0.0));
+    }
+
+    #[test]
+    fn embedding_round_trips_and_survives_a_refresh_upsert() {
+        let db = mem();
+        let p = db.create_project("trip", "/tmp/trip").unwrap();
+        let mut a = Asset::new("a1", PathBuf::from("/t/a1.jpg"), AssetKind::Photo);
+        a.size_bytes = 10;
+        a.mtime = 100;
+        db.upsert_asset(&p.id, &a).unwrap();
+        assert_eq!(db.list_assets(&p.id).unwrap()[0].embedding, None);
+
+        let e = Embedding::from_f32(&[0.5, -0.25, 1.0, 0.0]).unwrap();
+        let analysis = Analysis {
+            embedding: Some(e.clone()),
+            ..Default::default()
+        };
+        assert!(db
+            .update_asset_scoring_if_source_matches("a1", "/t/a1.jpg", 10, 100, &analysis)
+            .unwrap());
+        assert_eq!(db.list_assets(&p.id).unwrap()[0].embedding, Some(e.clone()));
+
+        // A later analysis without the model keeps the stored embedding.
+        db.update_asset_scoring_if_source_matches("a1", "/t/a1.jpg", 10, 100, &Analysis::default())
+            .unwrap();
+        assert_eq!(db.list_assets(&p.id).unwrap()[0].embedding, Some(e.clone()));
+
+        // Unchanged file: the foreground refresh keeps it too.
+        db.upsert_asset_preserving_analysis(&p.id, &a).unwrap();
+        assert_eq!(db.list_assets(&p.id).unwrap()[0].embedding, Some(e));
+
+        // Changed file: the stale embedding goes with the stale score.
+        a.mtime = 200;
+        db.upsert_asset_preserving_analysis(&p.id, &a).unwrap();
+        assert_eq!(db.list_assets(&p.id).unwrap()[0].embedding, None);
+    }
+
+    #[test]
+    fn init_adds_embedding_to_older_databases_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        let old_schema = SCHEMA.replace(
+            "    score_json TEXT,\n    embedding BLOB\n",
+            "    score_json TEXT\n",
+        );
+        assert_ne!(old_schema, SCHEMA);
+        conn.execute_batch(&old_schema).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id,name,folder,created_at,updated_at) VALUES ('p','t','/t',0,0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO assets (id,project_id,path,kind,size_bytes,mtime) VALUES ('a','p','/t/a.jpg','photo',1,1)",
+            [],
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        let db = Db::init(db.conn).unwrap();
+        let cols: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='embedding'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 1);
+        let assets = db.list_assets("p").unwrap();
+        assert_eq!(assets.len(), 1, "old rows survive the migration");
+        assert_eq!(assets[0].embedding, None);
     }
 
     #[test]

@@ -265,9 +265,24 @@ fn same_moment(a: &Asset, b: &Asset) -> bool {
     close_in_time && close_in_place
 }
 
-/// Collapse near-dupes (pHash distance ≤ threshold, captured within
-/// [`DUPE_WINDOW_SECS`] and, when both have GPS, [`DUPE_RADIUS_METERS`])
-/// with union-find; groups merge only when every cross pair is the same
+/// Whether two stills look like retakes of one shot: near pHash, or (when
+/// both carry an image embedding and tag the same people) embeddings at
+/// least [`crate::embedding::NEAR_DUPE_COSINE`] alike. Missing embeddings
+/// leave the pHash rule as it was. The people check keeps "the same view
+/// with someone else in it" apart, as the best-of pick does.
+fn looks_alike(a: &Asset, b: &Asset, pa: Option<u64>, pb: Option<u64>) -> bool {
+    matches!((pa, pb), (Some(p), Some(q)) if is_near_dupe(p, q))
+        || (a.people_sig == b.people_sig
+            && crate::embedding::alike(
+                a.embedding.as_ref(),
+                b.embedding.as_ref(),
+                crate::embedding::NEAR_DUPE_COSINE,
+            ))
+}
+
+/// Collapse near-dupes ([`looks_alike`]: pHash distance ≤ threshold or a
+/// retake by embedding, captured within [`DUPE_WINDOW_SECS`] and, when
+/// both have GPS, [`DUPE_RADIUS_METERS`]) with union-find; groups merge only when every cross pair is the same
 /// moment, so a whole group stays within the window and radius. The best
 /// shot is the highest `total` score (ties → first in story order).
 /// Videos never collapse: their pHash is only the poster frame, so two
@@ -287,32 +302,31 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
         .iter()
         .map(|a| a.phash.filter(|_| a.kind != AssetKind::Video))
         .collect();
+    let alike = |x: usize, y: usize| {
+        assets[x].kind != AssetKind::Video
+            && assets[y].kind != AssetKind::Video
+            && looks_alike(&assets[x], &assets[y], phashes[x], phashes[y])
+    };
     let mut members: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
     for i in 0..n {
         for j in (i + 1)..n {
-            if let (Some(a), Some(b)) = (phashes[i], phashes[j]) {
-                if !is_near_dupe(a, b) {
-                    continue;
-                }
-                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
-                // Complete linkage: merge only if every cross pair is the
-                // same moment, so chains (0, 9, 18 min) can't span the
-                // window or radius as a whole.
-                if ri != rj
-                    && members[ri].iter().all(|&x| {
-                        members[rj].iter().all(|&y| {
-                            same_moment(&assets[x], &assets[y])
-                                && matches!(
-                                    (phashes[x], phashes[y]),
-                                    (Some(p), Some(q)) if is_near_dupe(p, q)
-                                )
-                        })
-                    })
-                {
-                    parent[rj] = ri;
-                    let moved = std::mem::take(&mut members[rj]);
-                    members[ri].extend(moved);
-                }
+            if !alike(i, j) {
+                continue;
+            }
+            let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+            // Complete linkage: merge only if every cross pair is the
+            // same moment, so chains (0, 9, 18 min) can't span the
+            // window or radius as a whole.
+            if ri != rj
+                && members[ri].iter().all(|&x| {
+                    members[rj]
+                        .iter()
+                        .all(|&y| same_moment(&assets[x], &assets[y]) && alike(x, y))
+                })
+            {
+                parent[rj] = ri;
+                let moved = std::mem::take(&mut members[rj]);
+                members[ri].extend(moved);
             }
         }
     }
@@ -476,6 +490,49 @@ mod tests {
         let burst = g.iter().find(|x| x.members.len() == 2).unwrap();
         assert!(burst.members.contains(&"burst1".to_string()));
         assert!(burst.members.contains(&"burst2".to_string()));
+    }
+
+    #[test]
+    fn same_scene_by_embedding_collapses_within_the_window_only() {
+        use crate::embedding::Embedding;
+        let t0 = 1_714_550_400;
+        let scene = Embedding::from_f32(&[1.0, 0.1, 0.0]).unwrap();
+        let reframed = Embedding::from_f32(&[0.9, 0.3, 0.1]).unwrap();
+        let other = Embedding::from_f32(&[0.0, 0.2, 1.0]).unwrap();
+        let same_place = Embedding::from_f32(&[0.92, 0.1, 0.38]).unwrap();
+        let shot = |id: &str, t: i64, phash: u64, e: Option<&Embedding>| {
+            let mut a = asset(id, Some(t), None, Some(phash));
+            a.embedding = e.cloned();
+            a
+        };
+        let a = vec![
+            shot("wide", t0, 0x0000_0000_0000_0000, Some(&scene)),
+            // Far pHash (another framing), same scene: collapses.
+            shot("zoom", t0 + 60, 0xFFFF_FFFF_0000_0000, Some(&reframed)),
+            // Far pHash, another scene: stays.
+            shot("menu", t0 + 90, 0x0000_0000_FFFF_FFFF, Some(&other)),
+            // Same scene but outside the window: stays.
+            shot(
+                "later",
+                t0 + DUPE_WINDOW_SECS + 1,
+                0xFFFF_0000_FFFF_0000,
+                Some(&scene),
+            ),
+            // No embedding: pHash alone decides, and it is far.
+            shot("plain", t0 + 30, 0xF0F0_F0F0_F0F0_F0F0, None),
+            // Same place (cos ~0.93) but not a retake: stays.
+            shot("place", t0 + 120, 0x00FF_00FF_00FF_00FF, Some(&same_place)),
+        ];
+        let g = collapse_near_dupes(&a, &HashMap::new());
+        assert_eq!(g.len(), 5, "{g:?}");
+        let pair = g.iter().find(|x| x.members.len() == 2).unwrap();
+        assert!(pair.members.contains(&"wide".to_string()));
+        assert!(pair.members.contains(&"zoom".to_string()));
+
+        // Different people in the same view are different keepsakes.
+        let mut tagged = a[..2].to_vec();
+        tagged[1].people_sig = Some(42);
+        assert_eq!(collapse_near_dupes(&tagged, &HashMap::new()).len(), 2);
     }
 
     #[test]

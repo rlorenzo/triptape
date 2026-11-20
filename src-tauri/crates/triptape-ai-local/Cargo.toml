@@ -7,3 +7,9 @@ edition = "2021"
 
 [dependencies]
 triptape-core = { path = "../triptape-core" }
+image = "0.25"
+# ONNX Runtime bindings. `load-dynamic` links nothing at build time and never
+# downloads a runtime: the shared library is opened by absolute path at run
+# time (see `models::ModelPaths`). Default features stay off because they
+# include `download-binaries`, a build-time CDN fetch.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-31"] }

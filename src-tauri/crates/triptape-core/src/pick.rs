@@ -6,7 +6,7 @@
 //! people: the same view with someone else in it is a different keepsake.
 //! Waiting photos only fill the slots left once every distinct scene is in.
 
-use crate::plan::{has_caption, same_moment_at};
+use crate::plan::{has_caption, same_moment_at, Moment};
 use crate::types::{Asset, AssetKind};
 use std::collections::{HashMap, HashSet};
 
@@ -22,32 +22,53 @@ pub struct Candidate {
     pub score: f32,
 }
 
-/// True when `a` and `b` repeat one scene with the same people in it.
+impl Candidate {
+    /// The candidate as a [`Moment`]. It carries no embedding, so
+    /// [`repeats`] judges candidates on time and pHash alone.
+    pub fn moment(&self) -> Moment<'static> {
+        Moment {
+            taken_at: self.taken_at,
+            phash: self.phash,
+            embedding: None,
+        }
+    }
+}
+
+/// True when `a` and `b` repeat one scene with the same people in it
+/// (time and pHash only; see [`repeats_at`] for the embedding-aware form).
 pub fn repeats(a: &Candidate, b: &Candidate) -> bool {
-    a.people_sig == b.people_sig && same_moment_at((a.taken_at, a.phash), (b.taken_at, b.phash))
+    repeats_at(a.people_sig, a.moment(), b.people_sig, b.moment())
+}
+
+/// [`repeats`] on any [`Moment`]: the same people (`sig_*`, `None` for
+/// nobody or unknown) and the same moment, where a shared image embedding
+/// also catches the same scene in another framing.
+pub fn repeats_at(sig_a: Option<u64>, a: Moment, sig_b: Option<u64>, b: Moment) -> bool {
+    sig_a == sig_b && same_moment_at(a, b)
 }
 
 /// Indices of the `count` best candidates, ascending (the input's order).
 /// Distinct scenes come first, best score first (the earlier photo wins a
 /// tie); repeats fill what is left, also best first.
 pub fn pick_top(candidates: &[Candidate], count: usize) -> Vec<usize> {
-    let mut ranked: Vec<usize> = (0..candidates.len()).collect();
-    ranked.sort_by(|&a, &b| {
-        candidates[b]
-            .score
-            .total_cmp(&candidates[a].score)
-            .then(a.cmp(&b))
-    });
+    let scores: Vec<f32> = candidates.iter().map(|c| c.score).collect();
+    pick_top_by(&scores, count, |a, b| {
+        repeats(&candidates[a], &candidates[b])
+    })
+}
+
+/// [`pick_top`] over bare scores, with the repeat test supplied by the
+/// caller as a predicate on two indices into `scores`.
+fn pick_top_by(scores: &[f32], count: usize, repeats: impl Fn(usize, usize) -> bool) -> Vec<usize> {
+    let mut ranked: Vec<usize> = (0..scores.len()).collect();
+    ranked.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
     let mut picked: Vec<usize> = vec![];
     let mut waiting: Vec<usize> = vec![];
     for i in ranked {
         if picked.len() == count {
             break;
         }
-        if picked
-            .iter()
-            .any(|&p| repeats(&candidates[p], &candidates[i]))
-        {
+        if picked.iter().any(|&p| repeats(p, i)) {
             waiting.push(i);
         } else {
             picked.push(i);
@@ -136,16 +157,13 @@ pub fn pick_photos<'a>(
                 .is_none_or(|h| std::ptr::eq(keeper[h], *a))
         })
         .collect();
-    let candidates: Vec<Candidate> = pool
-        .iter()
-        .map(|a| Candidate {
-            taken_at: a.taken_at,
-            phash: a.phash,
-            people_sig: a.people_sig,
-            score: photo_score(a),
-        })
-        .collect();
-    pick_top(&candidates, count)
+    let scores: Vec<f32> = pool.iter().map(|a| photo_score(a)).collect();
+    // Embedding-aware: the same scene reframed counts as a repeat here.
+    let same = |i: usize, j: usize| {
+        let (a, b) = (pool[i], pool[j]);
+        repeats_at(a.people_sig, Moment::of(a), b.people_sig, Moment::of(b))
+    };
+    pick_top_by(&scores, count, same)
         .into_iter()
         .map(|i| pool[i])
         .collect()

@@ -11,6 +11,7 @@ serde_json = "1"
 thiserror = "2"
 image = "0.25"
 triptape-core = { path = "../triptape-core" }
+triptape-ai-local = { path = "../triptape-ai-local" }
 tempfile = "3"
 blake3 = "1"
 dirs = "7"

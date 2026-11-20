@@ -30,6 +30,9 @@ report/
 cache/
 output/
 exports/
+# Local model files (scripts/fetch-models); never committed
+/models/
+*.onnx
 
 # OS / editors
 .DS_Store
