@@ -1034,7 +1034,9 @@ pub fn render_book(
                 cursor += fp.take;
                 let (sw, sh) = slot_inches(opts.preset, fp.kind, fp.take);
                 placements.push((page_no, dpi_verdict(bg.width, bg.height, sw, sh)));
-                draw_photo_backed_page(bg, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?;
+                // Full brightness: the title sits in the caption strip, which
+                // carries its own dark backing.
+                draw_fullbleed(bg, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?;
                 let lines = divider_lines(bg, chapters, &mut announced);
                 if !lines.is_empty() {
                     captions.entry(page_no).or_default().extend(lines);
@@ -1045,7 +1047,7 @@ pub fn render_book(
                     draw_text_placeholder(fp.kind, tw, th, &out)?;
                 } else {
                     let last = &photos[photos.len() - 1];
-                    draw_photo_backed_page(last, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?;
+                    draw_fullbleed(last, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?;
                     captions
                         .entry(page_no)
                         .or_default()
@@ -1095,32 +1097,28 @@ pub fn render_book(
     }
 
     let counted = count_pages(&kinds);
+    let texts = PageTexts {
+        lines: captions,
+        cells: cell_captions,
+        // kinds[0] is the uncounted cover-proxy, so kinds[n] is page n.
+        titles: (1..kinds.len())
+            .filter(|&n| kinds[n] == PageKind::Divider)
+            .collect(),
+    };
     opts.progress.check_cancelled()?;
     opts.progress.step("book", "proof and press PDFs", None);
-    let proof = match write_typst_and_compile(
-        &jpegs,
-        (&captions, &cell_captions),
-        opts,
-        out_dir,
-        false,
-        cover.as_deref(),
-    ) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            // Never leave a previous export's PDF beside the new pages.
-            let _ = std::fs::remove_file(out_dir.join("proof.pdf"));
-            fallbacks.push(format!("proof.pdf skipped: {e}"));
-            None
-        }
-    };
-    let press = match write_typst_and_compile(
-        &jpegs,
-        (&captions, &cell_captions),
-        opts,
-        out_dir,
-        true,
-        cover.as_deref(),
-    ) {
+    let proof =
+        match write_typst_and_compile(&jpegs, &texts, opts, out_dir, false, cover.as_deref()) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                // Never leave a previous export's PDF beside the new pages.
+                let _ = std::fs::remove_file(out_dir.join("proof.pdf"));
+                fallbacks.push(format!("proof.pdf skipped: {e}"));
+                None
+            }
+        };
+    let press = match write_typst_and_compile(&jpegs, &texts, opts, out_dir, true, cover.as_deref())
+    {
         Ok(p) => Some(p),
         Err(e) => {
             // Never leave a previous export's PDF beside the new pages.
@@ -1134,11 +1132,12 @@ pub fn render_book(
     // JPEGs by rasterizing the matching proof pages. Runs after press.pdf so
     // neither PDF picks up a doubled caption.
     let captioned: Vec<usize> = {
-        let mut v: Vec<usize> = captions
+        let mut v: Vec<usize> = texts
+            .lines
             .iter()
             .filter(|(_, l)| !l.is_empty())
             .map(|(k, _)| *k)
-            .chain(cell_captions.keys().copied())
+            .chain(texts.cells.keys().copied())
             .collect();
         v.sort_unstable();
         v.dedup();
@@ -1238,6 +1237,16 @@ type CellCaption = (usize, String);
 /// Per page number: the grid's photo count (its [`grid_cells`] layout) and
 /// the captions set on its cells.
 type CellCaptions = HashMap<usize, (usize, Vec<CellCaption>)>;
+
+/// Everything burned over the page JPEGs, keyed by page number.
+struct PageTexts {
+    /// The bottom strip's lines.
+    lines: HashMap<usize, Vec<String>>,
+    /// Captions on individual grid photos.
+    cells: CellCaptions,
+    /// Chapter title (divider) pages, which get a larger strip.
+    titles: HashSet<usize>,
+}
 
 /// Captions for a grid page: the user's own words go on the photo they
 /// describe (a lounge caption must not sit under the plane photos beside
@@ -1459,20 +1468,6 @@ fn darken<'a>(pixels: impl Iterator<Item = &'a mut Rgb<u8>>, pct: u16) {
     }
 }
 
-/// Full-bleed photo darkened to 45% so burned chapter text stays readable.
-fn draw_photo_backed_page(
-    p: &BookPhoto,
-    tw: u32,
-    th: u32,
-    out: &Path,
-    ffmpeg_bin: &str,
-    fallbacks: &mut Vec<String>,
-) -> Result<(), crate::MediaError> {
-    let mut img = cover_fit(&load(p, ffmpeg_bin, fallbacks), tw, th);
-    darken(img.pixels_mut(), 45);
-    save_jpg(&img, out)
-}
-
 fn draw_text_placeholder(
     kind: PageKind,
     tw: u32,
@@ -1620,7 +1615,7 @@ fn save_jpg(img: &RgbImage, out: &Path) -> Result<(), crate::MediaError> {
 /// (trim + 0.125 in each side); otherwise screen proof geometry.
 fn write_typst_and_compile(
     jpegs: &[PathBuf],
-    (captions, cell_captions): (&HashMap<usize, Vec<String>>, &CellCaptions),
+    texts: &PageTexts,
     opts: &BookOptions,
     out_dir: &Path,
     bleed: bool,
@@ -1656,13 +1651,20 @@ fn write_typst_and_compile(
             "#rect(width: 100%, height: 100%, fill: rgb(18, 20, 26))\n#place(center + horizon)[#image(\"{}\", width: 100%, height: 100%, fit: \"cover\")]\n",
             jpg.file_name().unwrap().to_string_lossy()
         ));
-        if let Some(lines) = captions.get(&page_no).filter(|l| !l.is_empty()) {
+        if let Some(lines) = texts.lines.get(&page_no).filter(|l| !l.is_empty()) {
+            // Chapter title pages carry a bigger strip, so they read as a
+            // chapter opening without dimming the photo.
+            let (size, inset) = if texts.titles.contains(&page_no) {
+                (24, 14)
+            } else {
+                (14, 8)
+            };
             typ.push_str(&format!(
-                "#place(bottom + center)[#rect(fill: rgb(18, 20, 26).transparentize(20%), inset: 8pt)[{}]]\n",
+                "#place(bottom + center)[#rect(fill: rgb(18, 20, 26).transparentize(20%), inset: {inset}pt)[#text(size: {size}pt)[{}]]]\n",
                 typ_escape(&lines.join(" · "))
             ));
         }
-        if let Some((n, cells)) = cell_captions.get(&page_no) {
+        if let Some((n, cells)) = texts.cells.get(&page_no) {
             for (cell, text) in cells {
                 typ.push_str(&cell_caption_typ((pw, ph), (tw_in, th_in), *n, *cell, text));
             }
