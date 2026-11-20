@@ -1374,7 +1374,7 @@ type CellCaption = (usize, String);
 
 /// Per page number: captions on grid photos, each with its photo's cell
 /// `(x, y, w, h)` as fractions of the page.
-type CellCaptions = HashMap<usize, Vec<((f64, f64, f64, f64), String)>>;
+type CellCaptions = HashMap<usize, Vec<(Rect, String)>>;
 
 /// Everything burned over the page JPEGs, keyed by page number.
 struct PageTexts {
@@ -1555,6 +1555,9 @@ fn draw_half(
     )
 }
 
+/// A cell `(x, y, w, h)`.
+type Rect = (f64, f64, f64, f64);
+
 /// Row arrangements for `n` photos: up to 3 rows of 1–3 photos each.
 fn row_splits(n: usize) -> Vec<Vec<usize>> {
     fn go(left: usize, rows: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
@@ -1602,7 +1605,7 @@ fn orderings(n: usize) -> Vec<Vec<usize>> {
 /// at its edges), trimming sky or table off a landscape costs less than
 /// trimming its sides, and very unequal photo sizes and leaving story
 /// order cost a little.
-fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<(f64, f64, f64, f64)> {
+fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
     const BALANCE: f64 = 0.3;
     // How much a photo's faces raise the cost of cropping or shrinking it.
     let people_weight = |p: &BookPhoto| 1.0 + 0.5 * f64::from(p.people.min(4));
@@ -1615,7 +1618,7 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<(f64, f64, 
             1.0
         }
     };
-    let mut best: Option<(f64, Vec<(f64, f64, f64, f64)>)> = None;
+    let mut best: Option<(f64, Vec<Rect>)> = None;
     for rows in row_splits(n) {
         for order in orderings(n) {
             let avail_h = h - gap * (rows.len() + 1) as f64;
@@ -2004,12 +2007,7 @@ fn burn_captions(
 /// cell's width. `page` is the PDF page and `trim` the page JPEG's size
 /// (inches); with bleed the JPEG is cover-scaled onto the larger page, so
 /// the cell is mapped the same way.
-fn cell_caption_typ(
-    page: (f64, f64),
-    trim: (f64, f64),
-    (x, y, w, h): (f64, f64, f64, f64),
-    text: &str,
-) -> String {
+fn cell_caption_typ(page: (f64, f64), trim: (f64, f64), (x, y, w, h): Rect, text: &str) -> String {
     let scale = (page.0 / trim.0).max(page.1 / trim.1);
     let (ox, oy) = (
         (page.0 - trim.0 * scale) / 2.0,
