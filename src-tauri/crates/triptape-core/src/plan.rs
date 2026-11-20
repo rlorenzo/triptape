@@ -582,6 +582,43 @@ pub fn estimate_hero_secs<'e, 'c>(
     )
 }
 
+/// Estimated seconds of an (edited) plan's film, with the inputs the
+/// planner budgets with: route and places cards from the plan, panorama
+/// holds from `assets`, the plan's captions and its collage overrides.
+pub fn estimate_plan_secs(plan: &Plan, assets: &[Asset]) -> f64 {
+    let mut chapter: HashMap<&str, usize> = HashMap::new();
+    for (i, c) in plan.chapters.iter().enumerate() {
+        for id in &c.asset_ids {
+            chapter.entry(id).or_insert(i);
+        }
+    }
+    // Chapter labels only need to tell chapters apart.
+    let labels: Vec<String> = (0..=plan.chapters.len()).map(|i| i.to_string()).collect();
+    let pano: HashMap<&str, f64> = assets
+        .iter()
+        .filter_map(|a| {
+            let asp = a.display_aspect().filter(|&x| is_panorama(x))?;
+            Some((a.id.as_str(), pano_motion(asp).hold_secs))
+        })
+        .collect();
+    let cards = HeroCards {
+        route: !plan.map_polyline.is_empty(),
+        route_stops: crate::route_stops::animated_stop_count(
+            &crate::route_stops::chapter_route_stops(&plan.chapters, assets, &plan.map_polyline),
+        ),
+        route_secs: None,
+        places: plan.chapters.iter().any(|c| c.place.is_some()),
+    };
+    estimate_hero_secs_with(
+        &plan.hero,
+        |id| labels[chapter.get(id).copied().unwrap_or(plan.chapters.len())].as_str(),
+        |id| pano.get(id).copied(),
+        |id| has_caption(plan.captions.get(id).map(String::as_str)),
+        cards,
+        &plan.collage,
+    )
+}
+
 /// [`estimate_hero_secs`] under the user's collage overrides (an edited
 /// plan's `collage`), grouped as the renderer groups them.
 pub fn estimate_hero_secs_with<'e, 'c>(

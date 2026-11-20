@@ -4,7 +4,8 @@
 //! ```sh
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
-//! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...] [--list]
+//! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
+//!                [--solo REF...] [--unsolo REF...] [--join REF REF]... [--unjoin REF...] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--itinerary itinerary.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
@@ -796,9 +797,10 @@ fn cache_cmd(sub: &str, flags: &HashMap<String, String>) {
     }
 }
 
-/// Parsed `edit` arguments. `--include`, `--exclude`, `--uninclude` and
-/// `--unexclude` each take one or more asset references (id, file name or
-/// path) and may repeat.
+/// Parsed `edit` arguments. `--include`, `--exclude`, `--uninclude`,
+/// `--unexclude`, `--solo`, `--unsolo` and `--unjoin` each take one or more
+/// asset references (id, file name or path) and may repeat; `--join` takes
+/// exactly two and may repeat.
 #[derive(Debug, Default, PartialEq)]
 struct EditArgs {
     db: Option<PathBuf>,
@@ -808,6 +810,10 @@ struct EditArgs {
     exclude: Vec<String>,
     uninclude: Vec<String>,
     unexclude: Vec<String>,
+    solo: Vec<String>,
+    unsolo: Vec<String>,
+    join: Vec<(String, String)>,
+    unjoin: Vec<String>,
 }
 
 fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
@@ -832,7 +838,11 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
             "project" => out.project = Some(single(values)?),
             "list" if values.is_empty() => out.list = true,
             "list" => return Err("--list takes no value".to_string()),
-            "include" | "exclude" | "uninclude" | "unexclude" => {
+            "join" => match <[String; 2]>::try_from(values) {
+                Ok([a, b]) => out.join.push((a, b)),
+                Err(_) => return Err("--join wants exactly two assets".to_string()),
+            },
+            "include" | "exclude" | "uninclude" | "unexclude" | "solo" | "unsolo" | "unjoin" => {
                 if values.is_empty() {
                     return Err(format!("--{flag} wants at least one asset"));
                 }
@@ -840,7 +850,10 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     "include" => out.include.extend(values),
                     "exclude" => out.exclude.extend(values),
                     "uninclude" => out.uninclude.extend(values),
-                    _ => out.unexclude.extend(values),
+                    "unexclude" => out.unexclude.extend(values),
+                    "solo" => out.solo.extend(values),
+                    "unsolo" => out.unsolo.extend(values),
+                    _ => out.unjoin.extend(values),
                 }
             }
             other => return Err(format!("unknown flag --{other}")),
@@ -880,6 +893,54 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
         edits.place_overrides.len(),
         edits.caption_overrides.len()
     );
+    println!("on their own: {}", edits.solo.len());
+    for id in &edits.solo {
+        println!("  {}", show(id));
+    }
+    println!("joins: {}", edits.joins.len());
+    for (a, b) in &edits.joins {
+        println!("  {} + {}", show(a), show(b));
+    }
+}
+
+/// How the edited film groups, as the renderer will (missing files left
+/// out): `(groups as hero indices, estimated seconds)`.
+fn film_grouping(plan: &Plan, assets: &[Asset]) -> (Vec<Vec<usize>>, f64) {
+    let by_id: HashMap<&str, &Asset> = assets.iter().map(|x| (x.id.as_str(), x)).collect();
+    let grouping = planmod::HeroGrouping::new(
+        plan,
+        |id| by_id.get(id).and_then(|a| a.display_aspect()),
+        |id| by_id.get(id).is_some_and(|a| a.path.exists()),
+    );
+    (
+        grouping.groups(&plan.collage),
+        planmod::estimate_plan_secs(plan, assets),
+    )
+}
+
+/// Print the film's collages and estimated length.
+fn print_film(plan: &Plan, assets: &[Asset], was_secs: Option<f64>) {
+    let by_id: HashMap<&str, &Asset> = assets.iter().map(|x| (x.id.as_str(), x)).collect();
+    let (groups, secs) = film_grouping(plan, assets);
+    let collages: Vec<&Vec<usize>> = groups.iter().filter(|g| g.len() > 1).collect();
+    let was = was_secs.map_or_else(String::new, |w| format!(" (was {w:.1} s)"));
+    println!(
+        "film: {} segments, {} collages, about {secs:.1} s{was}",
+        groups.len(),
+        collages.len()
+    );
+    for g in collages {
+        let names: Vec<String> = g
+            .iter()
+            .map(|&i| {
+                let id = &plan.hero[i].asset_id;
+                by_id
+                    .get(id.as_str())
+                    .map_or_else(|| id.clone(), |a| asset_label(a))
+            })
+            .collect();
+        println!("  collage of {}: {}", g.len(), names.join(", "));
+    }
 }
 
 fn edit_cmd(args: &[String]) {
@@ -909,7 +970,7 @@ fn edit_cmd(args: &[String]) {
     }
     type Setter = fn(&mut PlanEdits, String, bool);
     // Un-dos first, then removals, then pins.
-    let ops: [(Vec<&Asset>, &str, Setter, bool); 4] = [
+    let ops: [(Vec<&Asset>, &str, Setter, bool); 6] = [
         (
             resolve(&a.uninclude),
             "uninclude",
@@ -929,12 +990,26 @@ fn edit_cmd(args: &[String]) {
             true,
         ),
         (includes, "include", PlanEdits::set_included, true),
+        // Collage edits after the picks they apply to.
+        (resolve(&a.unsolo), "unsolo", PlanEdits::set_solo, false),
+        (resolve(&a.solo), "solo", PlanEdits::set_solo, true),
     ];
-    let changed = ops.iter().any(|(assets, ..)| !assets.is_empty());
+    let unjoins = resolve(&a.unjoin);
+    let joins: Vec<(&Asset, &Asset)> = a
+        .join
+        .iter()
+        .map(|(x, y)| {
+            let both = resolve(&[x.clone(), y.clone()]);
+            (both[0], both[1])
+        })
+        .collect();
+    let changed = ops.iter().any(|(assets, ..)| !assets.is_empty())
+        || !unjoins.is_empty()
+        || !joins.is_empty();
     if !changed && !a.list {
         die(
             "edit",
-            "nothing to do: pass --include/--exclude/--uninclude/--unexclude or --list",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin or --list",
         );
     }
     let mut edits = ep.edits.clone();
@@ -944,16 +1019,62 @@ fn edit_cmd(args: &[String]) {
             println!("{verb}: {}", asset_label(asset));
         }
     }
+    for asset in &unjoins {
+        edits.unjoin(&asset.id);
+        println!("unjoin: {}", asset_label(asset));
+    }
+    // Each solo photo must be in the film; each join must leave the two in
+    // one collage of the film (neighbouring collage photos of one day).
+    let edited = |edits: &PlanEdits| planmod::apply_edits(&ep.base, &ep.assets, edits);
+    for asset in &ops[5].0 {
+        if !edited(&edits).hero.iter().any(|e| e.asset_id == asset.id) {
+            die("edit", format!("{} is not in the film", asset_label(asset)));
+        }
+    }
+    for (x, y) in &joins {
+        let plan = edited(&edits);
+        let at = |a: &Asset| {
+            plan.hero
+                .iter()
+                .position(|e| e.asset_id == a.id)
+                .unwrap_or_else(|| die("edit", format!("{} is not in the film", asset_label(a))))
+        };
+        let (first, second) = if at(x) <= at(y) { (x, y) } else { (y, x) };
+        edits.join(first.id.clone(), second.id.clone());
+        let plan = edited(&edits);
+        let (groups, _) = film_grouping(&plan, &ep.assets);
+        let pos = |a: &Asset| plan.hero.iter().position(|e| e.asset_id == a.id);
+        let together = groups.iter().any(|g| {
+            pos(first).is_some_and(|i| g.contains(&i))
+                && pos(second).is_some_and(|i| g.contains(&i))
+        });
+        if !together {
+            die(
+                "edit",
+                format!(
+                    "{} and {} can't share a collage: they must be neighbouring film photos of one day, \
+                     without a caption, not panoramas or videos, in a collage of at most {}",
+                    asset_label(first),
+                    asset_label(second),
+                    planmod::MAX_COLLAGE
+                ),
+            );
+        }
+        println!("join: {} + {}", asset_label(first), asset_label(second));
+    }
+    let was_secs = changed.then(|| film_grouping(&ep.edited, &ep.assets).1);
     if changed {
         db.save_plan_edits(&ep.project_id, &edits)
             .unwrap_or_else(|e| die("save edits", e));
     }
     print_edits(&edits, &by_id);
+    let plan = edited(&edits);
+    print_film(&plan, &ep.assets, was_secs);
     if !changed {
         return;
     }
     // Show where each included shot landed in the film.
-    let hero = planmod::apply_edits(&ep.base, &ep.assets, &edits).hero;
+    let hero = plan.hero;
     let label_at = |j: Option<usize>| {
         j.and_then(|j| hero.get(j))
             .and_then(|e| by_id.get(e.asset_id.as_str()))
@@ -1319,5 +1440,20 @@ mod tests {
         assert!(parse_edit_args(&args("stray")).is_err());
         assert!(parse_edit_args(&args("--db a b")).is_err());
         assert!(parse_edit_args(&args("--list x")).is_err());
+        assert!(parse_edit_args(&args("--join a")).is_err());
+        assert!(parse_edit_args(&args("--join a b c")).is_err());
+        assert!(parse_edit_args(&args("--solo")).is_err());
+    }
+
+    #[test]
+    fn edit_args_take_collage_edits() {
+        let a = parse_edit_args(&args(
+            "--db t.db --solo a b --unsolo c --join d e --join f g --unjoin h",
+        ))
+        .unwrap();
+        assert_eq!(a.solo, ["a", "b"]);
+        assert_eq!(a.unsolo, ["c"]);
+        assert_eq!(a.join, [("d".into(), "e".into()), ("f".into(), "g".into())]);
+        assert_eq!(a.unjoin, ["h"]);
     }
 }

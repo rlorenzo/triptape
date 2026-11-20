@@ -39,6 +39,12 @@ cargo run -p triptape-media --bin triptape -- export --db trip.db --out ~/Movies
 # Captioned photos come first; a shot that repeats a scene is skipped unless
 # different people are in it. Add --stills-only to leave the motion out.
 cargo run -p triptape-media --bin triptape -- pick --db trip.db --out ~/Pictures/trip-best --count 800
+# Story edits from the command line (asset id, file name or path). --list
+# shows the edits, the film's collages and its estimated length.
+cargo run -p triptape-media --bin triptape -- edit --db trip.db --exclude IMG_0412.HEIC --include IMG_0420.MOV
+# Collages: play a photo on its own (--unsolo undoes it), or join two
+# neighbouring film photos of one day into one collage (--unjoin undoes it).
+cargo run -p triptape-media --bin triptape -- edit --db trip.db --solo IMG_0899.HEIC --join IMG_1870.HEIC IMG_7072.HEIC --list
 ```
 
 Desktop app: `cargo run -p triptape-app` (Tauri v2 shell + Svelte frontend).
