@@ -336,6 +336,18 @@ pub fn flow_pages(
     has_map: bool,
     cap: usize,
 ) -> Vec<FlowPage> {
+    flow_pages_by_day(chapter_of, &[], wide_idx, has_map, cap)
+}
+
+/// [`flow_pages`] where no photo page mixes two trip days: `day_of` holds
+/// each photo's day in story order (empty: days unknown, no day breaks).
+pub fn flow_pages_by_day(
+    chapter_of: &[Option<usize>],
+    day_of: &[Option<u32>],
+    wide_idx: Option<usize>,
+    has_map: bool,
+    cap: usize,
+) -> Vec<FlowPage> {
     let n_photos = chapter_of.len();
     let mut pages = vec![FlowPage {
         kind: PageKind::CoverProxy,
@@ -366,11 +378,12 @@ pub fn flow_pages(
     let counted_before: usize = pages.iter().map(|p| p.kind.counts()).sum();
     // Closing page plus the optional map.
     let extras = 1 + usize::from(has_map);
-    let rest: Vec<Option<usize>> = story_order(n_photos, spread)
+    let rest_idx: Vec<usize> = story_order(n_photos, spread)
         .into_iter()
         .skip(1 + usize::from(spread.is_some()))
-        .map(|i| chapter_of[i])
         .collect();
+    let rest: Vec<Option<usize>> = rest_idx.iter().map(|&i| chapter_of[i]).collect();
+    let day_at = |k: usize| day_of.get(rest_idx[k]).copied().flatten();
     // A chapter opens at its first photo left after the hero and spread.
     let mut opened: HashSet<usize> = chapter_of[0].into_iter().collect();
     let openings: Vec<usize> = rest
@@ -399,40 +412,56 @@ pub fn flow_pages(
         .into_iter()
         .map(|j| eligible[j])
         .collect();
-    // Photo-page runs between dividers. Each divider consumes its photo as a
+    // Photo-page runs between dividers, each cut into one segment per trip
+    // day so no page mixes two days. Each divider consumes its photo as a
     // full-page background, so that photo never repeats later in the book.
-    let mut run_lens: Vec<usize> = vec![];
+    let mut bounds: Vec<(usize, usize)> = vec![];
     let mut start = 0;
     for &d in &dividers {
-        run_lens.push(d - start);
+        bounds.push((start, d));
         start = d + 1;
     }
-    run_lens.push(rest.len() - start);
+    bounds.push((start, rest.len()));
+    let runs: Vec<Vec<usize>> = bounds
+        .into_iter()
+        .map(|(a, b)| {
+            let mut segs: Vec<usize> = vec![];
+            for k in a..b {
+                match segs.last_mut() {
+                    Some(n) if day_at(k) == day_at(k - 1) => *n += 1,
+                    _ => segs.push(1),
+                }
+            }
+            segs
+        })
+        .collect();
     let photo_budget = cap
         .saturating_sub(counted_before + dividers.len() + extras)
         .max(1);
     let per_page = (1..=4)
-        .find(|&p| run_lens.iter().map(|l| l.div_ceil(p)).sum::<usize>() <= photo_budget)
+        .find(|&p| runs.iter().flatten().map(|l| l.div_ceil(p)).sum::<usize>() <= photo_budget)
         .unwrap_or(4);
-    for (i, &run) in run_lens.iter().enumerate() {
+    for (i, run) in runs.iter().enumerate() {
         if i > 0 {
             pages.push(FlowPage {
                 kind: PageKind::Divider,
                 take: 1,
             });
         }
-        let mut left = run;
-        while left > 0 {
-            let take = left.min(per_page);
-            pages.push(FlowPage {
-                kind: if take == 1 {
-                    PageKind::PhotoCaption
-                } else {
-                    PageKind::Grid
-                },
-                take,
-            });
-            left -= take;
+        for &seg in run {
+            let mut left = seg;
+            while left > 0 {
+                let take = left.min(per_page);
+                pages.push(FlowPage {
+                    kind: if take == 1 {
+                        PageKind::PhotoCaption
+                    } else {
+                        PageKind::Grid
+                    },
+                    take,
+                });
+                left -= take;
+            }
         }
     }
     if has_map {
@@ -581,7 +610,8 @@ fn wide_index(photos: &[BookPhoto]) -> Option<usize> {
 /// The page plan for exactly these photos.
 fn book_flow(photos: &[BookPhoto], has_map: bool, cap: usize) -> Vec<FlowPage> {
     let chapter_of: Vec<Option<usize>> = photos.iter().map(|p| p.chapter).collect();
-    flow_pages(&chapter_of, wide_index(photos), has_map, cap)
+    let day_of: Vec<Option<u32>> = photos.iter().map(|p| p.day).collect();
+    flow_pages_by_day(&chapter_of, &day_of, wide_index(photos), has_map, cap)
 }
 
 /// Largest selection size found whose flowed book fits `cap` counted pages.
@@ -977,7 +1007,9 @@ pub fn render_book(
     );
     let mut cursor = 0usize;
     let mut page_no = 0usize;
-    let mut announced: HashSet<usize> = HashSet::new();
+    let mut announced = Announced::default();
+    // The photos each page shows, for the manifest.
+    let mut page_photos: Vec<Vec<&BookPhoto>> = vec![];
 
     let total_pages = flow
         .iter()
@@ -991,6 +1023,7 @@ pub fn render_book(
         opts.progress.check_cancelled()?;
         page_no += 1;
         let fname = format!("page_{page_no:03}.jpg");
+        let mut shown: Vec<&BookPhoto> = vec![];
         let out = out_dir.join(&fname);
         match fp.kind {
             PageKind::Hero | PageKind::PhotoCaption | PageKind::Grid => {
@@ -999,6 +1032,7 @@ pub fn render_book(
                     .map(|oi| &photos[*oi])
                     .collect();
                 cursor += slot.len();
+                shown.clone_from(&slot);
                 for (k, p) in slot.iter().enumerate() {
                     let (sw, sh) = cell_inches(opts.preset, fp.kind, fp.take.max(1), k);
                     placements.push((page_no, dpi_verdict(p.width, p.height, sw, sh)));
@@ -1012,10 +1046,15 @@ pub fn render_book(
                 } else {
                     page_caption(&slot, fp.kind)
                 };
-                // The hero opens its chapter: no divider precedes it.
-                if fp.kind == PageKind::Hero {
-                    page_caps = titled(opening_title(slot[0], chapters, &mut announced), page_caps);
-                }
+                // The hero opens its chapter: no divider precedes it. Any
+                // other page that starts a day no title has named carries
+                // that day's banner.
+                let title = if fp.kind == PageKind::Hero {
+                    opening_title(slot[0], chapters, &mut announced)
+                } else {
+                    day_banner(slot[0], chapters, &mut announced)
+                };
+                page_caps = titled(title, page_caps);
                 if !page_caps.is_empty() {
                     captions.entry(page_no).or_default().extend(page_caps);
                 }
@@ -1034,6 +1073,7 @@ pub fn render_book(
                     .get(1)
                     .unwrap_or(&0)
                     .min(&photos.len().saturating_sub(1))];
+                shown.push(p);
                 if fp.kind == PageKind::SpreadLeft {
                     let (sw, sh) = slot_inches(opts.preset, fp.kind, 1);
                     placements.push((page_no, dpi_verdict(p.width, p.height, sw, sh)));
@@ -1073,6 +1113,7 @@ pub fn render_book(
                 // Consume the background photo: it belongs to this
                 // day-marker page and is not repeated later.
                 let bg = order.get(cursor).map_or(&photos[0], |&oi| &photos[oi]);
+                shown.push(bg);
                 cursor += fp.take;
                 let (sw, sh) = slot_inches(opts.preset, fp.kind, fp.take);
                 placements.push((page_no, dpi_verdict(bg.width, bg.height, sw, sh)));
@@ -1089,6 +1130,7 @@ pub fn render_book(
                     draw_text_placeholder(fp.kind, tw, th, &out)?;
                 } else {
                     let last = &photos[photos.len() - 1];
+                    shown.push(last);
                     draw_fullbleed(last, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?;
                     captions
                         .entry(page_no)
@@ -1107,6 +1149,7 @@ pub fn render_book(
             )));
         }
         jpegs.push(out);
+        page_photos.push(shown);
         opts.progress.counted("book", "page", page_no, total_pages);
     }
 
@@ -1218,6 +1261,11 @@ pub fn render_book(
             "page": i + 1,
             "file": p.file_name().unwrap().to_string_lossy(),
             "kind": kinds[i + 1], // +1: kinds[0] is the uncounted cover-proxy
+            // Which originals the page shows, to find one while reviewing.
+            "photos": page_photos[i].iter().map(|b| serde_json::json!({
+                "asset_id": b.asset_id,
+                "file": b.path.file_name().map(|f| f.to_string_lossy().into_owned()),
+            })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "preflight_warnings": fallbacks.clone(),
     });
@@ -1239,15 +1287,36 @@ pub fn render_book(
     })
 }
 
-/// The title of the chapter `p` opens, once per chapter.
-fn opening_title(
-    p: &BookPhoto,
-    chapters: &[String],
-    announced: &mut HashSet<usize>,
-) -> Option<String> {
-    p.chapter
-        .filter(|&c| announced.insert(c))
-        .and_then(|c| chapters.get(c).cloned())
+/// Chapters and trip days whose title the book has shown so far.
+#[derive(Default)]
+struct Announced {
+    chapters: HashSet<usize>,
+    days: HashSet<u32>,
+}
+
+/// The title of the chapter `p` opens, once per chapter. Showing it also
+/// names `p`'s day, so that day gets no second banner.
+fn opening_title(p: &BookPhoto, chapters: &[String], announced: &mut Announced) -> Option<String> {
+    let title = p
+        .chapter
+        .filter(|&c| announced.chapters.insert(c))
+        .and_then(|c| chapters.get(c).cloned())?;
+    announced.days.extend(p.day);
+    Some(title)
+}
+
+/// The day banner for a photo page starting with `p`: its chapter's title
+/// (`Day 4 · Tue, Oct 6 — Tokyo`) when `p` begins a day no title page or
+/// earlier banner has named. Chapters are single days, so the title names
+/// the day.
+fn day_banner(p: &BookPhoto, chapters: &[String], announced: &mut Announced) -> Option<String> {
+    let day = p.day?;
+    if announced.days.contains(&day) {
+        return None;
+    }
+    let title = opening_title(p, chapters, announced)?;
+    announced.days.insert(day);
+    Some(title)
 }
 
 /// Lead `caps` with a chapter title. An auto dateline or place caption would
@@ -1264,11 +1333,7 @@ fn titled(title: Option<String>, caps: Vec<String>) -> Vec<String> {
 
 /// Caption lines for a divider page: its background photo's chapter title
 /// plus that photo's own caption, since the photo is consumed here.
-fn divider_lines(
-    bg: &BookPhoto,
-    chapters: &[String],
-    announced: &mut HashSet<usize>,
-) -> Vec<String> {
+fn divider_lines(bg: &BookPhoto, chapters: &[String], announced: &mut Announced) -> Vec<String> {
     titled(opening_title(bg, chapters, announced), caption_of(bg))
 }
 
@@ -1322,6 +1387,10 @@ fn page_caption(slot: &[&BookPhoto], kind: PageKind) -> Vec<String> {
     if kind != PageKind::Grid || caps.len() <= 1 {
         return caps;
     }
+    // "Tokyo" beside "Tokyo DisneySea" says nothing more: keep the most
+    // specific place.
+    let all = caps.clone();
+    caps.retain(|c| !all.iter().any(|o| o != c && o.contains(c.as_str())));
     if caps.iter().all(|c| is_dateline(c)) {
         let dates: Vec<String> = caps.iter().map(|c| dateline_date(c)).collect();
         if dates.iter().all(|d| *d == dates[0]) {
@@ -2587,7 +2656,7 @@ mod tests {
             ..blank_photo()
         };
         let titles = ["Tokyo".to_string(), "Kyoto".to_string()];
-        let mut seen = HashSet::new();
+        let mut seen = Announced::default();
         // Title follows the photo's chapter, not the divider's position.
         assert_eq!(
             divider_lines(&photo(Some(1), None), &titles, &mut seen),
@@ -2616,6 +2685,33 @@ mod tests {
         );
         // A photo outside every chapter gets no title.
         assert!(divider_lines(&photo(None, None), &titles, &mut seen).is_empty());
+    }
+
+    #[test]
+    fn each_day_gets_one_banner() {
+        let photo = |chapter: usize, day: u32| BookPhoto {
+            chapter: Some(chapter),
+            day: Some(day),
+            ..blank_photo()
+        };
+        let titles = [
+            "Day 3 — Tokyo".to_string(),
+            "Day 3 — Tokyo".to_string(),
+            "Day 4 — Tokyo".to_string(),
+        ];
+        let mut seen = Announced::default();
+        assert_eq!(
+            day_banner(&photo(0, 3), &titles, &mut seen).as_deref(),
+            Some("Day 3 — Tokyo")
+        );
+        // Same day, next page or a second chapter that day: no banner.
+        assert_eq!(day_banner(&photo(0, 3), &titles, &mut seen), None);
+        assert_eq!(day_banner(&photo(1, 3), &titles, &mut seen), None);
+        // A divider already named day 4: its pages get no banner.
+        assert!(divider_lines(&photo(2, 4), &titles, &mut seen)[0].contains("Day 4"));
+        assert_eq!(day_banner(&photo(2, 4), &titles, &mut seen), None);
+        // Unknown day: no banner.
+        assert_eq!(day_banner(&blank_photo(), &titles, &mut seen), None);
     }
 
     #[test]
