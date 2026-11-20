@@ -1,5 +1,5 @@
 import { get } from "svelte/store";
-import { bookPages, exportJob, IDLE_EXPORT, liveCollages, project, validBookPages, type ExportJobState } from "./store";
+import { bookPages, bookPreset, exportJob, IDLE_EXPORT, liveCollages, project, savedExportFolder, validBookPages, type ExportJobState } from "./store";
 import { exportKeepsake, type ExportCmd, type ExportSummary, type ProgressEvent } from "./tauri";
 
 const key = (projectId: string) => `triptape-export-${projectId}`;
@@ -27,7 +27,9 @@ function mergeSummary(prev: ExportSummary | null, next: ExportSummary): ExportSu
     ...next,
     video: next.video ?? (lost("video") ? undefined : prev?.video),
     reels: next.reels.length > 0 || lost("reels") ? next.reels : (prev?.reels ?? []),
-    bookPages: next.bookPages || (lost("book") ? 0 : prev?.bookPages || 0)
+    bookPages: next.bookPages || (lost("book") ? 0 : prev?.bookPages || 0),
+    // Notes belong to the book they describe: a new book replaces them.
+    bookNotes: next.bookPages || lost("book") ? (next.bookNotes ?? []) : (prev?.bookNotes ?? [])
   };
 }
 
@@ -58,8 +60,13 @@ export async function runExport(cmd: ExportCmd, label: string, projectId: string
   if (jobs.get(projectId)?.label) return;
   record(projectId, { ...IDLE_EXPORT, cmd, label });
   try {
-    const pages = validBookPages(get(bookPages)) ?? undefined;
-    const summary = mergeSummary(savedExport(projectId), await exportKeepsake(cmd, projectId, pages, get(liveCollages)));
+    const made = await exportKeepsake(cmd, projectId, {
+      bookPages: validBookPages(get(bookPages)) ?? undefined,
+      bookPreset: get(bookPreset),
+      liveCollages: get(liveCollages),
+      destination: savedExportFolder(projectId) ?? undefined
+    });
+    const summary = mergeSummary(savedExport(projectId), made);
     saveExport(projectId, summary);
     record(projectId, { ...IDLE_EXPORT, cmd, summary });
   } catch (e) {

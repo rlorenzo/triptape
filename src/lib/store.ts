@@ -1,6 +1,6 @@
 import { derived, writable, type Writable } from "svelte/store";
 import { byTime, dayKey } from "./trip";
-import type { AssetView, ExportCmd, ExportSummary, ScanSummary } from "./tauri";
+import type { AssetView, BookPresetId, ExportCmd, ExportSummary, ScanSummary } from "./tauri";
 
 export type Screen = "import" | "library" | "story" | "export" | "settings";
 
@@ -53,22 +53,44 @@ export const dayNumbers = derived(assetsByTime, ($sorted) => {
 
 export const consentGiven = writable<boolean>(stored(CONSENT_KEY) === "1");
 
-/** Photo Book page cap bounds; the backend enforces the same range. */
+/** Photo Book page cap bounds for either shape; the backend enforces the same range. */
 export const BOOK_PAGES_MIN = 24;
 export const BOOK_PAGES_MAX = 400;
 const BOOK_PAGES_DEFAULT = 60;
 const BOOK_PAGES_KEY = "triptape-book-pages";
 
-/** A whole page count inside the allowed range, else null. */
-export function validBookPages(n: unknown): number | null {
-  return typeof n === "number" && Number.isInteger(n) && n >= BOOK_PAGES_MIN && n <= BOOK_PAGES_MAX ? n : null;
+/** A whole page count inside the allowed range (the chosen shape's, when given), else null. */
+export function validBookPages(n: unknown, min = BOOK_PAGES_MIN, max = BOOK_PAGES_MAX): number | null {
+  return typeof n === "number" && Number.isInteger(n) && n >= min && n <= max ? n : null;
 }
+
+const BOOK_PRESET_KEY = "triptape-book-preset";
+
+/** The Photo Book's shape. Classic Square (P1) unless the owner picked Travel Landscape. */
+export const bookPreset = remembered<BookPresetId>(BOOK_PRESET_KEY, stored(BOOK_PRESET_KEY) === "P2" ? "P2" : "P1");
 
 /** Most pages the Photo Book may use. Remembered across launches. */
 export const bookPages = remembered<number>(
   BOOK_PAGES_KEY,
   validBookPages(Number(stored(BOOK_PAGES_KEY))) ?? BOOK_PAGES_DEFAULT
 );
+
+const exportFolderKey = (projectId: string) => `triptape-export-folder-${projectId}`;
+
+/** The folder the owner chose for this trip's keepsakes, or null for the default. */
+export function savedExportFolder(projectId: string): string | null {
+  return stored(exportFolderKey(projectId)) || null;
+}
+
+/** Remember the chosen folder for this trip; null goes back to the default. */
+export function saveExportFolder(projectId: string, folder: string | null): void {
+  try {
+    if (folder) localStorage.setItem(exportFolderKey(projectId), folder);
+    else localStorage.removeItem(exportFolderKey(projectId));
+  } catch {
+    /* private mode: the choice lasts until the screen is left */
+  }
+}
 
 const LIVE_COLLAGES_KEY = "triptape-live-collages";
 

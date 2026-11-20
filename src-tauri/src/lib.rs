@@ -4,14 +4,17 @@
 //! - Coarse commands only: `scan_folder`, `get_assets`, `start_job`,
 //!   `cancel_job`, `export_video`, `export_reels`, `export_book`.
 //! - Commands take scoped identifiers (project id, asset id, job id),
-//!   never raw filesystem paths — except the folder-picker result returned
-//!   by the OS dialog, which enters only through `scan_folder`.
+//!   never raw filesystem paths — except folder-picker results returned
+//!   by the OS dialog (the trip folder through `scan_folder`, the export
+//!   folder through `check_export_folder` and the export commands, checked
+//!   by [`resolve_export_parent`]) and a finished film's path, which
+//!   `open_film` accepts only via [`finished_film`].
 //! - Progress goes out over `job://progress` events (~5 Hz), never one
 //!   invoke per file. Thumbnails are served over the `asset://` protocol
 //!   scoped to the cache dir; originals are never exposed to the webview.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -19,8 +22,9 @@ use triptape_core::db::{Db, EditedPlan};
 use triptape_core::metadata;
 use triptape_core::osxphotos::OsxPhotosIndex;
 use triptape_core::scan::{ScannedFile, VIDEO_EXTS};
-use triptape_core::types::{Asset, AssetKind, Chapter, PlanEntry};
+use triptape_core::types::{distinct_assets, Asset, AssetKind, Chapter, Plan, PlanEntry};
 use triptape_media::export::Skipped;
+use triptape_media::render_book::{BookPreset, MAX_BOOK_PAGES};
 
 // ---------------------------------------------------------------------------
 // State
@@ -324,6 +328,457 @@ pub struct ExportSummary {
     pub reels: Vec<String>,
     pub book_pages: usize,
     pub skipped: Vec<Skipped>,
+    /// What the book's print check found, in plain words (empty when the
+    /// book wasn't made or nothing needs a look).
+    pub book_notes: Vec<String>,
+}
+
+/// The book's preflight results from an export's fallback notes, worded for
+/// the owner. The renderer reports them only as notes in `export.json`; this
+/// groups them so the Export screen can show them. Notes it doesn't know
+/// are left to `export.json`.
+pub fn book_notes(fallbacks: &[String]) -> Vec<String> {
+    use triptape_media::render_book::{preflight, DpiVerdict};
+    // The renderer's own wording of a soft-photo warning, so a reworded
+    // message still matches.
+    let soft = preflight(
+        BookPreset::P1,
+        MAX_BOOK_PAGES,
+        &[],
+        &[(1, DpiVerdict::Warn)],
+    )
+    .into_iter()
+    .find(|i| i.level == "warn")
+    .map(|i| i.message)
+    .unwrap_or_default();
+    let mut soft_pages: Vec<usize> = vec![];
+    let (mut too_small, mut unavailable) = (0usize, 0usize);
+    let mut fit: Option<String> = None;
+    for note in fallbacks {
+        if let Some((page, message)) = note
+            .strip_prefix("page ")
+            .and_then(|rest| rest.split_once(": "))
+        {
+            if message == soft {
+                if let Ok(n) = page.parse() {
+                    soft_pages.push(n);
+                }
+            }
+            continue;
+        }
+        let Some(note) = note.strip_prefix("book: ") else {
+            continue;
+        };
+        if note.contains("excluded (below 200 dpi") {
+            too_small += 1;
+        } else if note.ends_with("; skipped") {
+            unavailable += 1;
+        } else if let Some(rest) = note.strip_prefix("selected ") {
+            fit = fit_note(rest);
+        }
+    }
+    soft_pages.sort_unstable();
+    soft_pages.dedup();
+    let mut notes = vec![];
+    match soft_pages.as_slice() {
+        [] => {}
+        [page] => notes.push(format!(
+            "Page {page} has a photo at 200-299 dpi. It may print a little soft."
+        )),
+        pages => notes.push(format!(
+            "{} pages have a photo at 200-299 dpi and may print a little soft: pages {}.",
+            pages.len(),
+            pages
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+    if too_small > 0 {
+        notes.push(format!(
+            "{} left out because {} too small to print sharply.",
+            photo_count(too_small),
+            if too_small == 1 {
+                "it was"
+            } else {
+                "they were"
+            }
+        ));
+    }
+    if unavailable > 0 {
+        notes.push(format!(
+            "{} left out because {} file was missing, changed or unreadable.",
+            photo_count(unavailable),
+            if unavailable == 1 { "its" } else { "each" }
+        ));
+    }
+    notes.extend(fit);
+    notes
+}
+
+fn photo_count(n: usize) -> String {
+    if n == 1 {
+        "1 photo was".to_string()
+    } else {
+        format!("{n} photos were")
+    }
+}
+
+/// "K of N photos ... to fit the C-page cap" as advice.
+fn fit_note(rest: &str) -> Option<String> {
+    let mut words = rest.split_whitespace();
+    let kept = words.next()?;
+    let of = words.nth(1)?;
+    let cap = rest
+        .rsplit_once("to fit the ")?
+        .1
+        .strip_suffix("-page cap")?;
+    Some(format!(
+        "The book uses {kept} of {of} photos to stay within {cap} pages. Allow more pages to fit more."
+    ))
+}
+
+/// A skipped keepsake's reason, with the book's print-check block reworded.
+pub fn plain_skip(mut skip: Skipped) -> Skipped {
+    if let Some(issue) = skip
+        .reason
+        .strip_prefix("preflight/render blocked: book preflight blocked: ")
+    {
+        skip.reason = format!("It didn't pass its print check: {issue}.");
+    }
+    skip
+}
+
+/// Whether one keepsake can be made from the trip, before any run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeepsakeEligibility {
+    pub enabled: bool,
+    /// Why it can't be made; for a film that will be the short version, why
+    /// it is short. Empty when there is nothing to say.
+    pub reason: String,
+}
+
+/// What the Export screen may offer, keepsake by keepsake (PLAN.md Sec 5.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EligibilityView {
+    pub video: KeepsakeEligibility,
+    pub reels: KeepsakeEligibility,
+    pub book: KeepsakeEligibility,
+}
+
+/// The plan's eligibility, counted exactly as `export::export_all` counts it
+/// (distinct film assets, every non-video asset, one moment per chapter), so
+/// the screen disables exactly what a run would skip, with the same reasons.
+pub fn export_eligibility(plan: &Plan, assets: &[Asset]) -> EligibilityView {
+    let usable = distinct_assets(&plan.hero);
+    let photos = assets.iter().filter(|a| a.kind != AssetKind::Video).count();
+    let e = triptape_core::plan::plan_eligibility(usable, photos, plan.chapters.len());
+    let card = |enabled: bool, reason: String, say_why: bool| KeepsakeEligibility {
+        enabled,
+        reason: if say_why { reason } else { String::new() },
+    };
+    EligibilityView {
+        video: card(e.video != "disabled", e.video_reason, e.video != "full"),
+        reels: card(e.reels > 0, e.reels_reason, e.reels == 0),
+        book: card(e.book_enabled, e.book_reason, !e.book_enabled),
+    }
+}
+
+/// One book shape the owner can pick, with the page limits the field follows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookPresetView {
+    /// `P1` or `P2`, as the export commands take it.
+    pub id: &'static str,
+    pub name: &'static str,
+    pub min_pages: usize,
+    /// The page cap used when the owner doesn't set one.
+    pub default_pages: usize,
+    pub max_pages: usize,
+}
+
+/// The book shapes on offer (PLAN.md Sec 11: only two in v1), P1 first.
+pub fn book_presets() -> Vec<BookPresetView> {
+    [(BookPreset::P1, "P1"), (BookPreset::P2, "P2")]
+        .into_iter()
+        .map(|(preset, id)| {
+            let (min_pages, default_pages) = preset.page_range();
+            BookPresetView {
+                id,
+                name: preset.name(),
+                min_pages,
+                default_pages,
+                max_pages: MAX_BOOK_PAGES,
+            }
+        })
+        .collect()
+}
+
+/// The book shape an export asked for; omitted means P1 (Classic Square).
+pub fn parse_book_preset(id: Option<&str>) -> Result<BookPreset, String> {
+    match id {
+        None => Ok(BookPreset::P1),
+        Some(id) => BookPreset::from_flag(id).ok_or_else(|| format!("unknown book shape {id:?}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Source integrity before a render (PLAN.md Sec 8): which originals are
+// missing or changed, and Relink for the missing ones.
+// ---------------------------------------------------------------------------
+
+/// One original that failed the pre-render check. Only its file name crosses
+/// IPC, never its path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceProblem {
+    pub asset_id: String,
+    pub name: String,
+}
+
+/// What the pre-render check found for one export.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceCheckView {
+    pub missing: Vec<SourceProblem>,
+    pub changed: Vec<SourceProblem>,
+    /// Originals checked.
+    pub checked: usize,
+}
+
+/// The originals an export of `only` ("all" | "video" | "reels" | "book")
+/// reads, each with the snapshot `export::export_all` checks it against:
+/// film and reel picks against their plan entry, book photos (every still in
+/// the plan's chapters) against their asset row. One per asset, first wins.
+pub fn export_sources<'a>(
+    plan: &'a Plan,
+    assets: &'a [Asset],
+    only: &str,
+) -> Vec<(&'a Asset, PlanEntry)> {
+    let by_id: HashMap<&str, &Asset> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
+    let wanted = |k: &str| only == "all" || only == k;
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out = vec![];
+    let mut add = |a: &'a Asset, entry: PlanEntry| {
+        if seen.insert(a.id.as_str()) {
+            out.push((a, entry));
+        }
+    };
+    let picks = wanted("video")
+        .then_some(&plan.hero)
+        .into_iter()
+        .chain(wanted("reels").then_some(&plan.reel_selects))
+        .flatten();
+    for entry in picks {
+        if let Some(a) = by_id.get(entry.asset_id.as_str()) {
+            add(a, entry.clone());
+        }
+    }
+    if wanted("book") {
+        // The book's flow, as `export::in_book_flow` decides it: the plan's
+        // chapter members, or every still when the plan has no chapters.
+        let in_chapters: HashSet<&str> = plan
+            .chapters
+            .iter()
+            .flat_map(|c| c.asset_ids.iter().map(String::as_str))
+            .collect();
+        for a in assets.iter().filter(|a| {
+            a.kind != AssetKind::Video
+                && (in_chapters.is_empty() || in_chapters.contains(a.id.as_str()))
+        }) {
+            add(a, row_snapshot(a));
+        }
+    }
+    out
+}
+
+/// An asset row as the snapshot the book checks its photos against (mirrors
+/// the private `export::asset_snapshot`).
+fn row_snapshot(a: &Asset) -> PlanEntry {
+    PlanEntry {
+        asset_id: a.id.clone(),
+        window: 0,
+        content_hash: a.content_hash.clone(),
+        size_bytes: a.size_bytes,
+        mtime: a.mtime,
+        rendition: triptape_core::types::Rendition::Still,
+    }
+}
+
+/// Size and whole-second mtime of a file, as the scanner records them
+/// (mirrors the private `export::current_size_mtime`).
+fn size_mtime(path: &Path) -> (Option<u64>, Option<i64>) {
+    let Ok(md) = std::fs::metadata(path) else {
+        return (None, None);
+    };
+    let mtime = md
+        .modified()
+        .ok()
+        .map(|m| match m.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs() as i64,
+            Err(e) => -(e.duration().as_secs() as i64),
+        });
+    (Some(md.len()), mtime)
+}
+
+/// The pre-render check the export itself runs, ahead of it: size and mtime
+/// first, the content hash only on a mismatch.
+pub fn check_sources(plan: &Plan, assets: &[Asset], only: &str) -> SourceCheckView {
+    use triptape_core::plan::{check_source_integrity, Integrity};
+    let mut view = SourceCheckView::default();
+    for (a, entry) in export_sources(plan, assets, only) {
+        view.checked += 1;
+        let (size, mtime) = size_mtime(&a.path);
+        let problem = || SourceProblem {
+            asset_id: a.id.clone(),
+            name: a
+                .path
+                .file_name()
+                .map_or_else(|| a.id.clone(), |n| n.to_string_lossy().into_owned()),
+        };
+        match check_source_integrity(&entry, &a.path, size, mtime, || {
+            triptape_core::hash::blake3_file(&a.path).ok()
+        }) {
+            Integrity::Ok => {}
+            Integrity::Missing { .. } => view.missing.push(problem()),
+            Integrity::Changed { .. } => view.changed.push(problem()),
+        }
+    }
+    view
+}
+
+/// Where a missing original now lives, found by Relink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relinked {
+    pub asset_id: String,
+    pub path: PathBuf,
+    /// The Live Photo's motion file, when it was missing too and was found.
+    pub companion: Option<PathBuf>,
+}
+
+/// Find each missing asset in `new_root`, whose media files are `files`.
+/// Candidates are the same relative path under `new_root` (as under the
+/// trip's `old_root`), then any file with the same name. A candidate counts
+/// only when its content hash matches the stored one; an asset never hashed
+/// needs exactly one same-name, same-size candidate, so a different photo
+/// is never swapped in.
+pub fn find_relinks(
+    missing: &[Asset],
+    old_root: &Path,
+    new_root: &Path,
+    files: &[PathBuf],
+) -> Vec<Relinked> {
+    let mut by_name: HashMap<&std::ffi::OsStr, Vec<&PathBuf>> = HashMap::new();
+    for f in files {
+        if let Some(name) = f.file_name() {
+            by_name.entry(name).or_default().push(f);
+        }
+    }
+    let same_place = |p: &Path| {
+        p.strip_prefix(old_root)
+            .ok()
+            .map(|rel| new_root.join(rel))
+            .filter(|c| c.is_file())
+    };
+    let mut out = vec![];
+    for a in missing {
+        let mut candidates: Vec<PathBuf> = same_place(&a.path).into_iter().collect();
+        if let Some(name) = a.path.file_name() {
+            for f in by_name.get(name).into_iter().flatten() {
+                if !candidates.contains(f) {
+                    candidates.push((*f).clone());
+                }
+            }
+        }
+        // A file of another size can't be this photo: skip it before hashing.
+        let mut same_size = candidates
+            .into_iter()
+            .filter(|c| size_mtime(c).0 == Some(a.size_bytes));
+        let found = match &a.content_hash {
+            Some(hash) => {
+                same_size.find(|c| triptape_core::hash::blake3_file(c).is_ok_and(|h| &h == hash))
+            }
+            None => match (same_size.next(), same_size.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            },
+        };
+        let Some(path) = found else { continue };
+        // A Live Photo's motion file moves with its still.
+        let companion = a
+            .companion_path
+            .as_ref()
+            .filter(|c| !c.exists())
+            .and_then(|c| {
+                same_place(c).or_else(|| {
+                    let beside = path.with_file_name(c.file_name()?);
+                    beside.is_file().then_some(beside)
+                })
+            });
+        out.push(Relinked {
+            asset_id: a.id.clone(),
+            path,
+            companion,
+        });
+    }
+    out
+}
+
+/// Apply one Relink to its asset row: the new path, plus the file's current
+/// size and mtime so the next check passes on the fast path. Everything else
+/// on the row (hash, score, captions) is kept.
+pub fn relinked_asset(mut a: Asset, found: &Relinked) -> Asset {
+    a.path = found.path.clone();
+    if let Some(c) = &found.companion {
+        a.companion_path = Some(c.clone());
+    }
+    let (size, mtime) = size_mtime(&found.path);
+    a.size_bytes = size.unwrap_or(a.size_bytes);
+    a.mtime = mtime.unwrap_or(a.mtime);
+    a
+}
+
+/// Carry relinked asset rows into the plan's film and reel picks, which the
+/// check and the export verify against their own snapshots: without this a
+/// relinked file with a new mtime fails as changed (or always re-hashes).
+/// Returns whether any entry changed.
+pub fn relink_plan(plan: &mut Plan, relinked: &[Asset]) -> bool {
+    let by_id: HashMap<&str, &Asset> = relinked.iter().map(|a| (a.id.as_str(), a)).collect();
+    let mut changed = false;
+    for entry in plan.hero.iter_mut().chain(plan.reel_selects.iter_mut()) {
+        let Some(a) = by_id.get(entry.asset_id.as_str()) else {
+            continue;
+        };
+        entry.size_bytes = a.size_bytes;
+        entry.mtime = a.mtime;
+        if entry.content_hash.is_none() {
+            entry.content_hash = a.content_hash.clone();
+        }
+        changed = true;
+    }
+    changed
+}
+
+/// Which keepsakes a check or export command covers.
+pub fn keepsake_scope(keepsake: &str) -> Result<&'static str, String> {
+    match keepsake {
+        "all" => Ok("all"),
+        "video" => Ok("video"),
+        "reels" => Ok("reels"),
+        "book" => Ok("book"),
+        _ => Err(format!("unknown keepsake {keepsake:?}")),
+    }
+}
+
+/// Outcome of a Relink, for the integrity sheet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelinkView {
+    pub found: usize,
+    pub not_found: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -496,8 +951,18 @@ pub fn paginate<T>(items: &[T], page: usize, per_page: usize) -> &[T] {
 /// Default export destination for a trip: `~/Movies/TripTape/<trip> (<project id>)/`
 /// (Windows: `%USERPROFILE%\\Videos\\TripTape\\...`). The project id keeps two
 /// trips with the same folder name from overwriting each other's output.
-/// The frontend never sends a path; the backend derives it.
 pub fn default_export_dir(trip_name: &str, project_id: &str) -> PathBuf {
+    export_dir_in(&default_export_parent(), trip_name, project_id)
+}
+
+/// The folder trips export into unless the owner picks another one.
+pub fn default_export_parent() -> PathBuf {
+    dirs_base().join("TripTape")
+}
+
+/// One trip's export folder inside `parent`. Every trip gets its own
+/// subfolder, so a picked folder's own `book/` or `reels/` is never replaced.
+pub fn export_dir_in(parent: &Path, trip_name: &str, project_id: &str) -> PathBuf {
     let safe: String = trip_name
         .chars()
         .map(|c| {
@@ -513,9 +978,68 @@ pub fn default_export_dir(trip_name: &str, project_id: &str) -> PathBuf {
         s => s,
     };
     // `project_id` is validated by `AppState::check_id` (no separators).
-    dirs_base()
-        .join("TripTape")
-        .join(format!("{safe} ({project_id})"))
+    parent.join(format!("{safe} ({project_id})"))
+}
+
+/// The folder an export goes into: the owner's pick (from the folder dialog),
+/// else the default. A pick must be an absolute path to a folder TripTape can
+/// write to, or one it can create inside a writable folder. Nothing is
+/// created here; the export makes the folders it needs.
+pub fn resolve_export_parent(picked: Option<&str>) -> Result<PathBuf, String> {
+    let Some(raw) = picked.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(default_export_parent());
+    };
+    let unusable = "TripTape can't save keepsakes in that folder. Choose another folder.";
+    if raw.contains('\0') {
+        return Err(unusable.to_string());
+    }
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err(unusable.to_string());
+    }
+    // The nearest part of the path that exists must be a writable folder.
+    let existing = path
+        .ancestors()
+        .find(|p| p.exists())
+        .ok_or_else(|| unusable.to_string())?;
+    if !existing.is_dir() || !folder_is_writable(existing) {
+        return Err(unusable.to_string());
+    }
+    Ok(path)
+}
+
+/// Whether a file can be created (and removed) in `dir`. Probes for real:
+/// permission bits miss read-only volumes and sandbox rules.
+fn folder_is_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".triptape-write-check-{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(f) => {
+            drop(f);
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Validate a "Play film" request: only a finished film (`hero.mp4` beside its
+/// `export.json`) may be opened, wherever the owner saved it. The opener's
+/// own scope only covers the default folder.
+pub fn finished_film(path: &str) -> Result<PathBuf, String> {
+    let p = PathBuf::from(path);
+    let named_film = p.file_name().is_some_and(|n| n == "hero.mp4");
+    let finished = p
+        .parent()
+        .is_some_and(|dir| dir.join("export.json").is_file());
+    if p.is_absolute() && named_film && p.is_file() && finished {
+        Ok(p)
+    } else {
+        Err("that file is not a finished TripTape film".to_string())
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -799,6 +1323,371 @@ mod tests {
         let s = d.to_string_lossy();
         assert!(!s.contains(".."));
         assert!(s.contains("TripTape"));
+    }
+
+    #[test]
+    fn export_parent_defaults_and_rejects_unusable_picks() {
+        assert_eq!(
+            resolve_export_parent(None).unwrap(),
+            default_export_parent()
+        );
+        assert_eq!(
+            resolve_export_parent(Some("  ")).unwrap(),
+            default_export_parent()
+        );
+        assert!(resolve_export_parent(Some("relative/folder")).is_err());
+        assert!(resolve_export_parent(Some("/tmp/a\0b")).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        // A file is not a folder, and nothing can be created under it.
+        assert!(resolve_export_parent(Some(file.to_str().unwrap())).is_err());
+        assert!(resolve_export_parent(Some(file.join("sub").to_str().unwrap())).is_err());
+    }
+
+    #[test]
+    fn export_parent_accepts_writable_and_creatable_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_str().unwrap();
+        assert_eq!(resolve_export_parent(Some(here)).unwrap(), dir.path());
+        let later = dir.path().join("not yet").join("made");
+        assert_eq!(
+            resolve_export_parent(Some(later.to_str().unwrap())).unwrap(),
+            later
+        );
+        // The check leaves nothing behind.
+        assert!(!later.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_parent_rejects_read_only_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores permission bits; the check is only meaningful otherwise.
+        if !folder_is_writable(&ro) {
+            assert!(resolve_export_parent(Some(ro.to_str().unwrap())).is_err());
+        }
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn export_dir_lives_inside_the_chosen_folder() {
+        let d = export_dir_in(Path::new("/Volumes/Photos"), "Rome", "prj_1");
+        assert_eq!(d, Path::new("/Volumes/Photos/Rome (prj_1)"));
+        assert!(default_export_dir("Rome", "prj_1").starts_with(default_export_parent()));
+    }
+
+    #[test]
+    fn only_a_finished_film_may_be_played() {
+        let dir = tempfile::tempdir().unwrap();
+        let film = dir.path().join("hero.mp4");
+        std::fs::write(&film, b"film").unwrap();
+        // Not finished yet: no export.json beside it.
+        assert!(finished_film(film.to_str().unwrap()).is_err());
+        std::fs::write(dir.path().join("export.json"), b"{}").unwrap();
+        assert_eq!(finished_film(film.to_str().unwrap()).unwrap(), film);
+        let other = dir.path().join("notes.txt");
+        std::fs::write(&other, b"x").unwrap();
+        assert!(finished_film(other.to_str().unwrap()).is_err());
+        assert!(finished_film("hero.mp4").is_err());
+    }
+
+    fn photos(n: usize) -> Vec<Asset> {
+        (0..n)
+            .map(|i| {
+                let mut a = Asset::new(
+                    format!("p{i:03}"),
+                    PathBuf::from(format!("/t/p{i:03}.jpg")),
+                    AssetKind::Photo,
+                );
+                // One photo an hour over a few days, so chapters form.
+                a.taken_at = Some(1_714_557_600 + i as i64 * 3_600);
+                a
+            })
+            .collect()
+    }
+
+    fn plan_for(assets: &[Asset]) -> Plan {
+        let cluster_of = assets
+            .iter()
+            .map(|a| (a.id.clone(), format!("day{}", a.taken_at.unwrap() / 86_400)))
+            .collect();
+        build_plan(assets, &cluster_of, &HashMap::new())
+    }
+
+    #[test]
+    fn eligibility_disables_the_book_with_its_reason_on_a_thin_trip() {
+        let assets = photos(12);
+        let e = export_eligibility(&plan_for(&assets), &assets);
+        assert!(!e.book.enabled);
+        assert_eq!(
+            e.book.reason,
+            triptape_core::plan::plan_eligibility(0, 12, 0).book_reason
+        );
+        // A short film is still a film; the reason says why it is short.
+        assert!(e.video.enabled);
+        assert!(e.video.reason.contains("short"));
+        assert!(e.reels.enabled);
+        assert!(e.reels.reason.is_empty());
+    }
+
+    #[test]
+    fn eligibility_disables_everything_on_an_empty_plan() {
+        let e = export_eligibility(&plan_for(&[]), &[]);
+        assert!(!e.video.enabled && !e.reels.enabled && !e.book.enabled);
+        for card in [&e.video, &e.reels, &e.book] {
+            assert!(!card.reason.is_empty());
+        }
+        let json = serde_json::to_value(&e).unwrap();
+        assert_eq!(json["book"]["enabled"], false);
+    }
+
+    #[test]
+    fn eligibility_enables_the_book_for_enough_photos() {
+        let assets = photos(40);
+        let e = export_eligibility(&plan_for(&assets), &assets);
+        assert!(e.book.enabled);
+        assert!(e.book.reason.is_empty());
+    }
+
+    #[test]
+    fn book_presets_follow_the_renderer_and_default_to_p1() {
+        let presets = book_presets();
+        assert_eq!(
+            presets.iter().map(|p| p.id).collect::<Vec<_>>(),
+            ["P1", "P2"]
+        );
+        for p in &presets {
+            let preset = parse_book_preset(Some(p.id)).unwrap();
+            assert_eq!((p.min_pages, p.default_pages), preset.page_range());
+            assert_eq!(preset.page_cap(None).unwrap(), p.default_pages);
+            assert!(preset.page_cap(Some(p.max_pages)).is_ok());
+            assert!(preset.page_cap(Some(p.max_pages + 1)).is_err());
+            assert!(preset.page_cap(Some(p.min_pages - 1)).is_err());
+        }
+        assert_eq!(presets[1].default_pages, 80);
+        assert_eq!(parse_book_preset(None).unwrap(), BookPreset::P1);
+        assert_eq!(parse_book_preset(Some("p2")).unwrap(), BookPreset::P2);
+        assert!(parse_book_preset(Some("P3")).is_err());
+        let json = serde_json::to_value(&presets[0]).unwrap();
+        assert_eq!(json["defaultPages"], 60);
+    }
+
+    #[test]
+    fn book_notes_group_the_print_check_in_plain_words() {
+        use triptape_media::render_book::{preflight, DpiVerdict};
+        let soft = preflight(BookPreset::P1, 60, &[], &[(3, DpiVerdict::Warn)])
+            .into_iter()
+            .find(|i| i.level == "warn")
+            .unwrap()
+            .message;
+        let fallbacks: Vec<String> = vec![
+            format!("page 12: {soft}"),
+            format!("page 3: {soft}"),
+            format!("page 3: {soft}"),
+            "page 4: something else".into(),
+            "book: p001 excluded (below 200 dpi even in the smallest slot)".into(),
+            "book: p002 excluded (below 200 dpi at its assigned slot)".into(),
+            "book: p003 is missing; offer Relink, Rescan, or Skip; skipped".into(),
+            "book: selected 120 of 180 photos (your captioned photos first, then the best-scored of each chapter) to fit the 60-page cap".into(),
+            "video: v1 changed on disk; skipped".into(),
+            "map card failed: x".into(),
+        ];
+        assert_eq!(
+            book_notes(&fallbacks),
+            [
+                "2 pages have a photo at 200-299 dpi and may print a little soft: pages 3, 12.",
+                "2 photos were left out because they were too small to print sharply.",
+                "1 photo was left out because its file was missing, changed or unreadable.",
+                "The book uses 120 of 180 photos to stay within 60 pages. Allow more pages to fit more.",
+            ]
+        );
+        assert_eq!(
+            book_notes(&[format!("page 7: {soft}")]),
+            ["Page 7 has a photo at 200-299 dpi. It may print a little soft."]
+        );
+        assert!(book_notes(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_print_check_block_reads_as_plain_words() {
+        let blocked = plain_skip(Skipped {
+            keepsake: "book".into(),
+            reason: "preflight/render blocked: book preflight blocked: 20 pages below the 24-page vendor minimum; add photos (18 photos)".into(),
+        });
+        assert_eq!(
+            blocked.reason,
+            "It didn't pass its print check: 20 pages below the 24-page vendor minimum; add photos (18 photos)."
+        );
+        let other = plain_skip(Skipped {
+            keepsake: "video".into(),
+            reason: "not selected (--only book)".into(),
+        });
+        assert_eq!(other.reason, "not selected (--only book)");
+    }
+
+    /// A trip whose originals live in `dir`: one photo per file name given.
+    fn trip_on_disk(dir: &Path, names: &[&str]) -> (Plan, Vec<Asset>) {
+        let assets: Vec<Asset> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let path = dir.join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, format!("photo {i}")).unwrap();
+                let mut a = Asset::new(format!("a{i}"), path.clone(), AssetKind::Photo);
+                a.taken_at = Some(1_714_557_600 + i as i64 * 300);
+                let (size, mtime) = size_mtime(&path);
+                a.size_bytes = size.unwrap();
+                a.mtime = mtime.unwrap();
+                a.content_hash = triptape_core::hash::blake3_file(&path).ok();
+                a
+            })
+            .collect();
+        let plan = plan_for(&assets);
+        (plan, assets)
+    }
+
+    #[test]
+    fn source_check_finds_missing_and_changed_originals() {
+        let dir = tempfile::tempdir().unwrap();
+        let (plan, assets) = trip_on_disk(dir.path(), &["a.jpg", "b.jpg", "c.jpg"]);
+        assert_eq!(check_sources(&plan, &assets, "all").missing, []);
+        std::fs::remove_file(dir.path().join("a.jpg")).unwrap();
+        std::fs::write(dir.path().join("b.jpg"), "a different photo").unwrap();
+        let view = check_sources(&plan, &assets, "all");
+        assert_eq!(view.checked, 3);
+        assert_eq!(
+            view.missing,
+            [SourceProblem {
+                asset_id: "a0".into(),
+                name: "a.jpg".into()
+            }]
+        );
+        assert_eq!(view.changed.len(), 1);
+        assert_eq!(view.changed[0].name, "b.jpg");
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["missing"][0]["assetId"], "a0");
+    }
+
+    #[test]
+    fn export_sources_follow_the_keepsake() {
+        let dir = tempfile::tempdir().unwrap();
+        let (plan, assets) = trip_on_disk(dir.path(), &["a.jpg", "b.jpg"]);
+        let all = export_sources(&plan, &assets, "all").len();
+        assert_eq!(all, 2);
+        assert!(export_sources(&plan, &assets, "book").len() <= all);
+        assert!(keepsake_scope("book").is_ok());
+        assert!(keepsake_scope("../x").is_err());
+    }
+
+    #[test]
+    fn relink_finds_moved_photos_by_path_or_name_and_hash() {
+        let old = tempfile::tempdir().unwrap();
+        let (_, assets) = trip_on_disk(old.path(), &["day1/a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+        let new = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(new.path().join("day1")).unwrap();
+        // a: same relative path. b: renamed folder, same name. c: a different
+        // photo with the same name must not be linked; nor d, a same-size one
+        // whose bytes differ (only the hash tells them apart).
+        std::fs::write(new.path().join("day1/a.jpg"), "photo 0").unwrap();
+        std::fs::create_dir_all(new.path().join("sorted")).unwrap();
+        std::fs::write(new.path().join("sorted/b.jpg"), "photo 1").unwrap();
+        std::fs::write(new.path().join("c.jpg"), "not the same photo").unwrap();
+        std::fs::write(new.path().join("d.jpg"), "photo X").unwrap();
+        let files: Vec<PathBuf> = ["day1/a.jpg", "sorted/b.jpg", "c.jpg", "d.jpg"]
+            .iter()
+            .map(|f| new.path().join(f))
+            .collect();
+        let found = find_relinks(&assets, old.path(), new.path(), &files);
+        assert_eq!(
+            found
+                .iter()
+                .map(|r| r.asset_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a0", "a1"]
+        );
+        assert_eq!(found[0].path, new.path().join("day1/a.jpg"));
+        assert_eq!(found[1].path, new.path().join("sorted/b.jpg"));
+        let moved = relinked_asset(assets[1].clone(), &found[1]);
+        assert_eq!(moved.path, new.path().join("sorted/b.jpg"));
+        assert_eq!(moved.content_hash, assets[1].content_hash);
+    }
+
+    #[test]
+    fn relink_without_a_hash_needs_one_same_size_match() {
+        let old = tempfile::tempdir().unwrap();
+        let (_, mut assets) = trip_on_disk(old.path(), &["a.jpg"]);
+        assets[0].content_hash = None;
+        let new = tempfile::tempdir().unwrap();
+        let one = new.path().join("x/a.jpg");
+        let two = new.path().join("y/a.jpg");
+        for f in [&one, &two] {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, "photo 0").unwrap();
+        }
+        // Two equal candidates: ambiguous, so nothing is linked.
+        assert!(find_relinks(&assets, old.path(), new.path(), &[one.clone(), two]).is_empty());
+        let found = find_relinks(&assets, old.path(), new.path(), std::slice::from_ref(&one));
+        assert_eq!(found[0].path, one);
+    }
+
+    #[test]
+    fn relink_updates_the_plan_picks_so_the_check_passes() {
+        let old = tempfile::tempdir().unwrap();
+        let (mut plan, mut assets) = trip_on_disk(old.path(), &["a.jpg"]);
+        // A pick planned before hashing, with a stale mtime once moved.
+        let pick = PlanEntry {
+            content_hash: None,
+            ..row_snapshot(&assets[0])
+        };
+        plan.hero = vec![pick.clone()];
+        plan.reel_selects = vec![pick];
+        assets[0].content_hash = None;
+        let new = tempfile::tempdir().unwrap();
+        let moved = new.path().join("a.jpg");
+        std::fs::write(&moved, "photo 0").unwrap();
+        let f = std::fs::File::options().write(true).open(&moved).unwrap();
+        f.set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000),
+        )
+        .unwrap();
+        let found = find_relinks(
+            &assets,
+            old.path(),
+            new.path(),
+            std::slice::from_ref(&moved),
+        );
+        let next = relinked_asset(assets[0].clone(), &found[0]);
+        assets[0] = next.clone();
+        assert_eq!(check_sources(&plan, &assets, "video").changed.len(), 1);
+        assert!(relink_plan(&mut plan, &[next]));
+        let view = check_sources(&plan, &assets, "all");
+        assert_eq!((view.missing.len(), view.changed.len()), (0, 0));
+        assert!(!relink_plan(&mut plan, &[]));
+    }
+
+    #[test]
+    fn relink_brings_a_live_photo_motion_file_along() {
+        let old = tempfile::tempdir().unwrap();
+        let (_, mut assets) = trip_on_disk(old.path(), &["IMG_1.HEIC"]);
+        assets[0].kind = AssetKind::LivePhoto;
+        assets[0].companion_path = Some(old.path().join("IMG_1.MOV"));
+        let new = tempfile::tempdir().unwrap();
+        let still = new.path().join("moved/IMG_1.HEIC");
+        std::fs::create_dir_all(still.parent().unwrap()).unwrap();
+        std::fs::write(&still, "photo 0").unwrap();
+        std::fs::write(new.path().join("moved/IMG_1.MOV"), "motion").unwrap();
+        let found = find_relinks(&assets, old.path(), new.path(), &[still]);
+        assert_eq!(
+            found[0].companion.as_deref(),
+            Some(new.path().join("moved/IMG_1.MOV").as_path())
+        );
     }
 
     #[test]

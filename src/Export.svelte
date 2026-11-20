@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import ErrorNote from "./lib/ErrorNote.svelte";
   import Thumb from "./lib/Thumb.svelte";
   import {
@@ -6,43 +7,181 @@
     BOOK_PAGES_MAX,
     BOOK_PAGES_MIN,
     bookPages,
+    bookPreset,
     exportJob,
     frameNumbers,
     liveCollages,
     project,
+    savedExportFolder,
+    saveExportFolder,
     screen,
     validBookPages
   } from "./lib/store";
   import ProgressBar from "./lib/ProgressBar.svelte";
   import { countOf, friendlyStep } from "./lib/trip";
   import { runExport, wasAttempted } from "./lib/exporter";
-  import { cancelJob, dismissInterruptedExport, getInterruptedExport, openExport, revealExport, REELS_DISCLOSURE, type ExportCmd } from "./lib/tauri";
+  import {
+    cancelJob,
+    checkExportFolder,
+    dismissInterruptedExport,
+    DEMO_BOOK_PRESETS,
+    getBookPresets,
+    getExportEligibility,
+    getInterruptedExport,
+    checkSources,
+    pickFolder,
+    playFilm,
+    relinkSources,
+    revealExport,
+    REELS_DISCLOSURE,
+    type BookPreset,
+    type Eligibility,
+    type ExportCmd,
+    type SourceCheck,
+    type SourceProblem
+  } from "./lib/tauri";
 
-  const KEEPSAKES: { cmd: Exclude<ExportCmd, "export_all">; label: string; blurb: string; button: string; note?: string }[] = [
-    { cmd: "export_video", label: "Trip Video", blurb: "A 1080p film of the trip, up to about 5 minutes.", button: "Make only the film" },
+  type Keepsake = {
+    cmd: Exclude<ExportCmd, "export_all">;
+    key: keyof Eligibility;
+    label: string;
+    /** Its name inside a sentence: "Make the film and the reels". */
+    short: string;
+    blurb: string;
+    button: string;
+    note?: string;
+  };
+
+  const KEEPSAKES: Keepsake[] = [
+    {
+      cmd: "export_video",
+      key: "video",
+      label: "Trip Video",
+      short: "film",
+      blurb: "A 1080p film of the trip, up to about 5 minutes.",
+      button: "Make only the film"
+    },
     {
       cmd: "export_reels",
+      key: "reels",
       label: "Reels Pack",
+      short: "reels",
       blurb: "3–5 vertical clips, ready to post.",
       button: "Make only the reels",
       note: REELS_DISCLOSURE
     },
-    { cmd: "export_book", label: "Photo Book", blurb: "A print-ready PDF proof and a JPEG of every page.", button: "Make only the book" }
+    {
+      cmd: "export_book",
+      key: "book",
+      label: "Photo Book",
+      short: "book",
+      blurb: "A print-ready PDF proof and a JPEG of every page.",
+      button: "Make only the book"
+    }
   ];
 
+  // What the trip can make, from its plan. Unknown (still loading, or no
+  // answer) leaves every card on: the run itself still skips with a reason.
+  let eligibility: Eligibility | null = null;
+  function loadEligibility(projectId: string | undefined) {
+    eligibility = null;
+    if (!projectId) return;
+    getExportEligibility(projectId)
+      .then((e) => {
+        if ($project?.projectId === projectId) eligibility = e;
+      })
+      .catch(() => {
+        // Only a preview of the run: without it, the cards stay on.
+      });
+  }
+  // Keyed on the id alone, so other project updates don't reload anything.
+  $: currentId = $project?.projectId;
+  $: loadEligibility(currentId);
+
+  const canMake = (k: Keepsake, e: Eligibility | null) => e?.[k.key].enabled ?? true;
+  $: makeable = KEEPSAKES.filter((k) => canMake(k, eligibility));
+  $: cantMake = KEEPSAKES.filter((k) => !canMake(k, eligibility));
+  // "Make all three" names what it will really make when some can't be.
+  $: someSkipped = cantMake.length > 0 && makeable.length > 0;
+  $: makeableNames = makeable.map((k) => k.short).join(" and the ");
+  $: allLabel = someSkipped ? `The ${makeableNames}` : "All three keepsakes";
+
   function labelFor(cmd: ExportCmd): string {
-    if (cmd === "export_all") return "All three keepsakes";
+    if (cmd === "export_all") return allLabel;
     return KEEPSAKES.find((k) => k.cmd === cmd)?.label ?? "Keepsake";
   }
 
   let openError = "";
 
+  // Book shapes and their page limits come from the backend; the preview's
+  // copy of them stands in until they arrive.
+  let presets: BookPreset[] = DEMO_BOOK_PRESETS;
+  getBookPresets()
+    .then((p) => (presets = p))
+    .catch(() => {});
+  $: preset = presets.find((p) => p.id === $bookPreset) ?? presets[0];
+  $: pagesMin = preset?.minPages ?? BOOK_PAGES_MIN;
+  $: pagesMax = preset?.maxPages ?? BOOK_PAGES_MAX;
+
   // The field holds what was typed; only a valid count reaches the store.
   let pagesInput: number | null = $bookPages;
-  $: pagesInvalid = validBookPages(pagesInput) === null;
+  $: pagesInvalid = validBookPages(pagesInput, pagesMin, pagesMax) === null;
   function commitPages() {
-    const n = validBookPages(pagesInput);
+    const n = validBookPages(pagesInput, pagesMin, pagesMax);
     if (n !== null) bookPages.set(n);
+  }
+
+  // A new shape starts from its own page default.
+  function presetChanged() {
+    const chosen = presets.find((p) => p.id === $bookPreset);
+    if (!chosen) return;
+    pagesInput = chosen.defaultPages;
+    bookPages.set(chosen.defaultPages);
+  }
+
+  // Where the keepsakes go: the folder chosen for this trip, else the usual one.
+  let chosenFolder: string | null = null;
+  let shownFolder = "";
+  let folderError = "";
+  // The remembered folder can't be used now (a drive was unplugged, say).
+  let folderUnavailable = false;
+  function loadFolder(projectId: string | undefined) {
+    chosenFolder = projectId ? savedExportFolder(projectId) : null;
+    folderError = "";
+    folderUnavailable = false;
+    const asked = chosenFolder;
+    checkExportFolder(asked)
+      .then((path) => {
+        if (chosenFolder === asked) shownFolder = path;
+      })
+      .catch(() => {
+        if (chosenFolder !== asked) return;
+        shownFolder = asked ?? "";
+        folderUnavailable = asked !== null;
+        folderError = "TripTape can't save to this folder right now. Connect the drive it's on, or choose another folder.";
+      });
+  }
+  $: loadFolder(currentId);
+
+  async function chooseFolder() {
+    folderError = "";
+    try {
+      const picked = await pickFolder("Choose where to save the keepsakes");
+      if (!picked || !$project) return;
+      const path = await checkExportFolder(picked);
+      saveExportFolder($project.projectId, picked);
+      chosenFolder = picked;
+      shownFolder = path;
+      folderUnavailable = false;
+    } catch (e) {
+      folderError = String(e);
+    }
+  }
+
+  function useUsualFolder() {
+    if (!$project) return;
+    saveExportFolder($project.projectId, null);
+    loadFolder($project.projectId);
   }
 
   // An export that stopped when the app closed, waiting on the user's call.
@@ -58,7 +197,7 @@
         // Only a convenience: the keepsakes can still be made from the cards.
       });
   }
-  $: checkInterrupted($project?.projectId);
+  $: checkInterrupted(currentId);
 
   function dismissInterrupted() {
     interrupted = null;
@@ -67,6 +206,20 @@
 
   $: job = $exportJob;
   $: busy = job.label !== null;
+
+  // The check before a run: originals that moved or changed wait on the
+  // owner's call in a sheet (Relink, make without them, or cancel).
+  let checking = false;
+  let sheet: { cmd: ExportCmd; check: SourceCheck } | null = null;
+  let sheetHeading: HTMLElement;
+  let relinking = false;
+  let relinkStatus = "";
+  let relinkError = "";
+  const SHOWN_NAMES = 8;
+
+  // Nothing can start until the chosen folder is usable again, or while
+  // the check or its sheet is waiting.
+  $: blocked = busy || folderUnavailable || checking || sheet !== null;
   $: percent = Math.round(job.progress * 100);
   $: hasPercent = job.progress > 0;
   $: summary = job.summary;
@@ -76,11 +229,73 @@
   // A photo from the trip to sit beside the finished film.
   $: poster = $assets.find((a) => a.highlight) ?? $assets[0];
 
-  function start(cmd: ExportCmd) {
-    if (!$project) return;
+  async function start(cmd: ExportCmd) {
+    if (!$project || blocked) return;
+    const projectId = $project.projectId;
     openError = "";
+    relinkStatus = "";
+    relinkError = "";
+    checking = true;
+    let check: SourceCheck | null = null;
+    try {
+      check = await checkSources(projectId, cmd);
+    } catch {
+      // The run checks again and skips what it can't read, with notes.
+    }
+    checking = false;
+    if ($project?.projectId !== projectId) return;
+    runOrAsk(cmd, check);
+  }
+
+  // Run when every original checks out (or the check had no answer);
+  // otherwise open the sheet, focused. True when the run started.
+  function runOrAsk(cmd: ExportCmd, check: SourceCheck | null): boolean {
+    if (!check || (check.missing.length === 0 && check.changed.length === 0)) {
+      run(cmd);
+      return true;
+    }
+    sheet = { cmd, check };
+    tick().then(() => sheetHeading?.focus());
+    return false;
+  }
+
+  function run(cmd: ExportCmd) {
+    if (!$project) return;
+    sheet = null;
     interrupted = null;
     runExport(cmd, labelFor(cmd), $project.projectId);
+  }
+
+  function closeSheet() {
+    sheet = null;
+    relinkStatus = "";
+    relinkError = "";
+  }
+
+  async function relink() {
+    if (!sheet || !$project) return;
+    const { cmd } = sheet;
+    const projectId = $project.projectId;
+    relinkError = "";
+    relinkStatus = "";
+    try {
+      const folder = await pickFolder("Choose the folder where the photos are now");
+      if (!folder) return;
+      relinking = true;
+      const result = await relinkSources(projectId, folder);
+      const check = await checkSources(projectId, cmd);
+      if (!sheet || $project?.projectId !== projectId) return;
+      // Focus stays in the sheet: "Find them" goes away once nothing is missing.
+      if (runOrAsk(cmd, check)) return;
+      relinkStatus =
+        result.found === 0
+          ? "None of the missing files are in that folder. Try another folder, or make the keepsakes without them."
+          : `Found ${countOf(result.found, "file")}.${check.missing.length > 0 ? ` ${countOf(check.missing.length, "file")} still can't be found.` : ""}`;
+    } catch (e) {
+      relinkError = String(e);
+    } finally {
+      relinking = false;
+    }
   }
 
   function retry() {
@@ -97,15 +312,27 @@
   }
 </script>
 
+{#snippet fileList(files: SourceProblem[])}
+  <ul class="files">
+    {#each files.slice(0, SHOWN_NAMES) as f (f.assetId)}<li>{f.name}</li>{/each}
+    {#if files.length > SHOWN_NAMES}<li>and {files.length - SHOWN_NAMES} more</li>{/if}
+  </ul>
+{/snippet}
+
 {#snippet rows()}
   {#each KEEPSAKES as k}
-    <div class="row">
+    {@const can = canMake(k, eligibility)}
+    {@const why = eligibility?.[k.key].reason ?? ""}
+    <div class="row" class:off={!can}>
       <div>
         <h2>{k.label}</h2>
         <p>{k.blurb}</p>
-        {#if k.note && !summary?.reels.length}<p class="note">{k.note}</p>{/if}
+        {#if why}<p class="why" id="why-{k.key}">{can ? `${why}.` : `Can't be made yet. ${why}.`}</p>{/if}
+        {#if can && k.note && !summary?.reels.length}<p class="note">{k.note}</p>{/if}
       </div>
-      <button class="btn" disabled={busy} on:click={() => start(k.cmd)}>{k.button}</button>
+      <button class="btn" disabled={blocked || !can} aria-describedby={why ? `why-${k.key}` : undefined} on:click={() => start(k.cmd)}>
+        {k.button}
+      </button>
     </div>
   {/each}
 {/snippet}
@@ -115,11 +342,23 @@
     <div>
       <h1 class="headline" tabindex="-1">{madeSomething ? "Your trip is back" : "Make your keepsakes"}</h1>
       {#if !madeSomething && $project}
-        <p class="lede">One pass makes the film, the reels and the book from your story. It can take a while, and you can keep using the app.</p>
+        {#if makeable.length === 0}
+          <p class="lede">This trip doesn't have enough usable photos for a keepsake yet. Add more to the folder and rescan it from the Library.</p>
+        {:else}
+          <p class="lede">One pass makes the film, the reels and the book from your story. It can take a while, and you can keep using the app.</p>
+          {#if cantMake.length > 0}
+            <p class="lede skip-note">
+              {cantMake.map((k) => `The ${k.label}`).join(" and the ")} can't be made yet, so {cantMake.length === 1 ? "it" : "they"} will be
+              skipped.
+            </p>
+          {/if}
+        {/if}
       {/if}
     </div>
     {#if $project && !madeSomething}
-      <button class="btn btn-primary" disabled={busy} on:click={() => start("export_all")}>Make all three</button>
+      <button class="btn btn-primary" disabled={blocked || makeable.length === 0} on:click={() => start("export_all")}>
+        {someSkipped ? `Make the ${makeableNames}` : "Make all three"}
+      </button>
     {/if}
   </div>
 
@@ -144,17 +383,52 @@
       </section>
     {/if}
 
+    {#if sheet}
+      {@const missing = sheet.check.missing}
+      {@const changed = sheet.check.changed}
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+      <section class="sheet" role="group" aria-labelledby="sheet-title" on:keydown={(e) => e.key === "Escape" && !relinking && closeSheet()}>
+        <h2 id="sheet-title" tabindex="-1" bind:this={sheetHeading}>Some photos have moved or changed</h2>
+        {#if missing.length > 0}
+          <p>{countOf(missing.length, "file")} {missing.length === 1 ? "isn't" : "aren't"} where {missing.length === 1 ? "it was" : "they were"} when you added the trip:</p>
+          {@render fileList(missing)}
+        {/if}
+        {#if changed.length > 0}
+          <p>{countOf(changed.length, "file")} changed since then, so {changed.length === 1 ? "it" : "they"} won't be used as {changed.length === 1 ? "it is" : "they are"}:</p>
+          {@render fileList(changed)}
+        {/if}
+        <p>
+          {#if missing.length > 0}
+            If you moved them, show TripTape the folder they're in now. Or make the keepsakes without these files.
+          {:else}
+            You can make the keepsakes without {changed.length === 1 ? "it" : "them"}.
+          {/if}
+        </p>
+        {#if relinkStatus}<p class="relink-status" role="status">{relinkStatus}</p>{/if}
+        {#if relinkError}<ErrorNote message="Couldn't look in that folder. Choose another folder." detail={relinkError} />{/if}
+        <div class="sheet-actions">
+          {#if missing.length > 0}
+            <button class="btn btn-primary" disabled={relinking} on:click={relink}>{relinking ? "Looking…" : "Find them…"}</button>
+          {/if}
+          <button class="btn" disabled={relinking} on:click={() => sheet && run(sheet.cmd)}>Make without them</button>
+          <button class="btn" disabled={relinking} on:click={closeSheet}>Cancel</button>
+        </div>
+      </section>
+    {:else if checking}
+      <p class="checking" role="status">Checking your photos…</p>
+    {/if}
+
     {#if interrupted && !busy}
       <div class="notice stop" role="status">
         <p>{labelFor(interrupted)} stopped when TripTape closed, so it wasn't finished. Your earlier keepsakes are untouched.</p>
-        <button class="btn" on:click={() => interrupted && start(interrupted)}>Make it again</button>
+        <button class="btn" disabled={blocked} on:click={() => interrupted && start(interrupted)}>Make it again</button>
         <button class="btn" on:click={dismissInterrupted}>Dismiss</button>
       </div>
     {/if}
 
     {#if job.error}
       <ErrorNote message="The export stopped before it finished. Try again. If it stops again, check that your computer has free disk space." detail={job.error} />
-      {#if job.cmd}<button class="btn retry" on:click={retry}>Try again</button>{/if}
+      {#if job.cmd}<button class="btn retry" disabled={blocked} on:click={retry}>Try again</button>{/if}
     {:else if job.cancelled}
       <p class="notice stop" role="status">Export cancelled. Nothing else was made.</p>
     {/if}
@@ -174,7 +448,7 @@
               <p>Your film is ready to watch together.</p>
             </div>
             <div class="made-actions">
-              <button class="btn btn-primary" on:click={() => summary?.video && open(openExport, summary.video)}>Play film</button>
+              <button class="btn btn-primary" on:click={() => summary?.video && open(playFilm, summary.video)}>Play film</button>
               <button class="btn" on:click={() => summary?.video && open(revealExport, summary.video)}>Show in folder</button>
             </div>
           </div>
@@ -195,6 +469,12 @@
             <div>
               <h2>Photo Book</h2>
               <p>{summary.bookPages} pages, with a PDF proof and a JPEG of every page. Upload them to your print service when you're ready.</p>
+              {#if summary.bookNotes?.length}
+                <p id="book-notes-title" class="notes-title">Look at these before you order</p>
+                <ul class="book-notes" aria-labelledby="book-notes-title">
+                  {#each summary.bookNotes as note}<li>{note}</li>{/each}
+                </ul>
+              {/if}
             </div>
             <div class="made-actions">
               <button class="btn" on:click={() => summary && open(revealExport, summary.outDir)}>Show in folder</button>
@@ -218,14 +498,34 @@
     {/if}
 
     <section class="list" aria-label="Keepsakes">
+      <div class="dest">
+        <div class="dest-text">
+          <span id="dest-label" class="dest-label">Save keepsakes in</span>
+          <p id="dest-path" class="dest-path">{shownFolder}</p>
+          <p class="dest-hint">Each trip gets its own folder inside it.</p>
+        </div>
+        <div class="dest-actions">
+          <button class="btn" disabled={busy} aria-describedby="dest-label dest-path" on:click={chooseFolder}>Choose folder…</button>
+          {#if chosenFolder}
+            <button class="btn" disabled={busy} on:click={useUsualFolder}>Use the usual folder</button>
+          {/if}
+        </div>
+      </div>
+      {#if folderError}<ErrorNote message={folderError} />{/if}
       <div class="pages">
+        <label for="book-preset">Photo Book shape</label>
+        <select id="book-preset" disabled={busy} bind:value={$bookPreset} on:change={presetChanged}>
+          {#each presets as p}
+            <option value={p.id}>{p.name} in</option>
+          {/each}
+        </select>
         <label for="book-pages">Most pages in the Photo Book</label>
         <input
           id="book-pages"
           type="number"
           inputmode="numeric"
-          min={BOOK_PAGES_MIN}
-          max={BOOK_PAGES_MAX}
+          min={pagesMin}
+          max={pagesMax}
           step="1"
           disabled={busy}
           bind:value={pagesInput}
@@ -235,9 +535,10 @@
         />
         <p id="book-pages-hint" class:bad={pagesInvalid}>
           {#if pagesInvalid}
-            Choose a whole number from {BOOK_PAGES_MIN} to {BOOK_PAGES_MAX}. Using {$bookPages}.
+            Choose a whole number from {pagesMin} to {pagesMax}. Using {$bookPages}.
           {:else}
-            More pages fit more photos. Check your print service's limit: Shutterfly 111, Snapfish 150, Mixbook 400.
+            This shape starts at {preset?.defaultPages ?? $bookPages} pages. More pages fit more photos. Check your print service's limit: Shutterfly
+            111, Snapfish 150, Mixbook 400.
           {/if}
         </p>
       </div>
@@ -251,7 +552,9 @@
       {#if madeSomething}
         <div class="again">
           <h2>Changed the story? Make them again.</h2>
-          <button class="btn" disabled={busy} on:click={() => start("export_all")}>Make all three again</button>
+          <button class="btn" disabled={blocked || makeable.length === 0} on:click={() => start("export_all")}>
+            {cantMake.length === 0 ? "Make all three again" : "Make them again"}
+          </button>
         </div>
         <details>
           <summary>Make only one</summary>
@@ -298,6 +601,53 @@
     align-items: center;
     justify-content: space-between;
     margin-top: 10px;
+    color: var(--ink-2);
+  }
+
+  .sheet {
+    max-width: 640px;
+    margin-bottom: 24px;
+    padding: 18px;
+    border: 1px solid var(--line);
+  }
+
+  .sheet h2 {
+    margin-bottom: 6px;
+  }
+
+  .sheet h2:focus {
+    outline: none;
+  }
+
+  .sheet p {
+    margin-bottom: 8px;
+  }
+
+  .files {
+    list-style: disc;
+    margin: 0 0 12px;
+    padding-left: 20px;
+    color: var(--ink-2);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+  }
+
+  .relink-status {
+    padding: 10px 14px;
+    border-radius: var(--radius);
+    background: var(--yellow-soft);
+  }
+
+  .sheet-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-top: 12px;
+  }
+
+  .checking {
+    margin-bottom: 24px;
     color: var(--ink-2);
   }
 
@@ -355,6 +705,22 @@
     margin-bottom: 24px;
   }
 
+  .notes-title {
+    margin-top: 10px;
+    font-weight: 500;
+  }
+
+  .book-notes {
+    list-style: disc;
+    margin: 4px 0 0;
+    padding-left: 20px;
+    max-width: 65ch;
+  }
+
+  .book-notes li + li {
+    margin-top: 2px;
+  }
+
   .made.not-made {
     background: var(--wash);
   }
@@ -387,9 +753,44 @@
     padding-bottom: 12px;
   }
 
+  .dest {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 0 16px;
+  }
+
+  .dest-text {
+    flex: 1 1 280px;
+    min-width: 0;
+  }
+
+  .dest-label {
+    font-weight: 500;
+  }
+
+  .dest-path {
+    max-width: none;
+    overflow-wrap: anywhere;
+  }
+
+  .dest-hint {
+    color: var(--ink-2);
+    font-size: 13px;
+  }
+
+  .dest-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
   .pages {
     display: grid;
-    grid-template-columns: auto 6em;
+    grid-template-columns: max-content max-content;
+    justify-content: start;
     gap: 4px 16px;
     align-items: center;
     padding: 0 0 16px;
@@ -399,10 +800,15 @@
     font-weight: 500;
   }
 
-  .pages input {
+  .pages input,
+  .pages select {
     font: inherit;
     padding: 4px 8px;
     border: 1px solid var(--line);
+  }
+
+  .pages input {
+    width: 6em;
   }
 
   .pages p {
@@ -446,6 +852,21 @@
     color: var(--ink);
     font-weight: 500;
     cursor: pointer;
+  }
+
+  .row.off h2,
+  .row.off > div > p:not(.why) {
+    color: var(--ink-3);
+  }
+
+  .row .why {
+    margin-top: 4px;
+    color: var(--ink);
+    font-size: 13px;
+  }
+
+  .skip-note {
+    color: var(--ink);
   }
 
   .row .note {

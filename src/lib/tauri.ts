@@ -39,6 +39,8 @@ export interface ExportSummary {
   reels: string[];
   bookPages: number;
   skipped: { keepsake: string; reason: string }[];
+  /** The book's print-check results in plain words. Absent in records saved before they existed. */
+  bookNotes?: string[];
 }
 
 export const REELS_DISCLOSURE =
@@ -49,6 +51,20 @@ export const REELS_DISCLOSURE =
 export { isTauri };
 
 // --- Demo state (browser fallback) -----------------------------------------
+
+/**
+ * Browser preview only: `?demo=<name>` (repeatable) switches on a scenario
+ * so states the default demo trip never reaches can be shown: `thin` (too few
+ * photos for a book), `soft` (book pages with soft photos), `missing`
+ * (originals moved or changed before a run).
+ */
+function demoScenario(name: string): boolean {
+  try {
+    return new URLSearchParams(window.location.search).getAll("demo").includes(name);
+  } catch {
+    return false;
+  }
+}
 
 const demoPlaces = ["Kyoto, Japan", "Osaka, Japan", undefined];
 
@@ -123,11 +139,32 @@ export async function loadAllAssets(projectId: string): Promise<AssetView[]> {
   }
 }
 
-/** Open a finished export in the default app. Tauri scopes this to the export folder. */
-export async function openExport(path: string): Promise<void> {
+/** Play a finished film in the default player. The backend opens only a finished film. */
+export async function playFilm(path: string): Promise<void> {
   if (!isTauri()) throw new Error("Opening files works in the desktop app, not this browser preview.");
-  const { openPath } = await import("@tauri-apps/plugin-opener");
-  await openPath(path);
+  await invoke("open_film", { path });
+}
+
+// Browser preview: where a "picked" folder lands, so the chosen-folder state can be shown.
+const DEMO_DEFAULT_FOLDER = "~/Movies/TripTape";
+const DEMO_PICKED_FOLDER = "/Users/demo/Desktop/Family keepsakes";
+
+/**
+ * The folder exports go into: `folder` checked by the backend (it must be a
+ * folder TripTape can write to, or can create), or the default when null.
+ * Rejects with a plain-words reason when the folder can't be used.
+ */
+export async function checkExportFolder(folder: string | null): Promise<string> {
+  if (isTauri()) return invoke("check_export_folder", { folder });
+  return folder ?? DEMO_DEFAULT_FOLDER;
+}
+
+/** Ask for a folder in the OS dialog; null when the owner closes it. */
+export async function pickFolder(title: string): Promise<string | null> {
+  if (!isTauri()) return DEMO_PICKED_FOLDER;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const picked = await open({ directory: true, multiple: false, title });
+  return typeof picked === "string" ? picked : null;
 }
 
 /** Show a finished export in Finder or Explorer. */
@@ -160,33 +197,142 @@ export async function dismissInterruptedExport(projectId: string): Promise<void>
 
 export type ExportCmd = "export_video" | "export_reels" | "export_book" | "export_all";
 
-/**
- * `bookPages` caps the book's pages (book and all only). `liveCollages` sets
- * Live Photo motion in the film's collages (film and all only; omitted means on).
- */
-export async function exportKeepsake(
-  cmd: ExportCmd,
-  projectId: string,
-  bookPages?: number,
-  liveCollages?: boolean
-): Promise<ExportSummary> {
+export interface KeepsakeEligibility {
+  enabled: boolean;
+  /** Why it can't be made, or why the film will be the short version. */
+  reason: string;
+}
+
+export interface Eligibility {
+  video: KeepsakeEligibility;
+  reels: KeepsakeEligibility;
+  book: KeepsakeEligibility;
+}
+
+/** One original that failed the check before a run; only its file name is known here. */
+export interface SourceProblem {
+  assetId: string;
+  name: string;
+}
+
+export interface SourceCheck {
+  missing: SourceProblem[];
+  changed: SourceProblem[];
+  checked: number;
+}
+
+const KEEPSAKE_OF: Record<ExportCmd, string> = {
+  export_video: "video",
+  export_reels: "reels",
+  export_book: "book",
+  export_all: "all"
+};
+
+// Browser preview of `?demo=missing`: Relink finds the missing files once.
+let demoRelinked = false;
+
+/** Check the originals an export will read: missing ones, and ones changed since the scan. */
+export async function checkSources(projectId: string, cmd: ExportCmd): Promise<SourceCheck> {
+  if (isTauri()) return invoke("check_sources", { projectId, keepsake: KEEPSAKE_OF[cmd] });
+  if (!demoScenario("missing")) return { missing: [], changed: [], checked: demoAssets.length };
+  const missing = demoRelinked ? [] : ["IMG_0412.HEIC", "IMG_0413.HEIC", "IMG_0420.MOV"];
+  return {
+    missing: missing.map((name, i) => ({ assetId: `demo_m${i}`, name })),
+    changed: [{ assetId: "demo_c0", name: "IMG_0398.JPG" }],
+    checked: demoAssets.length
+  };
+}
+
+export interface RelinkResult {
+  found: number;
+  notFound: number;
+}
+
+/** Look for the trip's missing originals in `folder` and use them where they are now. */
+export async function relinkSources(projectId: string, folder: string): Promise<RelinkResult> {
+  if (isTauri()) return invoke("relink_sources", { projectId, folder });
+  await new Promise((r) => setTimeout(r, 400));
+  demoRelinked = true;
+  return { found: 3, notFound: 0 };
+}
+
+/** Which keepsakes this trip can make, decided from its plan before any run. */
+export async function getExportEligibility(projectId: string): Promise<Eligibility> {
+  if (isTauri()) return invoke("get_export_eligibility", { projectId });
+  const ok = { enabled: true, reason: "" };
+  return {
+    video: ok,
+    reels: ok,
+    // The backend's reason, word for word.
+    book: demoScenario("thin") ? { enabled: false, reason: "Add more photos for a printable book (24-page vendor minimum)" } : ok
+  };
+}
+
+export type BookPresetId = "P1" | "P2";
+
+/** One book shape, with the page limits the pages field follows. */
+export interface BookPreset {
+  id: BookPresetId;
+  name: string;
+  minPages: number;
+  /** The page cap used when the owner doesn't set one. */
+  defaultPages: number;
+  maxPages: number;
+}
+
+/** Browser preview: the backend's two shapes, as `book_presets()` returns them. */
+export const DEMO_BOOK_PRESETS: BookPreset[] = [
+  { id: "P1", name: "Classic Square 12x12", minPages: 24, defaultPages: 60, maxPages: 400 },
+  { id: "P2", name: "Travel Landscape 11x8.5", minPages: 24, defaultPages: 80, maxPages: 400 }
+];
+
+export async function getBookPresets(): Promise<BookPreset[]> {
+  if (isTauri()) return invoke("get_book_presets");
+  return DEMO_BOOK_PRESETS;
+}
+
+export interface ExportChoices {
+  /** Caps the book's pages (book and all only). */
+  bookPages?: number;
+  /** The book's shape (book and all only); omitted means P1. */
+  bookPreset?: BookPresetId;
+  /** Live Photo motion in the film's collages (film and all only; omitted means on). */
+  liveCollages?: boolean;
+  /** The folder the trip's export folder goes inside; omitted uses the default. */
+  destination?: string;
+}
+
+export async function exportKeepsake(cmd: ExportCmd, projectId: string, choices: ExportChoices = {}): Promise<ExportSummary> {
   const withBook = cmd === "export_book" || cmd === "export_all";
   const withFilm = cmd === "export_video" || cmd === "export_all";
   if (isTauri()) {
     return invoke(cmd, {
       projectId,
-      ...(withBook ? { bookPages } : {}),
-      ...(withFilm ? { liveCollages } : {})
+      destination: choices.destination,
+      ...(withBook ? { bookPages: choices.bookPages, bookPreset: choices.bookPreset } : {}),
+      ...(withFilm ? { liveCollages: choices.liveCollages } : {})
     });
   }
   await new Promise((r) => setTimeout(r, 600));
   return {
     jobId: "demo_job",
-    outDir: `~/Movies/TripTape/Demo Trip/`,
-    video: cmd === "export_video" || cmd === "export_all" ? "hero.mp4" : undefined,
+    outDir: `${choices.destination ?? DEMO_DEFAULT_FOLDER}/Demo Trip (demo_prj)`,
+    video: withFilm ? "hero.mp4" : undefined,
     reels: cmd === "export_reels" || cmd === "export_all" ? ["reel-01.mp4", "reel-02.mp4"] : [],
-    bookPages: cmd === "export_book" || cmd === "export_all" ? 24 : 0,
-    skipped: []
+    bookPages: withBook && !demoScenario("thin") ? 24 : 0,
+    skipped:
+      cmd === "export_all" && demoScenario("thin")
+        ? [{ keepsake: "book", reason: "Add more photos for a printable book (24-page vendor minimum)" }]
+        : [],
+    // The backend's wording for a book with soft photos and a trimmed selection.
+    bookNotes:
+      withBook && demoScenario("soft")
+        ? [
+            "6 pages have a photo at 200-299 dpi and may print a little soft: pages 3, 7, 12, 15, 20, 31.",
+            "2 photos were left out because they were too small to print sharply.",
+            "The book uses 120 of 180 photos to stay within 60 pages. Allow more pages to fit more."
+          ]
+        : []
   };
 }
 

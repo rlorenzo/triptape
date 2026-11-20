@@ -660,7 +660,7 @@ The hackathon submission is done, including the demo video. The goal is now a re
 - Distribution: no signing, no release workflow, updater off. CI is not confirmed green on Windows.
 - Privacy (Section 14): `exif_strip_args` has no caller, so EXIF stripping is not applied to exports. Home fuzz exists only as a CLI flag. There is no rolling log or diagnostic report, and no crash reporting.
 - Settings: an About page only. No cache cap or clear, and no controls. The FFmpeg GPL text and source link are absent.
-- Export UX: the book preset is fixed to P1, the destination is fixed, eligibility and preflight appear only after a run, and there is no integrity sheet or Relink (Section 8).
+- Export UX (R5, in progress on `feat/export-choices`): the owner now picks the destination folder, eligibility disables cards with reasons before a run, the book preset (P1/P2) is chosen beside the page cap, the book's print-check notes show after a run, and a pre-render integrity sheet offers Relink, Skip, or Cancel. Still open: a dry-run book preflight before rendering (needs a planning API in `render_book`), the auto P1/P2 pick from orientation mix, "Use new version" for changed originals, and updating the project folder after a Relink.
 - Light tweaks: no reorder, music picker, caption toggle, map toggle, or single-reel re-export. One bundled music track.
 - Intelligence: no ML models. Face detection returns nothing, so there is no face scoring or smart crop. Reels crop to center or blurred fill. Audio scoring and stabilization are not implemented.
 - Library: thumbnails load lazily, but the grid is not virtualized. No "time guessed" badge or unpair control.
