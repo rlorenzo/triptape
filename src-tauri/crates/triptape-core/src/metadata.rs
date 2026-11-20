@@ -115,8 +115,8 @@ impl FfprobeOutput {
     pub fn creation_time(&self) -> Option<i64> {
         let tags = self.format.tags.as_ref()?;
         tags.get("creation_time")
-            .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
-            .map(|dt| dt.timestamp())
+            .and_then(|v| v.parse::<jiff::Timestamp>().ok())
+            .map(jiff::Timestamp::as_second)
     }
 
     /// Live Photo / content-identifier UUIDs, when the container carries one.
@@ -641,13 +641,20 @@ pub fn parse_tz_offset(s: &str) -> Option<i32> {
 /// Capture wall-clock in the photo's own timezone: the instant shifted
 /// by its UTC offset, read as a naive datetime. Without an offset the
 /// instant is read as UTC (legacy behavior). `None` when out of range.
-pub fn local_datetime(taken_at: i64, tz_offset_secs: Option<i32>) -> Option<chrono::NaiveDateTime> {
+pub fn local_datetime(taken_at: i64, tz_offset_secs: Option<i32>) -> Option<jiff::civil::DateTime> {
     let shifted = taken_at.checked_add(i64::from(tz_offset_secs.unwrap_or(0)))?;
-    chrono::DateTime::from_timestamp(shifted, 0).map(|d| d.naive_utc())
+    let ts = jiff::Timestamp::from_second(shifted).ok()?;
+    Some(jiff::tz::TimeZone::UTC.to_datetime(ts))
+}
+
+/// Unix seconds of a wall-clock time read as UTC.
+pub fn wall_to_unix(wall: jiff::civil::DateTime) -> Option<i64> {
+    let zoned = wall.to_zoned(jiff::tz::TimeZone::UTC).ok()?;
+    Some(zoned.timestamp().as_second())
 }
 
 /// Calendar date of [`local_datetime`].
-pub fn local_date(taken_at: i64, tz_offset_secs: Option<i32>) -> Option<chrono::NaiveDate> {
+pub fn local_date(taken_at: i64, tz_offset_secs: Option<i32>) -> Option<jiff::civil::Date> {
     local_datetime(taken_at, tz_offset_secs).map(|d| d.date())
 }
 
@@ -730,20 +737,27 @@ fn nearest_wall_clock_offset(
 /// normalization lands (see agent-code-review.md, capture-time finding).
 fn exif_datetime_to_unix(s: &str) -> Option<i64> {
     let s = s.trim();
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.timestamp());
+    if let Ok(ts) = s.parse::<jiff::Timestamp>() {
+        return Some(ts.as_second());
     }
-    for fmt in ["%Y:%m:%d %H:%M:%S%#z", "%Y-%m-%dT%H:%M:%S%#z"] {
-        if let Ok(dt) = chrono::DateTime::parse_from_str(s, fmt) {
-            return Some(dt.timestamp());
-        }
-    }
-    for fmt in ["%Y:%m:%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
-        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
-            return Some(dt.and_utc().timestamp());
-        }
-    }
-    None
+    // EXIF's colon-dated form is not RFC 3339: split any offset (`Z`,
+    // `+09:00`, `+0900`, `+09`) off the wall clock by hand. The date takes
+    // the first 10 bytes, so a sign past them starts the offset.
+    let cut = s
+        .bytes()
+        .enumerate()
+        .skip(10)
+        .find(|(_, b)| matches!(b, b'+' | b'-' | b'Z' | b'z'))
+        .map_or(s.len(), |(i, _)| i);
+    let (wall, offset) = s.split_at(cut);
+    let offset = match offset {
+        "" | "Z" | "z" => 0,
+        o => parse_tz_offset(o)?,
+    };
+    let wall = ["%Y:%m:%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]
+        .iter()
+        .find_map(|fmt| jiff::civil::DateTime::strptime(fmt, wall.trim_end()).ok())?;
+    Some(wall_to_unix(wall)? - i64::from(offset))
 }
 
 /// Degrees/minutes/seconds components (1–3 of them) to decimal degrees.
@@ -875,9 +889,15 @@ mod tests {
         // 2026-10-04 22:50 UTC is 07:50 next day in Japan.
         let t = 1_791_154_200;
         let jp = local_datetime(t, Some(9 * 3600)).unwrap();
-        assert_eq!(jp.format("%Y-%m-%d %H:%M").to_string(), "2026-10-05 07:50");
+        assert_eq!(
+            jp.strftime("%Y-%m-%d %H:%M").to_string(),
+            "2026-10-05 07:50"
+        );
         let utc = local_datetime(t, None).unwrap();
-        assert_eq!(utc.format("%Y-%m-%d %H:%M").to_string(), "2026-10-04 22:50");
+        assert_eq!(
+            utc.strftime("%Y-%m-%d %H:%M").to_string(),
+            "2026-10-04 22:50"
+        );
         assert_eq!(local_datetime(i64::MAX, Some(3600)), None);
     }
 
@@ -929,10 +949,7 @@ mod tests {
     fn fill_tz_offsets_normalizes_naive_wall_clock_per_candidate() {
         use crate::types::{Asset, AssetKind};
         let wall = |s: &str| {
-            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M")
-                .unwrap()
-                .and_utc()
-                .timestamp()
+            wall_to_unix(jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M", s).unwrap()).unwrap()
         };
         let known = |id: &str, utc: &str, o: i32| {
             let mut a = Asset::new(id, id.into(), AssetKind::Photo);
@@ -966,15 +983,12 @@ mod tests {
     fn fill_tz_offsets_keeps_naive_wall_clock_near_midnight() {
         use crate::types::{Asset, AssetKind};
         let wall = |s: &str| {
-            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M")
-                .unwrap()
-                .and_utc()
-                .timestamp()
+            wall_to_unix(jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M", s).unwrap()).unwrap()
         };
         let local = |a: &Asset| {
             local_datetime(a.taken_at.unwrap(), a.tz_offset_secs)
                 .unwrap()
-                .format("%Y-%m-%d %H:%M")
+                .strftime("%Y-%m-%d %H:%M")
                 .to_string()
         };
         let jst = 9 * 3600;
@@ -1122,6 +1136,34 @@ mod tests {
             exif_datetime_to_unix("2024-05-01T10:00:00+09:00"),
             Some(1714557600 - 9 * 3600)
         );
+        // EXIF's colon form takes every offset spelling, and `Z`.
+        for offset in ["+09:00", "+0900", "+09", " +09:00"] {
+            assert_eq!(
+                exif_datetime_to_unix(&format!("2024:05:01 10:00:00{offset}")),
+                Some(1714557600 - 9 * 3600),
+                "{offset}"
+            );
+        }
+        assert_eq!(
+            exif_datetime_to_unix("2024:05:01 10:00:00Z"),
+            Some(1714557600)
+        );
+        assert_eq!(
+            exif_datetime_to_unix("2024-05-01T10:00:00.000000Z"),
+            Some(1714557600)
+        );
+        assert_eq!(exif_datetime_to_unix("1969:12:31 23:59:59"), Some(-1));
+        // Impossible dates, offsets and partial times are refused.
+        for bad in [
+            "2024:02:30 10:00:00",
+            "0000:00:00 00:00:00",
+            "2024:05:01 24:00:00",
+            "2024:05:01 10:00:00+25:00",
+            "2024:05:01 10:00",
+            "2024:05:01",
+        ] {
+            assert_eq!(exif_datetime_to_unix(bad), None, "{bad}");
+        }
         // Local midnight in Tokyo is the previous UTC day.
         assert_eq!(
             exif_datetime_to_unix("2024:05:02 00:30:00+09:00"),

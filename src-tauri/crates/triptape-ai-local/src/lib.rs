@@ -245,11 +245,8 @@ pub fn template_caption(ctx: &CaptionContext) -> String {
         return place.to_string();
     }
     ctx.taken_at
-        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-        .map_or_else(
-            || "From the trip".to_string(),
-            |d| triptape_core::plan::dateline(&d),
-        )
+        .and_then(triptape_core::plan::dateline)
+        .unwrap_or_else(|| "From the trip".to_string())
 }
 
 // -- Music fit ("vibe fit", never fake emotion) -------------------------------------
@@ -273,11 +270,8 @@ pub fn vibe_fit_music_pick(assets: &[Asset]) -> MusicPick {
         .iter()
         .filter_map(|a| {
             a.taken_at
-                .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-                .map(|d| {
-                    use chrono::Timelike;
-                    d.hour()
-                })
+                .and_then(|t| triptape_core::metadata::local_datetime(t, None))
+                .map(|d| d.hour())
         })
         .filter(|h| (6..18).contains(h))
         .count();

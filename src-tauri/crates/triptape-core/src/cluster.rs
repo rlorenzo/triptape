@@ -38,7 +38,7 @@ const MERGE_WALK_MPS: f64 = 1.4;
 pub fn day_key(taken_at: Option<i64>, tz_offset_secs: Option<i32>) -> String {
     taken_at
         .and_then(|t| crate::metadata::local_datetime(t, tz_offset_secs))
-        .map(|d| d.format("%Y-%m-%d").to_string())
+        .map(|d| d.strftime("%Y-%m-%d").to_string())
         .unwrap_or_else(|| "unknown-date".to_string())
 }
 

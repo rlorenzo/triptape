@@ -18,9 +18,15 @@ use std::path::Path;
 const DAY_FORMAT: &str = "%a, %b %-d";
 
 /// Factual caption dateline, `Wed, May 1 · 10:00 AM` (UTC), used by the
-/// local caption fallback when no place is known.
-pub fn dateline(dt: &chrono::DateTime<chrono::Utc>) -> String {
-    format!("{} · {}", dt.format(DAY_FORMAT), dt.format("%-I:%M %p"))
+/// local caption fallback when no place is known. `None` when `taken_at`
+/// (unix seconds) is out of range.
+pub fn dateline(taken_at: i64) -> Option<String> {
+    let dt = crate::metadata::local_datetime(taken_at, None)?;
+    Some(format!(
+        "{} · {}",
+        dt.strftime(DAY_FORMAT),
+        dt.strftime("%-I:%M %p")
+    ))
 }
 
 /// 2: `captions` holds only the user's words (no auto place captions).
@@ -527,8 +533,8 @@ const UNGROUPED: &str = "Ungrouped";
 /// hardcoded in the app.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaceOverride {
-    pub start: chrono::NaiveDate,
-    pub end: chrono::NaiveDate,
+    pub start: jiff::civil::Date,
+    pub end: jiff::civil::Date,
     pub label: String,
 }
 
@@ -543,7 +549,7 @@ pub fn parse_place_overrides(spec: &str) -> Result<Vec<PlaceOverride>, String> {
             .split_once("..")
             .ok_or_else(|| format!("place override {part:?} is missing a .. date range"))?;
         let parse = |s: &str| {
-            chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+            jiff::civil::Date::strptime("%Y-%m-%d", s.trim())
                 .map_err(|e| format!("place override {part:?}: bad date: {e}"))
         };
         let (start, end) = (parse(a)?, parse(b)?);
@@ -940,10 +946,10 @@ pub fn build_plan_with_length(
                 asset_ids: members.iter().map(|a| a.id.clone()).collect(),
                 place,
                 day_index: match (first_date, trip_start) {
-                    (Some(d), Some(s)) => Some(((d - s).num_days() + 1).max(1) as u32),
+                    (Some(d), Some(s)) => Some(((d - s).get_days() + 1).max(1) as u32),
                     _ => None,
                 },
-                date_label: first_date.map(|d| d.format(DAY_FORMAT).to_string()),
+                date_label: first_date.map(|d| d.strftime(DAY_FORMAT).to_string()),
             }
         })
         .collect();
@@ -992,7 +998,7 @@ pub fn build_plan_with_length(
             // Inclusive calendar span, so days without captures still count.
             let dates = || ordered.iter().filter_map(|a| local_date(a));
             let span = match (dates().min(), dates().max()) {
-                (Some(first), Some(last)) => (last - first).num_days() as usize + 1,
+                (Some(first), Some(last)) => (last - first).get_days() as usize + 1,
                 _ => 1,
             };
             auto_film_secs(span)
@@ -1308,8 +1314,10 @@ pub(crate) fn medoid(gps: &[(f64, f64)]) -> Option<(f64, f64)> {
 /// `2026-10-12`) becomes `Mon, Oct 12`; anything else passes through.
 fn human_chapter_title(label: &str) -> String {
     let date_part = label.split_once(" · ").map_or(label, |(d, _)| d);
-    chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d")
-        .map_or_else(|_| label.to_string(), |d| d.format(DAY_FORMAT).to_string())
+    jiff::civil::Date::strptime("%Y-%m-%d", date_part).map_or_else(
+        |_| label.to_string(),
+        |d| d.strftime(DAY_FORMAT).to_string(),
+    )
 }
 
 /// An asset's score: the fresh one when scoring just ran, else the persisted
@@ -1499,8 +1507,11 @@ mod tests {
 
     #[test]
     fn dateline_is_weekday_date_and_clock() {
-        let dt = chrono::DateTime::from_timestamp(1_714_557_600, 0).unwrap();
-        assert_eq!(dateline(&dt), "Wed, May 1 · 10:00 AM");
+        assert_eq!(
+            dateline(1_714_557_600).as_deref(),
+            Some("Wed, May 1 · 10:00 AM")
+        );
+        assert_eq!(dateline(i64::MAX), None);
     }
     use crate::types::AssetKind;
     use std::path::PathBuf;
@@ -2147,12 +2158,8 @@ mod tests {
         assert!(parse_place_overrides("2024-05-03..2024-05-01=X").is_err());
         assert!(parse_place_overrides("May 1=X").is_err());
         let ts = |date: &str| {
-            chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-                .unwrap()
-                .and_hms_opt(12, 0, 0)
-                .unwrap()
-                .and_utc()
-                .timestamp()
+            let day = jiff::civil::Date::strptime("%Y-%m-%d", date).unwrap();
+            crate::metadata::wall_to_unix(day.at(12, 0, 0, 0)).unwrap()
         };
         let mut sea = asset("sea", ts("2024-05-02"), AssetKind::Photo);
         sea.gps = Some((2.221, 105.205)); // open water: names nothing

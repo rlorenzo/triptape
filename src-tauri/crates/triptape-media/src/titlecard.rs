@@ -134,16 +134,17 @@ pub const ROUTE_LABEL: &str = "Our route";
 pub fn format_date_range(taken: &[(i64, Option<i32>)]) -> Option<String> {
     // Compare local calendar dates, not UTC instants: across the date line
     // a later instant can fall on an earlier local date.
-    let dates: Vec<chrono::NaiveDate> = taken
+    let dates: Vec<_> = taken
         .iter()
         .filter_map(|&(t, off)| triptape_core::metadata::local_date(t, off))
         .collect();
     let (lo, hi) = (dates.iter().min()?, dates.iter().max()?);
-    let fmt = |d: &chrono::NaiveDate| d.format("%b %-d, %Y").to_string();
+    const FORMAT: &str = "%b %-d, %Y";
+    let (first, last) = (lo.strftime(FORMAT), hi.strftime(FORMAT));
     Some(if lo == hi {
-        fmt(lo)
+        first.to_string()
     } else {
-        format!("{} – {}", fmt(lo), fmt(hi))
+        format!("{first} – {last}")
     })
 }
 
@@ -167,7 +168,7 @@ fn all_digits(s: &str, len: std::ops::RangeInclusive<usize>) -> bool {
     len.contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// `Sun, Oct 5` (chrono `%a, %b %-d`).
+/// `Sun, Oct 5` (strftime `%a, %b %-d`).
 fn is_weekday_date(s: &str) -> bool {
     const WD: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     const MO: [&str; 12] = [
@@ -182,7 +183,7 @@ fn is_weekday_date(s: &str) -> bool {
     WD.contains(&wd) && MO.contains(&mo) && all_digits(d, 1..=2)
 }
 
-/// `4:32 PM` (chrono `%-I:%M %p`).
+/// `4:32 PM` (strftime `%-I:%M %p`).
 fn is_clock_time(s: &str) -> bool {
     let Some((hm, ampm)) = s.split_once(' ') else {
         return false;

@@ -8,7 +8,7 @@
 
 use crate::geo::{haversine_m, land_fraction};
 use crate::types::{Asset, Chapter, Plan};
-use chrono::NaiveDate;
+use jiff::civil::Date as NaiveDate;
 use serde::Deserialize;
 
 /// A shot this close to a docked ship's terminal counts as on board.
@@ -93,7 +93,7 @@ pub struct DayLabel {
 }
 
 fn parse_date(s: &str) -> Result<NaiveDate, String> {
-    NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+    NaiveDate::strptime("%Y-%m-%d", s.trim())
         .map_err(|_| format!("bad date {s:?} (want YYYY-MM-DD)"))
 }
 
@@ -560,7 +560,7 @@ mod tests {
     fn photo(id: &str, day: &str, gps: Option<(f64, f64)>) -> Asset {
         let mut a = Asset::new(id, std::path::PathBuf::from(id), AssetKind::Photo);
         let d = parse_date(day).unwrap();
-        a.taken_at = Some(d.and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp());
+        a.taken_at = crate::metadata::wall_to_unix(d.at(12, 0, 0, 0));
         a.gps = gps;
         a
     }
