@@ -203,6 +203,31 @@ pub struct Plan {
     /// Route polyline (lat, lon) with day markers.
     pub map_polyline: Vec<(f64, f64)>,
     pub music: MusicPick,
+    /// The user's collage overrides for the film, set only by
+    /// `plan::apply_edits` from the Story editor's edits. A stored plan never
+    /// carries any (and serializes as it always did).
+    #[serde(default, skip_serializing_if = "CollageEdits::is_empty")]
+    pub collage: CollageEdits,
+}
+
+/// How the user regrouped the film's collages, by asset id. Read by
+/// `plan::collage_slots`, the one place grouping inputs are built for the
+/// planner estimate, the renderer and the Story editor.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollageEdits {
+    /// Photos that play on their own ("Show on its own").
+    #[serde(default)]
+    pub solo: Vec<String>,
+    /// Photos joined into one collage, earlier one first. A link holds only
+    /// while the two are neighbouring collage photos of one chapter.
+    #[serde(default)]
+    pub joins: Vec<(String, String)>,
+}
+
+impl CollageEdits {
+    pub fn is_empty(&self) -> bool {
+        self.solo.is_empty() && self.joins.is_empty()
+    }
 }
 
 impl PlanEntry {

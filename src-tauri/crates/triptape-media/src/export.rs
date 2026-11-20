@@ -925,6 +925,7 @@ mod tests {
             reel_selects: vec![],
             chapters: vec![],
             captions: HashMap::new(),
+            collage: Default::default(),
             map_polyline: vec![],
             music: triptape_core::types::MusicPick {
                 track: "t".into(),

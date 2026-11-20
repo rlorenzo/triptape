@@ -14,10 +14,10 @@ use crate::segment_cache::SegmentCache;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{
-    self, collage_hold_secs, is_panorama, pano_coverage, pano_motion, GroupSlot, MAX_CLIP_SECS,
-    MAX_COLLAGE, MIN_SEGMENT_SECS,
+    self, collage_hold_secs, is_panorama, pano_coverage, pano_motion, MAX_CLIP_SECS, MAX_COLLAGE,
+    MIN_SEGMENT_SECS,
 };
-use triptape_core::types::{Plan, PlanEntry, Rendition};
+use triptape_core::types::{CollageEdits, Plan, PlanEntry, Rendition};
 
 /// Crossfade applied at the cut *into* a segment (PLAN.md Sec 9, 6-pack).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -662,7 +662,7 @@ pub fn render_hero_video(
     let groups: Vec<Vec<&ResolvedEntry>> = if opts.short_mode {
         selected.into_iter().map(|r| vec![r]).collect()
     } else {
-        hero_groups(&selected, chapter_of)
+        hero_groups(&selected, chapter_of, &plan.collage)
     };
     // Segment renders are independent unless a short-mode budget couples
     // them (each one's cap and freeze-pad depend on what earlier ones left),
@@ -1850,19 +1850,24 @@ fn collage_eligible(e: &ResolvedEntry) -> bool {
 }
 
 /// Hero segments in playback order: each is one entry or a collage of
-/// same-chapter stills, as [`plan::collage_groups`] decides (the plan's
-/// length estimate groups the same way).
+/// same-chapter stills, as [`plan::collage_groups`] decides under the
+/// user's `collage` overrides (the plan's length estimate and the Story
+/// editor group the same way).
 fn hero_groups<'a, C: PartialEq>(
     entries: &[&'a ResolvedEntry],
     chapter_of: impl Fn(&str) -> C,
+    collage: &CollageEdits,
 ) -> Vec<Vec<&'a ResolvedEntry>> {
-    let slots: Vec<GroupSlot<C>> = entries
-        .iter()
-        .map(|r| GroupSlot {
-            chapter: chapter_of(&r.entry.asset_id),
-            eligible: collage_eligible(r),
-        })
-        .collect();
+    let slots = plan::collage_slots(
+        entries.iter().map(|r| {
+            (
+                r.entry.asset_id.as_str(),
+                chapter_of(&r.entry.asset_id),
+                collage_eligible(r),
+            )
+        }),
+        collage,
+    );
     plan::collage_groups(&slots)
         .into_iter()
         .map(|g| g.into_iter().map(|i| entries[i]).collect())
@@ -2770,10 +2775,11 @@ mod tests {
                     })
                     .collect();
                 let refs: Vec<&ResolvedEntry> = resolved.iter().collect();
-                let groups: Vec<Vec<&PlanEntry>> = hero_groups(&refs, chapter_of)
-                    .into_iter()
-                    .map(|g| g.into_iter().map(|r| &r.entry).collect())
-                    .collect();
+                let groups: Vec<Vec<&PlanEntry>> =
+                    hero_groups(&refs, chapter_of, &CollageEdits::default())
+                        .into_iter()
+                        .map(|g| g.into_iter().map(|r| &r.entry).collect())
+                        .collect();
                 // (asset id, duration, kind) as in the renderer's `segs`.
                 let mut segs: Vec<(String, f64, &str)> =
                     vec![("title".into(), opts.title_secs, "title")];
@@ -3792,6 +3798,7 @@ mod tests {
                 },
             ],
             captions,
+            collage: Default::default(),
             map_polyline: vec![],
             music: triptape_core::types::MusicPick {
                 track: "bundled".into(),
@@ -4017,6 +4024,7 @@ mod tests {
                 ..Default::default()
             }],
             captions: HashMap::new(),
+            collage: Default::default(),
             map_polyline: vec![(35.0, 135.0), (35.1, 135.1)],
             music: triptape_core::types::MusicPick {
                 track: "bundled".into(),
@@ -4149,6 +4157,7 @@ mod tests {
                 ..Default::default()
             }],
             captions: HashMap::new(),
+            collage: Default::default(),
             map_polyline: vec![],
             music: triptape_core::types::MusicPick {
                 track: "bundled".into(),
@@ -4241,6 +4250,7 @@ mod tests {
                 ..Default::default()
             }],
             captions: HashMap::new(),
+            collage: Default::default(),
             map_polyline: vec![],
             music: triptape_core::types::MusicPick {
                 track: "bundled".into(),
@@ -4361,6 +4371,7 @@ mod tests {
                 ),
             ],
             captions: HashMap::new(),
+            collage: Default::default(),
             map_polyline: vec![(35.0, 135.7), (34.7, 135.5), (35.6, 139.7), (1.35, 103.8)],
             music: MusicPick {
                 track: "bundled".into(),
@@ -4512,6 +4523,7 @@ mod tests {
             reel_selects: vec![],
             chapters,
             captions: HashMap::new(),
+            collage: Default::default(),
             map_polyline: vec![],
             music: triptape_core::types::MusicPick {
                 track: "bundled".into(),
