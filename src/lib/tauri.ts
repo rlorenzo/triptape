@@ -291,6 +291,17 @@ export async function getBookPresets(): Promise<BookPreset[]> {
   return DEMO_BOOK_PRESETS;
 }
 
+/**
+ * Why keepsakes may come out simpler on this computer: a media tool taken
+ * from PATH instead of the bundled copy, or an FFmpeg without captions or
+ * stabilization. Empty with the bundled tools (and in the browser preview).
+ */
+export async function getToolNotes(): Promise<string[]> {
+  if (!isTauri()) return [];
+  const status = await invoke<{ notes: string[] }>("get_tool_status");
+  return status.notes;
+}
+
 export interface ExportChoices {
   /** Caps the book's pages (book and all only). */
   bookPages?: number;

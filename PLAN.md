@@ -655,7 +655,7 @@ The hackathon submission is done, including the demo video. The goal is now a re
 
 ### 23.2 Where the code falls short of this plan
 
-- Install: FFmpeg, ffprobe, and Typst are called by bare name from PATH. Nothing is bundled, so the app fails without developer tools. `sips` also makes HEIC decoding best on macOS only.
+- Install (R2, on `feat/self-contained-app`): FFmpeg 9.0.2, ffprobe, and Typst 0.15.1 are pinned by SHA-256 in `scripts/fetch-sidecars` and bundled as `externalBin` sidecars with their licences. One resolver (`triptape_core::process::resolve_tool`) picks an override, then the sidecar, then PATH as a noted dev fallback, and the Export screen says when captions or stabilization will be degraded. HEIC decodes through FFmpeg alone where there is no `sips` (verified on real iPhone files, including Dolby Vision gain-map ones). Open: the macOS FFmpeg is an Intel build that needs Rosetta 2 on Apple silicon (owner decision), and Windows is unverified until CI runs with the sidecars.
 - Jobs (Section 7): `cancel_job` only changes the database row. FFmpeg keeps running and temp files stay. Outputs are written straight to the destination, the app never runs the free-space precheck (only the CLI does), and interrupted jobs get no Resume or Discard.
 - Distribution: no signing, no release workflow, updater off. CI is not confirmed green on Windows.
 - Privacy (Section 14): `exif_strip_args` has no caller, so EXIF stripping is not applied to exports. Home fuzz exists only as a CLI flag. There is no rolling log or diagnostic report, and no crash reporting.
@@ -671,7 +671,7 @@ The hackathon submission is done, including the demo video. The goal is now a re
 | Phase | Outcome | Depends on |
 | --- | --- | --- |
 | R1 Reliable exports | Cancel stops the work, outputs appear only when verified, disk-full fails early, interrupted exports recover | Nothing |
-| R2 Self-contained app | Bundled, pinned FFmpeg, ffprobe, and Typst; HEIC works on both OSes; Windows CI green (G1) | Nothing |
+| R2 Self-contained app | Bundled, pinned FFmpeg, ffprobe, and Typst; HEIC works on both OSes; Windows CI green (G1). Status: sidecars pinned and bundled, resolver and notice in place, macOS verified; Windows pending CI; arm64 Rosetta decision open | Nothing |
 | R3 Signed releases | Release workflow, notarized and Authenticode-signed builds, working updater (G5) | R2; owner's signing certificates |
 | R4 Privacy and Settings | EXIF strip applied by default, hide home, cache cap and clear, redacted logs and diagnostic report, licenses | Nothing |
 | R5 Export choices | Destination picker, eligibility before a run, book preset and preflight in the UI, integrity sheet and Relink | R1 |

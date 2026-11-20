@@ -11,6 +11,10 @@
 //! triptape cache stats|clear [--segment-cache DIR]
 //! triptape pick --db trip.db --out /path/to/new-folder [--count 800] [--project ID] [--stills-only]
 //! ```
+//!
+//! `scan` and `export` take `--ffmpeg`, `--ffprobe` (and `export` `--typst`)
+//! paths; without them each tool comes from `TRIPTAPE_FFMPEG` and friends,
+//! then the bundled sidecar beside this binary, then `PATH` (with a note).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -21,7 +25,9 @@ use triptape_core::{
     db::{Db, EditedPlan},
     hash, jobs, learn, livephoto, metadata,
     osxphotos::OsxPhotosIndex,
-    pick, plan as planmod, privacy, proxies, scan, score,
+    pick, plan as planmod, privacy,
+    process::{resolve_tool, Tool},
+    proxies, scan, score,
     types::*,
 };
 use triptape_media::{
@@ -131,12 +137,23 @@ fn flag_or(flags: &HashMap<String, String>, k: &str, default: &str) -> String {
         .map_or_else(|| default.to_string(), Clone::clone)
 }
 
+/// The program to run for `tool`: its `--ffmpeg`/`--ffprobe`/`--typst` flag,
+/// then `TRIPTAPE_*`, the bundled sidecar beside this binary, then `PATH`.
+/// A `PATH` or missing tool is noted on stderr.
+fn tool_bin(flags: &HashMap<String, String>, tool: Tool) -> String {
+    let resolved = resolve_tool(tool, flags.get(tool.name()).map(String::as_str));
+    if let Some(note) = resolved.note() {
+        eprintln!("note: {note}");
+    }
+    resolved.bin
+}
+
 fn scan_cmd(flags: &HashMap<String, String>) {
     let folder = need(flags, "folder");
     let db_path = need(flags, "db");
     let cache = need(flags, "cache");
-    let ffmpeg = flag_or(flags, "ffmpeg", "ffmpeg");
-    let ffprobe = flag_or(flags, "ffprobe", "ffprobe");
+    let ffmpeg = tool_bin(flags, Tool::Ffmpeg);
+    let ffprobe = tool_bin(flags, Tool::Ffprobe);
     // Validate before any work so a bad value never yields a misleading exit 0.
     let allow_partial = match flag_or(flags, "allow-partial", "false").as_str() {
         "true" => true,
@@ -540,9 +557,9 @@ fn export_cmd(flags: &HashMap<String, String>) {
             .page_cap(Some(n))
             .unwrap_or_else(|e| die("--pages", e))
     });
-    let ffmpeg_bin = flag_or(flags, "ffmpeg", "ffmpeg");
-    let ffprobe_bin = flag_or(flags, "ffprobe", "ffprobe");
-    let typst_bin = flag_or(flags, "typst", "typst");
+    let ffmpeg_bin = tool_bin(flags, Tool::Ffmpeg);
+    let ffprobe_bin = tool_bin(flags, Tool::Ffprobe);
+    let typst_bin = tool_bin(flags, Tool::Typst);
     let music = flags.get("music").map_or_else(Vec::new, |v| music_list(v));
     for m in &music {
         if !m.exists() {
@@ -585,6 +602,10 @@ fn export_cmd(flags: &HashMap<String, String>) {
         caps.libass,
         caps.vidstabdetect && caps.vidstabtransform,
     );
+    println!("ffmpeg: {ffmpeg_bin}");
+    for note in caps.degradations() {
+        eprintln!("note: {note}");
+    }
 
     // Hero film frame size: 4K unless asked otherwise (reels stay 1080x1920).
     let resolution = Resolution::from_flag(&flag_or(flags, "resolution", "4k"))

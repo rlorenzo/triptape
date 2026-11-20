@@ -5,11 +5,17 @@
 //! for the current thread with [`with_cancel`], and [`output`] and [`status`]
 //! kill their child as soon as the flag is set. With no flag installed they
 //! behave exactly like the `Command` methods they replace.
+//!
+//! It is also the one place that decides *which* FFmpeg, ffprobe and Typst
+//! executables run: see [`resolve_tool`] and [`Toolchain`].
 
 use crate::jobs::CancelFlag;
 use std::cell::RefCell;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 thread_local! {
@@ -120,6 +126,296 @@ pub fn output(cmd: &mut Command) -> io::Result<Output> {
         stdout,
         stderr,
     })
+}
+
+/// An external executable TripTape runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    Ffmpeg,
+    Ffprobe,
+    Typst,
+}
+
+impl Tool {
+    /// The executable's name, without the platform suffix (`.exe`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Tool::Ffmpeg => "ffmpeg",
+            Tool::Ffprobe => "ffprobe",
+            Tool::Typst => "typst",
+        }
+    }
+
+    /// Environment variable that overrides where the tool is found.
+    pub fn env_var(self) -> &'static str {
+        match self {
+            Tool::Ffmpeg => "TRIPTAPE_FFMPEG",
+            Tool::Ffprobe => "TRIPTAPE_FFPROBE",
+            Tool::Typst => "TRIPTAPE_TYPST",
+        }
+    }
+
+    fn file_name(self) -> String {
+        format!("{}{}", self.name(), std::env::consts::EXE_SUFFIX)
+    }
+}
+
+/// Where a resolved tool came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolSource {
+    /// A `--ffmpeg`-style flag or a `TRIPTAPE_*` variable named it.
+    Override,
+    /// The pinned sidecar bundled next to the executable.
+    Sidecar,
+    /// Found on `PATH`: a development fallback, never what a release ships.
+    Path,
+    /// Nowhere: running it will fail.
+    Missing,
+}
+
+/// One tool, resolved to the program to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTool {
+    pub tool: Tool,
+    /// What to pass to [`Command::new`]: a full path, or the bare name when
+    /// the tool is left to the `PATH` lookup.
+    pub bin: String,
+    pub source: ToolSource,
+}
+
+impl ResolvedTool {
+    /// A sentence for the user when this tool is not the bundled or chosen one.
+    pub fn note(&self) -> Option<String> {
+        let name = self.tool.name();
+        match self.source {
+            ToolSource::Override | ToolSource::Sidecar => None,
+            ToolSource::Path => Some(format!(
+                "Using {name} from PATH: the copy bundled with TripTape is missing (development fallback)."
+            )),
+            ToolSource::Missing => Some(format!(
+                "{name} was not found: it is not bundled with this build and not on PATH."
+            )),
+        }
+    }
+}
+
+/// Resolve `tool`, first match wins:
+///
+/// 1. `explicit` (a command-line flag), then the tool's `TRIPTAPE_*`
+///    variable. Either is used as given, even if it does not exist, so a
+///    typo fails loudly instead of quietly picking another binary.
+/// 2. The bundled sidecar next to the running executable. Tauri installs
+///    `bundle.externalBin` there (`Contents/MacOS` in a macOS app, the
+///    install folder on Windows), and its build script copies them into
+///    `target/<profile>/` for `cargo run` of the app and the CLI.
+/// 3. Debug builds only: the sidecar `scripts/fetch-sidecars` put in this
+///    source checkout's `src-tauri/binaries/`, so tests find it wherever
+///    cargo places their binaries.
+/// 4. `PATH`, as a development fallback; [`ResolvedTool::note`] says so.
+pub fn resolve_tool(tool: Tool, explicit: Option<&str>) -> ResolvedTool {
+    let mut sidecars: Vec<PathBuf> = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(tool.file_name())))
+        .into_iter()
+        .collect();
+    sidecars.extend(source_tree_sidecar(tool));
+    resolve_tool_in(
+        tool,
+        explicit,
+        std::env::var_os(tool.env_var()),
+        &sidecars,
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// [`resolve_tool`] with its environment passed in; `sidecars` are the
+/// candidate files, in order.
+fn resolve_tool_in(
+    tool: Tool,
+    explicit: Option<&str>,
+    env: Option<OsString>,
+    sidecars: &[PathBuf],
+    path: Option<&OsStr>,
+) -> ResolvedTool {
+    let resolved = |bin: String, source| ResolvedTool { tool, bin, source };
+    if let Some(bin) = explicit.filter(|b| !b.is_empty()) {
+        return resolved(bin.to_string(), ToolSource::Override);
+    }
+    if let Some(bin) = env
+        .and_then(|v| v.into_string().ok())
+        .filter(|b| !b.is_empty())
+    {
+        return resolved(bin, ToolSource::Override);
+    }
+    // A non-UTF-8 install path cannot travel as a `String`; PATH then.
+    if let Some(bin) = sidecars
+        .iter()
+        .filter(|p| p.is_file())
+        .find_map(|p| p.to_str())
+    {
+        return resolved(bin.to_string(), ToolSource::Sidecar);
+    }
+    let file = tool.file_name();
+    let on_path = path.is_some_and(|p| std::env::split_paths(p).any(|d| d.join(&file).is_file()));
+    let source = if on_path {
+        ToolSource::Path
+    } else {
+        ToolSource::Missing
+    };
+    resolved(tool.name().to_string(), source)
+}
+
+/// `src-tauri/binaries/<name>-<target triple>[.exe]` in the source checkout
+/// this crate was built from. Release builds never look there.
+fn source_tree_sidecar(tool: Tool) -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let triple = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "aarch64-apple-darwin"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "x86_64-apple-darwin"
+    } else if cfg!(all(windows, target_arch = "x86_64", target_env = "msvc")) {
+        "x86_64-pc-windows-msvc"
+    } else {
+        return None;
+    };
+    // This crate is src-tauri/crates/triptape-core.
+    let src_tauri = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?.parent()?;
+    Some(src_tauri.join("binaries").join(format!(
+        "{}-{triple}{}",
+        tool.name(),
+        std::env::consts::EXE_SUFFIX
+    )))
+}
+
+/// FFmpeg, ffprobe and Typst, resolved together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toolchain {
+    pub ffmpeg: ResolvedTool,
+    pub ffprobe: ResolvedTool,
+    pub typst: ResolvedTool,
+}
+
+impl Toolchain {
+    /// The process-wide toolchain (no flags; `TRIPTAPE_*` variables still
+    /// apply), resolved once on first use.
+    pub fn global() -> &'static Toolchain {
+        static TOOLS: OnceLock<Toolchain> = OnceLock::new();
+        TOOLS.get_or_init(|| Toolchain {
+            ffmpeg: resolve_tool(Tool::Ffmpeg, None),
+            ffprobe: resolve_tool(Tool::Ffprobe, None),
+            typst: resolve_tool(Tool::Typst, None),
+        })
+    }
+
+    /// One note per tool that is not the bundled or chosen one.
+    pub fn notes(&self) -> Vec<String> {
+        [&self.ffmpeg, &self.ffprobe, &self.typst]
+            .into_iter()
+            .filter_map(ResolvedTool::note)
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    fn touch(p: &Path) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"").unwrap();
+    }
+
+    fn resolve(explicit: Option<&str>, env: Option<&str>, exe: &Path, path: &Path) -> ResolvedTool {
+        resolve_tool_in(
+            Tool::Ffmpeg,
+            explicit,
+            env.map(OsString::from),
+            &[exe.join(Tool::Ffmpeg.file_name())],
+            Some(path.as_os_str()),
+        )
+    }
+
+    #[test]
+    fn order_is_flag_then_env_then_sidecar_then_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("app");
+        let path = dir.path().join("bin");
+        let file = Tool::Ffmpeg.file_name();
+        touch(&exe.join(&file));
+        touch(&path.join(&file));
+
+        let r = resolve(Some("/x/ffmpeg"), Some("/y/ffmpeg"), &exe, &path);
+        assert_eq!(
+            (r.bin.as_str(), r.source),
+            ("/x/ffmpeg", ToolSource::Override)
+        );
+        let r = resolve(None, Some("/y/ffmpeg"), &exe, &path);
+        assert_eq!(
+            (r.bin.as_str(), r.source),
+            ("/y/ffmpeg", ToolSource::Override)
+        );
+        let r = resolve(Some(""), Some(""), &exe, &path);
+        assert_eq!(r.source, ToolSource::Sidecar);
+        assert_eq!(Path::new(&r.bin), exe.join(&file));
+        assert_eq!(r.note(), None);
+
+        std::fs::remove_file(exe.join(&file)).unwrap();
+        let r = resolve(None, None, &exe, &path);
+        assert_eq!((r.bin.as_str(), r.source), ("ffmpeg", ToolSource::Path));
+        assert!(r.note().unwrap().contains("development fallback"));
+
+        std::fs::remove_file(path.join(&file)).unwrap();
+        let r = resolve(None, None, &exe, &path);
+        assert_eq!(r.source, ToolSource::Missing);
+        assert!(r.note().unwrap().contains("not found"));
+    }
+
+    #[test]
+    fn the_first_existing_sidecar_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let beside_exe = dir.path().join("app").join("typst");
+        let in_tree = dir.path().join("binaries").join("typst-triple");
+        touch(&in_tree);
+        let candidates = [beside_exe.clone(), in_tree.clone()];
+        let r = resolve_tool_in(Tool::Typst, None, None, &candidates, None);
+        assert_eq!(
+            (Path::new(&r.bin), r.source),
+            (in_tree.as_path(), ToolSource::Sidecar)
+        );
+        touch(&beside_exe);
+        let r = resolve_tool_in(Tool::Typst, None, None, &candidates, None);
+        assert_eq!(Path::new(&r.bin), beside_exe);
+    }
+
+    #[test]
+    fn debug_builds_know_the_source_tree_sidecar() {
+        let Some(p) = source_tree_sidecar(Tool::Ffprobe) else {
+            return; // a target with no pinned sidecar
+        };
+        assert!(p.parent().unwrap().ends_with("src-tauri/binaries"), "{p:?}");
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("ffprobe-") && name.ends_with(std::env::consts::EXE_SUFFIX));
+    }
+
+    #[test]
+    fn notes_name_only_the_fallbacks() {
+        let tool = |tool, source| ResolvedTool {
+            tool,
+            bin: tool.name().to_string(),
+            source,
+        };
+        let tools = Toolchain {
+            ffmpeg: tool(Tool::Ffmpeg, ToolSource::Sidecar),
+            ffprobe: tool(Tool::Ffprobe, ToolSource::Path),
+            typst: tool(Tool::Typst, ToolSource::Missing),
+        };
+        let notes = tools.notes();
+        assert_eq!(notes.len(), 2);
+        assert!(notes[0].starts_with("Using ffprobe from PATH"));
+        assert!(notes[1].starts_with("typst was not found"));
+    }
 }
 
 #[cfg(all(test, unix))]

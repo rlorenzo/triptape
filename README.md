@@ -8,20 +8,23 @@ the source of truth until code exists.
 
 ## Run (Sprint 6)
 
-Prerequisites: Rust toolchain, system `ffmpeg`/`ffprobe` 9.x, `typst`
-0.15.1, `exiftool` 13.55, Node 20 + npm. No signing keys or vendor
-accounts needed.
+Prerequisites: Rust toolchain, Node 20 + npm, `exiftool` 13.55, and the
+pinned FFmpeg/ffprobe 9.0.2 and Typst 0.15.1 sidecars from
+`./scripts/fetch-sidecars` (on an Apple silicon Mac the pinned FFmpeg needs
+Rosetta 2). Without the sidecars, builds still work and the app falls back
+to `ffmpeg`/`ffprobe`/`typst` on `PATH`, with a note on the Export screen.
+No signing keys or vendor accounts needed.
 
 ```sh
 cargo build --workspace     # all Rust crates incl. Tauri glue
 cargo test --workspace      # core + media + glue unit tests
 npm install && npm run build  # frontend (Vite + Svelte 5 + Tailwind)
 npm run dev                 # browser preview (demo state, no Tauri)
-./scripts/check-ffmpeg.sh   # G1 capability gate (warns on known gaps)
+./scripts/check-ffmpeg.sh src-tauri/binaries/ffmpeg-aarch64-apple-darwin  # G1 capability gate
 ./scripts/spike-render.sh   # video spike -> /tmp/spike-render.mp4
 ./scripts/spike-book.sh     # book spike -> /tmp/book-spike/
 ./scripts/make-fixture.sh   # tiny synthetic trip -> fixtures/tiny-trip/
-./scripts/fetch-ffmpeg      # sidecar pin (BLOCKED: SHA-256 placeholders)
+./scripts/fetch-sidecars    # pinned FFmpeg, ffprobe, Typst -> src-tauri/binaries/
 ```
 
 CLI (`triptape-media` bin `triptape` — headless, no UI):
@@ -78,11 +81,16 @@ from one Export screen, with degradation rules (short film, 1–2 reel
 packs, disabled book card) and the Reels share disclosure (no blur gate,
 no extra click).
 
-Gaps: FFmpeg sidecar SHA-256 pins unfilled (system ffmpeg in dev only,
-`zscale`/`vidstab`/libass (`subtitles`) missing on plain Homebrew ffmpeg — hero captions burn (needs libass) and
-stabilization wait on the sidecar); no signing keys or update channel
-(G5 — updater wired off with a pubkey placeholder); G2/G3/G4 gates open;
-CI not yet green on Windows.
+Gaps: the pinned FFmpeg for macOS is an Intel build, so Apple silicon
+needs Rosetta 2 (owner decision pending, see
+[docs/ffmpeg-build.md](docs/ffmpeg-build.md)); a dev run without the
+sidecars uses `PATH` tools, and plain Homebrew ffmpeg has no libass, so
+captions are then written as an `.srt` instead of burned in (the Export
+screen says so); stabilization is not implemented yet; the sidecars add
+about 200 MB (macOS) and 260 MB (Windows) before installer compression; no
+signing keys or update channel (G5, updater wired off with a pubkey
+placeholder); G2/G3/G4 gates open; Windows CI with the sidecars is
+unverified until it runs.
 
 ## Git hooks
 
@@ -100,7 +108,10 @@ In an emergency, skip with `git commit --no-verify` or `git push --no-verify`.
 ## License
 
 MIT — see [LICENSE](LICENSE). FFmpeg stays a separate GPL sidecar
-executable; the project license is unaffected.
+executable; the project license is unaffected. The bundled programs, their
+licences and source links are listed in
+[resources/licenses/THIRD_PARTY.md](resources/licenses/THIRD_PARTY.md),
+which ships inside the app with the GPL text.
 
 ## Privacy
 
@@ -111,16 +122,19 @@ current state of each privacy control.
 
 ## Clean-machine notes
 
-- macOS: `brew install rust ffmpeg typst exiftool`; build with cargo.
-  No Xcode license, kernel extensions, or daemons required.
-- Windows: install Rust + the pinned static FFmpeg sidecar (see
-  `scripts/fetch-ffmpeg`); PATH fallback is dev-only.
+- macOS: `brew install rust exiftool`, then `./scripts/fetch-sidecars`
+  (and `softwareupdate --install-rosetta` on Apple silicon); build with
+  cargo. No Xcode license, kernel extensions, or daemons required.
+- Windows: install Rust, then run `./scripts/fetch-sidecars` from Git Bash.
+- Tool lookup: `TRIPTAPE_FFMPEG`/`TRIPTAPE_FFPROBE`/`TRIPTAPE_TYPST` (or the
+  CLI's `--ffmpeg`/`--ffprobe`/`--typst`), then the bundled sidecar next to
+  the executable, then `PATH` (dev only, noted).
 - Thumbnails cache in the OS cache dir with no size cap yet. Exports render
   in `.work` inside the export folder, which is removed when the export ends.
 
 ## Known blockers (Sprint 0)
 
-- Sidecar SHA-256 pins unfilled (`scripts/fetch-ffmpeg` refuses to install).
-- System ffmpeg lacks `zscale`/`drawtext`/`vidstab`/libass `subtitles` (recorded G1 gaps).
+- Sidecars pinned (FFmpeg 9.0.2, Typst 0.15.1); G1 still needs Windows CI,
+  a no-GPU baseline encode and playback checks.
 - G2 vendor workflow, G3 offline maps, G4 model budgets, G5 signed update:
   all open — see evidence in [docs/gates.md](docs/gates.md).

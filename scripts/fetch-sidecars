@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# Fetch the pinned sidecar executables Tauri bundles (`bundle.externalBin`):
+# FFmpeg + ffprobe (full GPL static builds, never --enable-nonfree) and Typst.
+#
+# Every download is checked against a pinned SHA-256 before anything is
+# extracted, and every extracted binary against its own pinned SHA-256 before
+# it is installed or run. Re-running verifies what is already installed and
+# downloads nothing when it matches. Sources, publisher verification, and the
+# re-pin procedure: docs/ffmpeg-build.md.
+#
+# Usage: ./scripts/fetch-sidecars [all|ffmpeg|typst] [--target <triple>] [--out <dir>]
+#   default: all, the host's target triple, src-tauri/binaries/
+#   Installs <out>/{ffmpeg,ffprobe,typst}-<triple>[.exe] (Tauri's naming), then
+#   runs scripts/check-ffmpeg.sh on the FFmpeg sidecar when the host can run it.
+#   Downloads are kept in $TRIPTAPE_SIDECAR_CACHE (default .sidecar-cache/).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WHAT=all
+TARGET=""
+OUT="$ROOT/src-tauri/binaries"
+CACHE="${TRIPTAPE_SIDECAR_CACHE:-$ROOT/.sidecar-cache}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    all|ffmpeg|typst) WHAT="$1" ;;
+    --target) TARGET="${2:?--target needs a triple}"; shift ;;
+    --out) OUT="${2:?--out needs a directory}"; shift ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    *) echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+host_target() {
+  case "$(uname -s)-$(uname -m)" in
+    Darwin-arm64) echo aarch64-apple-darwin ;;
+    Darwin-x86_64) echo x86_64-apple-darwin ;;
+    MINGW*-x86_64|MSYS*-x86_64|CYGWIN*-x86_64) echo x86_64-pc-windows-msvc ;;
+    *) echo "" ;;
+  esac
+}
+HOST="$(host_target)"
+TARGET="${TARGET:-$HOST}"
+if [ -z "$TARGET" ]; then
+  echo "unsupported host $(uname -s)-$(uname -m); pass --target (see docs/ffmpeg-build.md)" >&2
+  exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Pins. Change them only through the procedure in docs/ffmpeg-build.md and
+# record the new values there in the same commit.
+# ---------------------------------------------------------------------------
+FFMPEG_VERSION=9.0.2
+TYPST_VERSION=0.15.1
+
+EXE=""
+case "$TARGET" in
+  aarch64-apple-darwin|x86_64-apple-darwin)
+    # evermeet.cx static build (GPG-signed by the publisher). It is x86_64
+    # only, so Apple silicon runs it under Rosetta 2 (docs/ffmpeg-build.md).
+    FF_URL="https://evermeet.cx/ffmpeg/ffmpeg-${FFMPEG_VERSION}.zip"
+    FF_ZIP_SHA=4acc0be580f9b2788029eb7bd4d645ff87968911b0a62aeeb3940d42d54558d5
+    FF_MEMBER=ffmpeg
+    FF_SHA=a45b462cf91ed89148ae218c4577e30896485d7a6792c3673bcf5f823fa01b63
+    FP_URL="https://evermeet.cx/ffmpeg/ffprobe-${FFMPEG_VERSION}.zip"
+    FP_ZIP_SHA=24a9c968cd4da72d99c7245e914b921815835eb6dff01d99868031aebaf1d439
+    FP_MEMBER=ffprobe
+    FP_SHA=a29f8c2e03553223a8b480b1a1f04c42f680c138fa952c20086718a075db38cb
+    TY_URL="https://github.com/typst/typst/releases/download/v${TYPST_VERSION}/typst-${TARGET}.tar.xz"
+    TY_MEMBER="typst-${TARGET}/typst"
+    if [ "$TARGET" = aarch64-apple-darwin ]; then
+      TY_ARCHIVE_SHA=48f62ed034aa3a7978309579ac6ca00045e2ef0da73114e8af27cfd8e74dc05a
+      TY_SHA=7c4a136b377f3689400afe37b4f0fe3528d50faaa55cbb1106ac8a128f86ba1a
+    else
+      TY_ARCHIVE_SHA=7f9fdd9584866245de9a79e0add8f9236fae6f40a8a45e2c4771ccc14db4e0fa
+      TY_SHA=a6fb5786e71f6f95d8323b326353770734c1e4624e7c108783ea578723916b46
+    fi
+    ;;
+  x86_64-pc-windows-msvc)
+    # gyan.dev "essentials" release build (static, GPLv3), from the tagged
+    # GitHub release gyan.dev links as its mirror.
+    EXE=.exe
+    FF_URL="https://github.com/GyanD/codexffmpeg/releases/download/${FFMPEG_VERSION}/ffmpeg-${FFMPEG_VERSION}-essentials_build.zip"
+    FF_ZIP_SHA=60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba
+    FF_MEMBER="ffmpeg-${FFMPEG_VERSION}-essentials_build/bin/ffmpeg.exe"
+    FF_SHA=3256173f3f8bffd7df12227c68adf68025edb1832273a9530688a7bb1ed8edec
+    FP_URL="$FF_URL"
+    FP_ZIP_SHA="$FF_ZIP_SHA"
+    FP_MEMBER="ffmpeg-${FFMPEG_VERSION}-essentials_build/bin/ffprobe.exe"
+    FP_SHA=f0d36ecbbdd3bcfac3efa078c96c7271c2e68b3810595552ac3b7f17e9a65c52
+    TY_URL="https://github.com/typst/typst/releases/download/v${TYPST_VERSION}/typst-${TARGET}.zip"
+    TY_ARCHIVE_SHA=19ce3551153c2fe7ee9fa2f95208310c8f4d3209fedb699e0333faf8913f6736
+    TY_MEMBER="typst-${TARGET}/typst.exe"
+    TY_SHA=081217a463adb006f8894b44227fe4b9c9e91fc85f5463d5948e8370db9bb31e
+    ;;
+  *) echo "no pinned sidecars for target $TARGET (see docs/ffmpeg-build.md)" >&2; exit 2 ;;
+esac
+
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# verify <file> <sha256> <label>: delete <file> and exit 4 unless it matches.
+verify() {
+  local got
+  got="$(sha256 "$1")"
+  if [ "$got" != "$2" ]; then
+    rm -f "$1"
+    echo "FAIL: SHA-256 mismatch for $3" >&2
+    echo "  expected $2" >&2
+    echo "  got      $got" >&2
+    exit 4
+  fi
+}
+
+# fetch_archive <url> <sha256>: print the cached, verified archive path.
+# A cached copy that no longer matches is discarded and downloaded again.
+fetch_archive() {
+  local url="$1" want="$2" path
+  path="$CACHE/${want}-$(basename "$url")"
+  if [ -f "$path" ] && [ "$(sha256 "$path")" = "$want" ]; then
+    echo "$path"; return
+  fi
+  mkdir -p "$CACHE"
+  rm -f "$path" "$path.part"
+  echo "download: $url" >&2
+  curl -fsSL --retry 3 --proto '=https' --proto-redir '=https' -o "$path.part" "$url"
+  verify "$path.part" "$want" "$url"
+  mv "$path.part" "$path"
+  echo "$path"
+}
+
+# install_bin <name> <url> <archive-sha> <member> <bin-sha>: make
+# $OUT/<name>-<target><exe> the pinned binary, downloading only when the
+# installed copy is missing or does not match.
+install_bin() {
+  local name="$1" url="$2" archive_sha="$3" member="$4" want="$5"
+  local dest="$OUT/${name}-${TARGET}${EXE}"
+  if [ -f "$dest" ] && [ "$(sha256 "$dest")" = "$want" ]; then
+    echo "ok: $dest (verified, SHA-256 $want)"
+    return
+  fi
+  local archive tmp
+  archive="$(fetch_archive "$url" "$archive_sha")"
+  mkdir -p "$OUT"
+  tmp="$dest.part"
+  rm -f "$tmp"
+  case "$archive" in
+    *.zip) unzip -p "$archive" "$member" >"$tmp" ;;
+    *.tar.xz) tar -xJOf "$archive" "$member" >"$tmp" ;;
+    *) echo "unknown archive type: $archive" >&2; exit 2 ;;
+  esac
+  verify "$tmp" "$want" "extracted $member"
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$dest"
+  echo "installed: $dest (SHA-256 $want)"
+}
+
+can_run_target() {
+  [ "$TARGET" = "$HOST" ] && return 0
+  # An Intel Mac target runs on Apple silicon through Rosetta.
+  [ "$TARGET" = x86_64-apple-darwin ] && [ "$HOST" = aarch64-apple-darwin ]
+}
+
+need_rosetta() {
+  [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || return 0
+  if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+    echo "FAIL: the pinned macOS FFmpeg is an Intel build and needs Rosetta 2." >&2
+    echo "  Install it with: softwareupdate --install-rosetta --agree-to-license" >&2
+    exit 5
+  fi
+}
+
+if [ "$WHAT" = all ] || [ "$WHAT" = ffmpeg ]; then
+  echo "== FFmpeg ${FFMPEG_VERSION} for ${TARGET} =="
+  install_bin ffmpeg "$FF_URL" "$FF_ZIP_SHA" "$FF_MEMBER" "$FF_SHA"
+  install_bin ffprobe "$FP_URL" "$FP_ZIP_SHA" "$FP_MEMBER" "$FP_SHA"
+  if can_run_target; then
+    case "$TARGET" in *apple-darwin) need_rosetta ;; esac
+    "$OUT/ffprobe-${TARGET}${EXE}" -hide_banner -version | sed -n 1p
+    "$ROOT/scripts/check-ffmpeg.sh" "$OUT/ffmpeg-${TARGET}${EXE}"
+  else
+    echo "skip: cannot run $TARGET binaries on this host; check-ffmpeg.sh not run"
+  fi
+fi
+
+if [ "$WHAT" = all ] || [ "$WHAT" = typst ]; then
+  echo "== Typst ${TYPST_VERSION} for ${TARGET} =="
+  install_bin typst "$TY_URL" "$TY_ARCHIVE_SHA" "$TY_MEMBER" "$TY_SHA"
+  if [ "$TARGET" = "$HOST" ]; then
+    got="$("$OUT/typst-${TARGET}${EXE}" --version)"
+    case "$got" in
+      "typst ${TYPST_VERSION} "*) echo "ok: $got" ;;
+      *) echo "FAIL: expected typst ${TYPST_VERSION}, got: $got" >&2; exit 4 ;;
+    esac
+  fi
+fi

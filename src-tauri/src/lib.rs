@@ -15,16 +15,65 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use serde::Serialize;
 use triptape_core::db::{Db, EditedPlan};
 use triptape_core::metadata;
 use triptape_core::osxphotos::OsxPhotosIndex;
+use triptape_core::process::{ToolSource, Toolchain};
 use triptape_core::scan::{ScannedFile, VIDEO_EXTS};
 use triptape_core::types::{distinct_assets, Asset, AssetKind, Chapter, Plan, PlanEntry};
 use triptape_media::export::Skipped;
 use triptape_media::render_book::{BookPreset, MAX_BOOK_PAGES};
+
+// ---------------------------------------------------------------------------
+// Media tools
+// ---------------------------------------------------------------------------
+
+/// The FFmpeg, ffprobe and Typst every command runs, resolved once: a
+/// `TRIPTAPE_*` override, else the bundled sidecar, else `PATH` (dev only).
+/// See [`triptape_core::process::resolve_tool`].
+pub fn tools() -> &'static Toolchain {
+    Toolchain::global()
+}
+
+/// Why keepsakes may come out worse on this machine, in plain words: a tool
+/// taken from `PATH` instead of the bundled one, or an FFmpeg without the
+/// filters captions and stabilization need. Empty with the sidecars.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolStatusView {
+    pub notes: Vec<String>,
+}
+
+/// [`ToolStatusView`] for this run. The capability probe spawns FFmpeg, so
+/// the answer is computed once.
+pub fn tool_status() -> ToolStatusView {
+    static STATUS: OnceLock<ToolStatusView> = OnceLock::new();
+    STATUS
+        .get_or_init(|| {
+            let t = tools();
+            let mut notes = t.notes();
+            // A missing FFmpeg is already one note.
+            if t.ffmpeg.source != ToolSource::Missing {
+                let caps =
+                    triptape_media::ffmpeg::probe_capabilities(&t.ffmpeg.bin, &t.ffprobe.bin);
+                notes.extend(caps.degradations());
+                // The pinned macOS FFmpeg is an Intel build (docs/ffmpeg-build.md).
+                if !caps.ran()
+                    && t.ffmpeg.source == ToolSource::Sidecar
+                    && cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                {
+                    notes.push(
+                        "This Mac needs Rosetta 2 to run it: in Terminal, run softwareupdate --install-rosetta.".to_string(),
+                    );
+                }
+            }
+            ToolStatusView { notes }
+        })
+        .clone()
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -801,7 +850,7 @@ pub struct RelinkView {
 /// signature.
 pub fn fill_foreground_metadata(a: &mut Asset, library: Option<&OsxPhotosIndex>, salt: &str) {
     if a.kind == AssetKind::Video {
-        let probe = metadata::probe_video("ffprobe", &a.path).ok();
+        let probe = metadata::probe_video(&tools().ffprobe.bin, &a.path).ok();
         metadata::fill_video(a, probe.as_ref(), library, salt);
     } else {
         let exif = metadata::read_image_exif(&a.path);

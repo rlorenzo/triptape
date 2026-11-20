@@ -16,9 +16,9 @@ use triptape_app::{
     apply_live_photo_pairing, book_notes, book_presets, check_sources as check_plan_sources,
     export_dir_in, export_eligibility, export_sources, fill_assets_parallel, find_relinks,
     finished_film, keepsake_scope, paginate, parse_book_preset, plain_skip, relink_plan,
-    relinked_asset, resolve_export_parent, valid_job_kind, AppState, AssetView, BookPresetView,
-    EligibilityView, ExportSummary, JobView, RelinkView, ScanSummary, SourceCheckView, StoryData,
-    StoryEntryView, StoryView,
+    relinked_asset, resolve_export_parent, tool_status, tools, valid_job_kind, AppState, AssetView,
+    BookPresetView, EligibilityView, ExportSummary, JobView, RelinkView, ScanSummary,
+    SourceCheckView, StoryData, StoryEntryView, StoryView, ToolStatusView,
 };
 use triptape_core::{
     cluster,
@@ -121,12 +121,19 @@ fn score_asset_with_cache(cache_dir: &Path, a: &Asset) -> Scored {
     let thumb = proxies::source_cache_key(&a.id, &a.path)
         .ok()
         .map(|key| proxies::cache_path(cache_dir, "thumb", &key, ".jpg"))
-        .filter(|dst| triptape_media::ffmpeg::render_thumb("ffmpeg", &a.path, a.kind, dst).is_ok())
+        .filter(|dst| {
+            triptape_media::ffmpeg::render_thumb(&tools().ffmpeg.bin, &a.path, a.kind, dst).is_ok()
+        })
         .and_then(|dst| hash::open_image(&dst));
     if a.kind == AssetKind::Video {
         // Any failure keeps the start-of-clip trim and a neutral quality.
         let analysis = a.duration_secs.map_or_else(Default::default, |d| {
-            triptape_media::clip_analysis::analyze_clip("ffmpeg", "ffprobe", &a.path, d)
+            triptape_media::clip_analysis::analyze_clip(
+                &tools().ffmpeg.bin,
+                &tools().ffprobe.bin,
+                &a.path,
+                d,
+            )
         });
         return Scored {
             score: analysis.score(&signals),
@@ -1193,12 +1200,13 @@ fn export_blocking(
     let (_running, cancel) = RunningExport::register(&state, &job.id)?;
     emit(app, &job);
 
-    let caps = triptape_media::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
+    let caps =
+        triptape_media::ffmpeg::probe_capabilities(&tools().ffmpeg.bin, &tools().ffprobe.bin);
     let opts = triptape_media::export::ExportOptions {
         preset: choices.book_preset,
         book_max_pages: choices.book_pages,
         trip_name,
-        typst_bin: "typst".to_string(),
+        typst_bin: tools().typst.bin.clone(),
         music_paths: Vec::new(),
         keep_ambience: false,
         live_collages: choices.live_collages,
@@ -1400,7 +1408,7 @@ async fn get_thumbnail(
     tauri::async_runtime::spawn_blocking(move || {
         let key = triptape_core::proxies::source_cache_key(&asset_id, &src).ok()?;
         let dst = triptape_core::proxies::cache_path(&cache, "thumb", &key, ".jpg");
-        triptape_media::ffmpeg::render_thumb("ffmpeg", &src, kind, &dst)
+        triptape_media::ffmpeg::render_thumb(&tools().ffmpeg.bin, &src, kind, &dst)
             .ok()
             .map(|()| dst.to_string_lossy().into_owned())
     })
@@ -1548,6 +1556,16 @@ async fn get_book_presets() -> Vec<BookPresetView> {
     book_presets()
 }
 
+/// Notes for the Export screen when the media tools will make worse
+/// keepsakes: a tool taken from PATH, or an FFmpeg without libass or vidstab.
+#[tauri::command]
+async fn get_tool_status() -> Result<ToolStatusView, String> {
+    // The first call probes FFmpeg: keep that off the async executor.
+    tauri::async_runtime::spawn_blocking(tool_status)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// `book_pages` caps the book's counted pages; `None` keeps the preset
 /// default. `book_preset` is `P1` (the default) or `P2`.
 #[tauri::command]
@@ -1657,6 +1675,7 @@ fn main() {
             check_export_folder,
             get_export_eligibility,
             get_book_presets,
+            get_tool_status,
             check_sources,
             relink_sources,
             open_film,
