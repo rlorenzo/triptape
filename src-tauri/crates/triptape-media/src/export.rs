@@ -655,6 +655,13 @@ fn export_inner(
                     }
                 },
             };
+            // As displayed: a portrait shot stored sideways (EXIF rotation
+            // 90/270) must not lay out or pick the spread as a landscape.
+            let (w, h) = if matches!(a.rotation_deg, 90 | 270) {
+                (h, w)
+            } else {
+                (w, h)
+            };
             let chapter = chapter_of.get(a.id.as_str()).copied();
             book_photos.push(BookPhoto {
                 asset_id: a.id.clone(),
@@ -690,6 +697,12 @@ fn export_inner(
                 phash: a.phash,
                 people_sig: a.people_sig,
                 embedding: a.embedding.clone(),
+                // Tagged people, else detected faces (a stand-in: statues
+                // count too, which only makes the layout more careful).
+                people: a
+                    .people_count
+                    .unwrap_or(0)
+                    .max(a.faces.as_ref().map_or(0, |f| f.count)),
             });
         }
         // Story order: keep db order (taken_at, id).
