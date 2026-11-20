@@ -25,12 +25,14 @@ const AUDIO_RATE: u32 = 8000;
 const MAX_ANALYZED_SECS: f64 = 1200.0;
 
 fn run_capture(ffmpeg_bin: &str, args: &[String]) -> Option<Vec<u8>> {
-    let out = Command::new(ffmpeg_bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    // Registered with the cancel flag, so a cancel stops the decode.
+    let out = triptape_core::process::output(
+        Command::new(ffmpeg_bin)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .ok()?;
     out.status.success().then_some(out.stdout)
 }
 

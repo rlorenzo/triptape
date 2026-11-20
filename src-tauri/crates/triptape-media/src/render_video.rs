@@ -1790,7 +1790,10 @@ fn render_collage_segment(
         if live {
             // The motion recipe is not in the hold arguments; bump this
             // tag whenever the moving-cell graph or timing changes.
-            k.part("live", "7");
+            k.part("live", "8");
+            // The tone-map chain follows these, which the ffmpeg version
+            // line does not record.
+            k.part("tonemap", &format!("{}:{}", caps.tonemap, caps.zscale));
             for (i, m) in members.iter().enumerate() {
                 if let Some(p) = live_motion(m) {
                     k.file(&format!("motion{i}"), p);
@@ -1811,7 +1814,14 @@ fn render_collage_segment(
             render_hold_segment(caps, &canvas, dur, variant, res, out)?;
         } else {
             let args = live_collage_args(caps, &canvas, &moving, dur, variant, res, out);
-            caps.run(&args, out)?;
+            match caps.run(&args, out) {
+                // A motion file that will not decode must not cost the
+                // collage its stills.
+                Err(e) if !matches!(e, crate::MediaError::Cancelled) => {
+                    render_hold_segment(caps, &canvas, dur, variant, res, out)?;
+                }
+                done => done?,
+            }
         }
         Ok(dur)
     })
@@ -2242,9 +2252,12 @@ fn stagger_starts(secs: &[f64], dur: f64) -> Vec<f64> {
     let Some(last) = secs.last() else {
         return starts;
     };
-    let even = (dur - LIVE_LINGER - last) / (secs.len().max(2) - 1) as f64;
+    let last_start = (dur - LIVE_LINGER - last).max(0.0);
     for i in 1..secs.len() {
-        starts[i] = starts[i - 1] + even.clamp(0.0, secs[i - 1]);
+        // Even steps over what is left, so a step cut short by a brief
+        // motion is made up by the later ones.
+        let step = (last_start - starts[i - 1]) / (secs.len() - i) as f64;
+        starts[i] = starts[i - 1] + step.clamp(0.0, secs[i - 1]);
     }
     starts
 }
@@ -3498,6 +3511,8 @@ mod tests {
         assert!((s[3] + 2.2 - (7.0 - LIVE_LINGER)).abs() < 1e-9);
         // Short motions never leave a dead gap between cells.
         near(&stagger_starts(&[1.0, 1.0], 5.0), &[0.0, 1.0]);
+        // A short first motion: the later gap grows to keep the ending.
+        near(&stagger_starts(&[1.0, 3.0, 3.0], 7.0), &[0.0, 1.0, 3.0]);
         // Motions longer than the hold allows all start at once.
         near(&stagger_starts(&[3.0, 3.0], 3.5), &[0.0, 0.0]);
         // One moving cell starts at once; none is fine.

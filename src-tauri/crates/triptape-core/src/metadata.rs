@@ -116,7 +116,7 @@ impl FfprobeOutput {
         let tags = self.format.tags.as_ref()?;
         tags.get("creation_time")
             .and_then(|v| v.parse::<jiff::Timestamp>().ok())
-            .map(jiff::Timestamp::as_second)
+            .map(unix_floor)
     }
 
     /// Live Photo / content-identifier UUIDs, when the container carries one.
@@ -620,6 +620,9 @@ pub fn parse_tz_offset(s: &str) -> Option<i32> {
         Some(r) => (-1i32, r),
         None => (1i32, s.strip_prefix('+').unwrap_or(s)),
     };
+    if !rest.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+        return None;
+    }
     let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
     if digits.len() < 2 || digits.len() > 4 {
         return None;
@@ -645,6 +648,12 @@ pub fn local_datetime(taken_at: i64, tz_offset_secs: Option<i32>) -> Option<jiff
     let shifted = taken_at.checked_add(i64::from(tz_offset_secs.unwrap_or(0)))?;
     let ts = jiff::Timestamp::from_second(shifted).ok()?;
     Some(jiff::tz::TimeZone::UTC.to_datetime(ts))
+}
+
+/// Whole unix seconds of an instant, rounded down: half a second before
+/// 1970 is second -1, not 0.
+fn unix_floor(ts: jiff::Timestamp) -> i64 {
+    ts.as_millisecond().div_euclid(1000)
 }
 
 /// Unix seconds of a wall-clock time read as UTC.
@@ -738,7 +747,7 @@ fn nearest_wall_clock_offset(
 fn exif_datetime_to_unix(s: &str) -> Option<i64> {
     let s = s.trim();
     if let Ok(ts) = s.parse::<jiff::Timestamp>() {
-        return Some(ts.as_second());
+        return Some(unix_floor(ts));
     }
     // EXIF's colon-dated form is not RFC 3339: split any offset (`Z`,
     // `+09:00`, `+0900`, `+09`) off the wall clock by hand. The date takes
@@ -882,6 +891,8 @@ mod tests {
         assert_eq!(parse_tz_offset("+15:00"), None);
         assert_eq!(parse_tz_offset("+09:75"), None);
         assert_eq!(parse_tz_offset(""), None);
+        assert_eq!(parse_tz_offset("+09:xx"), None);
+        assert_eq!(parse_tz_offset("+09:00junk"), None);
     }
 
     #[test]
@@ -1153,12 +1164,15 @@ mod tests {
             Some(1714557600)
         );
         assert_eq!(exif_datetime_to_unix("1969:12:31 23:59:59"), Some(-1));
+        // A fraction before 1970 rounds down, as whole seconds do.
+        assert_eq!(exif_datetime_to_unix("1969-12-31T23:59:59.500Z"), Some(-1));
         // Impossible dates, offsets and partial times are refused.
         for bad in [
             "2024:02:30 10:00:00",
             "0000:00:00 00:00:00",
             "2024:05:01 24:00:00",
             "2024:05:01 10:00:00+25:00",
+            "2024:05:01 10:00:00+09:xx",
             "2024:05:01 10:00",
             "2024:05:01",
         ] {
