@@ -1176,7 +1176,11 @@ fn export_blocking(
     choices: &ExportPlan,
 ) -> Result<ExportSummary, String> {
     let state = app.state::<AppState>();
-    let (plan, assets, trip_name) = load_plan_assets(&state, project_id)?;
+    let (mut plan, assets, trip_name) = load_plan_assets(&state, project_id)?;
+    // Settings: hide home on the film's map and the book's map page, and
+    // the owner's segment cache limit.
+    let settings = triptape_app::settings::export_settings(app);
+    settings.hide_home_on(&mut plan.map_polyline);
     let out_dir = export_dir_in(&choices.parent, &trip_name, project_id);
     // Insert and mark Running before the render so the progress event
     // carries the job id the UI's Cancel button needs.
@@ -1199,6 +1203,7 @@ fn export_blocking(
     // Registered before the first emit, so Cancel always finds the flag.
     let (_running, cancel) = RunningExport::register(&state, &job.id)?;
     emit(app, &job);
+    triptape_app::settings::log_export_start(&job.id, kind, &trip_name, &plan);
 
     let caps =
         triptape_media::ffmpeg::probe_capabilities(&tools().ffmpeg.bin, &tools().ffprobe.bin);
@@ -1216,8 +1221,12 @@ fn export_blocking(
         itinerary: None,
         // The same dir the CLI uses, so `triptape cache` sees the app's
         // segments: macOS ~/Library/Caches/app.triptape.desktop/segments.
-        segment_cache: triptape_media::segment_cache::default_dir()
-            .map(triptape_media::segment_cache::SegmentCacheConfig::new),
+        segment_cache: triptape_media::segment_cache::default_dir().map(|dir| {
+            triptape_media::segment_cache::SegmentCacheConfig {
+                max_bytes: settings.segment_cache_max_bytes,
+                ..triptape_media::segment_cache::SegmentCacheConfig::new(dir)
+            }
+        }),
         // The registered flag: `cancel_job` sets it, so the render stops at
         // once instead of at the sink's next database poll.
         progress: triptape_media::progress::Progress::with_cancel(
@@ -1240,6 +1249,7 @@ fn export_blocking(
         .ok_or_else(|| "job vanished".to_string())?;
     drop(db);
     emit(app, &done);
+    triptape_app::settings::log_export_end(&done, &rendered);
     if done.state == JobState::Cancelled {
         return Err("export cancelled".to_string());
     }
@@ -1655,6 +1665,8 @@ fn main() {
                 }
             }
             app.manage(state);
+            // Settings, and the redacted log (R4).
+            triptape_app::settings::setup(app)?;
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
@@ -1686,7 +1698,19 @@ fn main() {
             set_asset_excluded,
             set_asset_included,
             swap_asset,
-            get_thumbnail
+            get_thumbnail,
+            // Settings screen (R4).
+            triptape_app::settings::get_privacy_settings,
+            triptape_app::settings::set_home,
+            triptape_app::settings::set_hide_home,
+            triptape_app::settings::trip_end_as_home,
+            triptape_app::settings::get_cache_info,
+            triptape_app::settings::set_segment_cache_cap,
+            triptape_app::settings::clear_thumbnail_cache,
+            triptape_app::settings::clear_segment_cache,
+            triptape_app::settings::get_licenses,
+            triptape_app::settings::get_diagnostic_report,
+            triptape_app::settings::save_diagnostic_report
         ])
         .build(tauri::generate_context!())
         .expect("error while building TripTape")

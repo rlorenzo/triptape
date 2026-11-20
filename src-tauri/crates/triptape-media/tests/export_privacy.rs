@@ -385,7 +385,10 @@ fn cli_export_strips_every_shared_file_and_keeps_home_out_of_sidecars() {
     let db = t.path().join("trip.db");
     let out = t.path().join("export");
     let cli = env!("CARGO_BIN_EXE_triptape");
+    // Never the app's saved settings: home comes from --home below.
+    let no_settings = t.path().join("no-settings.json");
     run(Command::new(cli)
+        .env("TRIPTAPE_SETTINGS", &no_settings)
         .args(["scan", "--folder"])
         .arg(&src)
         .arg("--db")
@@ -393,6 +396,7 @@ fn cli_export_strips_every_shared_file_and_keeps_home_out_of_sidecars() {
         .arg("--cache")
         .arg(t.path().join("cache")));
     run(Command::new(cli)
+        .env("TRIPTAPE_SETTINGS", &no_settings)
         .args(["export", "--db"])
         .arg(&db)
         .arg("--out")

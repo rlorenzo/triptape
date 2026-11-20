@@ -539,3 +539,193 @@ export function onProgress(cb: (e: ProgressEvent) => void): () => void {
   // Unsubscribing before `listen` resolves must still detach the listener.
   return () => void pending.then((unlisten) => unlisten());
 }
+
+// --- Settings ---------------------------------------------------------------
+
+/** Home, in decimal degrees. Kept on this computer only. */
+export interface Home {
+  lat: number;
+  lon: number;
+}
+
+export interface PrivacySettings {
+  home: Home | null;
+  /** Move the route out of a 500 m circle around home on every map. */
+  hideHome: boolean;
+}
+
+export interface CacheInfo {
+  thumbnailBytes: number;
+  thumbnailFiles: number;
+  segmentBytes: number;
+  segmentEntries: number;
+  /** Exports using the film pieces right now. */
+  segmentInUse: number;
+  /** The owner's limit; null means the default. */
+  segmentCapBytes: number | null;
+  defaultSegmentCapBytes: number;
+}
+
+export interface ClearResult {
+  removed: number;
+  freedBytes: number;
+  /** Kept because an export is using them. */
+  kept: number;
+}
+
+export interface LicenseInfo {
+  id: string;
+  title: string;
+  summary: string;
+  text: string;
+  links: { label: string; url: string }[];
+}
+
+const GB = 1024 ** 3;
+
+// Browser preview: settings and caches live in memory.
+const demoSettings: PrivacySettings = { home: null, hideHome: true };
+const demoCache: CacheInfo = {
+  thumbnailBytes: 48.2 * 1024 ** 2,
+  thumbnailFiles: 1240,
+  segmentBytes: 3.4 * GB,
+  segmentEntries: 212,
+  segmentInUse: 0,
+  segmentCapBytes: null,
+  defaultSegmentCapBytes: 20 * GB
+};
+
+export async function getPrivacySettings(): Promise<PrivacySettings> {
+  if (isTauri()) return invoke("get_privacy_settings");
+  return structuredClone(demoSettings);
+}
+
+/** Save home, or forget it with null. A new home switches hiding on. */
+export async function setHome(home: Home | null): Promise<PrivacySettings> {
+  if (isTauri()) return invoke("set_home", { lat: home?.lat ?? null, lon: home?.lon ?? null });
+  if (home && (Math.abs(home.lat) > 90 || Math.abs(home.lon) > 180)) {
+    throw new Error("Latitude must be from -90 to 90 and longitude from -180 to 180.");
+  }
+  if (home) demoSettings.hideHome = true;
+  demoSettings.home = home;
+  return structuredClone(demoSettings);
+}
+
+export async function setHideHome(hide: boolean): Promise<PrivacySettings> {
+  if (isTauri()) return invoke("set_hide_home", { hide });
+  demoSettings.hideHome = hide;
+  return structuredClone(demoSettings);
+}
+
+/** Where the trip's route starts or ends, to fill in as home. */
+export async function tripEndAsHome(projectId: string, which: "first" | "last"): Promise<Home> {
+  if (isTauri()) return invoke("trip_end_as_home", { projectId, which });
+  return which === "first" ? { lat: 35.0116, lon: 135.7681 } : { lat: 34.6937, lon: 135.5023 };
+}
+
+export async function getCacheInfo(): Promise<CacheInfo> {
+  if (isTauri()) return invoke("get_cache_info");
+  return structuredClone(demoCache);
+}
+
+/** The film-piece cache limit in bytes, or null for the default. */
+export async function setSegmentCacheCap(bytes: number | null): Promise<number | null> {
+  if (isTauri()) return invoke("set_segment_cache_cap", { bytes });
+  demoCache.segmentCapBytes = bytes;
+  return bytes;
+}
+
+export async function clearCache(which: "thumbnails" | "segments"): Promise<ClearResult> {
+  if (isTauri()) return invoke(which === "thumbnails" ? "clear_thumbnail_cache" : "clear_segment_cache");
+  await new Promise((r) => setTimeout(r, 300));
+  const thumbs = which === "thumbnails";
+  const result = {
+    removed: thumbs ? demoCache.thumbnailFiles : demoCache.segmentEntries,
+    freedBytes: thumbs ? demoCache.thumbnailBytes : demoCache.segmentBytes,
+    kept: 0
+  };
+  if (thumbs) Object.assign(demoCache, { thumbnailBytes: 0, thumbnailFiles: 0 });
+  else Object.assign(demoCache, { segmentBytes: 0, segmentEntries: 0 });
+  return result;
+}
+
+/** The licences, read from the files bundled with the app. */
+export async function getLicenses(): Promise<LicenseInfo[]> {
+  if (isTauri()) return invoke("get_licenses");
+  // Browser preview: the same files, from the checkout. The licence texts
+  // only load here, so the app's bundle does not carry them.
+  const [mit, gpl, typst, notice, bundled, models] = await Promise.all([
+    import("../../LICENSE?raw"),
+    import("../../resources/licenses/GPL-3.0.txt?raw"),
+    import("../../resources/licenses/Typst-LICENSE-Apache-2.0.txt?raw"),
+    import("../../resources/licenses/Typst-NOTICE.txt?raw"),
+    import("../../resources/licenses/THIRD_PARTY.md?raw"),
+    import("../../THIRD_PARTY_MODELS.md?raw")
+  ]);
+  const link = (label: string, url: string) => ({ label, url });
+  return [
+    {
+      id: "triptape",
+      title: "TripTape",
+      summary: "MIT License. Free to use, change and share.",
+      text: mit.default,
+      links: [link("Source code", "https://github.com/rlorenzo/triptape")]
+    },
+    {
+      id: "ffmpeg",
+      title: "FFmpeg and ffprobe 9.0.2",
+      summary:
+        "GNU General Public License, version 3. A separate program TripTape runs to make films and reels; it is not part of TripTape's code.",
+      text: gpl.default,
+      links: [
+        link("FFmpeg 9.0.2 source code", "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz"),
+        link("Windows build commit", "https://github.com/FFmpeg/FFmpeg/commit/946fcce07b"),
+        link("macOS build", "https://evermeet.cx/ffmpeg/"),
+        link("Windows build", "https://www.gyan.dev/ffmpeg/builds/")
+      ]
+    },
+    {
+      id: "typst",
+      title: "Typst 0.15.1",
+      summary: "Apache License 2.0. A separate program TripTape runs to lay out the photo book and titles.",
+      text: `${typst.default}\n\n${notice.default}`,
+      links: [link("Typst 0.15.1 source code", "https://github.com/typst/typst/tree/v0.15.1")]
+    },
+    {
+      id: "bundled",
+      title: "Bundled programs",
+      summary: "How the bundled programs are built and where their source is.",
+      text: bundled.default,
+      links: []
+    },
+    {
+      id: "models",
+      title: "Third-party models",
+      summary: "TripTape ships no machine-learning models yet. This ledger lists the ones planned and the licence each must have.",
+      text: models.default,
+      links: []
+    }
+  ];
+}
+
+/** A redacted report for asking for help: app, system, tools, caches and recent log lines. */
+export async function getDiagnosticReport(): Promise<string> {
+  if (isTauri()) return invoke("get_diagnostic_report");
+  return [
+    "TripTape diagnostic report",
+    `Made ${new Date().toISOString()}`,
+    "Nothing here was sent anywhere. Folder and file names are short codes; places, captions and names are left out.",
+    "",
+    "App: TripTape 0.1.0 (browser preview)",
+    "",
+    "Last 2 log lines:",
+    "2026-11-20T16:00:00Z INFO TripTape 0.1.0 started (macos aarch64)",
+    "2026-11-20T16:02:11Z INFO export job_demo render-video: done, folder ~/Movies/TripTape/<dir:1a2b3c4d>"
+  ].join("\n");
+}
+
+/** Save the report as a file in the log folder; returns its path. */
+export async function saveDiagnosticReport(): Promise<string> {
+  if (isTauri()) return invoke("save_diagnostic_report");
+  throw new Error("Saving files works in the desktop app, not this browser preview.");
+}
