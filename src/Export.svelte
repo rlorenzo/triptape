@@ -8,6 +8,7 @@
     bookPages,
     exportJob,
     frameNumbers,
+    liveCollages,
     project,
     screen,
     validBookPages
@@ -240,6 +241,13 @@
           {/if}
         </p>
       </div>
+      <div class="live">
+        <label for="live-collages">
+          <input id="live-collages" type="checkbox" disabled={busy} bind:checked={$liveCollages} aria-describedby="live-collages-hint" />
+          Live Photos move in collages
+        </label>
+        <p id="live-collages-hint">Off shows them as stills.</p>
+      </div>
       {#if madeSomething}
         <div class="again">
           <h2>Changed the story? Make them again.</h2>
@@ -405,6 +413,23 @@
 
   .pages p.bad {
     color: var(--ink);
+  }
+
+  .live {
+    padding: 0 0 16px;
+  }
+
+  .live label {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    font-weight: 500;
+  }
+
+  .live p {
+    margin-left: 21px;
+    color: var(--ink-2);
+    font-size: 13px;
   }
 
   .row {
