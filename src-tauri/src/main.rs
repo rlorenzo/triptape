@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 
 use tauri::{Emitter, Manager, State};
 use triptape_app::{
-    apply_live_photo_pairing, default_export_dir, fill_assets_parallel, paginate, valid_job_kind,
-    AppState, AssetView, ExportSummary, JobView, ScanSummary, StoryData, StoryEntryView, StoryView,
+    apply_live_photo_pairing, export_dir_in, fill_assets_parallel, finished_film, paginate,
+    resolve_export_parent, valid_job_kind, AppState, AssetView, ExportSummary, JobView,
+    ScanSummary, StoryData, StoryEntryView, StoryView,
 };
 use triptape_core::{
     cluster,
@@ -1058,24 +1059,51 @@ impl triptape_media::progress::ProgressSink for ExportProgress {
     }
 }
 
+/// The owner's export choices as they arrive over IPC. Every field is
+/// optional so an older frontend keeps today's defaults.
+#[derive(Debug, Default)]
+struct ExportChoices {
+    book_pages: Option<usize>,
+    live_collages: Option<bool>,
+    /// Folder picked in the OS dialog; `None` uses the default folder.
+    destination: Option<String>,
+}
+
+/// Choices checked and resolved, ready for a render.
+#[derive(Debug)]
+struct ExportPlan {
+    book_pages: Option<usize>,
+    live_collages: bool,
+    /// Folder the trip's own export folder goes inside.
+    parent: PathBuf,
+}
+
+impl ExportChoices {
+    /// Fail on a bad choice before a job row exists or anything renders.
+    fn validate(self) -> Result<ExportPlan, String> {
+        if let Some(n) = self.book_pages {
+            BOOK_PRESET.page_cap(Some(n))?;
+        }
+        Ok(ExportPlan {
+            book_pages: self.book_pages,
+            live_collages: live_collages_or_default(self.live_collages),
+            parent: resolve_export_parent(self.destination.as_deref())?,
+        })
+    }
+}
+
 /// Renders run on a blocking worker so ffmpeg/typst never stall the async
 /// executor (and with it `cancel_job` / `get_assets`).
 async fn run_export(
     app: tauri::AppHandle,
     project_id: String,
     kind: &'static str,
-    book_pages: Option<usize>,
-    live_collages: Option<bool>,
+    choices: ExportChoices,
 ) -> Result<ExportSummary, String> {
-    // A bad page count fails here, before a job row or any rendering.
-    if let Some(n) = book_pages {
-        BOOK_PRESET.page_cap(Some(n))?;
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        export_blocking(&app, &project_id, kind, book_pages, live_collages)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    let plan = choices.validate()?;
+    tauri::async_runtime::spawn_blocking(move || export_blocking(&app, &project_id, kind, &plan))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Live Photo motion in film collages: an omitted value (older frontends)
@@ -1134,12 +1162,11 @@ fn export_blocking(
     app: &tauri::AppHandle,
     project_id: &str,
     kind: &str,
-    book_pages: Option<usize>,
-    live_collages: Option<bool>,
+    choices: &ExportPlan,
 ) -> Result<ExportSummary, String> {
     let state = app.state::<AppState>();
     let (plan, assets, trip_name) = load_plan_assets(&state, project_id)?;
-    let out_dir = default_export_dir(&trip_name, project_id);
+    let out_dir = export_dir_in(&choices.parent, &trip_name, project_id);
     // Insert and mark Running before the render so the progress event
     // carries the job id the UI's Cancel button needs.
     let job = {
@@ -1165,12 +1192,12 @@ fn export_blocking(
     let caps = triptape_media::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
     let opts = triptape_media::export::ExportOptions {
         preset: BOOK_PRESET,
-        book_max_pages: book_pages,
+        book_max_pages: choices.book_pages,
         trip_name,
         typst_bin: "typst".to_string(),
         music_paths: Vec::new(),
         keep_ambience: false,
-        live_collages: live_collages_or_default(live_collages),
+        live_collages: choices.live_collages,
         only: keepsakes_of(kind).to_string(),
         resolution: triptape_media::resolution::Resolution::default(),
         jobs: None,
@@ -1372,18 +1399,50 @@ async fn get_thumbnail(
     .map_err(|e| e.to_string())
 }
 
+/// The folder exports go into: `folder` checked as the owner's pick, or the
+/// default folder when `None`. The Export screen shows the result and
+/// rejects an unusable pick before any export starts.
+#[tauri::command]
+async fn check_export_folder(folder: Option<String>) -> Result<String, String> {
+    resolve_export_parent(folder.as_deref()).map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Play a finished film in the default player, wherever it was saved.
+#[tauri::command]
+async fn open_film(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let film = finished_film(&path)?;
+    app.opener()
+        .open_path(film.to_string_lossy(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn export_video(
     app: tauri::AppHandle,
     project_id: String,
     live_collages: Option<bool>,
+    destination: Option<String>,
 ) -> Result<ExportSummary, String> {
-    run_export(app, project_id, "render-video", None, live_collages).await
+    let choices = ExportChoices {
+        live_collages,
+        destination,
+        ..Default::default()
+    };
+    run_export(app, project_id, "render-video", choices).await
 }
 
 #[tauri::command]
-async fn export_reels(app: tauri::AppHandle, project_id: String) -> Result<ExportSummary, String> {
-    run_export(app, project_id, "render-reels", None, None).await
+async fn export_reels(
+    app: tauri::AppHandle,
+    project_id: String,
+    destination: Option<String>,
+) -> Result<ExportSummary, String> {
+    let choices = ExportChoices {
+        destination,
+        ..Default::default()
+    };
+    run_export(app, project_id, "render-reels", choices).await
 }
 
 /// `book_pages` caps the book's counted pages; `None` keeps the preset default.
@@ -1392,8 +1451,14 @@ async fn export_book(
     app: tauri::AppHandle,
     project_id: String,
     book_pages: Option<usize>,
+    destination: Option<String>,
 ) -> Result<ExportSummary, String> {
-    run_export(app, project_id, "render-book", book_pages, None).await
+    let choices = ExportChoices {
+        book_pages,
+        destination,
+        ..Default::default()
+    };
+    run_export(app, project_id, "render-book", choices).await
 }
 
 /// One combined render for "Export all keepsakes" (instead of three passes).
@@ -1403,8 +1468,14 @@ async fn export_all(
     project_id: String,
     book_pages: Option<usize>,
     live_collages: Option<bool>,
+    destination: Option<String>,
 ) -> Result<ExportSummary, String> {
-    run_export(app, project_id, "export-all", book_pages, live_collages).await
+    let choices = ExportChoices {
+        book_pages,
+        live_collages,
+        destination,
+    };
+    run_export(app, project_id, "export-all", choices).await
 }
 
 /// Quitting must not leave FFmpeg rendering with no one to read the result.
@@ -1475,6 +1546,8 @@ fn main() {
             export_reels,
             export_book,
             export_all,
+            check_export_folder,
+            open_film,
             get_story,
             get_alternatives,
             set_chapter_place,
@@ -1502,6 +1575,37 @@ mod tests {
         assert!(live_collages_or_default(None));
         assert!(live_collages_or_default(Some(true)));
         assert!(!live_collages_or_default(Some(false)));
+    }
+
+    #[test]
+    fn export_choices_default_to_today_and_reject_bad_input() {
+        let plan = ExportChoices::default().validate().unwrap();
+        assert_eq!(plan.book_pages, None);
+        assert!(plan.live_collages);
+        assert_eq!(plan.parent, triptape_app::default_export_parent());
+
+        let dir = tempfile::tempdir().unwrap();
+        let picked = ExportChoices {
+            destination: Some(dir.path().to_string_lossy().into_owned()),
+            book_pages: Some(111),
+            live_collages: Some(false),
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(picked.parent, dir.path());
+        assert_eq!(picked.book_pages, Some(111));
+        assert!(!picked.live_collages);
+
+        let bad_pages = ExportChoices {
+            book_pages: Some(5),
+            ..Default::default()
+        };
+        assert!(bad_pages.validate().is_err());
+        let bad_folder = ExportChoices {
+            destination: Some("not/absolute".into()),
+            ..Default::default()
+        };
+        assert!(bad_folder.validate().is_err());
     }
 
     #[test]

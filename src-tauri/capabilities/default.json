@@ -1,15 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "IPC for the main window: app commands, job progress events, the trip-folder picker, and opening finished exports.",
+  "description": "IPC for the main window: app commands, job progress events, the trip-folder and export-folder pickers, and showing finished exports. Films play through the app's own open_film command, which opens only a finished film.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "dialog:allow-open",
-    "opener:allow-reveal-item-in-dir",
-    {
-      "identifier": "opener:allow-open-path",
-      "allow": [{ "path": "$VIDEO/TripTape/**" }]
-    }
+    "opener:allow-reveal-item-in-dir"
   ]
 }

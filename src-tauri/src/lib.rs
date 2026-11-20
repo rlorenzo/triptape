@@ -4,14 +4,17 @@
 //! - Coarse commands only: `scan_folder`, `get_assets`, `start_job`,
 //!   `cancel_job`, `export_video`, `export_reels`, `export_book`.
 //! - Commands take scoped identifiers (project id, asset id, job id),
-//!   never raw filesystem paths — except the folder-picker result returned
-//!   by the OS dialog, which enters only through `scan_folder`.
+//!   never raw filesystem paths — except folder-picker results returned
+//!   by the OS dialog (the trip folder through `scan_folder`, the export
+//!   folder through `check_export_folder` and the export commands, checked
+//!   by [`resolve_export_parent`]) and a finished film's path, which
+//!   `open_film` accepts only via [`finished_film`].
 //! - Progress goes out over `job://progress` events (~5 Hz), never one
 //!   invoke per file. Thumbnails are served over the `asset://` protocol
 //!   scoped to the cache dir; originals are never exposed to the webview.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -496,8 +499,18 @@ pub fn paginate<T>(items: &[T], page: usize, per_page: usize) -> &[T] {
 /// Default export destination for a trip: `~/Movies/TripTape/<trip> (<project id>)/`
 /// (Windows: `%USERPROFILE%\\Videos\\TripTape\\...`). The project id keeps two
 /// trips with the same folder name from overwriting each other's output.
-/// The frontend never sends a path; the backend derives it.
 pub fn default_export_dir(trip_name: &str, project_id: &str) -> PathBuf {
+    export_dir_in(&default_export_parent(), trip_name, project_id)
+}
+
+/// The folder trips export into unless the owner picks another one.
+pub fn default_export_parent() -> PathBuf {
+    dirs_base().join("TripTape")
+}
+
+/// One trip's export folder inside `parent`. Every trip gets its own
+/// subfolder, so a picked folder's own `book/` or `reels/` is never replaced.
+pub fn export_dir_in(parent: &Path, trip_name: &str, project_id: &str) -> PathBuf {
     let safe: String = trip_name
         .chars()
         .map(|c| {
@@ -513,9 +526,68 @@ pub fn default_export_dir(trip_name: &str, project_id: &str) -> PathBuf {
         s => s,
     };
     // `project_id` is validated by `AppState::check_id` (no separators).
-    dirs_base()
-        .join("TripTape")
-        .join(format!("{safe} ({project_id})"))
+    parent.join(format!("{safe} ({project_id})"))
+}
+
+/// The folder an export goes into: the owner's pick (from the folder dialog),
+/// else the default. A pick must be an absolute path to a folder TripTape can
+/// write to, or one it can create inside a writable folder. Nothing is
+/// created here; the export makes the folders it needs.
+pub fn resolve_export_parent(picked: Option<&str>) -> Result<PathBuf, String> {
+    let Some(raw) = picked.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(default_export_parent());
+    };
+    let unusable = "TripTape can't save keepsakes in that folder. Choose another folder.";
+    if raw.contains('\0') {
+        return Err(unusable.to_string());
+    }
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err(unusable.to_string());
+    }
+    // The nearest part of the path that exists must be a writable folder.
+    let existing = path
+        .ancestors()
+        .find(|p| p.exists())
+        .ok_or_else(|| unusable.to_string())?;
+    if !existing.is_dir() || !folder_is_writable(existing) {
+        return Err(unusable.to_string());
+    }
+    Ok(path)
+}
+
+/// Whether a file can be created (and removed) in `dir`. Probes for real:
+/// permission bits miss read-only volumes and sandbox rules.
+fn folder_is_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".triptape-write-check-{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(f) => {
+            drop(f);
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Validate a "Play film" request: only a finished film (`hero.mp4` beside its
+/// `export.json`) may be opened, wherever the owner saved it. The opener's
+/// own scope only covers the default folder.
+pub fn finished_film(path: &str) -> Result<PathBuf, String> {
+    let p = PathBuf::from(path);
+    let named_film = p.file_name().is_some_and(|n| n == "hero.mp4");
+    let finished = p
+        .parent()
+        .is_some_and(|dir| dir.join("export.json").is_file());
+    if p.is_absolute() && named_film && p.is_file() && finished {
+        Ok(p)
+    } else {
+        Err("that file is not a finished TripTape film".to_string())
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -799,6 +871,78 @@ mod tests {
         let s = d.to_string_lossy();
         assert!(!s.contains(".."));
         assert!(s.contains("TripTape"));
+    }
+
+    #[test]
+    fn export_parent_defaults_and_rejects_unusable_picks() {
+        assert_eq!(
+            resolve_export_parent(None).unwrap(),
+            default_export_parent()
+        );
+        assert_eq!(
+            resolve_export_parent(Some("  ")).unwrap(),
+            default_export_parent()
+        );
+        assert!(resolve_export_parent(Some("relative/folder")).is_err());
+        assert!(resolve_export_parent(Some("/tmp/a\0b")).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        // A file is not a folder, and nothing can be created under it.
+        assert!(resolve_export_parent(Some(file.to_str().unwrap())).is_err());
+        assert!(resolve_export_parent(Some(file.join("sub").to_str().unwrap())).is_err());
+    }
+
+    #[test]
+    fn export_parent_accepts_writable_and_creatable_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().to_str().unwrap();
+        assert_eq!(resolve_export_parent(Some(here)).unwrap(), dir.path());
+        let later = dir.path().join("not yet").join("made");
+        assert_eq!(
+            resolve_export_parent(Some(later.to_str().unwrap())).unwrap(),
+            later
+        );
+        // The check leaves nothing behind.
+        assert!(!later.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_parent_rejects_read_only_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores permission bits; the check is only meaningful otherwise.
+        if !folder_is_writable(&ro) {
+            assert!(resolve_export_parent(Some(ro.to_str().unwrap())).is_err());
+        }
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn export_dir_lives_inside_the_chosen_folder() {
+        let d = export_dir_in(Path::new("/Volumes/Photos"), "Rome", "prj_1");
+        assert_eq!(d, Path::new("/Volumes/Photos/Rome (prj_1)"));
+        assert!(default_export_dir("Rome", "prj_1").starts_with(default_export_parent()));
+    }
+
+    #[test]
+    fn only_a_finished_film_may_be_played() {
+        let dir = tempfile::tempdir().unwrap();
+        let film = dir.path().join("hero.mp4");
+        std::fs::write(&film, b"film").unwrap();
+        // Not finished yet: no export.json beside it.
+        assert!(finished_film(film.to_str().unwrap()).is_err());
+        std::fs::write(dir.path().join("export.json"), b"{}").unwrap();
+        assert_eq!(finished_film(film.to_str().unwrap()).unwrap(), film);
+        let other = dir.path().join("notes.txt");
+        std::fs::write(&other, b"x").unwrap();
+        assert!(finished_film(other.to_str().unwrap()).is_err());
+        assert!(finished_film("hero.mp4").is_err());
     }
 
     #[test]

@@ -70,6 +70,23 @@ export const bookPages = remembered<number>(
   validBookPages(Number(stored(BOOK_PAGES_KEY))) ?? BOOK_PAGES_DEFAULT
 );
 
+const exportFolderKey = (projectId: string) => `triptape-export-folder-${projectId}`;
+
+/** The folder the owner chose for this trip's keepsakes, or null for the default. */
+export function savedExportFolder(projectId: string): string | null {
+  return stored(exportFolderKey(projectId)) || null;
+}
+
+/** Remember the chosen folder for this trip; null goes back to the default. */
+export function saveExportFolder(projectId: string, folder: string | null): void {
+  try {
+    if (folder) localStorage.setItem(exportFolderKey(projectId), folder);
+    else localStorage.removeItem(exportFolderKey(projectId));
+  } catch {
+    /* private mode: the choice lasts until the screen is left */
+  }
+}
+
 const LIVE_COLLAGES_KEY = "triptape-live-collages";
 
 /** Whether Live Photos move inside the film's collages. On unless turned off. */

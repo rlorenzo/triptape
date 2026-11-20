@@ -10,13 +10,25 @@
     frameNumbers,
     liveCollages,
     project,
+    savedExportFolder,
+    saveExportFolder,
     screen,
     validBookPages
   } from "./lib/store";
   import ProgressBar from "./lib/ProgressBar.svelte";
   import { countOf, friendlyStep } from "./lib/trip";
   import { runExport, wasAttempted } from "./lib/exporter";
-  import { cancelJob, dismissInterruptedExport, getInterruptedExport, openExport, revealExport, REELS_DISCLOSURE, type ExportCmd } from "./lib/tauri";
+  import {
+    cancelJob,
+    checkExportFolder,
+    dismissInterruptedExport,
+    getInterruptedExport,
+    pickFolder,
+    playFilm,
+    revealExport,
+    REELS_DISCLOSURE,
+    type ExportCmd
+  } from "./lib/tauri";
 
   const KEEPSAKES: { cmd: Exclude<ExportCmd, "export_all">; label: string; blurb: string; button: string; note?: string }[] = [
     { cmd: "export_video", label: "Trip Video", blurb: "A 1080p film of the trip, up to about 5 minutes.", button: "Make only the film" },
@@ -45,6 +57,51 @@
     if (n !== null) bookPages.set(n);
   }
 
+  // Where the keepsakes go: the folder chosen for this trip, else the usual one.
+  let chosenFolder: string | null = null;
+  let shownFolder = "";
+  let folderError = "";
+  // The remembered folder can't be used now (a drive was unplugged, say).
+  let folderUnavailable = false;
+  function loadFolder(projectId: string | undefined) {
+    chosenFolder = projectId ? savedExportFolder(projectId) : null;
+    folderError = "";
+    folderUnavailable = false;
+    const asked = chosenFolder;
+    checkExportFolder(asked)
+      .then((path) => {
+        if (chosenFolder === asked) shownFolder = path;
+      })
+      .catch(() => {
+        if (chosenFolder !== asked) return;
+        shownFolder = asked ?? "";
+        folderUnavailable = asked !== null;
+        folderError = "TripTape can't save to this folder right now. Connect the drive it's on, or choose another folder.";
+      });
+  }
+  $: loadFolder($project?.projectId);
+
+  async function chooseFolder() {
+    folderError = "";
+    try {
+      const picked = await pickFolder("Choose where to save the keepsakes");
+      if (!picked || !$project) return;
+      const path = await checkExportFolder(picked);
+      saveExportFolder($project.projectId, picked);
+      chosenFolder = picked;
+      shownFolder = path;
+      folderUnavailable = false;
+    } catch (e) {
+      folderError = String(e);
+    }
+  }
+
+  function useUsualFolder() {
+    if (!$project) return;
+    saveExportFolder($project.projectId, null);
+    loadFolder($project.projectId);
+  }
+
   // An export that stopped when the app closed, waiting on the user's call.
   let interrupted: ExportCmd | null = null;
   function checkInterrupted(projectId: string | undefined) {
@@ -67,6 +124,8 @@
 
   $: job = $exportJob;
   $: busy = job.label !== null;
+  // Nothing can start until the chosen folder is usable again.
+  $: blocked = busy || folderUnavailable;
   $: percent = Math.round(job.progress * 100);
   $: hasPercent = job.progress > 0;
   $: summary = job.summary;
@@ -77,7 +136,7 @@
   $: poster = $assets.find((a) => a.highlight) ?? $assets[0];
 
   function start(cmd: ExportCmd) {
-    if (!$project) return;
+    if (!$project || folderUnavailable) return;
     openError = "";
     interrupted = null;
     runExport(cmd, labelFor(cmd), $project.projectId);
@@ -105,7 +164,7 @@
         <p>{k.blurb}</p>
         {#if k.note && !summary?.reels.length}<p class="note">{k.note}</p>{/if}
       </div>
-      <button class="btn" disabled={busy} on:click={() => start(k.cmd)}>{k.button}</button>
+      <button class="btn" disabled={blocked} on:click={() => start(k.cmd)}>{k.button}</button>
     </div>
   {/each}
 {/snippet}
@@ -119,7 +178,7 @@
       {/if}
     </div>
     {#if $project && !madeSomething}
-      <button class="btn btn-primary" disabled={busy} on:click={() => start("export_all")}>Make all three</button>
+      <button class="btn btn-primary" disabled={blocked} on:click={() => start("export_all")}>Make all three</button>
     {/if}
   </div>
 
@@ -147,14 +206,14 @@
     {#if interrupted && !busy}
       <div class="notice stop" role="status">
         <p>{labelFor(interrupted)} stopped when TripTape closed, so it wasn't finished. Your earlier keepsakes are untouched.</p>
-        <button class="btn" on:click={() => interrupted && start(interrupted)}>Make it again</button>
+        <button class="btn" disabled={blocked} on:click={() => interrupted && start(interrupted)}>Make it again</button>
         <button class="btn" on:click={dismissInterrupted}>Dismiss</button>
       </div>
     {/if}
 
     {#if job.error}
       <ErrorNote message="The export stopped before it finished. Try again. If it stops again, check that your computer has free disk space." detail={job.error} />
-      {#if job.cmd}<button class="btn retry" on:click={retry}>Try again</button>{/if}
+      {#if job.cmd}<button class="btn retry" disabled={blocked} on:click={retry}>Try again</button>{/if}
     {:else if job.cancelled}
       <p class="notice stop" role="status">Export cancelled. Nothing else was made.</p>
     {/if}
@@ -174,7 +233,7 @@
               <p>Your film is ready to watch together.</p>
             </div>
             <div class="made-actions">
-              <button class="btn btn-primary" on:click={() => summary?.video && open(openExport, summary.video)}>Play film</button>
+              <button class="btn btn-primary" on:click={() => summary?.video && open(playFilm, summary.video)}>Play film</button>
               <button class="btn" on:click={() => summary?.video && open(revealExport, summary.video)}>Show in folder</button>
             </div>
           </div>
@@ -218,6 +277,20 @@
     {/if}
 
     <section class="list" aria-label="Keepsakes">
+      <div class="dest">
+        <div class="dest-text">
+          <span id="dest-label" class="dest-label">Save keepsakes in</span>
+          <p id="dest-path" class="dest-path">{shownFolder}</p>
+          <p class="dest-hint">Each trip gets its own folder inside it.</p>
+        </div>
+        <div class="dest-actions">
+          <button class="btn" disabled={busy} aria-describedby="dest-label dest-path" on:click={chooseFolder}>Choose folder…</button>
+          {#if chosenFolder}
+            <button class="btn" disabled={busy} on:click={useUsualFolder}>Use the usual folder</button>
+          {/if}
+        </div>
+      </div>
+      {#if folderError}<ErrorNote message={folderError} />{/if}
       <div class="pages">
         <label for="book-pages">Most pages in the Photo Book</label>
         <input
@@ -251,7 +324,7 @@
       {#if madeSomething}
         <div class="again">
           <h2>Changed the story? Make them again.</h2>
-          <button class="btn" disabled={busy} on:click={() => start("export_all")}>Make all three again</button>
+          <button class="btn" disabled={blocked} on:click={() => start("export_all")}>Make all three again</button>
         </div>
         <details>
           <summary>Make only one</summary>
@@ -385,6 +458,40 @@
     align-items: center;
     justify-content: space-between;
     padding-bottom: 12px;
+  }
+
+  .dest {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 0 16px;
+  }
+
+  .dest-text {
+    flex: 1 1 280px;
+    min-width: 0;
+  }
+
+  .dest-label {
+    font-weight: 500;
+  }
+
+  .dest-path {
+    max-width: none;
+    overflow-wrap: anywhere;
+  }
+
+  .dest-hint {
+    color: var(--ink-2);
+    font-size: 13px;
+  }
+
+  .dest-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
   }
 
   .pages {
