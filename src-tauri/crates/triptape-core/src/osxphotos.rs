@@ -12,6 +12,7 @@
 use crate::metadata::PeopleTags;
 use rusqlite::{Connection, OpenFlags};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
 /// File name osxphotos writes at the root of an export folder.
@@ -55,13 +56,11 @@ impl LibraryEntry {
     /// The tagged people: `"_UNKNOWN_"` (and blank) entries count as
     /// unnamed faces. `None` when nobody is tagged.
     pub fn people(&self) -> Option<PeopleTags> {
-        let (unnamed, named): (Vec<&String>, Vec<&String>) = self
-            .persons
-            .iter()
-            .partition(|p| p.trim().is_empty() || p.trim() == UNKNOWN_PERSON);
+        let is_unnamed = |p: &&String| p.trim().is_empty() || p.trim() == UNKNOWN_PERSON;
+        let unnamed = self.persons.iter().filter(is_unnamed).count();
         PeopleTags::new(
-            named.into_iter().cloned(),
-            u32::try_from(unnamed.len()).unwrap_or(u32::MAX),
+            self.persons.iter().filter(|p| !is_unnamed(p)).cloned(),
+            u32::try_from(unnamed).unwrap_or(u32::MAX),
         )
     }
 }
@@ -78,7 +77,8 @@ impl OsxPhotosIndex {
     /// Load `<folder>/.osxphotos_export.db`. `None` when the file is
     /// missing, unreadable, not an osxphotos database, or maps no files.
     pub fn load(folder: &Path) -> Option<Self> {
-        let db_path = folder.join(EXPORT_DB_NAME);
+        let canon = folder.canonicalize().ok()?;
+        let db_path = canon.join(EXPORT_DB_NAME);
         if !db_path.is_file() {
             return None;
         }
@@ -88,10 +88,8 @@ impl OsxPhotosIndex {
             return None;
         }
         let mut roots = vec![folder.to_path_buf()];
-        if let Ok(canon) = folder.canonicalize() {
-            if canon != folder {
-                roots.push(canon);
-            }
+        if canon != folder {
+            roots.push(canon);
         }
         Some(Self { roots, entries })
     }
@@ -101,15 +99,6 @@ impl OsxPhotosIndex {
     pub fn get(&self, path: &Path) -> Option<&LibraryEntry> {
         let rel = self.roots.iter().find_map(|r| path.strip_prefix(r).ok())?;
         self.entries.get(&key(rel)?)
-    }
-
-    /// Number of exported files the index maps.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 }
 
@@ -131,13 +120,12 @@ fn stored_key(filepath: &str) -> Option<String> {
     key(Path::new(&filepath.replace('\\', "/")))
 }
 
-/// Open `path` read-only as an immutable database: SQLite then takes no
-/// locks and creates no journal, `-wal` or `-shm` files beside it.
+/// Open `path` (absolute) read-only as an immutable database: SQLite then
+/// takes no locks and creates no journal, `-wal` or `-shm` files beside it.
 fn open_immutable(path: &Path) -> rusqlite::Result<Connection> {
-    let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let uri = format!(
         "file:{}?mode=ro&immutable=1",
-        percent_encode(&abs.to_string_lossy())
+        percent_encode(&path.to_string_lossy())
     );
     Connection::open_with_flags(
         uri,
@@ -155,7 +143,7 @@ fn percent_encode(path: &str) -> String {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
             out.push(b as char);
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            let _ = write!(out, "%{b:02X}");
         }
     }
     out
@@ -163,24 +151,31 @@ fn percent_encode(path: &str) -> String {
 
 fn read_entries(conn: &Connection) -> rusqlite::Result<HashMap<String, LibraryEntry>> {
     let mut st = conn.prepare(
-        "SELECT e.filepath, p.photoinfo FROM export_data e JOIN photoinfo p ON p.uuid = e.uuid",
+        "SELECT e.filepath, p.uuid, p.photoinfo FROM export_data e JOIN photoinfo p ON p.uuid = e.uuid",
     )?;
     let rows = st.query_map([], |r| {
         Ok((
             r.get::<_, Option<String>>(0)?,
-            r.get::<_, Option<String>>(1)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
         ))
     })?;
+    // One photo exports as several files (still + Live Photo motion,
+    // original + edit): parse its JSON once per uuid, not once per file.
+    let mut parsed: HashMap<String, Option<LibraryEntry>> = HashMap::new();
     let mut out = HashMap::new();
     for row in rows {
         // A bad row (wrong type, bad JSON) is skipped, never fatal.
-        let Ok((Some(filepath), Some(json))) = row else {
+        let Ok((Some(filepath), uuid, Some(json))) = row else {
             continue;
         };
-        let (Some(k), Some(entry)) = (stored_key(&filepath), parse_photoinfo(&json)) else {
+        let Some(k) = stored_key(&filepath) else {
             continue;
         };
-        out.insert(k, entry);
+        let entry = parsed.entry(uuid).or_insert_with(|| parse_photoinfo(&json));
+        if let Some(entry) = entry {
+            out.insert(k, entry.clone());
+        }
     }
     Ok(out)
 }
@@ -286,7 +281,7 @@ mod tests {
             ],
         );
         let idx = OsxPhotosIndex::load(&folder).unwrap();
-        assert_eq!(idx.len(), 3, "the bad-JSON row is skipped");
+        assert_eq!(idx.entries.len(), 3, "the bad-JSON row is skipped");
         let still = idx.get(&folder.join("IMG_1.HEIC")).unwrap();
         assert_eq!(still.description.as_deref(), Some("Dinner by the river"));
         assert_eq!(still.overall, Some(0.42));
@@ -306,6 +301,45 @@ mod tests {
         assert!(idx.get(&dir.path().join("IMG_1.HEIC")).is_none());
         // Debug never prints names.
         assert!(!format!("{still:?}").contains("Ann"));
+    }
+
+    #[test]
+    fn shared_fill_helpers_use_the_library_for_stills_and_videos() {
+        use crate::metadata::{fill_photo, fill_video, ImageExif};
+        use crate::types::{Asset, AssetKind};
+        let dir = tempfile::tempdir().unwrap();
+        let info = r#"{"description":"River","persons":["Ann"],"date":"2026-10-27T10:05:38+08:00","latitude":1.29,"longitude":103.85}"#;
+        write_db(
+            dir.path(),
+            &[("IMG_1_edited.HEIC", "u1", info), ("IMG_1.mov", "u1", info)],
+        );
+        let idx = OsxPhotosIndex::load(dir.path()).unwrap();
+
+        let mut still = Asset::new("s", dir.path().join("IMG_1_edited.HEIC"), AssetKind::Photo);
+        still.mtime = 2_000_000_000;
+        let exif = ImageExif {
+            orientation: Some(6),
+            width: Some(40),
+            height: Some(30),
+            ..Default::default()
+        };
+        fill_photo(&mut still, &exif, Some(&idx), "prj");
+        assert_eq!(still.taken_at, Some(1_793_066_738));
+        assert!(!still.time_guessed);
+        assert_eq!(still.gps, Some((1.29, 103.85)));
+        assert_eq!(still.user_caption.as_deref(), Some("River"));
+        assert_eq!(still.people_count, Some(1));
+        assert_eq!(still.rotation_deg, 90);
+        assert_eq!((still.width, still.height), (Some(40), Some(30)));
+
+        // Unprobeable video: mtime, guessed, but story fields still land.
+        let mut clip = Asset::new("v", dir.path().join("IMG_1.mov"), AssetKind::Video);
+        clip.mtime = 2_000_000_001;
+        fill_video(&mut clip, None, Some(&idx), "prj");
+        assert_eq!(clip.taken_at, Some(2_000_000_001));
+        assert!(clip.time_guessed);
+        assert_eq!(clip.user_caption.as_deref(), Some("River"));
+        assert_eq!(clip.people_sig, still.people_sig);
     }
 
     #[test]
@@ -348,7 +382,7 @@ mod tests {
         let before = listing(&folder);
         assert_eq!(before, vec![EXPORT_DB_NAME.to_string()]);
         let idx = OsxPhotosIndex::load(&folder).unwrap();
-        assert_eq!(idx.len(), 1);
+        assert_eq!(idx.entries.len(), 1);
         assert_eq!(listing(&folder), before);
         drop(idx);
         assert_eq!(listing(&folder), before);

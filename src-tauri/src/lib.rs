@@ -345,44 +345,12 @@ pub struct ExportSummary {
 /// database, when present). `salt` (the project id) salts the people
 /// signature.
 pub fn fill_foreground_metadata(a: &mut Asset, library: Option<&OsxPhotosIndex>, salt: &str) {
-    let story = |a: &mut Asset, exif: Option<&metadata::ImageExif>| {
-        let lib = library.and_then(|l| l.get(&a.path));
-        metadata::story_fields(&a.path, exif, lib).apply(a, salt);
-    };
     if a.kind == AssetKind::Video {
         let probe = metadata::probe_video("ffprobe", &a.path).ok();
-        story(a, None);
-        let Some(p) = probe else {
-            a.taken_at = Some(a.mtime);
-            a.time_guessed = true;
-            return;
-        };
-        a.duration_secs = p.duration_secs();
-        if let Some((w, h)) = p.video_dims() {
-            a.width = Some(w);
-            a.height = Some(h);
-        }
-        a.rotation_deg = p.rotation_deg();
-        a.gps = p.gps();
-        let ct = metadata::resolve_capture_time(p.creation_time(), a.mtime);
-        a.taken_at = Some(ct.unix_secs);
-        a.time_guessed = ct.time_guessed;
+        metadata::fill_video(a, probe.as_ref(), library, salt);
     } else {
         let exif = metadata::read_image_exif(&a.path);
-        // EXIF capture time/GPS first; an osxphotos-exported edit without
-        // its own falls back to the library's, then to mtime.
-        let lib = library.and_then(|l| l.get(&a.path));
-        metadata::fill_photo_capture(a, &exif, lib);
-        story(a, Some(&exif));
-        a.rotation_deg = exif
-            .orientation
-            .map(metadata::orientation_to_degrees)
-            .unwrap_or(0);
-        // Undecoded stills (e.g. HEIC): EXIF carries the true size.
-        if let (Some(w), Some(h)) = (exif.width, exif.height) {
-            a.width = Some(w);
-            a.height = Some(h);
-        }
+        metadata::fill_photo(a, &exif, library, salt);
     }
 }
 

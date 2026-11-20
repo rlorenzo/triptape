@@ -230,26 +230,70 @@ pub fn fill_photo_capture(
     a.gps = exif.gps.or_else(|| library.and_then(|l| l.gps));
 }
 
+/// Fill a still's metadata from its `exif`: capture time, offset and GPS
+/// ([`fill_photo_capture`]), story fields ([`story_fields`]), rotation and
+/// the EXIF pixel size. `library` is the folder's osxphotos index (looked
+/// up once per asset); `salt` (the project id) salts the people signature.
+/// Shared by the CLI and app ingest so the two cannot drift.
+pub fn fill_photo(
+    a: &mut crate::types::Asset,
+    exif: &ImageExif,
+    library: Option<&crate::osxphotos::OsxPhotosIndex>,
+    salt: &str,
+) {
+    let lib = library.and_then(|l| l.get(&a.path));
+    fill_photo_capture(a, exif, lib);
+    story_fields(&a.path, Some(exif), lib).apply(a, salt);
+    a.rotation_deg = exif.orientation.map(orientation_to_degrees).unwrap_or(0);
+    if let (Some(w), Some(h)) = (exif.width, exif.height) {
+        a.width = Some(w);
+        a.height = Some(h);
+    }
+}
+
+/// Fill a video's metadata from its ffprobe output plus its story fields
+/// (see [`fill_photo`] for `library` and `salt`). Unprobeable videos fall
+/// back to file mtime with `time_guessed`.
+pub fn fill_video(
+    a: &mut crate::types::Asset,
+    probe: Option<&FfprobeOutput>,
+    library: Option<&crate::osxphotos::OsxPhotosIndex>,
+    salt: &str,
+) {
+    let lib = library.and_then(|l| l.get(&a.path));
+    story_fields(&a.path, None, lib).apply(a, salt);
+    let Some(p) = probe else {
+        a.taken_at = Some(a.mtime);
+        a.time_guessed = true;
+        return;
+    };
+    a.duration_secs = p.duration_secs();
+    if let Some((w, h)) = p.video_dims() {
+        a.width = Some(w);
+        a.height = Some(h);
+    }
+    a.rotation_deg = p.rotation_deg();
+    a.gps = p.gps();
+    let ct = resolve_capture_time(p.creation_time(), a.mtime);
+    a.taken_at = Some(ct.unix_secs);
+    a.time_guessed = ct.time_guessed;
+}
+
 /// Parse an ISO 8601 / RFC 3339 instant with a UTC offset (as osxphotos
 /// writes: `2026-10-27T10:05:38.928000+08:00`) to unix seconds (floored)
 /// and the offset in seconds east of UTC. `None` without an offset.
 pub fn parse_iso_instant(s: &str) -> Option<(i64, i32)> {
-    let s = s.trim();
-    let ts = s.parse::<jiff::Timestamp>().ok()?;
-    // The offset is whatever follows the time: `Z`, or the last sign past
-    // the date (dates themselves contain `-`).
-    let offset = if s.ends_with(['Z', 'z']) {
-        0
-    } else {
-        let cut = s
-            .char_indices()
-            .skip(10)
-            .filter(|(_, c)| matches!(c, '+' | '-'))
-            .last()?
-            .0;
-        parse_tz_offset(&s[cut..])?
+    use jiff::fmt::temporal::{Pieces, PiecesOffset};
+    let pieces = Pieces::parse(s.trim()).ok()?;
+    let offset = match pieces.offset()? {
+        PiecesOffset::Zulu => jiff::tz::Offset::UTC,
+        PiecesOffset::Numeric(n) => n.offset(),
+        _ => return None,
     };
-    Some((unix_floor(ts), offset))
+    let ts = offset
+        .to_timestamp(pieces.date().to_datetime(pieces.time()?))
+        .ok()?;
+    Some((unix_floor(ts), offset.seconds()))
 }
 
 /// Run ffprobe and parse its JSON. `ffprobe_bin` allows tests to stub it.
@@ -482,8 +526,7 @@ impl PeopleTags {
         }
         field(&self.unnamed.to_le_bytes());
         let digest = h.finalize();
-        let mut first = [0u8; 8];
-        first.copy_from_slice(&digest.as_bytes()[..8]);
+        let first: [u8; 8] = digest.as_bytes()[..8].try_into().expect("32-byte digest");
         u64::from_le_bytes(first)
     }
 }
@@ -528,13 +571,6 @@ pub fn xmp_people(data: &[u8]) -> Option<PeopleTags> {
         })
     };
     tagged.or_else(faces).or_else(keywords)
-}
-
-/// How many people a file's XMP says appear in the photo (see
-/// [`xmp_people`]). Counts saturate at [`MAX_PEOPLE`]; zero people yields
-/// `None`.
-pub fn xmp_people_count(data: &[u8]) -> Option<u32> {
-    xmp_people(data).map(|p| p.count())
 }
 
 /// User caption and tagged people from an XMP sidecar next to `path`
@@ -1476,6 +1512,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(people("IMG_2.heic"), None);
+    }
+
+    fn xmp_people_count(data: &[u8]) -> Option<u32> {
+        xmp_people(data).map(|p| p.count())
     }
 
     fn count_of(story: &Story) -> Option<u32> {
