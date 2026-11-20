@@ -206,11 +206,11 @@ impl Journey {
                     .dates
                     .as_deref()
                     .and_then(|d| d.split_once(".."))
-                    .and_then(|(a, _)| chrono::NaiveDate::parse_from_str(a, "%Y-%m-%d").ok())
+                    .and_then(|(a, _)| jiff::civil::Date::strptime("%Y-%m-%d", a).ok())
                     .or(from.depart_date())
                     .or(from.arrive_date());
                 match day {
-                    Some(d) => format!("Boarded {s} \u{b7} {}", d.format("%b %-d")),
+                    Some(d) => format!("Boarded {s} \u{b7} {}", d.strftime("%b %-d")),
                     None => format!("Boarded {s}"),
                 }
             });
@@ -257,7 +257,7 @@ impl Journey {
 /// Positions at sea between two dates, in capture order.
 fn sea_fixes(
     assets: &[Asset],
-    (from, to): (Option<chrono::NaiveDate>, Option<chrono::NaiveDate>),
+    (from, to): (Option<jiff::civil::Date>, Option<jiff::civil::Date>),
 ) -> Vec<(f64, f64)> {
     let (Some(from), Some(to)) = (from, to) else {
         return vec![];
@@ -645,14 +645,8 @@ mod tests {
         let mut a = Asset::new("p", std::path::PathBuf::from("p"), AssetKind::Photo);
         // Off Tanegashima on a sea day between Osaka (10-11) and Fukuoka (10-13).
         a.gps = Some((30.8, 131.5));
-        a.taken_at = Some(
-            chrono::NaiveDate::from_ymd_opt(2026, 10, 12)
-                .unwrap()
-                .and_hms_opt(12, 0, 0)
-                .unwrap()
-                .and_utc()
-                .timestamp(),
-        );
+        a.taken_at =
+            crate::metadata::wall_to_unix(jiff::civil::datetime(2026, 10, 12, 12, 0, 0, 0));
         let j = Journey::build(&it, &[a]);
         assert!(
             j.legs[3].path.iter().any(|p| p.0 < 32.0),

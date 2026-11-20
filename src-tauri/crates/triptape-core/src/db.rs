@@ -134,7 +134,7 @@ pub struct Db {
 }
 
 fn now() -> i64 {
-    chrono::Utc::now().timestamp()
+    jiff::Timestamp::now().as_second()
 }
 
 const JOB_COLS: &str = "id,kind,state,progress,error,current_step,temp_dir,project_id";
