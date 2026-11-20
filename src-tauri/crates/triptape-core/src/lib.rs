@@ -15,6 +15,7 @@ pub mod livephoto;
 pub mod metadata;
 pub mod osxphotos;
 pub mod parallel;
+pub mod pick;
 pub mod plan;
 pub mod privacy;
 pub mod process;
