@@ -844,7 +844,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
                 p.extension().and_then(|x| x.to_str()).is_some_and(|x| {
-                    matches!(x.to_ascii_lowercase().as_str(), "mp4" | "mov" | "m4v")
+                    triptape_core::scan::VIDEO_EXTS.contains(&x.to_ascii_lowercase().as_str())
                 })
             })
             .collect();
@@ -1726,11 +1726,19 @@ fn maps_cmd(flags: &HashMap<String, String>) {
             &tool_bin(flags, Tool::Ffmpeg),
             &tool_bin(flags, Tool::Ffprobe),
         );
-        for i in 0..journey.hops().len() {
+        for (i, hop) in journey.hops().iter().enumerate() {
             let mp4 = out.join(format!("hop-{:02}.mp4", i + 1));
-            let report =
-                parchment::render_hop(&caps, &journey, i, resolution, &typst_bin, &work, &mp4)
-                    .unwrap_or_else(|e| die("hop", e));
+            let report = parchment::render_hop(
+                &caps,
+                &journey,
+                hop,
+                i,
+                resolution.dims(),
+                &typst_bin,
+                &work,
+                &mp4,
+            )
+            .unwrap_or_else(|e| die("hop", e));
             for note in report.notes {
                 eprintln!("note: {note}");
             }

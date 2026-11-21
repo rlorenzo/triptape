@@ -6,7 +6,7 @@
 //! schedule exactly, and the plan's film-length budget reads
 //! [`Journey::duration_secs`], so the two cannot drift apart.
 
-use crate::itinerary::{asset_day, Itinerary, LegMode, StopKind};
+use crate::itinerary::{asset_day, ItinStop, Itinerary, LegMode, StopKind};
 use crate::searoute::{is_water, route, shape_ship_leg};
 use crate::types::Asset;
 
@@ -261,11 +261,6 @@ impl Journey {
         })
     }
 
-    /// Film time the hops and the closing whole-route map add.
-    pub fn hops_secs(&self) -> f64 {
-        self.hops().iter().map(|h| h.secs).sum::<f64>() + HOP_OVERVIEW_SECS
-    }
-
     /// Ships that appear on a leg.
     pub fn ships(&self) -> Vec<String> {
         let mut out: Vec<String> = vec![];
@@ -284,14 +279,16 @@ impl Journey {
         let mut nodes: Vec<JourneyNode> = vec![];
         let mut legs: Vec<JourneyLeg> = vec![];
         let first = itin.stop(&itin.legs[0].from).expect("validated chain");
-        nodes.push(JourneyNode {
-            pos: first.pos(),
-            label: Some(first.label.clone()),
-            pin: true,
-            arrive: first.arrive_date(),
-            home: first.kind == StopKind::Home,
-            sticker: first.sticker.as_ref().map(Into::into),
-        });
+        // `pin` is settled once every node is in.
+        let node = |stop: &ItinStop, label: Option<String>| JourneyNode {
+            pos: stop.pos(),
+            label,
+            pin: false,
+            arrive: stop.arrive_date(),
+            home: stop.kind == StopKind::Home,
+            sticker: stop.sticker.as_ref().map(Into::into),
+        };
+        nodes.push(node(first, Some(first.label.clone())));
         let mut prev_ship: Option<&str> = None;
         // Traced paths by leg, so a smoothed leg can borrow the neighbouring
         // leg's adjacent point and leave a stop with the tangent it arrived on.
@@ -351,14 +348,12 @@ impl Journey {
             let ship = leg.ship.as_deref().filter(|_| leg.mode == LegMode::Ship);
             let boarding_tag = ship.filter(|s| prev_ship != Some(*s)).map(|s| {
                 let day = leg
-                    .dates
-                    .as_deref()
-                    .and_then(|d| d.split_once(".."))
-                    .and_then(|(a, _)| jiff::civil::Date::strptime("%Y-%m-%d", a).ok())
+                    .date_range()
+                    .map(|(a, _)| a)
                     .or(from.depart_date())
                     .or(from.arrive_date());
                 match day {
-                    Some(d) => format!("Boarded {s} \u{b7} {}", d.strftime("%b %-d")),
+                    Some(d) => format!("Boarded {s} \u{b7} {}", short_date(d)),
                     None => format!("Boarded {s}"),
                 }
             });
@@ -369,20 +364,12 @@ impl Journey {
                 is_loop: leg.is_loop,
                 path,
                 boarding_tag,
-                dates: leg.dates.as_deref().and_then(|d| {
-                    let (a, b) = d.split_once("..")?;
-                    let day = |s| jiff::civil::Date::strptime("%Y-%m-%d", s).ok();
-                    Some((day(a)?, day(b)?))
-                }),
+                dates: leg.date_range(),
             });
-            nodes.push(JourneyNode {
-                pos: to.pos(),
-                label: (!to.hide_label && !leg.is_loop).then(|| to.label.clone()),
-                pin: false,
-                arrive: to.arrive_date(),
-                home: to.kind == StopKind::Home,
-                sticker: to.sticker.as_ref().map(Into::into),
-            });
+            nodes.push(node(
+                to,
+                (!to.hide_label && !leg.is_loop).then(|| to.label.clone()),
+            ));
         }
         let last = nodes.len() - 1;
         for (i, n) in nodes.iter_mut().enumerate() {
@@ -738,8 +725,6 @@ mod tests {
         // The round trip plays on its first day, not the day it returns.
         assert_eq!(hops[8].day, Some(jiff::civil::date(2026, 10, 26)));
         assert!(hops[9].home && !hops[0].home);
-        let total: f64 = hops.iter().map(|h| h.secs).sum();
-        assert!((j.hops_secs() - total - HOP_OVERVIEW_SECS).abs() < 1e-9);
         assert_eq!(
             date_span(
                 jiff::civil::date(2026, 10, 30),

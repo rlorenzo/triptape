@@ -399,9 +399,17 @@ fn closing_map_secs(route_stops: usize, map_secs: f64) -> f64 {
 /// Seconds the closing map segment will run for these options.
 fn closing_map_len(opts: &VideoOptions) -> f64 {
     match &opts.journey {
-        Some(_) if opts.map_style == MapStyle::Parchment && !opts.hop_clips.is_empty() => 0.0,
-        Some(_) if opts.map_style == MapStyle::Parchment => {
-            triptape_core::journey::HOP_OVERVIEW_SECS
+        // The owner's hop clips close the film themselves when they are
+        // adopted (one per hop, full mode only); otherwise a route map does.
+        Some(j) if opts.map_style == MapStyle::Parchment => {
+            if !opts.short_mode
+                && !opts.hop_clips.is_empty()
+                && opts.hop_clips.len() == j.hops().len()
+            {
+                0.0
+            } else {
+                triptape_core::journey::HOP_OVERVIEW_SECS
+            }
         }
         Some(j) => j.duration_secs(),
         None => closing_map_secs(
@@ -823,8 +831,7 @@ pub fn render_hero_video(
         .journey
         .as_ref()
         .filter(|_| (typst_ok || own_clips) && opts.map_style == MapStyle::Parchment);
-    // The owner's clips tell the whole journey; no route map follows them.
-    let mut route_closed = parchment.is_some() && own_clips;
+    let mut route_closed = false;
     if let Some(journey) = parchment {
         let hops = if opts.short_mode {
             vec![]
@@ -840,7 +847,7 @@ pub fn render_hero_video(
             .map(|s| s.0.taken_at.map(|t| (t, s.0.tz_offset_secs)))
             .collect();
         let cuts = triptape_core::journey::hop_cuts(&hops, &shots);
-        let adopt = own_clips && opts.hop_clips.len() == hops.len();
+        let adopt = own_clips && !hops.is_empty() && opts.hop_clips.len() == hops.len();
         if own_clips && !adopt && !hops.is_empty() {
             fallbacks.push(format!(
                 "{} hop clips for {} hops: the maps are drawn instead",
@@ -848,24 +855,30 @@ pub fn render_hero_video(
                 hops.len()
             ));
         }
-        progress.counted("video", "travel map", 0, hops.len());
+        // The owner's clips tell the whole journey; no route map follows them.
+        route_closed = adopt;
+        // Without Typst only adopted clips can play; drawn hops would all fail.
+        let todo = if adopt || typst_ok { hops.len() } else { 0 };
+        progress.counted("video", "travel map", 0, todo);
         let mut made = vec![];
-        for (i, cut) in cuts.iter().enumerate() {
+        for (i, (hop, cut)) in hops.iter().zip(&cuts).take(todo).enumerate() {
+            progress.check_cancelled()?;
             let mp4 = work_dir.join(format!("seg_hop_{i:02}.mp4"));
-            let hop = if adopt {
+            let made_hop = if adopt {
                 crate::parchment::adopt_hop_clip(caps, &opts.hop_clips[i], opts.resolution, &mp4)
             } else {
                 crate::parchment::render_hop(
                     caps,
                     journey,
+                    hop,
                     i,
-                    opts.resolution,
+                    opts.resolution.dims(),
                     &opts.typst_bin,
                     work_dir,
                     &mp4,
                 )
             };
-            match hop {
+            match made_hop {
                 Ok(rep) => {
                     fallbacks.extend(rep.notes);
                     made.push((first_shot + cut, i, mp4, rep.secs));
@@ -873,7 +886,7 @@ pub fn render_hero_video(
                 Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
                 Err(e) => fallbacks.push(format!("travel map {} skipped: {e}", i + 1)),
             }
-            progress.counted("video", "travel map", i + 1, hops.len());
+            progress.counted("video", "travel map", i + 1, todo);
         }
         // Back to front, so an insertion never shifts the ones before it.
         for (at, i, mp4, secs) in made.into_iter().rev() {
@@ -881,7 +894,7 @@ pub fn render_hero_video(
             segs.insert(at, (entry, mp4, secs, "map".into()));
         }
     }
-    if let Some(journey) = parchment.filter(|_| !own_clips) {
+    if let Some(journey) = parchment.filter(|_| !route_closed && typst_ok) {
         let png = work_dir.join("route.png");
         let close_mp4 = work_dir.join("seg_closing.mp4");
         let dur = triptape_core::journey::HOP_OVERVIEW_SECS;

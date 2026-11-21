@@ -1135,11 +1135,7 @@ pub fn render_book(
         &mut fallbacks,
     );
     let back_cover_jpg = out_dir.join("back-cover.jpg");
-    let back_cover = match (&opts.back_cover_image, &opts.journey) {
-        (Some(src), _) => adopt_back_cover(src, (tw, th), &back_cover_jpg, &mut fallbacks),
-        (None, Some(j)) => draw_back_cover(j, (tw, th), opts, &back_cover_jpg, &mut fallbacks),
-        (None, None) => None,
-    };
+    let back_cover = make_back_cover(opts, (tw, th), &back_cover_jpg, &mut fallbacks);
     let covers = (cover.as_deref(), back_cover.as_deref());
     let mut cursor = 0usize;
     let mut page_no = 0usize;
@@ -2278,52 +2274,39 @@ fn draw_cover_collage(
     }
 }
 
-/// Build `back-cover.jpg` from the owner's own picture, cropped to fill
-/// the page. `None` (with a note) when it cannot be read.
-fn adopt_back_cover(
-    src: &Path,
-    (tw, th): (u32, u32),
+/// Build `back-cover.jpg` at `size`: the owner's own picture when given,
+/// else the journey's whole route on a parchment map under the trip's
+/// name. `None` when there is neither, or (with a note) when it cannot be
+/// made; a previous export's back cover never survives beside new pages.
+fn make_back_cover(
+    opts: &BookOptions,
+    size: (u32, u32),
     out: &Path,
     fallbacks: &mut Vec<String>,
 ) -> Option<PathBuf> {
     let _ = std::fs::remove_file(out);
-    let made = image::open(src)
-        .map_err(|e| crate::MediaError::Io(format!("{}: {e}", src.display())))
-        .and_then(|img| save_jpg(&cover_fit(&img.to_rgb8(), tw, th), out));
-    match made {
+    let made = match (&opts.back_cover_image, &opts.journey) {
+        (Some(src), _) => image::open(src)
+            .map(|img| cover_fit(&img.to_rgb8(), size.0, size.1))
+            .map_err(|e| crate::MediaError::Io(format!("{}: {e}", src.display()))),
+        (None, Some(journey)) => {
+            let work = out.with_file_name(".back-cover-work");
+            let drawn = crate::parchment::render_overview(
+                journey,
+                Some(&opts.trip_name),
+                size,
+                &opts.typst_bin,
+                &work,
+            );
+            let _ = std::fs::remove_dir(&work);
+            drawn
+        }
+        (None, None) => return None,
+    };
+    match made.and_then(|img| save_jpg(&img, out)) {
         Ok(()) => Some(out.to_path_buf()),
         Err(e) => {
             fallbacks.push(format!("back cover skipped: {e}"));
-            None
-        }
-    }
-}
-
-/// Build `back-cover.jpg`: the journey's whole route on a parchment map,
-/// under the trip's name. `None` (with a note) when it cannot be drawn.
-fn draw_back_cover(
-    journey: &triptape_core::journey::Journey,
-    size: (u32, u32),
-    opts: &BookOptions,
-    out: &Path,
-    fallbacks: &mut Vec<String>,
-) -> Option<PathBuf> {
-    // A previous export's map must not survive beside new pages.
-    let _ = std::fs::remove_file(out);
-    let work = out.with_file_name(".back-cover-work");
-    let drawn = crate::parchment::render_overview(
-        journey,
-        Some(&opts.trip_name),
-        size,
-        &opts.typst_bin,
-        &work,
-    )
-    .and_then(|img| save_jpg(&img, out));
-    let _ = std::fs::remove_dir(&work);
-    match drawn {
-        Ok(()) => Some(out.to_path_buf()),
-        Err(e) => {
-            fallbacks.push(format!("back cover map skipped: {e}"));
             None
         }
     }
@@ -2598,6 +2581,22 @@ fn guide_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Book options for a P1 test book named `Test`, run with `typst_bin`.
+    fn test_opts(typst_bin: &str) -> BookOptions {
+        BookOptions {
+            preset: BookPreset::P1,
+            trip_name: "Test".into(),
+            typst_bin: typst_bin.into(),
+            ffmpeg_bin: "ffmpeg".into(),
+            max_pages: None,
+            progress: Default::default(),
+            dates: None,
+            faces: None,
+            journey: None,
+            back_cover_image: None,
+        }
+    }
 
     #[test]
     fn darken_scales_channels() {
@@ -3824,18 +3823,7 @@ mod tests {
             })
             .collect();
         let out = dir.path().join("book");
-        let opts = BookOptions {
-            preset: BookPreset::P1,
-            trip_name: "Test".into(),
-            typst_bin: "typst".into(),
-            ffmpeg_bin: "ffmpeg".into(),
-            max_pages: None,
-            progress: Default::default(),
-            dates: None,
-            faces: None,
-            journey: None,
-            back_cover_image: None,
-        };
+        let opts = test_opts("typst");
         let res = render_book(&photos, None, &[], &out, &opts).unwrap();
         assert!(
             !res.fallbacks
@@ -3904,18 +3892,7 @@ mod tests {
             .map(String::from)
             .to_vec();
         let out = dir.path().join("book");
-        let opts = BookOptions {
-            preset: BookPreset::P1,
-            trip_name: "Test".into(),
-            typst_bin: "typst-not-installed".into(),
-            ffmpeg_bin: "ffmpeg".into(),
-            max_pages: None,
-            progress: Default::default(),
-            dates: None,
-            faces: None,
-            journey: None,
-            back_cover_image: None,
-        };
+        let opts = test_opts("typst-not-installed");
         render_book(&photos, None, &titles, &out, &opts).unwrap();
         let typ = std::fs::read_to_string(out.join("proof.typ")).unwrap();
         // Proof opens page 1 on the right; press files have no blanks.
@@ -3946,7 +3923,10 @@ mod tests {
             .unwrap();
         let out = dir.path().join("back-cover.jpg");
         let mut notes = vec![];
-        let made = adopt_back_cover(&src, (120, 120), &out, &mut notes);
+        let mut opts = test_opts("typst-not-installed");
+        assert!(make_back_cover(&opts, (120, 120), &out, &mut notes).is_none());
+        opts.back_cover_image = Some(src);
+        let made = make_back_cover(&opts, (120, 120), &out, &mut notes);
         assert_eq!(made.as_deref(), Some(out.as_path()));
         assert_eq!(
             image::open(&out).unwrap().to_rgb8().dimensions(),
@@ -3954,9 +3934,24 @@ mod tests {
         );
         assert!(notes.is_empty());
         // A picture that cannot be read is noted, and no stale file is left.
-        let missing = adopt_back_cover(&dir.path().join("nope.png"), (120, 120), &out, &mut notes);
+        opts.back_cover_image = Some(dir.path().join("nope.png"));
+        let missing = make_back_cover(&opts, (120, 120), &out, &mut notes);
         assert!(missing.is_none() && !out.exists());
         assert!(notes[0].starts_with("back cover skipped"), "{notes:?}");
+        // With no picture the route map is drawn; without Typst it is noted.
+        opts.back_cover_image = None;
+        opts.journey = Some(triptape_core::journey::Journey::build(
+            &triptape_core::itinerary::Itinerary::from_json(
+                r#"{"stops": [
+                  { "id": "a", "label": "Lisbon", "lat": 38.72, "lon": -9.14 },
+                  { "id": "b", "label": "Porto", "lat": 41.15, "lon": -8.61 }
+                ], "legs": [{ "from": "a", "to": "b", "mode": "ground" }]}"#,
+            )
+            .unwrap(),
+            &[],
+        ));
+        assert!(make_back_cover(&opts, (120, 120), &out, &mut notes).is_none());
+        assert_eq!(notes.len(), 2, "{notes:?}");
         let guide = guide_text(BookPreset::P1, "Trip", 24, true, true);
         assert!(guide.contains("back-cover.jpg"));
         assert!(!guide_text(BookPreset::P1, "Trip", 24, true, false).contains("back-cover"));

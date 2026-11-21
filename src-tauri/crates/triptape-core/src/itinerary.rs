@@ -89,6 +89,13 @@ pub struct ItinLeg {
     pub path: Option<Vec<[f64; 2]>>,
 }
 
+impl ItinLeg {
+    /// The leg's `dates`, when given and well-formed.
+    pub fn date_range(&self) -> Option<(NaiveDate, NaiveDate)> {
+        self.dates.as_deref().and_then(|d| parse_range(d).ok())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Itinerary {
     pub stops: Vec<ItinStop>,
@@ -372,19 +379,15 @@ impl Itinerary {
                     continue;
                 }
             };
-            let range = leg
-                .dates
-                .as_deref()
-                .and_then(|d| parse_range(d).ok())
-                .or_else(|| {
-                    let start = self
-                        .stop(&leg.from)
-                        .and_then(|s| s.depart_date().or(s.arrive_date()))?;
-                    let end = self
-                        .stop(&leg.to)
-                        .and_then(|s| s.arrive_date().or(s.depart_date()))?;
-                    Some((start, end.max(start)))
-                });
+            let range = leg.date_range().or_else(|| {
+                let start = self
+                    .stop(&leg.from)
+                    .and_then(|s| s.depart_date().or(s.arrive_date()))?;
+                let end = self
+                    .stop(&leg.to)
+                    .and_then(|s| s.arrive_date().or(s.depart_date()))?;
+                Some((start, end.max(start)))
+            });
             let Some((start, end)) = range else {
                 prev_ship_leg = false;
                 continue;
@@ -531,10 +534,7 @@ impl Itinerary {
     /// `None` when nothing carries a date.
     pub fn span(&self) -> Option<(NaiveDate, NaiveDate)> {
         let stops = self.stops.iter().filter_map(ItinStop::window);
-        let legs = self
-            .legs
-            .iter()
-            .filter_map(|l| l.dates.as_deref().and_then(|d| parse_range(d).ok()));
+        let legs = self.legs.iter().filter_map(ItinLeg::date_range);
         stops.chain(legs).fold(None, |acc, (a, d)| {
             Some(match acc {
                 None => (a, d),

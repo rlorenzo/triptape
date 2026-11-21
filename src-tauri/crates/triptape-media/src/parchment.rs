@@ -207,11 +207,8 @@ fn land_paths(v: &View) -> (String, String) {
             if f64::from(x1) + shift < lon_l || f64::from(x0) + shift > lon_r {
                 continue;
             }
-            let seam = |p: P| {
-                [-180.0, 180.0]
-                    .iter()
-                    .any(|m| (p.0 - v.xy((0.0, m + shift)).0).abs() < 0.02)
-            };
+            let seams = [v.xy((0.0, shift - 180.0)).0, v.xy((0.0, shift + 180.0)).0];
+            let seam = |p: P| seams.iter().any(|x| (p.0 - x).abs() < 0.02);
             let projected: Vec<P> = ring
                 .pts
                 .iter()
@@ -494,8 +491,8 @@ fn sprite(
     rasterize(typst_bin, &svg, px, stem)
 }
 
-fn flatten(img: &RgbaImage) -> RgbImage {
-    image::DynamicImage::ImageRgba8(img.clone()).to_rgb8()
+fn flatten(img: RgbaImage) -> RgbImage {
+    image::DynamicImage::ImageRgba8(img).into_rgb8()
 }
 
 /// A leg's path as drawn: a sailing's corners are rounded off (two rounds
@@ -923,7 +920,7 @@ impl HopScene {
             );
         }
         let stem = |part: &str| work_dir.join(format!("parchment_{tag_name}_{part}"));
-        let sheet = flatten(&rasterize(
+        let sheet = flatten(rasterize(
             typst_bin,
             &sheet_svg(&view, &under, ""),
             (w, h),
@@ -932,24 +929,29 @@ impl HopScene {
 
         // The hop's own line, in pixels, and what travels each part of it.
         let mut pts: Vec<P> = vec![];
-        let mut stretches = vec![];
-        let ship_names = journey.ships();
+        let mut leg_ends = vec![];
         for leg in legs {
             pts.extend(drawn_path(leg).iter().map(|&p| {
                 let (x, y) = view.xy(p);
                 (x * u, y * u)
             }));
-            stretches.push(Stretch {
-                end: Track::new(pts.clone()).len(),
+            leg_ends.push(pts.len().max(1) - 1);
+        }
+        let track = Track::new(pts);
+        let ship_names = journey.ships();
+        let stretches: Vec<Stretch> = legs
+            .iter()
+            .zip(leg_ends)
+            .map(|(leg, last)| Stretch {
+                end: track.cum[last],
                 mode: leg.mode,
                 ship: leg
                     .ship
                     .as_ref()
                     .and_then(|s| ship_names.iter().position(|n| n == s))
                     .unwrap_or(0),
-            });
-        }
-        let track = Track::new(pts);
+            })
+            .collect();
 
         // A sprite that fails to render is left out and noted, never fatal.
         let skipped = std::cell::RefCell::new(vec![]);
@@ -1189,41 +1191,20 @@ impl HopScene {
     }
 }
 
-/// Render hop `index` of the journey (see [`Journey::hops`]) at `res` into
-/// `out_mp4`: H.264 with stereo silence, like the other map segments.
+/// Render `hop` of the journey (see [`Journey::hops`]; `index` is its
+/// place there) at `size` pixels into `out_mp4`: H.264 with stereo
+/// silence, like the other map segments.
+#[allow(clippy::too_many_arguments)]
 pub fn render_hop(
     caps: &Capabilities,
     journey: &Journey,
-    index: usize,
-    res: Resolution,
-    typst_bin: &str,
-    work_dir: &Path,
-    out_mp4: &Path,
-) -> Result<RecapReport, MediaError> {
-    render_hop_sized(
-        caps,
-        journey,
-        index,
-        res.dims(),
-        typst_bin,
-        work_dir,
-        out_mp4,
-    )
-}
-
-pub(crate) fn render_hop_sized(
-    caps: &Capabilities,
-    journey: &Journey,
+    hop: &Hop,
     index: usize,
     size: (u32, u32),
     typst_bin: &str,
     work_dir: &Path,
     out_mp4: &Path,
 ) -> Result<RecapReport, MediaError> {
-    let hops = journey.hops();
-    let hop = hops
-        .get(index)
-        .ok_or_else(|| MediaError::InvalidArg(format!("journey has no hop {index}")))?;
     let mut notes = vec![];
     let mut scene = HopScene::build(
         journey,
@@ -1242,9 +1223,9 @@ pub(crate) fn render_hop_sized(
     Ok(RecapReport { secs, notes })
 }
 
-/// Lead-in and hold added around a ready-made hop clip, so the crossfades
-/// into and out of it do not eat its first stroke or its arrival.
-const CLIP_LEAD_SECS: f64 = 0.4;
+/// Hold added after a ready-made hop clip (with [`HOP_LEAD_SECS`] before
+/// it), so the crossfades into and out of it do not eat its first stroke
+/// or its arrival. (A drawn hop holds for [`HOP_HOLD_SECS`] instead.)
 const CLIP_HOLD_SECS: f64 = 1.2;
 
 /// Video filter that fits a ready-made hop clip to `w` x `h` at the film's
@@ -1252,8 +1233,8 @@ const CLIP_HOLD_SECS: f64 = 1.2;
 fn clip_filter((w, h): (u32, u32)) -> String {
     format!(
         "scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,\
-         pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps={FPS},\
-         tpad=start_mode=clone:start_duration={CLIP_LEAD_SECS}:stop_mode=clone:stop_duration={CLIP_HOLD_SECS},\
+         pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={FPS},\
+         tpad=start_mode=clone:start_duration={HOP_LEAD_SECS}:stop_mode=clone:stop_duration={CLIP_HOLD_SECS},\
          format=yuv420p"
     )
 }
@@ -1274,7 +1255,7 @@ pub fn adopt_hop_clip(
             clip.display()
         )));
     }
-    let secs = info.duration_secs + CLIP_LEAD_SECS + CLIP_HOLD_SECS;
+    let secs = info.duration_secs + HOP_LEAD_SECS + CLIP_HOLD_SECS;
     let args: Vec<String> = [
         vec![
             "-y".into(),
@@ -1418,7 +1399,7 @@ pub fn render_overview(
             plaque_svg(text, label_size)
         );
     }
-    Ok(flatten(&rasterize(
+    Ok(flatten(rasterize(
         typst_bin,
         &sheet_svg(&view, &under, &over),
         size,
@@ -1550,7 +1531,7 @@ mod tests {
     fn a_ready_made_clip_is_fitted_and_held_at_both_ends() {
         let f = clip_filter((1920, 1080));
         assert!(f.starts_with("scale=1920:1080:force_original_aspect_ratio=decrease"));
-        assert!(f.contains("pad=1920:1080") && f.contains("fps=30"));
+        assert!(f.contains("pad=1920:1080") && f.contains("setsar=1") && f.contains("fps=30"));
         assert!(f.contains("start_duration=0.4") && f.contains("stop_duration=1.2"));
         assert!(!f.contains(' '), "one filter chain, no stray spaces: {f}");
     }

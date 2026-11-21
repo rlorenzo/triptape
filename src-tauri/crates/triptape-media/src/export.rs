@@ -435,6 +435,16 @@ fn export_inner(
     // Every keepsake reads its places from here (chapter names are already
     // in the plan): none names a place on its own.
     let places = triptape_core::places::photo_places(plan, assets, opts.itinerary.as_ref());
+    // The film and the book share one journey; building it routes every
+    // sailing, so it is built once, and only if one of them asks.
+    let journey_cell = std::cell::OnceCell::new();
+    let journey = || {
+        opts.itinerary.as_ref().map(|i| {
+            journey_cell
+                .get_or_init(|| triptape_core::journey::Journey::build(i, assets))
+                .clone()
+        })
+    };
 
     // Validated here too, so a bad cap fails before the free-space check.
     let book_cap = opts
@@ -526,10 +536,7 @@ fn export_inner(
                 jobs: opts.jobs,
                 map_style: opts.map_style,
                 hop_clips: opts.hop_clips.clone(),
-                journey: opts
-                    .itinerary
-                    .as_ref()
-                    .map(|i| triptape_core::journey::Journey::build(i, assets)),
+                journey: journey(),
                 route_stops: if opts.itinerary.is_some() {
                     vec![]
                 } else {
@@ -793,10 +800,7 @@ fn export_inner(
                     .or(photo_span)
                     .map(|(a, b)| triptape_core::plan::date_range_label(a, b)),
                 faces: opts.faces.clone(),
-                journey: opts
-                    .itinerary
-                    .as_ref()
-                    .map(|i| triptape_core::journey::Journey::build(i, assets)),
+                journey: journey(),
                 back_cover_image: opts.back_cover.clone(),
             },
         ) {
