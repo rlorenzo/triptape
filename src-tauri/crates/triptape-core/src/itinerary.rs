@@ -504,15 +504,6 @@ impl Itinerary {
         })
     }
 
-    /// The port the ship calls at on `day`, when it does: a port day spent
-    /// ashore is about the port even if its first shots were on deck.
-    pub fn port_on(&self, day: NaiveDate) -> Option<String> {
-        self.stops
-            .iter()
-            .find(|s| s.kind == StopKind::Port && s.active_on(day) && !s.hide_label)
-            .map(|s| s.label.clone())
-    }
-
     /// First and last day of the trip: the earliest and latest dates of
     /// any stop or dated leg (a cruise may give only its leg's `dates`).
     /// `None` when nothing carries a date.
@@ -686,7 +677,7 @@ fn relabel_chapter(
 /// A relabelled chapter's name, shared by every keepsake: a place the
 /// owner named when most of its photos are there; on board, the boarding
 /// (`Carnival Luminosa Embarkation`) on a cruise's first or last day, else
-/// the port on a port day, else the ship; ashore, the attraction its
+/// the ship (on a port day too); ashore, the attraction its
 /// photos visited (see [`crate::places`]), else the stop's city.
 fn chapter_name(
     itin: &Itinerary,
@@ -706,10 +697,9 @@ fn chapter_name(
         return name.to_string();
     }
     if label.on_ship {
-        return itin
-            .boarding(day)
-            .or_else(|| itin.port_on(day))
-            .unwrap_or(label.place);
+        // Shots aboard on a port day (the lounge, the cabin, the party
+        // that stayed on the ship) are the ship's, not the port's.
+        return itin.boarding(day).unwrap_or(label.place);
     }
     let fixes: Vec<(f64, f64)> = members.iter().filter_map(|a| a.gps).collect();
     // Neither a hidden name nor the hotel's neighbourhood (a home base).
@@ -1067,12 +1057,16 @@ mod tests {
             let label = chapter_label(it, day(date), &refs).unwrap();
             chapter_name(it, day(date), &refs, label, &Default::default(), 3)
         };
-        // On board on the cruise's first day, and on a port day.
+        // On board on the cruise's first day; on a port day, shots aboard
+        // (the party that stayed on the ship) are the ship's.
         assert_eq!(
             name(&it, "2026-10-09", (35.6190, 139.7766), 3),
             "Carnival Luminosa Embarkation"
         );
-        assert_eq!(name(&it, "2026-10-11", (34.656, 135.4306), 3), "Osaka");
+        assert_eq!(
+            name(&it, "2026-10-11", (34.656, 135.4306), 3),
+            "Carnival Luminosa"
+        );
         // At sea: the ship.
         assert_eq!(
             name(&it, "2026-10-10", (30.0, 140.0), 3),
@@ -1125,14 +1119,6 @@ mod tests {
         for p in ["Osaka", "Carnival Luminosa Deck 9", "Carnival"] {
             assert!(!is_ship_place(&ships, p), "{p}");
         }
-    }
-
-    #[test]
-    fn port_on_names_port_days_only() {
-        assert_eq!(itin().port_on(day("2026-10-11")).as_deref(), Some("Osaka"));
-        assert_eq!(itin().port_on(day("2026-10-10")), None);
-        // The embarkation port is hidden on the map and has no port day.
-        assert_eq!(itin().port_on(day("2026-10-09")), None);
     }
 
     #[test]
