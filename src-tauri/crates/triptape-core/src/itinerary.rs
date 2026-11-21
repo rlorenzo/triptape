@@ -61,6 +61,10 @@ pub struct ItinStop {
     /// no pin label on the map.
     #[serde(default)]
     pub hide_label: bool,
+    /// Artwork for the stop on the parchment travel maps (a PNG or JPEG;
+    /// a path relative to the itinerary file is resolved on load).
+    #[serde(default)]
+    pub sticker: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +87,13 @@ pub struct ItinLeg {
     /// generated path. Must have two or more points.
     #[serde(default)]
     pub path: Option<Vec<[f64; 2]>>,
+}
+
+impl ItinLeg {
+    /// The leg's `dates`, when given and well-formed.
+    pub fn date_range(&self) -> Option<(NaiveDate, NaiveDate)> {
+        self.dates.as_deref().and_then(|d| parse_range(d).ok())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -211,7 +222,16 @@ impl Itinerary {
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("read itinerary {}: {e}", path.display()))?;
-        Self::from_json(&text)
+        let mut it = Self::from_json(&text)?;
+        // Sticker paths are written relative to the itinerary file.
+        if let Some(dir) = path.parent() {
+            for stop in &mut it.stops {
+                if let Some(s) = &mut stop.sticker {
+                    *s = dir.join(&*s).to_string_lossy().into_owned();
+                }
+            }
+        }
+        Ok(it)
     }
 
     /// The owner-named place a shot was taken in: one whose time window
@@ -359,19 +379,15 @@ impl Itinerary {
                     continue;
                 }
             };
-            let range = leg
-                .dates
-                .as_deref()
-                .and_then(|d| parse_range(d).ok())
-                .or_else(|| {
-                    let start = self
-                        .stop(&leg.from)
-                        .and_then(|s| s.depart_date().or(s.arrive_date()))?;
-                    let end = self
-                        .stop(&leg.to)
-                        .and_then(|s| s.arrive_date().or(s.depart_date()))?;
-                    Some((start, end.max(start)))
-                });
+            let range = leg.date_range().or_else(|| {
+                let start = self
+                    .stop(&leg.from)
+                    .and_then(|s| s.depart_date().or(s.arrive_date()))?;
+                let end = self
+                    .stop(&leg.to)
+                    .and_then(|s| s.arrive_date().or(s.depart_date()))?;
+                Some((start, end.max(start)))
+            });
             let Some((start, end)) = range else {
                 prev_ship_leg = false;
                 continue;
@@ -518,10 +534,7 @@ impl Itinerary {
     /// `None` when nothing carries a date.
     pub fn span(&self) -> Option<(NaiveDate, NaiveDate)> {
         let stops = self.stops.iter().filter_map(ItinStop::window);
-        let legs = self
-            .legs
-            .iter()
-            .filter_map(|l| l.dates.as_deref().and_then(|d| parse_range(d).ok()));
+        let legs = self.legs.iter().filter_map(ItinLeg::date_range);
         stops.chain(legs).fold(None, |acc, (a, d)| {
             Some(match acc {
                 None => (a, d),

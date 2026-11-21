@@ -7,10 +7,11 @@
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
 //!                [--solo REF...] [--unsolo REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
-//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
 //! triptape cache stats|clear [--segment-cache DIR]
 //! triptape pick --db trip.db --out /path/to/new-folder [--count 800] [--project ID] [--stills-only]
+//! triptape maps --itinerary itinerary.json --out /path/to/out [--db trip.db] [--title TEXT] [--resolution 4k|1080p] [--page WxH] [--stills-only]
 //! ```
 //!
 //! Without `--home` or `--segment-cache-max`, `plan`, `export` and `cache`
@@ -41,9 +42,10 @@ use triptape_media::{
     clip_analysis,
     export::export_all,
     export::ExportOptions,
-    ffmpeg,
+    ffmpeg, parchment,
     progress::{ConsoleProgress, Progress},
     render_book::BookPreset,
+    render_video::MapStyle,
     resolution::Resolution,
     segment_cache::{self, SegmentCacheConfig},
 };
@@ -832,6 +834,30 @@ fn export_cmd(flags: &HashMap<String, String>) {
     } else {
         Progress::new(console.clone())
     };
+    let map_style = MapStyle::from_flag(&flag_or(flags, "map-style", "parchment"))
+        .unwrap_or_else(|e| die("map-style", e));
+    // The owner's own travel clips (one video per hop of the itinerary,
+    // in name order) and back-cover picture, used in place of drawn ones.
+    let hop_clips = flags.get("hop-clips").map_or_else(Vec::new, |dir| {
+        let mut clips: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| die("hop-clips", format!("{dir}: {e}")))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension().and_then(|x| x.to_str()).is_some_and(|x| {
+                    triptape_core::scan::VIDEO_EXTS.contains(&x.to_ascii_lowercase().as_str())
+                })
+            })
+            .collect();
+        clips.sort();
+        if clips.is_empty() {
+            die("hop-clips", format!("no video clips in {dir}"));
+        }
+        clips
+    });
+    let back_cover = flags.get("back-cover").map(PathBuf::from);
+    if let Some(p) = back_cover.as_ref().filter(|p| !p.is_file()) {
+        die("back-cover", format!("not found: {}", p.display()));
+    }
     let segment_cache = segment_cache_config(flags);
     // Only the book crops around faces; skip loading the models otherwise.
     let faces = matches!(only.as_str(), "all" | "book")
@@ -858,6 +884,9 @@ fn export_cmd(flags: &HashMap<String, String>) {
             segment_cache,
             itinerary,
             faces,
+            map_style,
+            hop_clips,
+            back_cover,
         },
     );
     console.finish();
@@ -1653,6 +1682,73 @@ fn pick_cmd(flags: &HashMap<String, String>) {
     }
 }
 
+/// `maps`: the itinerary's parchment travel maps on their own, to look at
+/// before a full export: a clip per hop (`hop-01.mp4`...), the whole route
+/// at film size (`route.png`) and at a book page's size (`back-cover.jpg`).
+fn maps_cmd(flags: &HashMap<String, String>) {
+    let out = need(flags, "out");
+    let itinerary = load_itinerary(flags).unwrap_or_else(|| die("maps", "--itinerary is required"));
+    // With a library, ship legs follow the photos' positions at sea.
+    let assets = flags.get("db").map_or_else(Vec::new, |db| {
+        Db::open(Path::new(db))
+            .unwrap_or_else(|e| die("open db", e))
+            .edited_plan_with(flags.get("project").map(String::as_str), Some(&itinerary))
+            .unwrap_or_else(|e| die("plan", e))
+            .map_or_else(Vec::new, |p| p.assets)
+    });
+    let journey = triptape_core::journey::Journey::build(&itinerary, &assets);
+    let resolution = Resolution::from_flag(&flag_or(flags, "resolution", "1080p"))
+        .unwrap_or_else(|e| die("resolution", e));
+    let page = flag_or(flags, "page", "3600x3600");
+    let page = page
+        .split_once('x')
+        .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+        .filter(|&(w, h)| w >= 200 && h >= 200)
+        .unwrap_or_else(|| die("page", "want WIDTHxHEIGHT in pixels, e.g. 3600x3600"));
+    let typst_bin = tool_bin(flags, Tool::Typst);
+    std::fs::create_dir_all(&out).unwrap_or_else(|e| die("out", e));
+    let title = flags.get("title").map(String::as_str);
+    let route = parchment::render_overview(&journey, None, resolution.dims(), &typst_bin)
+        .unwrap_or_else(|e| die("route map", e));
+    route
+        .save(out.join("route.png"))
+        .unwrap_or_else(|e| die("route map", e));
+    println!("map: {}", out.join("route.png").display());
+    let cover = parchment::render_overview(&journey, title, page, &typst_bin)
+        .unwrap_or_else(|e| die("back cover", e));
+    cover
+        .save(out.join("back-cover.jpg"))
+        .unwrap_or_else(|e| die("back cover", e));
+    println!("map: {}", out.join("back-cover.jpg").display());
+    if !flags.get("stills-only").is_some_and(|v| v != "false") {
+        let caps = ffmpeg::probe_capabilities(
+            &tool_bin(flags, Tool::Ffmpeg),
+            &tool_bin(flags, Tool::Ffprobe),
+        );
+        // Hops from an earlier run (a longer itinerary) must not be left
+        // among the new ones: `--hop-clips` counts the videos in a folder.
+        for old in std::fs::read_dir(&out).into_iter().flatten().flatten() {
+            let name = old.file_name().to_string_lossy().into_owned();
+            let number = name
+                .strip_prefix("hop-")
+                .and_then(|n| n.strip_suffix(".mp4"));
+            if number.is_some_and(|n| n.len() == 2 && n.bytes().all(|b| b.is_ascii_digit())) {
+                std::fs::remove_file(old.path()).unwrap_or_else(|e| die("old hop clip", e));
+            }
+        }
+        for (i, hop) in journey.hops().iter().enumerate() {
+            let mp4 = out.join(format!("hop-{:02}.mp4", i + 1));
+            let report =
+                parchment::render_hop(&caps, &journey, hop, resolution.dims(), &typst_bin, &mp4)
+                    .unwrap_or_else(|e| die("hop", e));
+            for note in report.notes {
+                eprintln!("note: {note}");
+            }
+            println!("map: {} ({:.1} s)", mp4.display(), report.secs);
+        }
+    }
+}
+
 fn main() {
     let (cmd, flags) = parse_args();
     match cmd.as_str() {
@@ -1660,11 +1756,12 @@ fn main() {
         "plan" => plan_cmd(&flags),
         "export" => export_cmd(&flags),
         "pick" => pick_cmd(&flags),
+        "maps" => maps_cmd(&flags),
         "learn" => learn_cmd(&flags),
         "cache" => cache_cmd(std::env::args().nth(2).as_deref().unwrap_or(""), &flags),
         "edit" => edit_cmd(&std::env::args().skip(2).collect::<Vec<_>>()),
         _ => {
-            eprintln!("unknown command {cmd}; want scan|plan|edit|learn|export|pick|cache");
+            eprintln!("unknown command {cmd}; want scan|plan|edit|learn|export|pick|maps|cache");
             std::process::exit(2);
         }
     }

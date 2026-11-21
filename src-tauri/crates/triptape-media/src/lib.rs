@@ -5,6 +5,7 @@ pub mod export;
 pub mod ffmpeg;
 pub mod map;
 pub mod music;
+pub mod parchment;
 pub mod progress;
 pub mod render_book;
 pub mod render_reels;
