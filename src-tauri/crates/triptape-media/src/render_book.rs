@@ -1844,6 +1844,17 @@ fn typst_text_png(
 /// Indices of up to 12 cover tiles. People make the cover: tiles come from
 /// photos with people in them (`has_people[i]`), evenly through the trip,
 /// topped up from the rest only when too few. Returned in trip order.
+/// A photo the cover prefers: people in it, and a camera original. A PNG
+/// is a screenshot or an edit saved as an image (a "2009 vs 2026"
+/// side-by-side), which reads as clutter in a cover tile.
+fn cover_worthy(p: &BookPhoto) -> bool {
+    let png = p
+        .path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"));
+    p.people > 0 && !png
+}
+
 fn cover_picks(has_people: &[bool]) -> Vec<usize> {
     let (with_people, rest): (Vec<usize>, Vec<usize>) =
         (0..has_people.len()).partition(|&i| has_people[i]);
@@ -1874,7 +1885,7 @@ fn draw_cover_collage(
     if photos.is_empty() {
         return None;
     }
-    let picks = cover_picks(&photos.iter().map(|p| p.people > 0).collect::<Vec<_>>());
+    let picks = cover_picks(&photos.iter().map(cover_worthy).collect::<Vec<_>>());
     let (cols, rows) = cover_grid(picks.len());
     let gap = 14u32;
     let tile_w = (tw - gap * (cols + 1)) / cols;
@@ -3342,6 +3353,19 @@ mod tests {
             .collect();
         // Hero (Lisbon), spread (Sintra, used up), then dividers in order.
         assert!(at.windows(2).all(|w| w[0] < w[1]), "{titles:?} at {at:?}");
+    }
+
+    #[test]
+    fn cover_prefers_camera_photos_of_people() {
+        let shot = |path: &str, people: u32| BookPhoto {
+            path: PathBuf::from(path),
+            people,
+            ..blank_photo()
+        };
+        assert!(cover_worthy(&shot("IMG_1028.HEIC", 3)));
+        assert!(!cover_worthy(&shot("E5B14CFD.png", 3)), "composite");
+        assert!(!cover_worthy(&shot("SHOT.PNG", 1)));
+        assert!(!cover_worthy(&shot("IMG_1.HEIC", 0)), "no people");
     }
 
     #[test]
