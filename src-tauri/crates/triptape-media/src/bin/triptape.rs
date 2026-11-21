@@ -197,6 +197,9 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         eprintln!("{note}");
     }
 
+    // Plan flags are checked before any write, so a typo never leaves a
+    // half-refreshed project behind.
+    let (overrides, length) = plan_flags(flags);
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
     let name = folder
         .file_name()
@@ -205,12 +208,19 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     // asset id for every file still there, so Story edits (exclusions,
     // captions) keep pointing at the right photos.
     let folder_key = folder.to_string_lossy().into_owned();
-    // Older CLI scans stored the folder exactly as typed.
+    // Older CLI scans stored the folder exactly as typed. Only an absolute
+    // spelling names the same folder for sure (a relative `photos` could
+    // be any trip's); a project found that way moves to the canonical path.
     let raw_key = raw_folder.to_string_lossy().into_owned();
+    let mut relocate = false;
     let existing = db
         .project_for_folder(&folder_key)
         .and_then(|found| match found {
-            None if raw_key != folder_key => db.project_for_folder(&raw_key),
+            None if raw_key != folder_key && raw_folder.is_absolute() => {
+                let legacy = db.project_for_folder(&raw_key)?;
+                relocate = legacy.is_some();
+                Ok(legacy)
+            }
             found => Ok(found),
         })
         .unwrap_or_else(|e| die("find project", e));
@@ -227,6 +237,7 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     };
     let mut ids = AssetIds::new(
         &project.id,
+        rescan,
         db.list_assets(&project.id)
             .unwrap_or_else(|e| die("list assets", e))
             .into_iter()
@@ -444,13 +455,38 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         a.score = scores.get(&a.id).cloned();
     }
 
-    // Persist assets, clusters, and links in one transaction.
+    let cluster_of = cluster::chapter_labels(&clusters);
+    let plan_assets: Vec<Asset> = final_assets
+        .iter()
+        .filter(|a| !suppressed.contains(&a.id))
+        .cloned()
+        .collect();
+    let p = planmod::build_plan_with_length(&plan_assets, &cluster_of, &scores, &overrides, length);
+    let elig = planmod::plan_eligibility(
+        plan_assets.len(),
+        plan_assets
+            .iter()
+            .filter(|a| a.kind != AssetKind::Video)
+            .count(),
+        clusters.len(),
+    );
+
+    // Persist assets, clusters, links and the plan in one transaction: a
+    // failure leaves the project exactly as it was.
+    let mut plan_id = String::new();
     let persisted = db.in_transaction(|db| {
         if rescan {
-            // Files gone from the folder leave; the day clusters rebuild.
-            let keep: Vec<String> = final_assets.iter().map(|a| a.id.clone()).collect();
+            // Files gone from the folder leave, unless the walk was partial
+            // (an unreadable folder is not a deleted one); the day clusters
+            // rebuild.
             db.clear_project_clusters(&project.id)?;
-            db.delete_stale_assets(&project.id, &keep)?;
+            if result.errors.is_empty() {
+                let keep: Vec<String> = final_assets.iter().map(|a| a.id.clone()).collect();
+                db.delete_stale_assets(&project.id, &keep)?;
+            }
+            if relocate {
+                db.set_project_folder(&project.id, &folder_key)?;
+            }
             // Only a committed rescan makes the project latest.
             db.touch_project(&project.id)?;
         }
@@ -466,6 +502,9 @@ fn scan_cmd(flags: &HashMap<String, String>) {
                     .map_err(|e| format!("link {id} -> {}: {e}", c.id))?;
             }
         }
+        plan_id = db
+            .insert_plan(&project.id, &p, "local")
+            .map_err(|e| format!("insert plan: {e}"))?;
         Ok(())
     });
     if let Err(e) = persisted {
@@ -496,26 +535,6 @@ fn scan_cmd(flags: &HashMap<String, String>) {
             }
         }
     }
-
-    let cluster_of = cluster::chapter_labels(&clusters);
-    let plan_assets: Vec<Asset> = final_assets
-        .iter()
-        .filter(|a| !suppressed.contains(&a.id))
-        .cloned()
-        .collect();
-    let (overrides, length) = plan_flags(flags);
-    let p = planmod::build_plan_with_length(&plan_assets, &cluster_of, &scores, &overrides, length);
-    let elig = planmod::plan_eligibility(
-        plan_assets.len(),
-        plan_assets
-            .iter()
-            .filter(|a| a.kind != AssetKind::Video)
-            .count(),
-        clusters.len(),
-    );
-    let plan_id = db
-        .insert_plan(&project.id, &p, "local")
-        .unwrap_or_else(|e| die("insert plan", e));
 
     println!("project: {}", project.id);
     println!("files: {}", result.files.len());
@@ -558,28 +577,29 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     }
 }
 
-/// Asset ids for one scan: a file the project already holds keeps its id;
-/// a new file takes the next free `{project}_a{n:05}`. (`assets.id` is
-/// database-wide, hence the project prefix.)
+/// Asset ids for one scan: a file the project already holds keeps its id.
+/// A new file in a fresh project takes `{project}_a{n:05}` in walk order;
+/// one added on a rescan takes a never-reused unique id, so a deleted
+/// file's id (and any edit still naming it) can never land on another.
+/// (`assets.id` is database-wide, hence the project prefix.)
 struct AssetIds {
-    prefix: String,
+    project: String,
+    rescan: bool,
     by_path: HashMap<PathBuf, String>,
     next: usize,
 }
 
 impl AssetIds {
-    fn new(project_id: &str, known: impl IntoIterator<Item = (PathBuf, String)>) -> Self {
-        let prefix = format!("{project_id}_a");
-        let by_path: HashMap<PathBuf, String> = known.into_iter().collect();
-        let next = by_path
-            .values()
-            .filter_map(|id| id.strip_prefix(&prefix)?.parse::<usize>().ok())
-            .max()
-            .map_or(0, |n| n + 1);
+    fn new(
+        project_id: &str,
+        rescan: bool,
+        known: impl IntoIterator<Item = (PathBuf, String)>,
+    ) -> Self {
         Self {
-            prefix,
-            by_path,
-            next,
+            project: project_id.to_string(),
+            rescan,
+            by_path: known.into_iter().collect(),
+            next: 0,
         }
     }
 
@@ -587,8 +607,12 @@ impl AssetIds {
         if let Some(id) = self.by_path.get(path) {
             return id.clone();
         }
-        let id = format!("{}{:05}", self.prefix, self.next);
-        self.next += 1;
+        let id = if self.rescan {
+            format!("{}_{}", self.project, triptape_core::db::new_id("a"))
+        } else {
+            self.next += 1;
+            format!("{}_a{:05}", self.project, self.next - 1)
+        };
         self.by_path.insert(path.to_path_buf(), id.clone());
         id
     }
@@ -1567,20 +1591,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_rescan_keeps_each_files_id_and_numbers_new_ones_after() {
+    fn a_rescan_keeps_each_files_id_and_never_reuses_one() {
         let known = [
             (PathBuf::from("/t/IMG_1.HEIC"), "prj_x_a00000".to_string()),
             (PathBuf::from("/t/IMG_3.HEIC"), "prj_x_a00002".to_string()),
         ];
-        let mut ids = AssetIds::new("prj_x", known);
+        let mut ids = AssetIds::new("prj_x", true, known);
         // IMG_2 left the folder: IMG_3 keeps its id, nothing shifts.
         assert_eq!(ids.id_for(Path::new("/t/IMG_3.HEIC")), "prj_x_a00002");
         assert_eq!(ids.id_for(Path::new("/t/IMG_1.HEIC")), "prj_x_a00000");
-        assert_eq!(ids.id_for(Path::new("/t/IMG_9.HEIC")), "prj_x_a00003");
-        assert_eq!(ids.id_for(Path::new("/t/IMG_9.HEIC")), "prj_x_a00003");
-        // A fresh project numbers from zero.
-        let mut fresh = AssetIds::new("prj_y", []);
+        // A new file never takes a number a deleted file once had.
+        let new = ids.id_for(Path::new("/t/IMG_9.HEIC"));
+        assert!(new.starts_with("prj_x_a_") && new.len() > 20, "{new}");
+        assert_eq!(ids.id_for(Path::new("/t/IMG_9.HEIC")), new);
+        // A fresh project numbers in walk order.
+        let mut fresh = AssetIds::new("prj_y", false, []);
         assert_eq!(fresh.id_for(Path::new("/t/a.jpg")), "prj_y_a00000");
+        assert_eq!(fresh.id_for(Path::new("/t/b.jpg")), "prj_y_a00001");
     }
 
     #[test]

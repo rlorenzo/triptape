@@ -279,7 +279,13 @@ impl Db {
 
     // -- projects ---------------------------------------------------------
     pub fn create_project(&self, name: &str, folder: &str) -> Result<Project, String> {
-        let t = now();
+        // Ordered with [`Db::touch_project`]: a new project is the latest
+        // even when a touch has run ahead of the clock.
+        let top: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(updated_at) FROM projects", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        let t = now().max(top.map_or(0, |t| t + 1));
         let p = Project {
             id: new_id("prj"),
             name: name.to_string(),
@@ -310,6 +316,17 @@ impl Db {
             )
             .optional()
             .map_err(|e| e.to_string())
+    }
+
+    /// Point a project at its folder's canonical path.
+    pub fn set_project_folder(&self, id: &str, folder: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE projects SET folder=?2 WHERE id=?1",
+                params![id, folder],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// Mark a project as just updated, so [`Db::latest_project`] opens it:
@@ -1696,6 +1713,18 @@ mod tests {
         assert!(db.project_for_folder("/trips/none").unwrap().is_none());
         db.touch_project(&a.id).unwrap();
         assert_eq!(db.latest_project().unwrap().unwrap().id, a.id);
+    }
+
+    #[test]
+    fn a_new_project_is_latest_even_after_a_touch_ran_ahead() {
+        let db = mem();
+        let a = db.create_project("a", "/a").unwrap();
+        db.touch_project(&a.id).unwrap();
+        db.touch_project(&a.id).unwrap();
+        let b = db.create_project("b", "/b").unwrap();
+        assert_eq!(db.latest_project().unwrap().unwrap().id, b.id);
+        db.set_project_folder(&b.id, "/b2").unwrap();
+        assert_eq!(db.project_for_folder("/b2").unwrap().unwrap().id, b.id);
     }
 
     #[test]
