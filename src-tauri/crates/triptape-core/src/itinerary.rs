@@ -449,7 +449,11 @@ impl Itinerary {
         let port = docks.iter().find(|s| s.active_on(day));
         let port_call = port.is_some_and(|s| s.kind == StopKind::Port);
         let on_board = match gps {
-            None => !port_call,
+            // No fix on a cruise day: the phone was aboard (in airplane
+            // mode at sea, or on the ship's wifi in port). A shot ashore
+            // without GPS borrows a nearby shot's fix before it gets here
+            // (`places::borrowed_fixes`).
+            None => true,
             Some(p) => {
                 let at_dock = self
                     .docks()
@@ -769,9 +773,13 @@ mod tests {
             .label_for(day("2026-10-11"), Some((34.6687, 135.4986)))
             .unwrap();
         assert_eq!((ashore.place.as_str(), ashore.on_ship), ("Osaka", false));
-        // No GPS on a port day: most shots that day are ashore.
+        // No GPS on a cruise day, port day included: the ship (a shot ashore
+        // borrows a nearby shot's fix before it gets here).
         let unfixed = it.label_for(day("2026-10-11"), None).unwrap();
-        assert_eq!((unfixed.place.as_str(), unfixed.on_ship), ("Osaka", false));
+        assert_eq!(
+            (unfixed.place.as_str(), unfixed.on_ship),
+            ("Carnival Luminosa", true)
+        );
         // At sea, or with no GPS, on a sea day: the ship.
         let sea = it
             .label_for(day("2026-10-10"), Some((30.0, 140.0)))
@@ -1081,11 +1089,10 @@ mod tests {
         assert_eq!(ashore.place, "Osaka");
         let at_sea = itin().label_for(day("2026-10-10"), Some(seaside)).unwrap();
         assert_eq!(at_sea.place, "Carnival Luminosa");
-        // No GPS anywhere: the no-fix rule (ashore on a port day, on board
-        // on a sea day).
+        // No GPS anywhere: the no-fix rule (on board on any cruise day).
         let blind = photo("x", "2026-10-11", None);
         let label = chapter_label(&itin(), day("2026-10-11"), &[&blind]).unwrap();
-        assert_eq!(label.place, "Osaka");
+        assert_eq!(label.place, "Carnival Luminosa");
         let blind = photo("x", "2026-10-10", None);
         let label = chapter_label(&itin(), day("2026-10-10"), &[&blind]).unwrap();
         assert_eq!(label.place, "Carnival Luminosa");

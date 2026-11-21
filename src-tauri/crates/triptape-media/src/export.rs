@@ -751,6 +751,7 @@ fn export_inner(
                 caption: book_caption(plan, &places, &a.id),
                 place,
                 aboard: matches!(spot, Spot::Aboard(_)),
+                faces: vec![],
                 area: match spot {
                     Spot::Named(name) => Some(name.to_string()),
                     _ => None,

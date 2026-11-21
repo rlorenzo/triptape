@@ -139,6 +139,36 @@ pub fn chapter_attraction(fixes: &[(f64, f64)], home: &HashSet<String>) -> Optio
     })
 }
 
+/// How far in time a shot without GPS may borrow another's fix.
+pub const BORROW_FIX_SECS: i64 = 30 * 60;
+
+/// For each asset without GPS, the fix of the nearest-in-time asset of
+/// the same day that has one, within [`BORROW_FIX_SECS`].
+pub fn borrowed_fixes(assets: &[Asset]) -> HashMap<&str, (f64, f64)> {
+    let mut fixed: Vec<(i64, Option<jiff::civil::Date>, (f64, f64))> = assets
+        .iter()
+        .filter_map(|a| Some((a.taken_at?, asset_day(a), a.gps?)))
+        .collect();
+    fixed.sort_by_key(|f| f.0);
+    let mut out = HashMap::new();
+    for a in assets.iter().filter(|a| a.gps.is_none()) {
+        let (Some(t), day) = (a.taken_at, asset_day(a)) else {
+            continue;
+        };
+        let k = fixed.partition_point(|f| f.0 < t);
+        let near = [k.checked_sub(1), Some(k)]
+            .into_iter()
+            .flatten()
+            .filter_map(|j| fixed.get(j))
+            .filter(|f| f.1 == day && (f.0 - t).abs() <= BORROW_FIX_SECS)
+            .min_by_key(|f| (f.0 - t).abs());
+        if let Some(f) = near {
+            out.insert(a.id.as_str(), f.2);
+        }
+    }
+    out
+}
+
 /// Each planned photo's place, by asset id: a place the owner named in
 /// the itinerary; the ship for shots the itinerary puts on board (even at
 /// a dock beside Miraikan or the Osaka Aquarium); else the attraction it
@@ -182,8 +212,22 @@ pub fn photo_places(
             .or_else(|| crate::geo::city_name(a.gps?))
     };
     let mut out = HashMap::new();
+    let borrowed = borrowed_fixes(assets);
     for (a, poi) in planned {
-        let own = match spot(itin, a) {
+        // A shot without GPS (a friend's phone, a screenshot) stands where
+        // the trip's nearest shot in time was: dinner aboard after leaving
+        // port reads as the ship, not the port.
+        let located;
+        let at: &Asset = match (a.gps, borrowed.get(a.id.as_str())) {
+            (None, Some(&fix)) => {
+                let mut c = a.clone();
+                c.gps = Some(fix);
+                located = c;
+                &located
+            }
+            _ => a,
+        };
+        let own = match spot(itin, at) {
             Spot::Named(name) => Some(name.to_string()),
             Spot::Aboard(ship) => Some(ship),
             Spot::Ashore => poi
@@ -250,6 +294,21 @@ mod tests {
         assert_eq!(t, [("b", 2), ("a", 2), ("c", 1)]);
         assert_eq!(most_counted(t), Some(("b", 2)));
         assert_eq!(most_counted(tally(Vec::<&str>::new())), None);
+    }
+
+    #[test]
+    fn a_shot_without_gps_stands_where_the_nearest_shot_was() {
+        let noon = 1_791_288_000;
+        let ship = (33.20, 126.51);
+        let assets = vec![
+            photo("a", noon, Some(ship)),
+            photo("b", noon + 600, None),
+            photo("c", noon + 4 * 3600, None),
+        ];
+        let fixes = borrowed_fixes(&assets);
+        assert_eq!(fixes.get("b"), Some(&ship));
+        assert!(!fixes.contains_key("c"), "hours later: no fix");
+        assert!(!fixes.contains_key("a"));
     }
 
     #[test]
