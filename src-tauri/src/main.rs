@@ -16,10 +16,10 @@ use triptape_ai_local::local::{LocalModels, ModelPaths};
 use triptape_app::{
     apply_live_photo_pairing, book_notes, book_presets, check_sources as check_plan_sources,
     export_dir_in, export_eligibility, export_sources, fill_assets_parallel, find_relinks,
-    finished_film, keepsake_scope, paginate, parse_book_preset, plain_skip, relink_plan,
-    relinked_asset, resolve_export_parent, tool_status, tools, valid_job_kind, AppState, AssetView,
-    BookPresetView, EligibilityView, ExportSummary, JobView, RelinkView, ScanSummary,
-    SourceCheckView, StoryData, StoryEntryView, StoryView, ToolStatusView,
+    finished_film, keep_known_asset_ids, keepsake_scope, paginate, parse_book_preset, plain_skip,
+    relink_plan, relinked_asset, resolve_export_parent, tool_status, tools, valid_job_kind,
+    AppState, AssetView, BookPresetView, EligibilityView, ExportSummary, JobView, RelinkView,
+    ScanSummary, SourceCheckView, StoryData, StoryEntryView, StoryView, ToolStatusView,
 };
 use triptape_core::{
     cluster,
@@ -552,11 +552,11 @@ type IngestWalk = (usize, Vec<(String, PathBuf, u64, i64)>);
 /// Shared ingest pipeline behind `scan_folder` (new project row) and
 /// `rescan_project` (in-place refresh of the stored project).
 ///
-/// Asset ids are enumeration-index based (`{pid}_a{i:06}` in walk order),
-/// so an unchanged folder yields identical ids across rescans: Story edits
-/// (`plan_edits`, keyed by asset/chapter ids) are never touched here and
-/// keep applying to the refreshed assets and plans. `files_seen` is the
-/// enumerated file count, as in the picker flow.
+/// A fresh scan numbers assets in walk order (`{pid}_a{i:06}`); a refresh
+/// keeps each known file's id by path and gives new files never-reused
+/// ids ([`keep_known_asset_ids`]), so Story edits (`plan_edits`, keyed by asset
+/// ids) keep applying to the right photos even after files are deleted.
+/// `files_seen` is the enumerated file count, as in the picker flow.
 ///
 /// `refresh` selects the persist semantics: a fresh scan only adds rows,
 /// while a refresh first clears this project's cluster graph and prunes
@@ -681,12 +681,20 @@ async fn run_ingest(
             // all see the paired set. The motion file is not hashed as its
             // own asset (the Live Photo row hashes its still).
             assets = apply_live_photo_pairing(assets);
+            // Hold the store from here through the save: a rescan reads the
+            // project's ids and saves the rows it assigned under one lock,
+            // so two overlapping rescans can never give one new file two
+            // ids (the later save would orphan edits made against the
+            // first). Grouping and the plan below are quick, in-memory work.
+            let db = lock()?;
+            if refresh {
+                let known = db.list_assets(&pid)?;
+                keep_known_asset_ids(&pid, &mut assets, known.into_iter().map(|a| (a.path, a.id)));
+            }
             // Short foreground phases; the background task continues from
             // `FOREGROUND_DONE_PROGRESS` once the command returns.
-            if let Ok(db) = lock() {
-                report_ingest(&worker_app, &db, &worker_job, 0.05, "Grouping photos…");
-                last_progress = 0.05;
-            }
+            report_ingest(&worker_app, &db, &worker_job, 0.05, "Grouping photos…");
+            last_progress = 0.05;
             let mut clusters = cluster::cluster_assets(&assets);
             for c in &mut clusters {
                 c.id = format!("{pid}_{}", c.id);
@@ -699,11 +707,8 @@ async fn run_ingest(
             // this path, so the library opens fast); the background task
             // scores every asset and rebuilds the plan before marking Done.
             let plan = planmod::build_plan(&assets, &cluster_of, &HashMap::new());
-            if let Ok(db) = lock() {
-                report_ingest(&worker_app, &db, &worker_job, 0.10, "Building story plan…");
-                last_progress = 0.10;
-            }
-            let db = lock()?;
+            report_ingest(&worker_app, &db, &worker_job, 0.10, "Building story plan…");
+            last_progress = 0.10;
             db.in_transaction(|db| {
                 if refresh {
                     // In-place refresh: drop the previous cluster graph
@@ -723,10 +728,11 @@ async fn run_ingest(
                         db.upsert_asset(&pid, a)?;
                     }
                 }
-                if refresh {
-                    // Prune rows whose files left the folder. Kept ids
-                    // upsert in place above (identical ids for unchanged
-                    // folders), so `plan_edits` keep applying.
+                // Prune rows whose files left the folder, but only after a
+                // complete walk: an unreadable subfolder is not a deleted
+                // one. Kept ids upsert in place above, so `plan_edits` keep
+                // applying.
+                if refresh && result.errors.is_empty() {
                     let keep: Vec<String> = assets.iter().map(|a| a.id.clone()).collect();
                     db.delete_stale_assets(&pid, &keep)?;
                 }
