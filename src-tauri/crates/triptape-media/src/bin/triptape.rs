@@ -388,6 +388,13 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     // in the photo's local time, not UTC.
     metadata::fill_tz_offsets(&mut final_assets);
 
+    // The same file in the library twice: its copies share their caption,
+    // people tags and score, and an edit takes what it lacks from its
+    // original, so the one kept below carries all of them. Before
+    // clustering, so an edit that lost its date sits in its original's
+    // chapter.
+    cluster::share_identical_metadata(&mut final_assets, &mut scores);
+
     // Cluster + near-dupe hero picks.
     // Cluster ids restart per scan; prefix with the project id so they stay
     // unique across projects sharing one database.
@@ -395,9 +402,6 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     for c in &mut clusters {
         c.id = format!("{}_{}", project.id, c.id);
     }
-    // The same file in the library twice: its copies share their caption,
-    // people tags and score, so the one kept below carries all of them.
-    cluster::share_identical_metadata(&mut final_assets, &mut scores);
     let groups = cluster::collapse_near_dupes(&final_assets, &scores);
     let best: HashSet<String> = groups.iter().map(|g| g.best_id.clone()).collect();
     // Non-best near-dupe members stay in the DB but are kept out of the plan.

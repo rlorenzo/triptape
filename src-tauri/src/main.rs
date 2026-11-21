@@ -429,20 +429,22 @@ fn background_hash_job(
         // adds a row, so Story edits (PlanEdits applied on read) survive
         // untouched.
         let mut assets = lock()?.list_assets(project_id)?;
-        let clusters = cluster::cluster_assets(&assets);
-        let cluster_of = cluster::chapter_labels(&clusters);
         // The plan reads the freshly persisted scores (already-scored
         // restores contribute theirs too), so hero trim/cap match CLI use.
         let mut scores: HashMap<String, Score> = assets
             .iter()
             .filter_map(|a| a.score.clone().map(|s| (a.id.clone(), s)))
             .collect();
+        // Copies of one file share their caption, people tags and score,
+        // and an edit takes what it lacks from its original, so the one that
+        // stays below carries all of them (in the plan only: each library
+        // row keeps what its own file says). Before clustering, so an edit
+        // that lost its date sits in its original's chapter.
+        cluster::share_identical_metadata(&mut assets, &mut scores);
+        let clusters = cluster::cluster_assets(&assets);
+        let cluster_of = cluster::chapter_labels(&clusters);
         // Near-duplicates (same moment, similar pixels) stay in the library
         // but only the best shot of each stack enters the plan, as in the CLI.
-        // Copies of one file share their caption, people tags and score
-        // first, so the copy that stays carries all of them (in the plan
-        // only: each library row keeps what its own file says).
-        cluster::share_identical_metadata(&mut assets, &mut scores);
         let suppressed = cluster::suppressed_ids(&cluster::collapse_near_dupes(&assets, &scores));
         assets.retain(|a| !suppressed.contains(&a.id));
         let plan = planmod::build_plan(&assets, &cluster_of, &scores);
