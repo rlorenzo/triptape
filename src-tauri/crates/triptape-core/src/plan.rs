@@ -7,7 +7,7 @@
 //! Sec 5.4 degradation eligibility lives here too.
 
 use crate::clip_window::MAX_WINDOW_SECS;
-use crate::cluster::{gps_outliers, story_key, story_order};
+use crate::cluster::{gps_outliers_in, story_positions, story_tracks};
 use crate::embedding::{same_scene, Embedding};
 use crate::types::{
     distinct_assets, Asset, AssetKind, Chapter, CollageEdits, MusicPick, Plan, PlanEntry,
@@ -1167,7 +1167,7 @@ fn with_user_captions_only(plan: &Plan, by_id: &HashMap<&str, &Asset>) -> Plan {
 /// then pinned inclusions, then exclusions, then caption overrides on top.
 ///
 /// Inclusions (hero only) put each pinned asset into `hero` at its
-/// story-order position (capture time, then id: [`story_order`]) with the
+/// story-order position ([`crate::cluster::story_order`]) with the
 /// same rendition rules as a swap-in (clips keep their window, Live
 /// Photos are stills). Pins must belong to this plan's chapters and are
 /// skipped when already picked. To keep the film at the length the user
@@ -1237,7 +1237,7 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
         }
     }
 
-    include_pins(&mut out, &by_id, edits, &dead);
+    include_pins(&mut out, assets, &by_id, edits, &dead);
 
     // Exclusions: out of every pick and out of the book flow.
     out.hero.retain(|e| !dead.contains(e.asset_id.as_str()));
@@ -1278,6 +1278,7 @@ fn user_hero_entry(asset: &Asset) -> PlanEntry {
 /// Insert the user's pinned assets into the hero (see [`apply_edits`]).
 fn include_pins(
     out: &mut Plan,
+    assets: &[Asset],
     by_id: &HashMap<&str, &Asset>,
     edits: &PlanEdits,
     dead: &HashSet<&str>,
@@ -1295,8 +1296,12 @@ fn include_pins(
             .and_then(|a| a.score.as_ref())
             .map_or(DEFAULT_SCORE, |s| s.total)
     };
-    // Unknown assets sort last.
-    let key_of = |id: &str| by_id.get(id).map_or((i64::MAX, ""), |a| story_key(a));
+    if edits.included.is_empty() {
+        return;
+    }
+    // Story positions over the project's assets; unknown assets sort last.
+    let pos = story_positions(assets);
+    let key_of = |id: &str| pos.get(id).copied().unwrap_or(usize::MAX);
     for id in &edits.included {
         let Some(asset) = by_id.get(id.as_str()) else {
             continue;
@@ -1322,9 +1327,9 @@ fn include_pins(
             out.hero.remove(i);
         }
         // Swaps keep their slot, so the hero may be out of story order:
-        // land right after the last earlier capture, so nothing captured
-        // before the pin plays after it.
-        let key = story_key(asset);
+        // land right after the last entry earlier in story order, so
+        // nothing told before the pin plays after it.
+        let key = key_of(&asset.id);
         let at = out
             .hero
             .iter()
@@ -1368,8 +1373,10 @@ pub fn build_plan_with_length(
     overrides: &[PlaceOverride],
     length: FilmLength,
 ) -> Plan {
-    let ordered = story_order(assets);
+    // Story order: capture time, a split day told party by party.
+    let tracked = story_tracks(assets);
     let chapter_label = |id: &str| cluster_of.get(id).map_or(UNGROUPED, String::as_str);
+    let ordered = chapters_together(&tracked, chapter_label);
     // Story score per asset: technical quality relative to its chapter plus
     // the story bonuses (people, caption, clip). Assets without a score keep
     // the neutral default.
@@ -1423,7 +1430,10 @@ pub fn build_plan_with_length(
 
     // Map polyline: GPS fixes in story order, minus fixes that imply
     // impossible speed. Capture times separate those from real flights.
-    let outliers = gps_outliers(assets);
+    // On a split day the line follows one party's stretch, then the next
+    // party's (one hop between them), as the film tells it, instead of
+    // zig-zagging between parties in capture order.
+    let outliers = gps_outliers_in(&tracked);
     let map_polyline: Vec<(f64, f64)> = ordered
         .iter()
         .filter(|a| !outliers.contains(&a.id))
@@ -1602,6 +1612,49 @@ pub fn build_plan_with_length(
                 .to_string(),
         },
     }
+}
+
+/// Story order with each chapter of a split day kept in one piece.
+///
+/// Chapters come from clustering every asset, while the plan sees only the
+/// kept ones (near-dupes suppressed), so a shot told with one party here
+/// can belong to another party's chapter: a captioned copy of a photo
+/// whose original was the only nearby shot of its phone. On a day with a
+/// split stretch, the day's shots are regrouped by chapter, chapters in
+/// the order of their median member, each chapter's shots in story order.
+/// Every other day is untouched.
+fn chapters_together<'a, 'c>(
+    tracked: &[(&'a Asset, crate::party::Track)],
+    chapter_of: impl Fn(&str) -> &'c str,
+) -> Vec<&'a Asset> {
+    let day = |a: &Asset| crate::cluster::day_key(a.taken_at, a.tz_offset_secs);
+    let mut out = Vec::with_capacity(tracked.len());
+    let mut i = 0;
+    while i < tracked.len() {
+        let d = day(tracked[i].0);
+        let len = tracked[i..]
+            .iter()
+            .position(|(a, _)| day(a) != d)
+            .unwrap_or(tracked.len() - i);
+        let run = &tracked[i..i + len];
+        i += len;
+        if run.iter().all(|(_, t)| *t == crate::party::Track::Shared) {
+            out.extend(run.iter().map(|(a, _)| *a));
+            continue;
+        }
+        let mut members: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (p, (a, _)) in run.iter().enumerate() {
+            members.entry(chapter_of(&a.id)).or_default().push(p);
+        }
+        let median: HashMap<&str, usize> = members
+            .iter()
+            .map(|(c, ps)| (*c, ps[(ps.len() - 1) / 2]))
+            .collect();
+        let mut idx: Vec<usize> = (0..run.len()).collect();
+        idx.sort_by_key(|&p| (median[chapter_of(&run[p].0.id)], p));
+        out.extend(idx.into_iter().map(|p| run[p].0));
+    }
+    out
 }
 
 /// Move each further window of a clip to where it was captured: the clip's
@@ -4780,5 +4833,68 @@ mod tests {
         // 0.54 + 0.7 = 2.48 s.
         let est = estimate_hero_secs(&entries, ch, |_| None, |id| id == "x3", |_| Some(0), bare);
         assert!((est - 18.02).abs() < 1e-9, "{est}");
+    }
+
+    fn split_fixture() -> Vec<Asset> {
+        let (city, park) = ((22.282, 114.154), (22.313, 114.043));
+        let t0 = 1_792_285_200;
+        let mut assets = vec![];
+        for k in 0..8 {
+            let mut c = asset(
+                &format!("IMG_{}", 1502 + k),
+                t0 + k * 3000,
+                AssetKind::Photo,
+            );
+            c.gps = Some(city);
+            let mut p = asset(
+                &format!("IMG_{}", 5801 + k),
+                t0 + k * 3000 + 1500,
+                AssetKind::Photo,
+            );
+            p.gps = Some(park);
+            assets.extend([c, p]);
+        }
+        assets[0].user_caption = Some("I toured the city".into());
+        assets
+    }
+
+    fn split_plan(assets: &[Asset]) -> Plan {
+        let cluster_of = crate::cluster::chapter_labels(&crate::cluster::cluster_assets(assets));
+        build_plan_with_length(
+            assets,
+            &cluster_of,
+            &HashMap::new(),
+            &[],
+            FilmLength::Secs(3600.0),
+        )
+    }
+
+    #[test]
+    fn a_split_day_plays_the_owners_party_then_the_others() {
+        let assets = split_fixture();
+        let plan = split_plan(&assets);
+        let hero = hero_ids(&plan);
+        let first_park = hero.iter().position(|id| id.starts_with("IMG_58")).unwrap();
+        assert!(
+            hero[..first_park].iter().all(|id| id.starts_with("IMG_15")),
+            "{hero:?}"
+        );
+        assert!(
+            hero[first_park..].iter().all(|id| id.starts_with("IMG_58")),
+            "{hero:?}"
+        );
+        assert_eq!(plan.chapters.len(), 2);
+        assert_eq!(
+            plan.chapters[1].place.as_deref(),
+            Some("Hong Kong Disneyland")
+        );
+        assert_ne!(plan.chapters[0].place, plan.chapters[1].place);
+        // The route follows one party, then hops once to the other.
+        let hops = plan
+            .map_polyline
+            .windows(2)
+            .filter(|w| crate::geo::haversine_m(w[0], w[1]) > 3000.0)
+            .count();
+        assert_eq!(hops, 1, "{:?}", plan.map_polyline);
     }
 }
