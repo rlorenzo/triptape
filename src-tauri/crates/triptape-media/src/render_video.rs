@@ -1016,7 +1016,27 @@ pub fn render_hero_video(
         .chain(offsets.iter().copied())
         .collect();
     let srt_path = out_mp4.with_extension("srt");
-    let srt_count = write_captions_srt(&segs, &starts, &srt_path)?;
+    // The same caption on a run of shots (seven panoramas all "Some fun
+    // multiple person panoramas") is shown once, on the first.
+    let chapter_index: HashMap<&str, usize> = plan
+        .chapters
+        .iter()
+        .enumerate()
+        .flat_map(|(k, c)| c.asset_ids.iter().map(move |id| (id.as_str(), k)))
+        .collect();
+    let repeats = repeated_captions(
+        &segs
+            .iter()
+            .map(|(r, ..)| {
+                (
+                    r.caption.as_deref(),
+                    chapter_index.get(r.entry.asset_id.as_str()).copied(),
+                    r.taken_at,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    let srt_count = write_captions_srt(&segs, &starts, &repeats, &srt_path)?;
     let srt_opt = if srt_count > 0 {
         // A file name: the film may be moved after rendering.
         srt_path
@@ -1207,16 +1227,51 @@ fn overlay_key(
     k.finish()
 }
 
+/// Seconds within which a caption repeated in another chapter still counts
+/// as the same showing (see [`repeated_captions`]).
+const CAPTION_REPEAT_SECS: i64 = 30 * 60;
+
+/// Which segments' captions repeat the caption last shown, so only the
+/// first of a run is shown. Per segment: its caption, chapter and capture
+/// time. A caption repeats when its text (trimmed, case-insensitive) is
+/// the last shown one's and it is in the same chapter or taken within
+/// [`CAPTION_REPEAT_SECS`] of it. Uncaptioned segments in between do not
+/// break the run; a different caption does. A skipped caption only loses
+/// its text on screen: the shot still counts as captioned for layout.
+fn repeated_captions(segs: &[(Option<&str>, Option<usize>, Option<i64>)]) -> Vec<bool> {
+    let mut last: Option<(String, Option<usize>, Option<i64>)> = None;
+    segs.iter()
+        .map(|&(caption, chapter, taken)| {
+            let Some(text) = caption.map(str::trim).filter(|c| !c.is_empty()) else {
+                return false;
+            };
+            let text = text.to_lowercase();
+            let repeat = last.as_ref().is_some_and(|(t, ch, at)| {
+                *t == text
+                    && ((ch.is_some() && *ch == chapter)
+                        || matches!((at, taken), (Some(a), Some(b)) if (a - b).abs() <= CAPTION_REPEAT_SECS))
+            });
+            if !repeat {
+                last = Some((text, chapter, taken));
+            }
+            repeat
+        })
+        .collect()
+}
+
+/// Write the film's captions as SRT cues timed to each segment's `starts`,
+/// leaving out the captions `repeats` marks ([`repeated_captions`]).
 fn write_captions_srt(
     segs: &[(ResolvedEntry, PathBuf, f64, String)],
     starts: &[f64],
+    repeats: &[bool],
     out: &Path,
 ) -> Result<usize, crate::MediaError> {
     let mut n = 0;
     let mut body = String::new();
     for (i, (r, _, d, _)) in segs.iter().enumerate() {
         if let Some(c) = &r.caption {
-            if c.trim().is_empty() {
+            if c.trim().is_empty() || repeats.get(i).copied().unwrap_or(false) {
                 continue;
             }
             n += 1;
@@ -5308,6 +5363,46 @@ mod tests {
         let out = dir.join(format!("vis_{}_map.mp4", res.label()));
         crate::map::render_map_push_in(&caps, &card, &out, 3.0, 0, res).unwrap();
         eprintln!("fallbacks: {fb:?}");
+    }
+
+    #[test]
+    fn a_repeated_caption_is_shown_once() {
+        let h = 3600;
+        let cap = |c: Option<&'static str>, ch: usize, t: i64| (c, Some(ch), Some(t));
+        // A A A -> A _ _, case and spacing aside, an uncaptioned shot
+        // between them or not.
+        let a = Some("Some fun multiple person panoramas");
+        let a2 = Some("  some fun Multiple person panoramas ");
+        assert_eq!(
+            repeated_captions(&[
+                cap(a, 0, 0),
+                cap(a2, 0, 60),
+                cap(None, 0, 90),
+                cap(a, 0, 120)
+            ]),
+            [false, true, false, true]
+        );
+        // A B A -> all shown.
+        let b = Some("Lunch");
+        assert_eq!(
+            repeated_captions(&[cap(a, 0, 0), cap(b, 0, 60), cap(a, 0, 120)]),
+            [false, false, false]
+        );
+        // The same words in another chapter hours later are a new showing;
+        // minutes later across a chapter change, still a repeat.
+        assert_eq!(
+            repeated_captions(&[cap(a, 0, 0), cap(a, 1, 5 * h)]),
+            [false, false]
+        );
+        assert_eq!(
+            repeated_captions(&[cap(a, 0, 0), cap(a, 1, 600)]),
+            [false, true]
+        );
+        // Unknown chapter and time: never a repeat.
+        assert_eq!(
+            repeated_captions(&[(a, None, None), (a, None, None)]),
+            [false, false]
+        );
     }
 
     #[test]
