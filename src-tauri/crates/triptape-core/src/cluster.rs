@@ -22,6 +22,12 @@ pub const TIME_GAP_SECS: i64 = 4 * 3600;
 pub const PLACE_SPLIT_METERS: f64 = 5_000.0;
 /// Implied speed that marks a GPS fix an outlier (1,000 km/h in m/s).
 pub const OUTLIER_SPEED_MPS: f64 = 1_000_000.0 / 3600.0;
+
+/// Whether moving `from` -> `to` in `dt_secs` implies more than
+/// [`OUTLIER_SPEED_MPS`]. A zero or negative delta judges nothing.
+pub fn speed_jump(dt_secs: i64, from: (f64, f64), to: (f64, f64)) -> bool {
+    dt_secs > 0 && haversine_m(from, to) / dt_secs as f64 > OUTLIER_SPEED_MPS
+}
 /// Max capture-time gap between two shots for them to count as near-dupes
 /// (a burst / retake window, 10 min).
 pub const DUPE_WINDOW_SECS: i64 = 10 * 60;
@@ -44,6 +50,13 @@ pub fn day_key(taken_at: Option<i64>, tz_offset_secs: Option<i32>) -> String {
         .and_then(|t| crate::metadata::local_datetime(t, tz_offset_secs))
         .map(|d| d.strftime("%Y-%m-%d").to_string())
         .unwrap_or_else(|| "unknown-date".to_string())
+}
+
+/// Whether two assets share a capture-local day ([`day_key`]); an unknown
+/// date matches nothing.
+pub fn same_day(a: &Asset, b: &Asset) -> bool {
+    a.taken_at.is_some()
+        && day_key(a.taken_at, a.tz_offset_secs) == day_key(b.taken_at, b.tz_offset_secs)
 }
 
 /// Capture-time sort key: capture time (unknown last), then id. This is
@@ -73,8 +86,9 @@ pub fn story_tracks(assets: &[Asset]) -> Vec<(&Asset, Track)> {
         .collect()
 }
 
-/// One asset's place in the story: what a keepsake needs to follow
-/// [`story_order`] and to tell a split day's parties apart.
+/// One asset's place in the story, for keepsakes that follow
+/// [`story_order`] (the book, once it is wired to it) and need to tell a
+/// split day's parties apart.
 #[derive(Debug, Clone)]
 pub struct StorySlot<'a> {
     pub asset: &'a Asset,
@@ -127,8 +141,7 @@ pub fn gps_outliers_in(ordered: &[(&Asset, Track)]) -> HashSet<String> {
             continue;
         };
         if let (Some(t), Some(pt)) = (a.taken_at, pt) {
-            let dt = (t - pt).abs() as f64;
-            if dt > 0.0 && haversine_m(pg, g) / dt > OUTLIER_SPEED_MPS {
+            if speed_jump((t - pt).abs(), pg, g) {
                 bad.insert(a.id.clone());
                 continue;
             }
@@ -1254,19 +1267,25 @@ mod tests {
         assert!(c[0].asset_ids.iter().all(|id| id.starts_with("IMG_15")));
         assert!(c[1].asset_ids.iter().all(|id| id.starts_with("IMG_58")));
         let slots = story_slots(&a);
-        // The first city shot comes before anyone is seen apart.
-        assert_eq!(slots[0].track, Track::Shared);
-        assert!(slots[1..8].iter().all(|s| s.track
-            == Track::Party {
-                segment: 0,
-                rank: 0
-            }));
-        assert!(slots[8..].iter().all(|s| s.track
-            == Track::Party {
-                segment: 0,
-                rank: 1
-            }));
         assert!(slots.iter().all(|s| s.day == slots[0].day));
+        let tracks: Vec<Track> = slots.iter().map(|s| s.track).collect();
+        // The first city shot comes before anyone is seen apart.
+        assert_eq!(tracks[0], Track::Shared);
+        let party = |rank| Track::Party { segment: 0, rank };
+        assert!(tracks[1..8].iter().all(|&t| t == party(0)));
+        assert!(tracks[8..].iter().all(|&t| t == party(1)));
+    }
+
+    #[test]
+    fn same_day_needs_a_known_shared_day() {
+        let a = split_day(1);
+        assert!(same_day(&a[0], &a[1]));
+        let mut later = a[0].clone();
+        later.taken_at = later.taken_at.map(|t| t + 86_400);
+        assert!(!same_day(&a[0], &later));
+        let mut undated = a[0].clone();
+        undated.taken_at = None;
+        assert!(!same_day(&undated, &undated));
     }
 
     #[test]

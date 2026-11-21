@@ -1177,11 +1177,6 @@ fn apply_moves(
     moves: &[FilmMove],
     dead: &HashSet<&str>,
 ) {
-    let day_of = |id: &str| {
-        by_id
-            .get(id)
-            .map(|a| crate::cluster::day_key(a.taken_at, a.tz_offset_secs))
-    };
     let move_of: HashMap<&str, usize> = moves
         .iter()
         .enumerate()
@@ -1217,7 +1212,11 @@ fn apply_moves(
         if x == y || dead.contains(x) || dead.contains(y) || !in_film(x) || !in_film(y) {
             continue;
         }
-        if day_of(x).is_none() || day_of(x) != day_of(y) {
+        let same_day = by_id
+            .get(x)
+            .zip(by_id.get(y))
+            .is_some_and(|(a, b)| crate::cluster::same_day(a, b));
+        if !same_day {
             continue;
         }
         let moved: Vec<PlanEntry> = hero.iter().filter(|e| e.asset_id == x).cloned().collect();

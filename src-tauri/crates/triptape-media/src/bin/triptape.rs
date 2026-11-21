@@ -931,6 +931,8 @@ struct EditArgs {
     unmove: Vec<String>,
 }
 
+const MOVE_USAGE: &str = "--move wants --after REF or --before REF";
+
 fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
     let mut out = EditArgs::default();
     let mut pending_move: Option<String> = None;
@@ -969,7 +971,7 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
             },
             "move" => {
                 if pending_move.is_some() {
-                    return Err("--move wants --after REF or --before REF".to_string());
+                    return Err(MOVE_USAGE.to_string());
                 }
                 pending_move = Some(single(values)?);
             }
@@ -999,7 +1001,7 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
         }
     }
     if pending_move.is_some() {
-        return Err("--move wants --after REF or --before REF".to_string());
+        return Err(MOVE_USAGE.to_string());
     }
     Ok(out)
 }
@@ -1080,11 +1082,6 @@ fn print_film(plan: &Plan, assets: &[Asset], by_id: &HashMap<&str, &Asset>, was_
             .collect();
         println!("  collage of {}: {}", g.len(), names.join(", "));
     }
-}
-
-/// Whether two capture-local days differ (unknown days never match).
-fn a_day_differs(a: String, b: String) -> bool {
-    a != b || a == "unknown-date"
 }
 
 fn edit_cmd(args: &[String]) {
@@ -1221,11 +1218,10 @@ fn edit_cmd(args: &[String]) {
                 die("edit", format!("{} is not in the film", asset_label(asset)));
             }
         }
-        let day = |a: &Asset| cluster::day_key(a.taken_at, a.tz_offset_secs);
         if x.id == y.id {
             die("edit", "a shot can't move next to itself");
         }
-        if a_day_differs(day(x), day(y)) {
+        if !cluster::same_day(x, y) {
             die(
                 "edit",
                 format!(

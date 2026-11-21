@@ -31,11 +31,13 @@
 //!    parties were seen apart until a fix puts one party back near where
 //!    another was last seen (or that sighting is over [`CARRY_SECS`] old,
 //!    or the day ends), and is told party by party (each party's shots in
-//!    time order, the owner's party first); then the shared remainder. The primary stream is the one holding the most user
-//!    captions (ties: most files): the owner's phone.
+//!    time order, the owner's party first); then the shared remainder.
+//!    The primary stream is the one holding the most user captions (ties:
+//!    most files): the owner's phone.
 
-use crate::cluster::{day_key, story_key, OUTLIER_SPEED_MPS};
+use crate::cluster::{day_key, speed_jump, story_key};
 use crate::geo::haversine_m;
+use crate::plan::has_caption;
 use crate::types::Asset;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -292,11 +294,7 @@ fn primary_stream(assets: &[Asset], streams: &[Option<u32>]) -> Option<u32> {
     for (a, s) in assets.iter().zip(streams) {
         let Some(s) = s else { continue };
         let t = tally.entry(*s).or_default();
-        t.0 += usize::from(
-            a.user_caption
-                .as_deref()
-                .is_some_and(|c| !c.trim().is_empty()),
-        );
+        t.0 += usize::from(has_caption(a.user_caption.as_deref()));
         t.1 += 1;
     }
     tally
@@ -408,7 +406,7 @@ fn apart_runs(streams: (u32, u32), obs: &[Obs]) -> Vec<Apart> {
 }
 
 /// Each stream's own GPS track on one day: time order, copies dropped,
-/// fixes implying more than [`OUTLIER_SPEED_MPS`] from the stream's
+/// fixes implying more than [`crate::cluster::OUTLIER_SPEED_MPS`] from the stream's
 /// previous kept fix dropped. Judged per stream: two phones 40 km apart
 /// are not one phone teleporting.
 fn day_tracks(assets: &[Asset], run: &[usize], streams: &[Option<u32>]) -> BTreeMap<u32, Vec<Fix>> {
@@ -430,11 +428,10 @@ fn day_tracks(assets: &[Asset], run: &[usize], streams: &[Option<u32>]) -> BTree
         fixes.dedup_by(|b, a| a.t == b.t && a.gps == b.gps);
         let mut kept: Vec<Fix> = Vec::with_capacity(fixes.len());
         for f in fixes.drain(..) {
-            let jump = kept.last().is_some_and(|p| {
-                let dt = f.t - p.t;
-                dt > 0 && haversine_m(p.gps, f.gps) / dt as f64 > OUTLIER_SPEED_MPS
-            });
-            if !jump {
+            if !kept
+                .last()
+                .is_some_and(|p| speed_jump(f.t - p.t, p.gps, f.gps))
+            {
                 kept.push(f);
             }
         }
