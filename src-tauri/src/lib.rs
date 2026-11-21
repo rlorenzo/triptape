@@ -464,6 +464,20 @@ impl StoryData {
             .collect())
     }
 
+    /// The id to pin for `asset_id`: itself, or the byte-identical copy the
+    /// plan kept when this copy was left out (the Library lists both).
+    pub fn planned_twin_id(&self, asset_id: &str) -> String {
+        let assets = &self.0.assets;
+        let in_plan = |id: &str| self.0.base.chapter_of(id).is_some();
+        assets
+            .iter()
+            .find(|a| a.id == asset_id)
+            .map_or(asset_id, |a| {
+                &triptape_core::asset_ref::planned_twin(assets, a, in_plan).id
+            })
+            .to_string()
+    }
+
     /// Only assets of a scan-time chapter can be pinned into the film
     /// (the plan needs the chapter to trade a shot off against).
     pub fn check_include(&self, asset_id: &str) -> Result<(), String> {
@@ -1344,6 +1358,30 @@ mod tests {
             data.check_include("missing").unwrap_err(),
             "asset is not in any chapter"
         );
+    }
+
+    #[test]
+    fn story_include_of_a_left_out_copy_pins_its_planned_twin() {
+        let (db, pid) = story_db(&["a", "b"]);
+        // "copy" is b's byte-identical twin, added after the plan was built
+        // (as the scan leaves a collapsed copy out of every chapter).
+        let mut copy = Asset::new("copy", story_asset_path("copy"), AssetKind::Photo);
+        std::fs::write(&copy.path, b"").unwrap();
+        copy.content_hash = Some("h".into());
+        db.upsert_asset(&pid, &copy).unwrap();
+        let mut b = db
+            .list_assets(&pid)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.id == "b")
+            .unwrap();
+        b.content_hash = Some("h".into());
+        db.upsert_asset(&pid, &b).unwrap();
+        let data = StoryData::load(&db, &pid).unwrap();
+        assert!(data.check_include("copy").is_err());
+        assert_eq!(data.planned_twin_id("copy"), "b");
+        assert_eq!(data.planned_twin_id("a"), "a");
+        assert_eq!(data.planned_twin_id("missing"), "missing");
     }
 
     #[test]

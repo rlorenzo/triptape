@@ -1409,9 +1409,16 @@ async fn set_asset_included(
     AppState::check_id(&asset_id)?;
     state.require_project(&project_id)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    if included {
-        StoryData::load(&db, &project_id)?.check_include(&asset_id)?;
-    }
+    // The Library lists both copies of a file in it twice; pinning the one
+    // the plan left out pins the copy it kept.
+    let asset_id = if included {
+        let data = StoryData::load(&db, &project_id)?;
+        let id = data.planned_twin_id(&asset_id);
+        data.check_include(&id)?;
+        id
+    } else {
+        asset_id
+    };
     save_edits(&db, &project_id, |edits| {
         edits.set_included(asset_id, included)
     })

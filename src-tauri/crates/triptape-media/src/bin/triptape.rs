@@ -1060,8 +1060,20 @@ fn edit_cmd(args: &[String]) {
         .unwrap_or_else(|e| die("plan", e))
         .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
     let by_id: HashMap<&str, &Asset> = ep.assets.iter().map(|x| (x.id.as_str(), x)).collect();
+    // A copy the scan left out stands for its byte-identical twin in the
+    // plan, so either file name works.
     let resolve_one = |q: &str| -> &Asset {
-        asset_ref::resolve_asset(&ep.assets, q).unwrap_or_else(|e| die("edit", e))
+        let named = asset_ref::resolve_asset(&ep.assets, q).unwrap_or_else(|e| die("edit", e));
+        let twin =
+            asset_ref::planned_twin(&ep.assets, named, |id| ep.base.chapter_of(id).is_some());
+        if twin.id != named.id {
+            println!(
+                "{} is an identical copy of {}, which is in the plan: using it",
+                asset_label(named),
+                asset_label(twin)
+            );
+        }
+        twin
     };
     let resolve =
         |refs: &[String]| -> Vec<&Asset> { refs.iter().map(|q| resolve_one(q)).collect() };
