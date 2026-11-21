@@ -1759,6 +1759,22 @@ pub(crate) fn medoid(gps: &[(f64, f64)]) -> Option<(f64, f64)> {
     Some(medoid)
 }
 
+/// A trip's dates for the cover: `October 3–30, 2026`, `October 28 –
+/// November 3, 2026`, or `December 28, 2026 – January 4, 2027`.
+pub fn date_range_label(start: jiff::civil::Date, end: jiff::civil::Date) -> String {
+    let (a, b) = (start.min(end), start.max(end));
+    let md = |d: jiff::civil::Date| d.strftime("%B %-d").to_string();
+    if a == b {
+        format!("{}, {}", md(a), a.year())
+    } else if a.year() != b.year() {
+        format!("{}, {} \u{2013} {}, {}", md(a), a.year(), md(b), b.year())
+    } else if a.month() != b.month() {
+        format!("{} \u{2013} {}, {}", md(a), md(b), b.year())
+    } else {
+        format!("{}\u{2013}{}, {}", md(a), b.day(), b.year())
+    }
+}
+
 /// 1-based trip day of local date `d` when the trip starts on `start`
 /// (dates before the start count as day 1).
 pub fn trip_day(d: jiff::civil::Date, start: jiff::civil::Date) -> u32 {
@@ -3177,6 +3193,27 @@ mod tests {
             places: false,
         };
         assert!((estimate_hero_secs(&entries, |_| "X", pano, |_| false, bare) - 15.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn date_range_label_reads_naturally() {
+        let d = jiff::civil::date;
+        assert_eq!(
+            date_range_label(d(2026, 10, 3), d(2026, 10, 30)),
+            "October 3\u{2013}30, 2026"
+        );
+        assert_eq!(
+            date_range_label(d(2026, 10, 28), d(2026, 11, 3)),
+            "October 28 \u{2013} November 3, 2026"
+        );
+        assert_eq!(
+            date_range_label(d(2026, 12, 28), d(2027, 1, 4)),
+            "December 28, 2026 \u{2013} January 4, 2027"
+        );
+        assert_eq!(
+            date_range_label(d(2026, 7, 4), d(2026, 7, 4)),
+            "July 4, 2026"
+        );
     }
 
     #[test]

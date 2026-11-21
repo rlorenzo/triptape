@@ -648,7 +648,11 @@ fn export_inner(
         let chapter_of = book_chapter_of(plan);
         // Day 1 is the earliest local date in the project, as the plan
         // numbers its chapters.
-        let trip_start = assets.iter().filter_map(asset_day).min();
+        let photo_span = {
+            let days = assets.iter().filter_map(asset_day);
+            days.clone().min().zip(days.max())
+        };
+        let trip_start = photo_span.map(|(s, _)| s);
         let mut book_photos: Vec<BookPhoto> = vec![];
         for a in assets
             .iter()
@@ -729,6 +733,13 @@ fn export_inner(
                 ffmpeg_bin: caps.ffmpeg_bin.clone(),
                 max_pages: opts.book_max_pages,
                 progress: opts.progress.clone(),
+                // The itinerary's span, else the first to last photo day.
+                dates: opts
+                    .itinerary
+                    .as_ref()
+                    .and_then(|i| i.span())
+                    .or(photo_span)
+                    .map(|(a, b)| triptape_core::plan::date_range_label(a, b)),
             },
         ) {
             Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
