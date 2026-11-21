@@ -114,12 +114,22 @@ pub struct BookPhoto {
     /// visited attraction, else the chapter's place). The page's location
     /// strip lists it even when the user's caption is shown instead.
     pub place: Option<String>,
+    /// The owner-named place the photo was taken in (the Flower Dome, the
+    /// Cloud Forest): pages never mix two, so each visit reads as its own.
+    pub area: Option<String>,
     /// People (or detected faces) in the photo: cropping a group shot's
     /// edges cuts faces, so grid layouts give such photos room.
     pub people: u32,
 }
 
 impl BookPhoto {
+    /// Whether two photos may trade places in the page order: the same
+    /// chapter and the same owner-named place, so no swap carries a photo
+    /// across a page break between two visits.
+    fn same_stretch(&self, other: &BookPhoto) -> bool {
+        self.chapter == other.chapter && self.area == other.area
+    }
+
     /// Whether this photo repeats `other`: the same people at the same
     /// moment ([`triptape_core::plan::same_moment_at`]). With embeddings,
     /// the same scene in another framing counts too, as in the film's
@@ -267,7 +277,7 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
     let rest_at = 1 + usize::from(spread.is_some());
     let lead: Vec<usize> = std::iter::once(0)
         .chain(rest_at..order.len())
-        .take_while(|&pos| photos[order[pos]].chapter == photos[order[0]].chapter)
+        .take_while(|&pos| photos[order[pos]].same_stretch(&photos[order[0]]))
         .take(HERO_WINDOW)
         .collect();
     if let Some(pos) = best_sharp_at(&order, &lead, PageKind::Hero).filter(|&pos| pos != 0) {
@@ -292,9 +302,9 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
         .collect();
     for (d, &at) in divider_at.iter().enumerate() {
         let limit = divider_at.get(d + 1).copied().unwrap_or(order.len());
-        let chapter = photos[order[at]].chapter;
+        let opener = &photos[order[at]];
         let run: Vec<usize> = (at..limit)
-            .take_while(|&pos| photos[order[pos]].chapter == chapter)
+            .take_while(|&pos| photos[order[pos]].same_stretch(opener))
             .collect();
         if let Some(pos) = best_sharp_at(&order, &run, PageKind::Divider) {
             order[at..=pos].rotate_right(1);
@@ -333,7 +343,7 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
             let partner = small_cells
                 .iter()
                 .filter(|&&(c, small)| {
-                    photos[order[c]].chapter == photos[soft].chapter
+                    photos[order[c]].same_stretch(&photos[soft])
                         && sharp_in(order[c], size)
                         && sharp_in(soft, small)
                 })
@@ -633,7 +643,18 @@ fn wide_index(photos: &[BookPhoto]) -> Option<usize> {
 /// The page plan for exactly these photos.
 fn book_flow(photos: &[BookPhoto], has_map: bool, cap: usize) -> Vec<FlowPage> {
     let chapter_of: Vec<Option<usize>> = photos.iter().map(|p| p.chapter).collect();
-    let day_of: Vec<Option<u32>> = photos.iter().map(|p| p.day).collect();
+    // A page break wherever the day or the owner-named place changes.
+    let mut stretch = 0u32;
+    let day_of: Vec<Option<u32>> = photos
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if i > 0 && (p.day, &p.area) != (photos[i - 1].day, &photos[i - 1].area) {
+                stretch += 1;
+            }
+            Some(stretch)
+        })
+        .collect();
     flow_pages(&chapter_of, &day_of, wide_index(photos), has_map, cap)
 }
 
@@ -2271,6 +2292,7 @@ mod tests {
             day: None,
             people: 0,
             place: None,
+            area: None,
         }
     }
 
@@ -2692,6 +2714,34 @@ mod tests {
             "Tea",
         );
         assert!(level.contains("dy: -6.0pt"), "{level}");
+    }
+
+    #[test]
+    fn pages_never_mix_two_named_places() {
+        // One chapter, one day: a walk in, the Flower Dome, the Cloud Forest.
+        let areas = [
+            None,
+            None,
+            Some("Flower Dome"),
+            Some("Flower Dome"),
+            Some("Flower Dome"),
+            Some("Cloud Forest"),
+            Some("Cloud Forest"),
+            Some("Cloud Forest"),
+            Some("Cloud Forest"),
+        ];
+        let photos: Vec<BookPhoto> = (0..60)
+            .map(|i| BookPhoto {
+                day: Some(1),
+                area: areas[i % 9 / 1].filter(|_| i >= 30).map(String::from),
+                ..sized(i, 4032, 3024, Some(0), NEUTRAL_SCORE)
+            })
+            .collect();
+        for (kind, taken) in pages_of(&photos, 24) {
+            let on_page: HashSet<Option<&str>> =
+                taken.iter().map(|&i| photos[i].area.as_deref()).collect();
+            assert!(on_page.len() <= 1, "{kind:?} mixes {on_page:?}");
+        }
     }
 
     #[test]

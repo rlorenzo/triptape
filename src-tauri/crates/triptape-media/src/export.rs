@@ -188,7 +188,7 @@ fn photo_place(
     a: &triptape_core::types::Asset,
 ) -> Option<String> {
     // A place the owner named wins: they were there.
-    if let Some(named) = itin.and_then(|i| i.place_at(a.gps)) {
+    if let Some(named) = itin.and_then(|i| i.place_of(a)) {
         return Some(named.to_string());
     }
     let aboard = itin
@@ -250,6 +250,27 @@ fn book_caption(
     a: &triptape_core::types::Asset,
 ) -> Option<String> {
     plan.captions.get(&a.id).cloned().or(place)
+}
+
+/// Book score added to a sharp, well-exposed panorama: on a grid page it
+/// takes a full-width row between the other photos, a layout the owner
+/// asked for more of, but against ~1,300 candidates for ~350 slots a plain
+/// score leaves most panoramas out.
+const PANORAMA_BOOK_BONUS: f32 = 0.15;
+
+/// Technical quality a panorama needs for [`PANORAMA_BOOK_BONUS`] (the
+/// scorer's quality runs 0.30-0.75): a soft or murky sweep earns nothing.
+const PANORAMA_MIN_QUALITY: f32 = 0.55;
+
+fn panorama_bonus(a: &triptape_core::types::Asset, quality: f32) -> f32 {
+    let wide = a
+        .display_aspect()
+        .is_some_and(triptape_core::plan::is_panorama);
+    if wide && quality >= PANORAMA_MIN_QUALITY {
+        PANORAMA_BOOK_BONUS
+    } else {
+        0.0
+    }
 }
 
 /// Where a book photo was taken, for [`port_day_order`].
@@ -857,7 +878,7 @@ fn export_inner(
             whereabouts.push(Whereabouts {
                 day,
                 port_day: itin.zip(date).and_then(|(i, d)| i.port_on(d)).is_some(),
-                aboard: itin.and_then(|i| i.place_at(a.gps)).is_none()
+                aboard: itin.and_then(|i| i.place_of(a)).is_none()
                     && itin
                         .zip(date)
                         .and_then(|(i, d)| i.label_for(d, a.gps))
@@ -871,14 +892,14 @@ fn export_inner(
                 height: h,
                 caption: book_caption(plan, place.clone(), a),
                 place,
+                area: itin.and_then(|i| i.place_of(a)).map(String::from),
                 day,
                 chapter,
                 // Unclamped, so a strong bonus still ranks above a weak one
                 // once `total` saturates.
-                score: a
-                    .score
-                    .as_ref()
-                    .map_or(render_book::NEUTRAL_SCORE, |s| s.tech_quality() + s.bonus),
+                score: a.score.as_ref().map_or(render_book::NEUTRAL_SCORE, |s| {
+                    s.tech_quality() + s.bonus + panorama_bonus(a, s.tech_quality())
+                }),
                 keep: plan
                     .captions
                     .get(&a.id)

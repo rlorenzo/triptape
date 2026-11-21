@@ -91,15 +91,40 @@ pub struct Itinerary {
     pub hide_attractions: Vec<String>,
 }
 
-/// A place the owner named, as a point and the reach that counts as there.
+/// A place the owner named: a point and the reach that counts as there,
+/// or a local time window (`from`/`until`, `YYYY-MM-DD HH:MM`) for places
+/// GPS cannot tell apart, such as two glasshouses 130 m apart where indoor
+/// fixes drift. A window, when given, decides on its own.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NamedPlace {
     pub name: String,
-    pub lat: f64,
-    pub lon: f64,
+    #[serde(default)]
+    pub lat: Option<f64>,
+    #[serde(default)]
+    pub lon: Option<f64>,
     /// Metres from the point that count as at the place (default 300).
     #[serde(default = "default_place_radius")]
     pub radius_m: f64,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub until: Option<String>,
+}
+
+impl NamedPlace {
+    /// The local time window, when both ends parse.
+    fn window(&self) -> Option<(jiff::civil::DateTime, jiff::civil::DateTime)> {
+        let parse = |s: &Option<String>| {
+            jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M", s.as_deref()?.trim()).ok()
+        };
+        Some((parse(&self.from)?, parse(&self.until)?))
+    }
+
+    /// Metres from `gps` when the place has a point and `gps` is inside it.
+    fn reach(&self, gps: Option<(f64, f64)>) -> Option<f64> {
+        let d = haversine_m(gps?, (self.lat?, self.lon?));
+        (d <= self.radius_m).then_some(d)
+    }
 }
 
 fn default_place_radius() -> f64 {
@@ -171,16 +196,27 @@ impl Itinerary {
         Self::from_json(&text)
     }
 
-    /// The owner-named place a shot at `gps` was taken in: the nearest one
-    /// whose radius reaches it.
-    pub fn place_at(&self, gps: Option<(f64, f64)>) -> Option<&str> {
-        let p = gps?;
-        self.places
-            .iter()
-            .map(|pl| (pl, haversine_m(p, (pl.lat, pl.lon))))
-            .filter(|(pl, d)| *d <= pl.radius_m)
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(pl, _)| pl.name.as_str())
+    /// The owner-named place a shot was taken in: one whose time window
+    /// holds its local time, else the nearest whose radius reaches its GPS.
+    pub fn place_of(&self, a: &Asset) -> Option<&str> {
+        let when = a
+            .taken_at
+            .and_then(|t| crate::metadata::local_datetime(t, a.tz_offset_secs));
+        let timed = self.places.iter().find(|pl| {
+            pl.window()
+                .zip(when)
+                .is_some_and(|((from, until), w)| from <= w && w <= until)
+        });
+        timed
+            .or_else(|| {
+                self.places
+                    .iter()
+                    .filter(|pl| pl.window().is_none())
+                    .filter_map(|pl| pl.reach(a.gps).map(|d| (pl, d)))
+                    .min_by(|x, y| x.1.total_cmp(&y.1))
+                    .map(|(pl, _)| pl)
+            })
+            .map(|pl| pl.name.as_str())
     }
 
     /// Whether the owner asked never to name this attraction.
@@ -196,6 +232,21 @@ impl Itinerary {
     fn validate(&self) -> Result<(), String> {
         if self.stops.len() < 2 || self.legs.is_empty() {
             return Err("itinerary needs at least two stops and one leg".into());
+        }
+        for pl in &self.places {
+            let timed = pl.from.is_some() || pl.until.is_some();
+            if timed && pl.window().is_none() {
+                return Err(format!(
+                    "place {:?}: from/until must both be \"YYYY-MM-DD HH:MM\"",
+                    pl.name
+                ));
+            }
+            if !timed && (pl.lat.is_none() || pl.lon.is_none()) {
+                return Err(format!(
+                    "place {:?} needs lat and lon, or from/until",
+                    pl.name
+                ));
+            }
         }
         for (i, s) in self.stops.iter().enumerate() {
             if self.stops[..i].iter().any(|o| o.id == s.id) {
@@ -729,24 +780,39 @@ mod tests {
     }
 
     #[test]
-    fn named_places_label_shots_inside_their_radius() {
+    fn named_places_label_shots_inside_their_radius_or_window() {
         let mut it = itin();
         assert!(it.places.is_empty());
         it.places = serde_json::from_str(
             r#"[
               { "name": "Taipei 101", "lat": 25.0340, "lon": 121.5645, "radius_m": 250 },
-              { "name": "Raohe Night Market", "lat": 25.0509, "lon": 121.5775 }
+              { "name": "Raohe Night Market", "lat": 25.0509, "lon": 121.5775 },
+              { "name": "Flower Dome", "from": "2026-10-23 11:30", "until": "2026-10-23 12:30" }
             ]"#,
         )
         .unwrap();
-        assert_eq!(it.place_at(Some((25.0343, 121.5648))), Some("Taipei 101"));
+        let at = |gps| photo("p", "2026-10-16", gps);
         assert_eq!(
-            it.place_at(Some((25.0510, 121.5770))),
+            it.place_of(&at(Some((25.0343, 121.5648)))),
+            Some("Taipei 101")
+        );
+        assert_eq!(
+            it.place_of(&at(Some((25.0510, 121.5770)))),
             Some("Raohe Night Market")
         );
-        // Between the two, outside both radii.
-        assert_eq!(it.place_at(Some((25.0420, 121.5700))), None);
-        assert_eq!(it.place_at(None), None);
+        // Between the two, outside both radii; or no GPS.
+        assert_eq!(it.place_of(&at(Some((25.0420, 121.5700)))), None);
+        assert_eq!(it.place_of(&at(None)), None);
+        // In the window (noon on Oct 23), whatever the GPS says.
+        let dome = photo("d", "2026-10-23", Some((25.0343, 121.5648)));
+        assert_eq!(it.place_of(&dome), Some("Flower Dome"));
+        // A malformed window is refused when loading.
+        let bad = JSON.replacen(
+            "\"legs\"",
+            r#""places": [{ "name": "X", "from": "Oct 23", "until": "2026-10-23 12:30" }], "legs""#,
+            1,
+        );
+        assert!(Itinerary::from_json(&bad).is_err());
     }
 
     #[test]
