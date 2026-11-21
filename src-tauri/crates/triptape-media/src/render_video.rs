@@ -1866,6 +1866,7 @@ fn hero_groups<'a, C: PartialEq>(
                 r.entry.asset_id.as_str(),
                 chapter_of(&r.entry.asset_id),
                 collage_eligible(r),
+                r.taken_at,
             )
         }),
         collage,
@@ -2754,6 +2755,15 @@ mod tests {
                 }
             }
             let chapter_of = |id: &str| id[..3].to_string();
+            // Shots 9 minutes apart, so the collage time window splits
+            // some runs; every tenth undated.
+            let taken: HashMap<&str, i64> = entries
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % 10 != 9)
+                .map(|(i, e)| (e.asset_id.as_str(), i as i64 * 540))
+                .collect();
+            let taken_of = |id: &str| taken.get(id).copied();
             for cards in [
                 HeroCards {
                     route: true,
@@ -2786,6 +2796,7 @@ mod tests {
                     .map(|e| ResolvedEntry {
                         entry: e.clone(),
                         caption: captions.get(&e.asset_id).cloned(),
+                        taken_at: taken_of(&e.asset_id),
                         ..card_entry(&e.asset_id, Path::new("x.jpg"))
                     })
                     .collect();
@@ -2864,6 +2875,7 @@ mod tests {
                     |id| CHAPTER_LABELS[id[1..3].parse::<usize>().unwrap()],
                     |_| None,
                     |id| has_caption(captions.get(id).map(String::as_str)),
+                    taken_of,
                     cards,
                 );
                 let err = (est - actual).abs() / actual;

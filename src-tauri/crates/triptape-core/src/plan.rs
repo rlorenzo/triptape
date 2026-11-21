@@ -208,6 +208,13 @@ pub fn collage_hold_secs(n: usize, still_secs: f64) -> f64 {
 /// segments (roughly 10-20 s of film), and never into another chapter.
 pub const COLLAGE_REACH: usize = 3;
 
+/// Most seconds of capture time between a collage's first photo and any
+/// other photo it joins automatically. A chapter can be a whole day, and a
+/// sparse evening pick must not be pulled into a midday collage; half an
+/// hour keeps a collage to one outing. A photo with no capture time never
+/// joins automatically. The user's own joins are not bound by it.
+pub const COLLAGE_WINDOW_SECS: i64 = 30 * 60;
+
 /// One hero entry, in playback order, as [`collage_groups`] sees it.
 /// Build them with [`collage_slots`], which applies the user's edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,10 +229,13 @@ pub struct GroupSlot<C> {
     /// entries lie between them. Honoured within one chapter, and while the
     /// photos joined this way in a row number at most [`MAX_COLLAGE`].
     pub join_prev: bool,
+    /// Capture time (unix seconds): automatic collages stay within
+    /// [`COLLAGE_WINDOW_SECS`] of their first photo.
+    pub taken_at: Option<i64>,
 }
 
 /// Grouping slots for hero entries in playback order, given as
-/// `(asset id, chapter, eligible)`, with the user's collage `edits`
+/// `(asset id, chapter, eligible, capture time)`, with the user's collage `edits`
 /// applied: a `solo` photo arrives ineligible, so it plays on its own, and a
 /// `joins` link between a photo and the previous collage photo sets its
 /// `join_prev`. Links between
@@ -234,13 +244,13 @@ pub struct GroupSlot<C> {
 /// like a swap whose asset is gone. The planner estimate, the renderer and
 /// the Story editor all build their slots here.
 pub fn collage_slots<'a, C>(
-    entries: impl IntoIterator<Item = (&'a str, C, bool)>,
+    entries: impl IntoIterator<Item = (&'a str, C, bool, Option<i64>)>,
     edits: &CollageEdits,
 ) -> Vec<GroupSlot<C>> {
     let mut prev: Option<&str> = None;
     entries
         .into_iter()
-        .map(|(id, chapter, eligible)| {
+        .map(|(id, chapter, eligible, taken_at)| {
             let eligible = eligible && !edits.is_solo(id);
             let join_prev = eligible && prev.is_some_and(|p| edits.linked(p, id));
             if eligible {
@@ -250,9 +260,17 @@ pub fn collage_slots<'a, C>(
                 chapter,
                 eligible,
                 join_prev,
+                taken_at,
             }
         })
         .collect()
+}
+
+/// Whether `b` is close enough in capture time to `a` (a collage's first
+/// photo) to join it automatically: both dated, within
+/// [`COLLAGE_WINDOW_SECS`].
+fn within_window(a: Option<i64>, b: Option<i64>) -> bool {
+    matches!((a, b), (Some(x), Some(y)) if (x - y).abs() <= COLLAGE_WINDOW_SECS)
 }
 
 /// Why a hero entry always plays on its own, whatever the user's collage
@@ -336,6 +354,7 @@ pub struct HeroGrouping {
     chapter: Vec<usize>,
     alone: Vec<Option<PlaysAlone>>,
     ids: Vec<String>,
+    taken_at: Vec<Option<i64>>,
 }
 
 impl HeroGrouping {
@@ -346,15 +365,17 @@ impl HeroGrouping {
         Self::new(
             plan,
             |id| by_id.get(id).and_then(|a| a.display_aspect()),
+            |id| by_id.get(id).and_then(|a| a.taken_at),
             |id| by_id.get(id).is_some_and(|a| a.path.exists()),
         )
     }
 
-    /// `aspect_of` gives an asset's display aspect, `present` whether its
-    /// source is on disk.
+    /// `aspect_of` gives an asset's display aspect, `taken_of` its capture
+    /// time, `present` whether its source is on disk.
     pub fn new(
         plan: &Plan,
         aspect_of: impl Fn(&str) -> Option<f64>,
+        taken_of: impl Fn(&str) -> Option<i64>,
         present: impl Fn(&str) -> bool,
     ) -> Self {
         let chapter_of = chapter_index(plan);
@@ -383,6 +404,7 @@ impl HeroGrouping {
                 })
                 .collect(),
             ids: hero.iter().map(|e| e.asset_id.clone()).collect(),
+            taken_at: hero.iter().map(|e| taken_of(&e.asset_id)).collect(),
         }
     }
 
@@ -446,6 +468,7 @@ impl HeroGrouping {
                     self.ids[i].as_str(),
                     self.chapter[i],
                     self.alone[i].is_none(),
+                    self.taken_at[i],
                 )
             }),
             collage,
@@ -465,16 +488,17 @@ impl HeroGrouping {
 ///
 /// Eligible stills of one chapter are grouped even when other entries sit
 /// between them, as long as a group spans at most [`COLLAGE_REACH`] other
-/// entries and no entry of another chapter; those entries keep their own
-/// positions. Among the ways to split a chapter's stills into groups of at
+/// entries and no entry of another chapter, and every member was taken
+/// within [`COLLAGE_WINDOW_SECS`] of the group's first; those entries keep
+/// their own positions. Among the ways to split a chapter's stills into groups of at
 /// most [`MAX_COLLAGE`], the chosen one leaves the fewest stills solo, then
 /// moves stills across the fewest entries, then makes the fewest segments,
 /// then balances group sizes (five stills in a row play as 3 + 2, not 4 + 1).
 ///
 /// The user's overrides come first: a photo set solo arrives ineligible
 /// (see [`collage_slots`]), and a `join_prev` link keeps its photo in the previous
-/// collage photo's group even beyond the reach (entries it crosses do not
-/// count against the reach); links still never cross a chapter, and a row
+/// collage photo's group even beyond the reach and the time window
+/// (entries it crosses do not count against the reach); links still never cross a chapter, and a row
 /// of linked photos longer than [`MAX_COLLAGE`] drops the links past it.
 /// The planner's length estimate, the renderer and the Story editor all
 /// group through this, so the planned length matches the film.
@@ -494,7 +518,11 @@ pub fn collage_groups<C: PartialEq>(slots: &[GroupSlot<C>]) -> Vec<Vec<usize>> {
         let prev = runs.last().and_then(|(r, _)| r.last().copied());
         let same_chapter = prev.is_some_and(|p| slots[p..i].iter().all(|o| o.chapter == s.chapter));
         let linked = same_chapter && s.join_prev && linked_row < MAX_COLLAGE;
-        let joins = linked || (same_chapter && prev.is_some_and(|p| i - p - 1 <= COLLAGE_REACH));
+        let joins = linked
+            || (same_chapter
+                && prev.is_some_and(|p| {
+                    i - p - 1 <= COLLAGE_REACH && within_window(slots[p].taken_at, s.taken_at)
+                }));
         linked_row = if linked { linked_row + 1 } else { 1 };
         match runs.last_mut() {
             Some((r, l)) if joins => {
@@ -505,16 +533,19 @@ pub fn collage_groups<C: PartialEq>(slots: &[GroupSlot<C>]) -> Vec<Vec<usize>> {
         }
     }
     for (run, linked) in &runs {
-        groups.extend(split_run(run, linked));
+        let times: Vec<Option<i64>> = run.iter().map(|&i| slots[i].taken_at).collect();
+        groups.extend(split_run(run, linked, &times));
     }
     groups.sort_unstable_by_key(|g| g[0]);
     groups
 }
 
 /// Best split of one run (ascending entry indices) into consecutive
-/// groups, never between a photo and the one it is `linked` to; see
-/// [`collage_groups`] for the order of preferences.
-fn split_run(run: &[usize], linked: &[bool]) -> Vec<Vec<usize>> {
+/// groups, never between a photo and the one it is `linked` to, with every
+/// unlinked member within [`COLLAGE_WINDOW_SECS`] of its group's first
+/// (`times`, per run member); see [`collage_groups`] for the order of
+/// preferences.
+fn split_run(run: &[usize], linked: &[bool], times: &[Option<i64>]) -> Vec<Vec<usize>> {
     // Cost of a split, compared in order: solo stills, entries crossed,
     // segments, sum of squared sizes (lower is more balanced). On a full
     // tie the larger group comes first (3 + 2, not 2 + 3).
@@ -529,6 +560,9 @@ fn split_run(run: &[usize], linked: &[bool]) -> Vec<Vec<usize>> {
                 continue;
             }
             let n = j - start;
+            if !(start + 1..j).all(|k| linked[k] || within_window(times[start], times[k])) {
+                continue;
+            }
             // Entries crossed between members; a user link crosses freely.
             let crossed: usize = (start + 1..j)
                 .filter(|&k| !linked[k])
@@ -552,7 +586,8 @@ fn split_run(run: &[usize], linked: &[bool]) -> Vec<Vec<usize>> {
     let mut j = run.len();
     while j > 0 {
         // Each row of linked photos (at most MAX_COLLAGE, crossing nothing
-        // that counts) can be a group of its own, so the run always splits.
+        // that counts, bound by no window) can be a group of its own, and a
+        // lone photo always can, so the run always splits.
         let (_, start) = best[j].expect("every run splits");
         out.push(run[start..j].to_vec());
         j = start;
@@ -659,6 +694,7 @@ pub fn estimate_hero_secs<'e, 'c>(
     chapter_of: impl Fn(&str) -> &'c str,
     pano_secs_of: impl Fn(&str) -> Option<f64>,
     captioned: impl Fn(&str) -> bool,
+    taken_of: impl Fn(&str) -> Option<i64>,
     cards: HeroCards,
 ) -> f64 {
     estimate_hero_secs_with(
@@ -666,6 +702,7 @@ pub fn estimate_hero_secs<'e, 'c>(
         chapter_of,
         pano_secs_of,
         captioned,
+        taken_of,
         cards,
         &CollageEdits::default(),
     )
@@ -685,6 +722,10 @@ pub fn estimate_plan_secs(plan: &Plan, assets: &[Asset]) -> f64 {
             Some((a.id.as_str(), pano_motion(asp).hold_secs))
         })
         .collect();
+    let taken: HashMap<&str, i64> = assets
+        .iter()
+        .filter_map(|a| Some((a.id.as_str(), a.taken_at?)))
+        .collect();
     let cards = HeroCards {
         route: !plan.map_polyline.is_empty(),
         route_stops: crate::route_stops::animated_stop_count(
@@ -698,6 +739,7 @@ pub fn estimate_plan_secs(plan: &Plan, assets: &[Asset]) -> f64 {
         |id| labels[chapter.get(id).copied().unwrap_or(plan.chapters.len())].as_str(),
         |id| pano.get(id).copied(),
         |id| has_caption(plan.captions.get(id).map(String::as_str)),
+        |id| taken.get(id).copied(),
         cards,
         &plan.collage,
     )
@@ -710,6 +752,7 @@ pub fn estimate_hero_secs_with<'e, 'c>(
     chapter_of: impl Fn(&str) -> &'c str,
     pano_secs_of: impl Fn(&str) -> Option<f64>,
     captioned: impl Fn(&str) -> bool,
+    taken_of: impl Fn(&str) -> Option<i64>,
     cards: HeroCards,
     collage: &CollageEdits,
 ) -> f64 {
@@ -729,6 +772,7 @@ pub fn estimate_hero_secs_with<'e, 'c>(
                     pano_secs_of(&e.asset_id).is_some(),
                     captioned(&e.asset_id),
                 ),
+                taken_of(&e.asset_id),
             )
         }),
         collage,
@@ -801,6 +845,7 @@ struct HeroBudget {
 /// same moment, but they would play back to back); when every chapter has
 /// run dry the budget is plentiful, and a second pass allows both. Keeps
 /// story order.
+#[allow(clippy::too_many_arguments)]
 fn select_hero_by_budget<'a>(
     cands: Vec<PlanEntry>,
     chapter_of: impl Fn(&str) -> &'a str + Copy,
@@ -808,6 +853,7 @@ fn select_hero_by_budget<'a>(
     similar: impl Fn(&str, &str) -> bool,
     pano_secs_of: impl Fn(&str) -> Option<f64> + Copy,
     captioned: impl Fn(&str) -> bool + Copy,
+    taken_of: impl Fn(&str) -> Option<i64> + Copy,
     budget: HeroBudget,
 ) -> Vec<PlanEntry> {
     // Chapters in story order, each with its candidates best-first.
@@ -837,6 +883,7 @@ fn select_hero_by_budget<'a>(
             chapter_of,
             pano_secs_of,
             captioned,
+            taken_of,
             budget.cards,
         )
     };
@@ -1473,6 +1520,7 @@ pub fn build_plan_with_length(
         similar,
         pano_secs_of,
         |id| has_caption(by_id.get(id).and_then(|a| a.user_caption.as_deref())),
+        |id| by_id.get(id).and_then(|a| a.taken_at),
         budget,
     );
 
@@ -2792,6 +2840,7 @@ mod tests {
             |id| clusters.get(id).map_or(UNGROUPED, String::as_str),
             |_| None,
             |id| has_caption(plan.captions.get(id).map(String::as_str)),
+            |_| Some(0),
             HeroCards {
                 route: !plan.map_polyline.is_empty(),
                 route_stops: 0,
@@ -3068,7 +3117,9 @@ mod tests {
             places: true,
         };
         assert!(
-            (estimate_hero_secs(&entries, ch, |_| None, |_| false, cards) - 33.18).abs() < 1e-9
+            (estimate_hero_secs(&entries, ch, |_| None, |_| false, |_| Some(0), cards) - 33.18)
+                .abs()
+                < 1e-9
         );
         // Without a route or places only the title card remains.
         let bare = HeroCards {
@@ -3079,7 +3130,11 @@ mod tests {
         };
         // 2.5 + 7 + 4 + 6 + 2.5 + 4 = 26 s; cuts 0.7 + 0.54 + 0.8 + 0.54 +
         // 0.7 = 3.28 s.
-        assert!((estimate_hero_secs(&entries, ch, |_| None, |_| false, bare) - 22.72).abs() < 1e-9);
+        assert!(
+            (estimate_hero_secs(&entries, ch, |_| None, |_| false, |_| Some(0), bare) - 22.72)
+                .abs()
+                < 1e-9
+        );
     }
 
     #[test]
@@ -3098,6 +3153,7 @@ mod tests {
                 |_| "X",
                 |_| None,
                 |id| has_caption(caps.get(id).copied()),
+                |_| Some(0),
                 bare,
             )
         };
@@ -3195,7 +3251,11 @@ mod tests {
             route_secs: None,
             places: false,
         };
-        assert!((estimate_hero_secs(&entries, |_| "X", pano, |_| false, bare) - 15.1).abs() < 1e-9);
+        assert!(
+            (estimate_hero_secs(&entries, |_| "X", pano, |_| false, |_| Some(0), bare) - 15.1)
+                .abs()
+                < 1e-9
+        );
     }
 
     #[test]
@@ -3348,6 +3408,7 @@ mod tests {
             similar,
             |_| None,
             |_| false,
+            |_| Some(0),
             HeroBudget {
                 ceiling_secs,
                 cards: NO_CARDS,
@@ -3372,6 +3433,7 @@ mod tests {
             letter,
             |_| None,
             |_| false,
+            |_| Some(0),
             NO_CARDS,
         );
         // Room for a still after the reps, not for a second 8 s clip.
@@ -3395,7 +3457,14 @@ mod tests {
             let pair = |p: &str, q: &str| (x == p && y == q) || (x == q && y == p);
             pair("a1", "a2")
         };
-        let reps = estimate_hero_secs([&cands()[0]], letter, |_| None, |_| false, NO_CARDS);
+        let reps = estimate_hero_secs(
+            [&cands()[0]],
+            letter,
+            |_| None,
+            |_| false,
+            |_| Some(0),
+            NO_CARDS,
+        );
         let tight = pick(cands(), &scores, reps + 7.0, twin);
         assert_eq!(tight, vec!["a1", "a3", "a4"], "twin skipped: {tight:?}");
         // With budget to spare the twin comes back in the second pass.
@@ -3410,8 +3479,14 @@ mod tests {
             .map(|i| clip_entry(&format!("a{i:02}"), 3.0))
             .collect();
         cands.extend((0..4).map(|i| clip_entry(&format!("b{i:02}"), 3.0)));
-        let ceiling =
-            estimate_hero_secs(&cands[..0], letter, |_| None, |_| false, NO_CARDS) + 20.0 * 2.5;
+        let ceiling = estimate_hero_secs(
+            &cands[..0],
+            letter,
+            |_| None,
+            |_| false,
+            |_| Some(0),
+            NO_CARDS,
+        ) + 20.0 * 2.5;
         let got = pick(cands, &[], ceiling, |_, _| false);
         let big = got.iter().filter(|i| i.starts_with('a')).count() as f64;
         let small = got.iter().filter(|i| i.starts_with('b')).count() as f64;
@@ -3517,6 +3592,7 @@ mod tests {
             |_| UNGROUPED,
             |_| None,
             |_| false,
+            |_| Some(0),
             NO_CARDS,
         );
         let plan = build_plan_with_length(
@@ -3816,12 +3892,13 @@ mod tests {
     #[test]
     fn route_and_places_cards_shift_the_estimate() {
         let e = [still_entry("a1")];
-        let bare = estimate_hero_secs(&e, letter, |_| None, |_| false, NO_CARDS);
+        let bare = estimate_hero_secs(&e, letter, |_| None, |_| false, |_| Some(0), NO_CARDS);
         let full = estimate_hero_secs(
             &e,
             letter,
             |_| None,
             |_| false,
+            |_| Some(0),
             HeroCards {
                 route: true,
                 route_stops: 0,
@@ -3834,7 +3911,7 @@ mod tests {
         assert!((full - bare - 10.0).abs() < 1e-9, "{full}");
         // No entries: nothing but the title, and no overlap to subtract.
         assert_eq!(
-            estimate_hero_secs([], letter, |_| None, |_| false, NO_CARDS),
+            estimate_hero_secs([], letter, |_| None, |_| false, |_| Some(0), NO_CARDS),
             EST_TITLE_SECS
         );
     }
@@ -3979,6 +4056,7 @@ mod tests {
                 |_, _| false,
                 |_| None,
                 |_| false,
+                |_| Some(0),
                 budget(ceiling),
             )
             .iter()
@@ -4163,6 +4241,7 @@ mod tests {
                 chapter,
                 eligible: matches!(c, 's' | 'j'),
                 join_prev: c == 'j',
+                taken_at: Some(0),
             }));
         }
         out
@@ -4200,12 +4279,12 @@ mod tests {
             joins: vec![("a".into(), "c".into()), ("c".into(), "e".into())],
         };
         let entries = [
-            ("a", 0, true),
-            ("b", 0, true),
-            ("c", 0, true),
-            ("clip", 0, false),
-            ("d", 0, true),
-            ("e", 0, true),
+            ("a", 0, true, Some(0)),
+            ("b", 0, true, Some(0)),
+            ("c", 0, true, Some(0)),
+            ("clip", 0, false, Some(0)),
+            ("d", 0, true, Some(0)),
+            ("e", 0, true, Some(0)),
         ];
         let s = collage_slots(entries, &edits);
         let flags: Vec<(bool, bool)> = s.iter().map(|g| (g.eligible, g.join_prev)).collect();
@@ -4283,7 +4362,15 @@ mod tests {
     fn estimate_follows_collage_overrides() {
         let entries: Vec<PlanEntry> = ["a1", "a2", "a3"].map(still_entry).to_vec();
         let est = |c: &CollageEdits| {
-            estimate_hero_secs_with(&entries, letter, |_| None, |_| false, NO_CARDS, c)
+            estimate_hero_secs_with(
+                &entries,
+                letter,
+                |_| None,
+                |_| false,
+                |_| Some(0),
+                NO_CARDS,
+                c,
+            )
         };
         let auto = est(&CollageEdits::default());
         let solo = est(&CollageEdits {
@@ -4295,7 +4382,7 @@ mod tests {
         assert!(solo - auto > 2.0, "{auto} -> {solo}");
         assert_eq!(
             auto,
-            estimate_hero_secs(&entries, letter, |_| None, |_| false, NO_CARDS)
+            estimate_hero_secs(&entries, letter, |_| None, |_| false, |_| Some(0), NO_CARDS)
         );
     }
 
@@ -4309,15 +4396,19 @@ mod tests {
         for _ in 0..2000 {
             let len = 1 + next(40) as usize;
             let mut chapter = 0;
+            let mut t = 0i64;
             // Links land anywhere, even on entries collage_slots would
-            // never mark: grouping must still be sound.
+            // never mark: grouping must still be sound. Shots come 0-19
+            // minutes apart, a few undated.
             let v: Vec<GroupSlot<usize>> = (0..len)
                 .map(|_| {
                     chapter += usize::from(next(8) == 0);
+                    t += next(20) as i64 * 60;
                     GroupSlot {
                         chapter,
                         eligible: next(3) != 0,
                         join_prev: next(3) == 0,
+                        taken_at: (next(12) != 0).then_some(t),
                     }
                 })
                 .collect();
@@ -4335,9 +4426,15 @@ mod tests {
                     assert!(g.len() <= MAX_COLLAGE, "{g:?}");
                     assert!(g.iter().all(|&i| photo(i)), "solo or ineligible in {g:?}");
                     assert!(v[a..=b].iter().all(|s| s.chapter == v[a].chapter));
-                    // Without links among them, the reach still holds.
+                    // Without links among them, the reach and the time
+                    // window still hold.
                     if g[1..].iter().all(|&i| !v[i].join_prev) {
                         assert!(b - a + 1 - g.len() <= COLLAGE_REACH, "{g:?}");
+                        assert!(
+                            g.iter()
+                                .all(|&i| within_window(v[a].taken_at, v[i].taken_at)),
+                            "{g:?}"
+                        );
                     }
                 }
             }
@@ -4360,6 +4457,46 @@ mod tests {
 
     fn groups_of(spec: &str) -> Vec<Vec<usize>> {
         collage_groups(&slots(spec))
+    }
+
+    #[test]
+    fn collages_stay_within_the_time_window_unless_the_user_joins() {
+        let at = |spec: &str, mins: &[Option<i64>]| {
+            let mut v = slots(spec);
+            for (s, m) in v.iter_mut().zip(mins) {
+                s.taken_at = m.map(|m| m * 60);
+            }
+            collage_groups(&v)
+        };
+        // Midday stills and one from that evening, one entry apart: the
+        // evening shot plays alone.
+        assert_eq!(
+            at("sscs", &[Some(0), Some(5), Some(6), Some(8 * 60)]),
+            vec![vec![0, 1], vec![2], vec![3]]
+        );
+        // Within 30 minutes of the first photo: one collage.
+        assert_eq!(
+            at("sss", &[Some(0), Some(20), Some(30)]),
+            vec![vec![0, 1, 2]]
+        );
+        // 31 minutes from the first, though 11 from the second: split.
+        assert_eq!(
+            at("ssss", &[Some(0), Some(20), Some(31), Some(40)]),
+            vec![vec![0, 1], vec![2, 3]]
+        );
+        // An undated still never joins on its own (and, as a photo in
+        // between, ends the run like a change of chapter would).
+        assert_eq!(
+            at("sss", &[Some(0), None, Some(1)]),
+            vec![vec![0], vec![1], vec![2]]
+        );
+        assert_eq!(
+            at("ssss", &[Some(0), Some(1), None, Some(2)]),
+            vec![vec![0, 1], vec![2], vec![3]]
+        );
+        // The user's join overrides the window.
+        assert_eq!(at("sj", &[Some(0), Some(8 * 60)]), vec![vec![0, 1]]);
+        assert_eq!(at("sj", &[Some(0), None]), vec![vec![0, 1]]);
     }
 
     #[test]
@@ -4463,18 +4600,18 @@ mod tests {
         let all = |_: &str| true;
         let none = CollageEdits::default();
         assert_eq!(
-            HeroGrouping::new(&plan, pano, all).groups(&none),
+            HeroGrouping::new(&plan, pano, |_| Some(0), all).groups(&none),
             vec![vec![0, 2], vec![1], vec![3], vec![4, 6], vec![5]]
         );
         // Without the panorama, a4 joins a1 and a3.
-        let plain = HeroGrouping::new(&plan, |_| None, all);
+        let plain = HeroGrouping::new(&plan, |_| None, |_| Some(0), all);
         assert_eq!(plain.groups(&none)[0], vec![0, 2, 3]);
         assert_eq!(
             (plain.chapter(4), plain.plays_alone(5)),
             (1, Some(PlaysAlone::Caption))
         );
         // A missing a3 does not play: a1 and a4 group without it.
-        let gone = HeroGrouping::new(&plan, |_| None, |id| id != "a3");
+        let gone = HeroGrouping::new(&plan, |_| None, |_| Some(0), |id| id != "a3");
         assert_eq!(gone.groups(&none)[0], vec![0, 3]);
         assert!(gone.groups(&none).iter().all(|g| !g.contains(&2)));
         // The user's edits regroup it.
@@ -4539,13 +4676,17 @@ mod tests {
         for _ in 0..500 {
             let len = 1 + next(40) as usize;
             let mut chapter = 0;
+            let mut t = 0i64;
+            // Shots 0-19 minutes apart, a few undated.
             let v: Vec<GroupSlot<usize>> = (0..len)
                 .map(|_| {
                     chapter += usize::from(next(8) == 0);
+                    t += next(20) as i64 * 60;
                     GroupSlot {
                         chapter,
                         eligible: next(3) != 0,
                         join_prev: false,
+                        taken_at: (next(12) != 0).then_some(t),
                     }
                 })
                 .collect();
@@ -4560,6 +4701,8 @@ mod tests {
                 g.len() <= MAX_COLLAGE
                     && b - a + 1 - g.len() <= COLLAGE_REACH
                     && v[a..=b].iter().all(|s| s.chapter == v[a].chapter)
+                    && g.iter()
+                        .all(|&i| within_window(v[a].taken_at, v[i].taken_at))
             };
             for g in &groups {
                 assert!(g.windows(2).all(|w| w[0] < w[1]), "chronological {g:?}");
@@ -4610,12 +4753,12 @@ mod tests {
         };
         // Title 2.5, x1+x3 collage 5, clip 6, y1 solo 4 = 17.5 s; cuts
         // opening 0.7, plain 0.54, closing 0.7 = 1.94 s.
-        let est = estimate_hero_secs(&entries, ch, |_| None, |_| false, bare);
+        let est = estimate_hero_secs(&entries, ch, |_| None, |_| false, |_| Some(0), bare);
         assert!((est - 15.56).abs() < 1e-9, "{est}");
         // Captioning x3 leaves x1 nobody to pair with: x1 solo 4, clip 6,
         // x3 solo 4, y1 solo 4 + title 2.5 = 20.5 s; cuts 0.7 + 0.54 +
         // 0.54 + 0.7 = 2.48 s.
-        let est = estimate_hero_secs(&entries, ch, |_| None, |id| id == "x3", bare);
+        let est = estimate_hero_secs(&entries, ch, |_| None, |id| id == "x3", |_| Some(0), bare);
         assert!((est - 18.02).abs() < 1e-9, "{est}");
     }
 }
