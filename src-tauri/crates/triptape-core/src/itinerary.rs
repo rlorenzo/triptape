@@ -633,15 +633,19 @@ fn chapter_name(
     home: &std::collections::HashSet<String>,
 ) -> String {
     let named = crate::places::tally(members.iter().filter_map(|a| itin.place_of(a)));
-    // A chapter spanning several named places (the Flower Dome, then the
-    // Cloud Forest) is named for what holds them, not its biggest part.
-    let several = named
+    // A chapter spanning several named places (Mount Faber, then the
+    // Oceanarium) is named for the first one visited, as a day is named
+    // for its first sight.
+    let visited: Vec<&str> = named
         .iter()
         .filter(|(_, c)| *c >= crate::places::PLACE_MIN_SHOTS)
-        .count()
-        > 1;
+        .map(|(n, _)| *n)
+        .collect();
+    if visited.len() > 1 {
+        return visited[0].to_string();
+    }
     if let Some((name, _)) =
-        crate::places::most_counted(named).filter(|(_, c)| !several && 2 * c >= members.len())
+        crate::places::most_counted(named).filter(|(_, c)| 2 * c >= members.len())
     {
         return name.to_string();
     }
@@ -651,7 +655,14 @@ fn chapter_name(
             .or_else(|| itin.port_on(day))
             .unwrap_or(label.place);
     }
-    let fixes: Vec<(f64, f64)> = members.iter().filter_map(|a| a.gps).collect();
+    // Shots inside a place the owner named are that place, not the
+    // built-in landmark next door (the Oceanarium is not Universal
+    // Studios).
+    let fixes: Vec<(f64, f64)> = members
+        .iter()
+        .filter(|a| itin.place_of(a).is_none())
+        .filter_map(|a| a.gps)
+        .collect();
     // Neither a hidden name nor the hotel's neighbourhood (a home base).
     crate::places::visited_attraction(&fixes, crate::places::PLACE_MIN_SHOTS, |n| {
         itin.hides_attraction(n) || home.contains(n)
@@ -970,7 +981,7 @@ mod tests {
         );
         // Ashore: a named place, then a visited attraction, then the city.
         assert_eq!(name(&it, "2026-10-11", (34.6687, 135.5013), 3), "Dotonbori");
-        // Two named places in one chapter: neither names it.
+        // Two named places in one chapter: the first one visited names it.
         it.places.push(
             serde_json::from_str(
                 r#"{ "name": "Kuromon Market", "lat": 34.6655, "lon": 135.5065, "radius_m": 200 }"#,
@@ -991,7 +1002,7 @@ mod tests {
         let label = chapter_label(&it, day("2026-10-11"), &refs).unwrap();
         assert_eq!(
             chapter_name(&it, day("2026-10-11"), &refs, label, &Default::default()),
-            "Osaka"
+            "Dotonbori"
         );
         assert_eq!(
             name(&it, "2026-10-06", (35.6267, 139.8881), 3),

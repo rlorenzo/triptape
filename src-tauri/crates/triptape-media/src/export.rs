@@ -156,7 +156,12 @@ fn book_chapter_of(plan: &Plan) -> HashMap<&str, usize> {
 /// A book photo's caption: the user's, else its shared place
 /// ([`triptape_core::places::photo_places`]).
 fn book_caption(plan: &Plan, places: &HashMap<String, String>, id: &str) -> Option<String> {
-    plan.captions.get(id).or_else(|| places.get(id)).cloned()
+    // A hidden (blank) caption still leaves the photo its place.
+    plan.captions
+        .get(id)
+        .filter(|c| !c.trim().is_empty())
+        .or_else(|| places.get(id))
+        .cloned()
 }
 
 /// Book score added to a sharp, well-exposed panorama: on a grid page it
@@ -197,6 +202,26 @@ fn book_story_positions<'a>(
         .enumerate()
         .map(|(i, id)| (id, i))
         .collect()
+}
+
+/// A leg this long at either end of the route is the flight there or
+/// home, not part of the trip (Los Angeles to Tokyo is ~8,800 km; the
+/// longest cruise leg, Osaka to Singapore, ~4,900 km).
+const LONG_HAUL_M: f64 = 7_000_000.0;
+
+/// `route` without its long-haul legs at the start and end (home to the
+/// first stop, the last stop home).
+fn trip_route(route: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let far = |a: (f64, f64), b: (f64, f64)| triptape_core::geo::haversine_m(a, b) > LONG_HAUL_M;
+    let mut start = 0;
+    while start + 1 < route.len() && far(route[start], route[start + 1]) {
+        start += 1;
+    }
+    let mut end = route.len();
+    while end > start + 1 && far(route[end - 2], route[end - 1]) {
+        end -= 1;
+    }
+    route[start..end].to_vec()
 }
 
 /// Drop every photo whose `_edited` version is in the book too (Photos
@@ -815,9 +840,20 @@ fn export_inner(
             .iter()
             .map(crate::titlecard::chapter_book_title)
             .collect();
+        // The book's route map: a square card of the trip itself, without
+        // the long-haul flights from and to home, which would stretch it
+        // across an ocean and shrink the trip to a corner.
+        let book_route = trip_route(&plan.map_polyline);
+        let book_map = (book_route.len() >= 2)
+            .then(|| work.join("route_card_book.png"))
+            .filter(|card| {
+                crate::map::save_route_card(&book_route, &[], 1800, 1800, card)
+                    .map_err(|e| report.fallbacks.push(format!("book map failed: {e}")))
+                    .is_ok()
+            });
         match render_book::render_book(
             &book_photos,
-            map_card.as_deref(),
+            book_map.as_deref().or(map_card.as_deref()),
             &chapter_titles,
             &staged_book,
             &BookOptions {
@@ -1066,6 +1102,21 @@ mod tests {
         assert_eq!(order(&plan), ["p1", "c1", "p2", "c2"]);
         plan.chapters = vec![chapter(&["c1", "c2"]), chapter(&["p1", "p2"])];
         assert_eq!(order(&plan), ["c1", "c2", "p1", "p2"]);
+    }
+
+    #[test]
+    fn the_book_map_leaves_out_the_flights_home() {
+        let (lax, tokyo, osaka, sg) = (
+            (33.94, -118.41),
+            (35.71, 139.80),
+            (34.66, 135.43),
+            (1.27, 103.86),
+        );
+        assert_eq!(
+            trip_route(&[lax, tokyo, osaka, sg, lax]),
+            [tokyo, osaka, sg]
+        );
+        assert_eq!(trip_route(&[tokyo, osaka]), [tokyo, osaka]);
     }
 
     #[test]
