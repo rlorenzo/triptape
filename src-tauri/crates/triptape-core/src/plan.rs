@@ -1345,6 +1345,7 @@ pub fn build_plan_with_length(
     // per chapter (overlays, book day-marker pages) — photos inside a
     // chapter need no per-photo timestamp.
     let trip_start = ordered.iter().filter_map(|a| local_date(a)).min();
+    let home = crate::places::home_bases(assets);
     let chapters: Vec<Chapter> = groups
         .iter()
         .map(|(label, members)| {
@@ -1352,7 +1353,7 @@ pub fn build_plan_with_length(
             let first_date = members.iter().filter_map(|a| local_date(a)).min();
             // GPS naming first; a user override (e.g. the ship's name for
             // days at sea) only fills what GPS honestly cannot name.
-            let place = chapter_place(&gps).or_else(|| {
+            let place = chapter_place(&gps, &home).or_else(|| {
                 let d = first_date?;
                 overrides
                     .iter()
@@ -1740,11 +1741,11 @@ fn motion_picks<'a, 'c>(
 /// (the fix minimizing total distance to the others) names the place.
 /// A raw mean breaks at the antimeridian and is dragged by outliers. The
 /// search is quadratic, so large chapters use an even sample of their fixes.
-fn chapter_place(gps: &[(f64, f64)]) -> Option<String> {
+fn chapter_place(gps: &[(f64, f64)], home: &HashSet<String>) -> Option<String> {
     // An attraction only when the chapter's photos visited it (see
     // `places`), else the city at the medoid: 2 km around the medoid named
     // whatever the day walked past.
-    crate::places::chapter_attraction(gps).or_else(|| crate::geo::city_name(medoid(gps)?))
+    crate::places::chapter_attraction(gps, home).or_else(|| crate::geo::city_name(medoid(gps)?))
 }
 
 /// Geographic medoid of `gps`: the fix minimizing total distance to the
@@ -2121,6 +2122,8 @@ mod tests {
 
     #[test]
     fn chapter_place_uses_medoid_not_mean() {
+        let none = HashSet::new();
+        let chapter_place = |g: &[(f64, f64)]| super::chapter_place(g, &none);
         // Fushimi Inari cluster plus one far outlier: still Fushimi Inari.
         let mut gps: Vec<(f64, f64)> = (0..8)
             .map(|i| (34.9671 + i as f64 * 0.001, 135.7727))
@@ -2139,6 +2142,10 @@ mod tests {
             Some("Tokyo DisneySea")
         );
         assert_eq!(chapter_place(&[(2.221, 105.205)]), None);
+        // A home base (the hotel's neighbourhood) never names a chapter.
+        let home = HashSet::from(["Tokyo DisneySea".to_string()]);
+        let near_hotel = super::chapter_place(&[(35.6267, 139.8881); 3], &home);
+        assert!(near_hotel.is_some_and(|n| n != "Tokyo DisneySea"));
         // Past the sampling cap, the dense cluster still wins.
         let mut many = vec![(34.9671, 135.7727); 1_000];
         many.extend([(-33.8688, 151.2093); 20]);

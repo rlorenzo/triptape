@@ -119,16 +119,19 @@ pub fn spot<'a>(itin: Option<&'a Itinerary>, a: &Asset) -> Spot<'a> {
 
 /// A chapter's attraction for its name when the plan has no itinerary:
 /// the one its photos visited (a single-photo chapter needs only that
-/// shot there).
-pub fn chapter_attraction(fixes: &[(f64, f64)]) -> Option<String> {
-    visited_attraction(fixes, PLACE_MIN_SHOTS.min(fixes.len()), |_| false)
+/// shot there), never one of the trip's [`home_bases`].
+pub fn chapter_attraction(fixes: &[(f64, f64)], home: &HashSet<String>) -> Option<String> {
+    visited_attraction(fixes, PLACE_MIN_SHOTS.min(fixes.len()), |n| {
+        home.contains(n)
+    })
 }
 
 /// Each planned photo's place, by asset id: a place the owner named in
 /// the itinerary; the ship for shots the itinerary puts on board (even at
 /// a dock beside Miraikan or the Osaka Aquarium); else the attraction it
 /// was taken at on a day with [`PLACE_MIN_SHOTS`] there; else its
-/// chapter's place. Photos with none of these are absent.
+/// chapter's place, unless that is a name the trip hides (a home base or
+/// an itinerary `hide_attractions` entry). Photos with none are absent.
 pub fn photo_places(
     plan: &Plan,
     assets: &[Asset],
@@ -174,7 +177,13 @@ pub fn photo_places(
                 })
                 .map(String::from),
         };
-        if let Some(p) = own.or_else(|| chapter_place.get(a.id.as_str()).map(|p| p.to_string())) {
+        let fallback = || {
+            chapter_place
+                .get(a.id.as_str())
+                .filter(|&&p| !hidden(p))
+                .map(|p| p.to_string())
+        };
+        if let Some(p) = own.or_else(fallback) {
             out.insert(a.id.clone(), p);
         }
     }
@@ -242,6 +251,11 @@ mod tests {
             "a home base captions no photo"
         );
         assert_eq!(photo_places(&plan, &seen(&[0, 1]), None).len(), 6);
+        // Nor does a chapter named for it give it back as the fallback.
+        let assets = seen(&[0, 1, 2]);
+        let ids: Vec<&str> = assets.iter().map(|a| a.id.as_str()).collect();
+        let named = plan_of(vec![(name.as_str(), ids)]);
+        assert!(photo_places(&named, &assets, None).is_empty());
     }
 
     #[test]
@@ -272,7 +286,7 @@ mod tests {
         );
         // Single-photo chapters name the place that photo was taken at.
         assert_eq!(
-            chapter_attraction(&[disneysea]).as_deref(),
+            chapter_attraction(&[disneysea], &HashSet::new()).as_deref(),
             Some("Tokyo DisneySea")
         );
     }

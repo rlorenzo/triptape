@@ -1841,33 +1841,35 @@ fn typst_text_png(
     img
 }
 
-/// A photo the cover prefers: people in it, and a camera original. A PNG
-/// is a screenshot or an edit saved as an image (a "2009 vs 2026"
-/// side-by-side), which reads as clutter in a cover tile.
-fn cover_worthy(p: &BookPhoto) -> bool {
+/// How much the cover wants a photo: 2 for a camera original with people,
+/// 1 for one without, 0 for a PNG. A PNG is a screenshot or an edit saved
+/// as an image (a "2009 vs 2026" side-by-side), which reads as clutter in
+/// a cover tile, so it fills one only when the camera photos run out.
+fn cover_rank(p: &BookPhoto) -> u8 {
     let png = p
         .path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("png"));
-    p.people > 0 && !png
+    match (png, p.people > 0) {
+        (true, _) => 0,
+        (false, false) => 1,
+        (false, true) => 2,
+    }
 }
 
 /// Indices of up to 12 cover tiles. People make the cover: tiles come from
-/// [`cover_worthy`] photos (`preferred[i]`), evenly through the trip,
-/// topped up from the rest only when too few. Returned in trip order.
-fn cover_picks(preferred: &[bool]) -> Vec<usize> {
-    let (with_people, rest): (Vec<usize>, Vec<usize>) =
-        (0..preferred.len()).partition(|&i| preferred[i]);
-    let want = preferred.len().min(12);
-    if with_people.len() >= want {
-        return evenly_spaced(with_people.len(), want)
-            .into_iter()
-            .map(|j| with_people[j])
-            .collect();
+/// the best [`cover_rank`] first, evenly through the trip, and each lower
+/// rank only tops up what the ones above could not fill. Returned in trip
+/// order.
+fn cover_picks(ranks: &[u8]) -> Vec<usize> {
+    let mut left = ranks.len().min(12);
+    let mut picks = vec![];
+    for rank in (0..=2).rev() {
+        let tier: Vec<usize> = (0..ranks.len()).filter(|&i| ranks[i] == rank).collect();
+        let take = tier.len().min(left);
+        picks.extend(evenly_spaced(tier.len(), take).into_iter().map(|j| tier[j]));
+        left -= take;
     }
-    let top_up = evenly_spaced(rest.len(), want - with_people.len());
-    let mut picks = with_people;
-    picks.extend(top_up.into_iter().map(|j| rest[j]));
     picks.sort_unstable();
     picks
 }
@@ -1885,7 +1887,7 @@ fn draw_cover_collage(
     if photos.is_empty() {
         return None;
     }
-    let picks = cover_picks(&photos.iter().map(cover_worthy).collect::<Vec<_>>());
+    let picks = cover_picks(&photos.iter().map(cover_rank).collect::<Vec<_>>());
     let (cols, rows) = cover_grid(picks.len());
     let gap = 14u32;
     let tile_w = (tw - gap * (cols + 1)) / cols;
@@ -3362,28 +3364,36 @@ mod tests {
             people,
             ..blank_photo()
         };
-        assert!(cover_worthy(&shot("IMG_1028.HEIC", 3)));
-        assert!(!cover_worthy(&shot("E5B14CFD.png", 3)), "composite");
-        assert!(!cover_worthy(&shot("SHOT.PNG", 1)));
-        assert!(!cover_worthy(&shot("IMG_1.HEIC", 0)), "no people");
+        assert_eq!(cover_rank(&shot("IMG_1028.HEIC", 3)), 2);
+        assert_eq!(cover_rank(&shot("IMG_1.HEIC", 0)), 1, "no people");
+        assert_eq!(cover_rank(&shot("E5B14CFD.png", 3)), 0, "composite");
+        assert_eq!(cover_rank(&shot("SHOT.PNG", 1)), 0);
     }
 
     #[test]
     fn cover_picks_prefer_people_and_top_up_in_trip_order() {
         // Plenty of people photos: only those, spread through the trip.
-        let mostly: Vec<bool> = (0..40).map(|i| i % 3 != 0).collect();
+        let mostly: Vec<u8> = (0..40).map(|i| if i % 3 != 0 { 2 } else { 1 }).collect();
         let picks = cover_picks(&mostly);
         assert_eq!(picks.len(), 12);
-        assert!(picks.iter().all(|&i| mostly[i]), "{picks:?}");
+        assert!(picks.iter().all(|&i| mostly[i] == 2), "{picks:?}");
         assert!(picks.windows(2).all(|w| w[0] < w[1]));
-        // Too few: every people photo, topped up from the rest, sorted.
-        let few: Vec<bool> = (0..20).map(|i| i == 5 || i == 15).collect();
+        // Too few: every people photo, topped up from camera photos before
+        // any PNG, sorted.
+        let few: Vec<u8> = (0..30)
+            .map(|i| match i {
+                5 | 15 => 2,
+                _ if i % 2 == 0 => 0,
+                _ => 1,
+            })
+            .collect();
         let picks = cover_picks(&few);
         assert_eq!(picks.len(), 12);
         assert!(picks.contains(&5) && picks.contains(&15));
+        assert!(picks.iter().all(|&i| few[i] > 0), "no PNG: {picks:?}");
         assert!(picks.windows(2).all(|w| w[0] < w[1]), "{picks:?}");
-        // Small trip: every photo.
-        assert_eq!(cover_picks(&[false, true, false]), vec![0, 1, 2]);
+        // Small trip: every photo, PNGs included.
+        assert_eq!(cover_picks(&[1, 2, 0]), vec![0, 1, 2]);
     }
 
     #[test]
