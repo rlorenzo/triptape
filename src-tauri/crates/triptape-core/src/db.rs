@@ -299,6 +299,30 @@ impl Db {
         Ok(p)
     }
 
+    /// The most recently updated project for `folder`, so a rescan
+    /// refreshes it (and keeps its Story edits) instead of starting over.
+    pub fn project_for_folder(&self, folder: &str) -> Result<Option<Project>, String> {
+        self.conn
+            .query_row(
+                "SELECT id,name,folder,created_at,updated_at,cloud_consent,book_preset,music_pick FROM projects WHERE folder=?1 ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT 1",
+                params![folder],
+                project_from_row,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Mark a project as just updated, so [`Db::latest_project`] opens it.
+    pub fn touch_project(&self, id: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE projects SET updated_at=MAX(updated_at + 1, ?2) WHERE id=?1",
+                params![id, now()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn get_project(&self, id: &str) -> Result<Option<Project>, String> {
         self.conn
             .query_row(
@@ -1656,6 +1680,21 @@ mod tests {
         assert_eq!(back.state, JobState::Running);
         assert_eq!(back.current_step.as_deref(), Some("xfade"));
         assert!(db.get_job("job_missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_folder_finds_its_project_and_a_touch_makes_it_latest() {
+        let db = Db::open_in_memory().unwrap();
+        let a = db.create_project("trip", "/trips/japan").unwrap();
+        let b = db.create_project("other", "/trips/peru").unwrap();
+        assert_eq!(
+            db.project_for_folder("/trips/japan").unwrap().unwrap().id,
+            a.id
+        );
+        assert!(db.project_for_folder("/trips/none").unwrap().is_none());
+        db.touch_project(&a.id).unwrap();
+        assert_eq!(db.latest_project().unwrap().unwrap().id, a.id);
+        let _ = b;
     }
 
     #[test]
