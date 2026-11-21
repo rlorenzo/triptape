@@ -185,11 +185,7 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     // TRIPTAPE_MODELS_DIR, else the app data dir's `models/`. Missing files
     // print one line each and leave the scan exactly as without models.
     let workers = std::thread::available_parallelism().map_or(2, |n| n.get().min(4));
-    let model_paths = ModelPaths::from_env(
-        flags.get("models").map(Path::new),
-        dirs::data_dir().map(|d| d.join("app.triptape.desktop").join("models")),
-    );
-    let models = LocalModels::load(model_paths.as_ref(), workers);
+    let models = LocalModels::load(model_paths(flags).as_ref(), workers);
     for note in models.notes() {
         eprintln!("{note}");
     }
@@ -645,13 +641,23 @@ fn parse_lat_lon(s: &str) -> Option<(f64, f64)> {
     ((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)).then_some((lat, lon))
 }
 
+/// Where the optional local models live: `--models DIR`, else
+/// TRIPTAPE_MODELS_DIR, else the app data dir's `models/`.
+fn model_paths(flags: &HashMap<String, String>) -> Option<ModelPaths> {
+    ModelPaths::from_env(
+        flags.get("models").map(Path::new),
+        dirs::data_dir().map(|d| {
+            d.join(triptape_core::settings::APP_IDENTIFIER)
+                .join("models")
+        }),
+    )
+}
+
 /// Face detection for the book's crops when the local face models are
 /// installed (`scripts/fetch-models`); `None` crops around the centre.
 fn book_faces(flags: &HashMap<String, String>) -> Option<triptape_media::render_book::FaceFinder> {
-    let paths = ModelPaths::from_env(
-        flags.get("models").map(Path::new),
-        dirs::data_dir().map(|d| d.join("app.triptape.desktop").join("models")),
-    )?;
+    let paths = model_paths(flags)?;
+    // Skip loading the other models when the face ones are not there.
     if !paths.installed().faces {
         return None;
     }

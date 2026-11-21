@@ -195,9 +195,8 @@ const PORT_AREA_LINK_M: f64 = 6_000.0;
 /// up (half to Hong Kong Disneyland, half around the city) and the shots
 /// interleave by time, so the day's places alternate page to page. There,
 /// ashore shots group by area (single-linked within [`PORT_AREA_LINK_M`]),
-/// areas in the order first reached. Shots on board before the first
-/// one ashore open the day; the rest follow together. Other days keep
-/// story order.
+/// areas in the order first reached, and shots on board keep their
+/// moment between them. Other days keep story order.
 fn port_day_order(at: &[Whereabouts]) -> Vec<usize> {
     let mut out = Vec::with_capacity(at.len());
     let mut start = 0;
@@ -211,7 +210,7 @@ fn port_day_order(at: &[Whereabouts]) -> Vec<usize> {
             out.extend(day);
             continue;
         }
-        let (aboard, ashore): (Vec<usize>, Vec<usize>) = day.iter().partition(|&&i| at[i].aboard);
+        let ashore: Vec<usize> = day.iter().copied().filter(|&i| !at[i].aboard).collect();
         // Area per ashore shot: union-find over GPS links; a shot without
         // GPS joins its nearest neighbour in time that has one.
         let mut area: Vec<usize> = (0..ashore.len()).collect();
@@ -243,18 +242,25 @@ fn port_day_order(at: &[Whereabouts]) -> Vec<usize> {
             }
         }
         // Unions keep the lower index as root, so an area's root is its
-        // first shot: sorting by root puts areas in the order reached.
+        // first shot. Walk the day in time: a shot on board stays at its
+        // moment (the gangway at 9 AM before the waterfall, the cabin at
+        // 5 PM after the cliffs); the first shot of an area brings its
+        // whole area along.
         let roots: Vec<usize> = (0..ashore.len()).map(|a| root(&mut area, a)).collect();
-        let mut order: Vec<usize> = (0..ashore.len()).collect();
-        order.sort_by_key(|&a| (roots[a], a));
-        // Shots on board before the first one ashore (breakfast, the
-        // terminal on the way out) open the day; the rest follow it.
-        let first_ashore = ashore.first().copied().unwrap_or(usize::MAX);
-        let (before, after): (Vec<usize>, Vec<usize>) =
-            aboard.iter().partition(|&&i| i < first_ashore);
-        out.extend(before);
-        out.extend(order.into_iter().map(|a| ashore[a]));
-        out.extend(after);
+        let area_of: HashMap<usize, usize> =
+            ashore.iter().zip(&roots).map(|(&i, &r)| (i, r)).collect();
+        let mut emitted: HashSet<usize> = HashSet::new();
+        for &i in &day {
+            match area_of.get(&i) {
+                None => out.push(i),
+                Some(&r) if emitted.insert(r) => out.extend(
+                    (0..ashore.len())
+                        .filter(|&a| roots[a] == r)
+                        .map(|a| ashore[a]),
+                ),
+                Some(_) => {}
+            }
+        }
     }
     out
 }

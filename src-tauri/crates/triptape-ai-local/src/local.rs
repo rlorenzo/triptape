@@ -344,12 +344,17 @@ struct FaceModels {
 }
 
 impl FaceModels {
-    fn analyze(&self, img: &RgbImage) -> Result<FaceSignals, String> {
+    /// Every face YuNet finds in `img`, in its pixels.
+    fn detect(&self, img: &RgbImage) -> Result<Vec<faces::Face>, String> {
         let (input, shape, scale) = faces::yunet_input(img);
         let out = self.detector.with(|s| run_f32(s, shape, input))?;
         let data: Vec<Vec<f32>> = out.into_iter().map(|(_, d)| d).collect();
         let (h, w) = (shape[2] as u32, shape[3] as u32);
-        let found = faces::yunet_decode(&data, w, h, scale).ok_or("unexpected YuNet outputs")?;
+        faces::yunet_decode(&data, w, h, scale).ok_or_else(|| "unexpected YuNet outputs".into())
+    }
+
+    fn analyze(&self, img: &RgbImage) -> Result<FaceSignals, String> {
+        let found = self.detect(img)?;
         let happy: Vec<Option<f32>> = faces::smile_gated(&found)
             .map(|f| {
                 let input = faces::ferplus_input(img, f);
@@ -366,16 +371,10 @@ impl FaceModels {
             img.height(),
         ))
     }
-}
 
-impl FaceModels {
     /// Plausible faces in `img`, as boxes normalised to its size.
     fn boxes(&self, img: &RgbImage) -> Result<Vec<crate::FaceBox>, String> {
-        let (input, shape, scale) = faces::yunet_input(img);
-        let out = self.detector.with(|s| run_f32(s, shape, input))?;
-        let data: Vec<Vec<f32>> = out.into_iter().map(|(_, d)| d).collect();
-        let (h, w) = (shape[2] as u32, shape[3] as u32);
-        let found = faces::yunet_decode(&data, w, h, scale).ok_or("unexpected YuNet outputs")?;
+        let found = self.detect(img)?;
         let (iw, ih) = (img.width().max(1) as f32, img.height().max(1) as f32);
         Ok(found
             .iter()

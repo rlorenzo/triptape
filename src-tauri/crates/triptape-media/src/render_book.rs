@@ -643,6 +643,9 @@ impl std::fmt::Debug for FaceFinder {
 struct Fit<'a> {
     ffmpeg: &'a str,
     faces: Option<&'a FaceFinder>,
+    /// Faces found so far, by asset id: a photo on the cover and a page,
+    /// or both halves of a spread, runs the detector once.
+    found: std::cell::RefCell<HashMap<String, Vec<FaceBox>>>,
 }
 
 #[derive(Debug)]
@@ -1087,6 +1090,9 @@ pub fn render_book(
     let mut cell_captions: CellCaptions = HashMap::new();
     // Photo pages that open a day: their banner reads as a heading.
     let mut bannered: HashSet<usize> = HashSet::new();
+    // When the last photo page's latest photo was taken, for the
+    // chronology check.
+    let mut last_time: Option<i64> = None;
     // Consumption order: hero, then the spread wide photo, then the rest
     // in story order, each page's photos picked for sharpness — every photo
     // placed exactly once, exactly as `planned_blocked` simulated.
@@ -1094,12 +1100,14 @@ pub fn render_book(
     let fit = Fit {
         ffmpeg: &opts.ffmpeg_bin,
         faces: opts.faces.as_ref(),
+        found: Default::default(),
     };
     let cover = draw_cover_collage(
         photos,
         tw,
         th,
         opts,
+        &fit,
         &out_dir.join("cover.jpg"),
         &mut fallbacks,
     );
@@ -1171,6 +1179,11 @@ pub fn render_book(
                 if !page_caps.is_empty() {
                     captions.entry(page_no).or_default().extend(page_caps);
                 }
+                let cells = match fp.kind {
+                    PageKind::Grid => grid_cells(&slot, f64::from(tw), f64::from(th)),
+                    _ => vec![(0.0, 0.0, 1.0, 1.0); slot.len()],
+                };
+                fallbacks.extend(time_order_notes(page_no, &slot, &cells, &mut last_time));
                 match fp.kind {
                     // Caption pages are full-bleed too: the caption burn lays
                     // its strip over the photo's lower edge.
@@ -1199,6 +1212,9 @@ pub fn render_book(
                     } else {
                         opening_title(p, chapters, &mut announced)
                     };
+                    if title.is_some() {
+                        bannered.insert(page_no);
+                    }
                     captions
                         .entry(page_no)
                         .or_default()
@@ -1416,13 +1432,11 @@ fn opening_title(p: &BookPhoto, chapters: &[String], announced: &mut Announced) 
         .chapter
         .filter(|&c| announced.chapters.insert(c))
         .and_then(|c| chapters.get(c).cloned())?;
-    let seen = p.day.is_some_and(|d| !announced.days.insert(d));
-    if seen {
-        if let Some((_, place)) = title.split_once(" — ") {
-            return Some(place.to_string());
-        }
+    let day_shown = p.day.is_some_and(|d| !announced.days.insert(d));
+    match title.split_once(" — ") {
+        Some((_, place)) if day_shown => Some(place.to_string()),
+        _ => Some(title),
     }
-    Some(title)
 }
 
 /// The day banner for a photo page starting with `p`: its chapter's title
@@ -1436,6 +1450,66 @@ fn day_banner(p: &BookPhoto, chapters: &[String], announced: &mut Announced) -> 
     }
     // `opening_title` records the day as announced.
     opening_title(p, chapters, announced)
+}
+
+/// Photos taken this close together count as the same moment for the
+/// chronology check (bursts, a panorama finished after a snapshot).
+const TIME_ORDER_SLACK_SECS: i64 = 120;
+
+/// Chronology check for one photo page: its photos in reading order (top
+/// to bottom, then left to right) and its first photo after the previous
+/// page's last must run forward in time. Returns one note per break, for
+/// the render's fallback list; `last` carries the latest time to the
+/// next page.
+fn time_order_notes(
+    page_no: usize,
+    slot: &[&BookPhoto],
+    cells: &[Rect],
+    last: &mut Option<i64>,
+) -> Vec<String> {
+    let mut reading: Vec<(Rect, &BookPhoto)> =
+        cells.iter().copied().zip(slot.iter().copied()).collect();
+    reading.sort_by(|(a, _), (b, _)| {
+        // Same row when the tops are within a tenth of the cell height.
+        if (a.1 - b.1).abs() < a.3.min(b.3) * 0.1 {
+            a.0.total_cmp(&b.0)
+        } else {
+            a.1.total_cmp(&b.1)
+        }
+    });
+    let name = |p: &BookPhoto| {
+        p.path
+            .file_name()
+            .map_or_else(|| p.asset_id.clone(), |n| n.to_string_lossy().into_owned())
+    };
+    let mut notes = vec![];
+    let mut prev: Option<(i64, &BookPhoto)> = None;
+    for (_, p) in &reading {
+        let Some(t) = p.taken_at else { continue };
+        if let Some((pt, q)) = prev {
+            if t + TIME_ORDER_SLACK_SECS < pt {
+                notes.push(format!(
+                    "page {page_no}: out of time order: {} comes after the later {}",
+                    name(p),
+                    name(q)
+                ));
+            }
+        } else if let Some(l) = *last {
+            if t + TIME_ORDER_SLACK_SECS < l {
+                notes.push(format!(
+                    "page {page_no}: out of time order: {} is earlier than the page before",
+                    name(p)
+                ));
+            }
+        }
+        if prev.is_none_or(|(pt, _)| t > pt) {
+            prev = Some((t, p));
+        }
+    }
+    if let Some((t, _)) = prev {
+        *last = Some(last.map_or(t, |l| l.max(t)));
+    }
+    notes
 }
 
 /// Lead `caps` with a chapter title. An auto dateline or place caption would
@@ -1638,7 +1712,15 @@ pub(crate) fn cover_fit(src: &RgbImage, tw: u32, th: u32) -> RgbImage {
 /// fit, the biggest stay and the render notes the photo.
 fn fit_photo(p: &BookPhoto, tw: u32, th: u32, fit: &Fit, fb: &mut Vec<String>) -> RgbImage {
     let src = load(p, fit.ffmpeg, fb);
-    let faces = fit.faces.map(|f| (f.0)(&src)).unwrap_or_default();
+    let faces = match fit.faces {
+        Some(f) => fit
+            .found
+            .borrow_mut()
+            .entry(p.asset_id.clone())
+            .or_insert_with(|| (f.0)(&src))
+            .clone(),
+        None => vec![],
+    };
     let (img, cut) = cover_fit_faces(&src, tw, th, &faces);
     if cut {
         let name = p
@@ -1706,10 +1788,6 @@ fn face_window(
         Some(k) => (place(k.0, k.2, cw, sw), place(k.1, k.3, ch, sh)),
         None => ((sw - cw) / 2.0, (sh - ch) / 2.0),
     };
-    // A face too big for the window even alone is cut as well.
-    if keep.is_none() && !faces.is_empty() {
-        cut = true;
-    }
     ((x, y, cw, ch), cut)
 }
 
@@ -1801,6 +1879,10 @@ fn orderings(n: usize) -> Vec<Vec<usize>> {
     out
 }
 
+/// Width / height from which a photo is a panorama: alone on a grid row
+/// it spans the page at its own height.
+const PANORAMA_ASPECT: f64 = 2.0;
+
 /// Cells `(x, y, w, h)` for `slot` on a `w`×`h` page with `gap` between
 /// cells, one per photo in slot order. Rows of 1–3 photos fill the page;
 /// within a row each photo's width follows its shape, and rows share the
@@ -1811,13 +1893,11 @@ fn orderings(n: usize) -> Vec<Vec<usize>> {
 /// at its edges), trimming sky or table off a landscape costs less than
 /// trimming its sides, and very unequal photo sizes and leaving story
 /// order cost a little.
-/// Width / height from which a photo is a panorama: alone on a grid row
-/// it spans the page at its own height.
-const PANORAMA_ASPECT: f64 = 2.0;
-
 fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
     const BALANCE: f64 = 0.3;
-    const REORDER: f64 = 0.02;
+    // Pages read in time order: moving a photo ahead of an earlier one
+    // costs about as much as cutting a fifth of a photo away.
+    const REORDER: f64 = 0.1;
     // How much a photo's faces raise the cost of cropping or shrinking it.
     let people_weight = |p: &BookPhoto| 1.0 + 0.5 * f64::from(p.people.min(4));
     let n = slot.len();
@@ -1849,29 +1929,27 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
                 fixed.push(k == 1 && sum >= PANORAMA_ASPECT);
                 placed.extend(members.iter().map(|&i| (i, r, aspect(slot[i]) / sum)));
             }
+            let total: f64 = natural.iter().sum();
             let held: f64 = natural
                 .iter()
                 .zip(&fixed)
                 .filter(|(_, &f)| f)
                 .map(|(n, _)| n)
                 .sum();
-            let free: f64 = natural
+            let free = total - held;
+            // Panoramas keep their height only when the other rows can
+            // take up the rest; else every row stretches alike.
+            let hold = free > 0.0 && held < avail_h;
+            let stretch = if hold {
+                (avail_h - held) / free
+            } else {
+                avail_h / total
+            };
+            let row_h: Vec<f64> = natural
                 .iter()
                 .zip(&fixed)
-                .filter(|(_, &f)| !f)
-                .map(|(n, _)| n)
-                .sum();
-            let row_h: Vec<f64> = if free > 0.0 && held < avail_h {
-                let stretch = (avail_h - held) / free;
-                natural
-                    .iter()
-                    .zip(&fixed)
-                    .map(|(&nh, &f)| if f { nh } else { nh * stretch })
-                    .collect()
-            } else {
-                let stretch = avail_h / natural.iter().sum::<f64>();
-                natural.iter().map(|nh| nh * stretch).collect()
-            };
+                .map(|(&nh, &f)| if hold && f { nh } else { nh * stretch })
+                .collect();
             let mut cells = vec![(0.0, 0.0, 0.0, 0.0); n];
             let mut cost = 0.0;
             let mut y = gap;
@@ -2064,6 +2142,7 @@ fn draw_cover_collage(
     tw: u32,
     th: u32,
     opts: &BookOptions,
+    fit: &Fit,
     out: &Path,
     fallbacks: &mut Vec<String>,
 ) -> Option<PathBuf> {
@@ -2078,11 +2157,7 @@ fn draw_cover_collage(
     let mut canvas = solid(tw, th, Rgb([18, 20, 26]));
     for (k, pi) in picks.iter().enumerate() {
         let (cx, cy) = ((k as u32) % cols, (k as u32) / cols);
-        let fit = Fit {
-            ffmpeg: &opts.ffmpeg_bin,
-            faces: opts.faces.as_ref(),
-        };
-        let tile = fit_photo(&photos[*pi], tile_w, tile_h, &fit, fallbacks);
+        let tile = fit_photo(&photos[*pi], tile_w, tile_h, fit, fallbacks);
         image::imageops::replace(
             &mut canvas,
             &tile,
@@ -2815,6 +2890,34 @@ mod tests {
     }
 
     #[test]
+    fn pages_are_checked_for_time_order() {
+        let at = |t: i64| BookPhoto {
+            taken_at: Some(t),
+            ..blank_photo()
+        };
+        let (a, b, c) = (at(1_000), at(5_000), at(9_000));
+        let grid = [
+            (0.0, 0.0, 5.0, 5.0),
+            (5.0, 0.0, 5.0, 5.0),
+            (0.0, 5.0, 10.0, 5.0),
+        ];
+        let mut last = None;
+        assert!(time_order_notes(1, &[&a, &b, &c], &grid, &mut last).is_empty());
+        // The later photo top left: a break.
+        let mut last = None;
+        assert_eq!(
+            time_order_notes(2, &[&b, &a, &c], &grid, &mut last).len(),
+            1
+        );
+        // A page that starts before the previous one ended.
+        assert_eq!(time_order_notes(3, &[&a], &[grid[0]], &mut last).len(), 1);
+        // A burst a minute apart is the same moment.
+        let mut last = None;
+        let d = at(1_060);
+        assert!(time_order_notes(4, &[&d, &a], &grid[..2], &mut last).is_empty());
+    }
+
+    #[test]
     fn a_panorama_spans_its_row() {
         let photos: Vec<BookPhoto> = [(5712, 4284), (4284, 5712), (16242, 3854), (5712, 4284)]
             .iter()
@@ -2865,6 +2968,45 @@ mod tests {
         // No faces: centred, as before.
         let ((x, y, _, _), cut) = face_window(4000.0, 3000.0, 1.0, 1.0, &[]);
         assert_eq!((x, y, cut), (500.0, 0.0, false));
+    }
+
+    #[test]
+    fn each_photo_meets_the_face_detector_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jpg");
+        RgbImage::new(64, 48).save(&path).unwrap();
+        let p = BookPhoto {
+            asset_id: "a".into(),
+            path,
+            width: 64,
+            height: 48,
+            ..blank_photo()
+        };
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let finder = FaceFinder(std::sync::Arc::new(move |_: &RgbImage| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            vec![FaceBox {
+                x: 0.8,
+                y: 0.4,
+                w: 0.1,
+                h: 0.1,
+            }]
+        }));
+        let fit = Fit {
+            ffmpeg: "ffmpeg",
+            faces: Some(&finder),
+            found: Default::default(),
+        };
+        let mut fb = vec![];
+        // A spread's two halves and a cover tile: one detector run.
+        for (w, h) in [(40, 20), (40, 20), (10, 10)] {
+            let img = fit_photo(&p, w, h, &fit, &mut fb);
+            assert_eq!(img.dimensions(), (w, h));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(fb.is_empty(), "{fb:?}");
     }
 
     #[test]
