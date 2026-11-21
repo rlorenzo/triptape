@@ -199,40 +199,32 @@ fn book_story_positions<'a>(
         .collect()
 }
 
-/// The name a photo and its edits share: the file stem without a
-/// `_edited` suffix or a ` (1)` copy number, lower-cased.
-fn edit_stem(p: &std::path::Path) -> (String, bool) {
-    let stem = p
-        .file_stem()
-        .map_or_else(String::new, |s| s.to_string_lossy().to_lowercase());
-    let (stem, edited) = match stem.strip_suffix("_edited") {
-        Some(s) => (s.to_string(), true),
-        None => (stem, false),
-    };
-    let base = match stem.rsplit_once(" (") {
-        Some((b, n))
-            if n.ends_with(')') && n[..n.len() - 1].bytes().all(|c| c.is_ascii_digit()) =>
-        {
-            b.to_string()
-        }
-        _ => stem,
-    };
-    (base, edited)
-}
-
 /// Drop every photo whose `_edited` version is in the book too (Photos
 /// exports both, and they read as one photo printed twice).
 fn drop_originals_of_edits(photos: &mut Vec<render_book::BookPhoto>) {
-    let edited: HashSet<String> = photos
+    // Keyed by folder too, like `cluster::edit_families`: two cameras'
+    // IMG_0042 in different folders are different photos.
+    let key = |p: &render_book::BookPhoto| {
+        let (dir, name) = (p.path.parent()?, p.path.file_name()?);
+        let (stem, edited) = triptape_core::cluster::edit_stem(&name.to_string_lossy());
+        Some((dir.to_path_buf(), stem, edited))
+    };
+    let keys: Vec<Option<(std::path::PathBuf, String, bool)>> = photos.iter().map(key).collect();
+    let edited: HashSet<(&std::path::Path, &str)> = keys
         .iter()
-        .map(|p| edit_stem(&p.path))
-        .filter(|(_, e)| *e)
-        .map(|(s, _)| s)
+        .flatten()
+        .filter(|(_, _, e)| *e)
+        .map(|(d, s, _)| (d.as_path(), s.as_str()))
         .collect();
-    photos.retain(|p| {
-        let (stem, is_edit) = edit_stem(&p.path);
-        is_edit || !edited.contains(&stem)
-    });
+    let keep: Vec<bool> = keys
+        .iter()
+        .map(|k| match k {
+            Some((d, s, e)) => *e || !edited.contains(&(d.as_path(), s.as_str())),
+            None => true,
+        })
+        .collect();
+    let mut keep = keep.into_iter();
+    photos.retain(|_| keep.next().unwrap_or(true));
 }
 
 /// Whether the book may use this asset. The plan's chapters hold near-dupe
@@ -1085,6 +1077,19 @@ mod tests {
             .map(|p| p.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["IMG_6448_edited.heic", "IMG_7000.HEIC"]);
+        // Another folder's same-named original is a different photo.
+        let mut photos = vec![
+            render_book::BookPhoto {
+                path: PathBuf::from("/t/alice/IMG_0042.HEIC"),
+                ..render_book::BookPhoto::blank()
+            },
+            render_book::BookPhoto {
+                path: PathBuf::from("/t/bob/IMG_0042_edited.heic"),
+                ..render_book::BookPhoto::blank()
+            },
+        ];
+        drop_originals_of_edits(&mut photos);
+        assert_eq!(photos.len(), 2);
     }
 
     #[test]

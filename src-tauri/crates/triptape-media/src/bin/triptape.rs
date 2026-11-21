@@ -1133,11 +1133,12 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
 /// edge .. 100 right edge; 50 when left out).
 fn parse_cover_pin(v: &str) -> Result<(String, u8), String> {
     match v.rsplit_once('@') {
-        Some((r, pct)) if !r.is_empty() => match pct.parse::<u8>() {
+        Some(("", _)) => Err(format!("--cover wants REF or REF@PERCENT, got {v:?}")),
+        Some((r, pct)) => match pct.parse::<u8>() {
             Ok(p) if p <= 100 => Ok((r.to_string(), p)),
             _ => Err(format!("--cover focus must be 0-100, got {pct:?}")),
         },
-        _ => Ok((v.to_string(), 50)),
+        None => Ok((v.to_string(), 50)),
     }
 }
 
@@ -1371,8 +1372,7 @@ fn edit_cmd(args: &[String]) {
         println!("book: {}", asset_label(asset));
     }
     for asset in &hidden {
-        // A blank override counts as no caption, beating the library's.
-        edits.set_caption(asset.id.clone(), Some(" ".to_string()));
+        edits.hide_caption(asset.id.clone());
         println!("hide caption: {}", asset_label(asset));
     }
     for asset in &uncrops {
@@ -1879,6 +1879,29 @@ mod tests {
             ]
         );
         assert!(parse_edit_args(&args("--caption a")).is_err());
+    }
+
+    #[test]
+    fn edit_args_set_book_pins() {
+        let a = parse_edit_args(&args(
+            "--cover a@80 b --crop c 10 90 --hide-caption d --book e --unbook f --uncover g --uncrop h",
+        ))
+        .unwrap();
+        assert_eq!(a.cover, [("a".to_string(), 80), ("b".to_string(), 50)]);
+        assert_eq!(a.crop, [("c".to_string(), 10, 90)]);
+        assert_eq!(a.hide_caption, ["d"]);
+        assert_eq!(
+            (a.book, a.unbook),
+            (vec!["e".to_string()], vec!["f".to_string()])
+        );
+        assert_eq!(
+            (a.uncover, a.uncrop),
+            (vec!["g".to_string()], vec!["h".to_string()])
+        );
+        assert!(parse_edit_args(&args("--cover a@101")).is_err());
+        assert!(parse_edit_args(&args("--cover")).is_err());
+        assert!(parse_edit_args(&args("--crop a 10")).is_err());
+        assert!(parse_edit_args(&args("--crop a 10 200")).is_err());
     }
 
     #[test]

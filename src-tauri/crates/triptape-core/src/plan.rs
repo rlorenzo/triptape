@@ -1127,27 +1127,17 @@ impl PlanEdits {
 
     /// Set (or clear, `None`) where a photo's crops centre, in percent.
     pub fn set_crop(&mut self, asset: String, focus: Option<(u8, u8)>) {
-        match focus {
-            Some((x, y)) => {
-                self.crop.insert(asset, (x.min(100), y.min(100)));
-            }
-            None => {
-                self.crop.remove(&asset);
-            }
-        }
+        set_pin(
+            &mut self.crop,
+            asset,
+            focus.map(|(x, y)| (x.min(100), y.min(100))),
+        );
     }
 
     /// Pin `asset` to the book cover with a horizontal focus percent, or
     /// unpin it (`None`).
     pub fn set_cover(&mut self, asset: String, focus: Option<u8>) {
-        match focus {
-            Some(f) => {
-                self.cover.insert(asset, f.min(100));
-            }
-            None => {
-                self.cover.remove(&asset);
-            }
-        }
+        set_pin(&mut self.cover, asset, focus.map(|f| f.min(100)));
     }
 
     /// Play `asset` right after (or before) `anchor` in the film,
@@ -1176,6 +1166,13 @@ impl PlanEdits {
     /// Set or (when blank) clear the caption for an asset.
     pub fn set_caption(&mut self, asset_id: String, caption: Option<String>) {
         set_override(&mut self.caption_overrides, asset_id, caption);
+    }
+
+    /// Hide an asset's caption, its own and the library's: a blank
+    /// override counts as no caption (see [`has_caption`]), which
+    /// [`Self::set_caption`] would clear instead.
+    pub fn hide_caption(&mut self, asset_id: String) {
+        self.caption_overrides.insert(asset_id, String::new());
     }
 
     /// Remove an asset from the keepsakes, or restore it.
@@ -1330,6 +1327,14 @@ fn apply_moves(
         };
         hero.splice(at..at, moved);
     }
+}
+
+/// Insert `value` under `key`, or remove the key for `None`.
+fn set_pin<V>(map: &mut BTreeMap<String, V>, key: String, value: Option<V>) {
+    match value {
+        Some(v) => map.insert(key, v),
+        None => map.remove(&key),
+    };
 }
 
 fn set_override(map: &mut BTreeMap<String, String>, key: String, value: Option<String>) {
@@ -2609,6 +2614,37 @@ mod tests {
         edits.set_place("k".into(), Some("Hotel".into()));
         edits.set_place("k".into(), None);
         assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn book_pin_setters_clamp_replace_and_clear() {
+        let mut edits = PlanEdits::default();
+        edits.set_cover("a".into(), Some(30));
+        edits.set_cover("a".into(), Some(250));
+        assert_eq!(edits.cover["a"], 100);
+        edits.set_crop("a".into(), Some((120, 40)));
+        assert_eq!(edits.crop["a"], (100, 40));
+        edits.set_book("b".into(), true);
+        edits.set_book("c".into(), true);
+        edits.set_book("b".into(), true);
+        assert_eq!(edits.book, ["c", "b"]);
+        edits.set_cover("a".into(), None);
+        edits.set_crop("a".into(), None);
+        edits.set_book("b".into(), false);
+        edits.set_book("c".into(), false);
+        assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn a_hidden_caption_beats_the_librarys() {
+        let assets = vec![asset("a", 1_714_557_600, AssetKind::Photo)];
+        let mut base = build_plan(&assets, &HashMap::new(), &HashMap::new());
+        base.captions.insert("a".into(), "From the library".into());
+        let mut edits = PlanEdits::default();
+        edits.hide_caption("a".into());
+        assert!(!edits.is_empty());
+        let out = apply_edits(&base, &assets, &edits);
+        assert!(!has_caption(out.captions.get("a").map(String::as_str)));
     }
 
     #[test]

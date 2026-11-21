@@ -1,6 +1,7 @@
 //! Shared domain types: Asset, Cluster, Plan, Job.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// What kind of media an asset is.
@@ -258,13 +259,13 @@ pub struct Plan {
     /// Photos the owner pinned to the book cover: asset id -> horizontal
     /// focus in percent (0 left edge .. 100 right edge; 50 centres), for a
     /// panorama whose interesting part is off centre.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub cover: std::collections::BTreeMap<String, u8>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cover: BTreeMap<String, u8>,
     /// Crop focus the owner set per photo: asset id -> (x, y) percent of
     /// the photo (0,0 top left .. 100,100 bottom right) a cropped cell
     /// centres on, for heads the face detector cannot see (a mascot).
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub crop: std::collections::BTreeMap<String, (u8, u8)>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub crop: BTreeMap<String, (u8, u8)>,
     /// Photos the owner pinned into the book: always placed, like a
     /// captioned photo.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

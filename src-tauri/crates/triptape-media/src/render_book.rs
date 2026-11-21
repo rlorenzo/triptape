@@ -137,9 +137,10 @@ pub struct BookPhoto {
 }
 
 impl BookPhoto {
-    /// A photo with nothing set but defaults, for building one field by
-    /// field (tests, mostly).
-    pub fn blank() -> Self {
+    /// A 0x0 neutral-score photo with nothing set, for tests to fill in
+    /// with struct-update syntax.
+    #[cfg(test)]
+    pub(crate) fn blank() -> Self {
         Self {
             asset_id: String::new(),
             path: PathBuf::new(),
@@ -163,6 +164,12 @@ impl BookPhoto {
             crop_focus: None,
             aboard: false,
         }
+    }
+
+    /// Whether the photo is of people: someone tagged in the library, or a
+    /// face big enough to be the subject.
+    fn is_of_people(&self) -> bool {
+        self.tagged_people > 0 || self.face_size >= SUBJECT_FACE
     }
 
     /// The photo's file name for render notes, else its asset id.
@@ -368,14 +375,10 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
             let p = &photos[order[pos]];
             dpi_verdict(p.width, p.height, w, h) != DpiVerdict::Block
         };
-        let of_people = |pos: usize| {
-            let p = &photos[order[pos]];
-            p.tagged_people > 0 || p.face_size >= COVER_FACE
-        };
         if let Some(pos) = run[..run.len().min(DIVIDER_WINDOW)]
             .iter()
             .copied()
-            .find(|&pos| printable(pos) && of_people(pos))
+            .find(|&pos| printable(pos) && photos[order[pos]].is_of_people())
             .or_else(|| run.iter().copied().find(|&pos| printable(pos)))
         {
             order[at..=pos].rotate_right(1);
@@ -1631,7 +1634,8 @@ fn titled(title: Option<String>, caps: Vec<String>) -> Vec<String> {
 /// places of its page's photos in the order they were taken, the title's
 /// own place among them: a day that began in Tokyo reads `— Tokyo ·
 /// Tsurugaoka Hachimangū`. A title whose place no photo on the page has
-/// keeps its place first.
+/// stays as it is, unless the page opens on board: then the place comes
+/// where the page first goes ashore (`— Ship · Port · Temple`).
 fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
     let Some((head, place)) = title.split_once(" — ") else {
         return title.to_string();
@@ -1645,25 +1649,21 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
         }
     }
     if !seen.contains(&place) {
-        // No photo here is at the day's place itself: it comes where the
-        // page first goes ashore (after the morning on board, before the
-        // temple), or first when nothing is on board.
-        let at = slot
-            .iter()
-            .filter_map(|p| p.place.as_deref().map(|pl| (pl, p.aboard)))
-            .position(|(_, aboard)| !aboard)
-            .map_or(0, |k| {
-                let before: Vec<&str> = slot[..k]
-                    .iter()
-                    .filter_map(|p| p.place.as_deref())
-                    .collect();
-                seen.iter().filter(|s| before.contains(s)).count()
-            });
-        let aboard_first = slot.first().is_some_and(|p| p.aboard);
-        if !aboard_first {
+        if !slot.first().is_some_and(|p| p.aboard) {
             return title.to_string();
         }
-        seen.insert(at.min(seen.len()), place);
+        // After the places seen before the first placed photo ashore
+        // (first when the page never goes ashore).
+        let at = slot
+            .iter()
+            .position(|p| p.place.is_some() && !p.aboard)
+            .map_or(0, |k| {
+                let before = &slot[..k];
+                seen.iter()
+                    .filter(|&&s| before.iter().any(|p| p.place.as_deref() == Some(s)))
+                    .count()
+            });
+        seen.insert(at, place);
     }
     format!("{head} — {}", seen.join(" · "))
 }
@@ -1856,13 +1856,15 @@ pub(crate) fn cover_fit(src: &RgbImage, tw: u32, th: u32) -> RgbImage {
 /// faces (with room above for the head) in frame. When they cannot all
 /// fit, the biggest stay and the render notes the photo.
 fn fit_photo(p: &BookPhoto, tw: u32, th: u32, fit: &Fit, fb: &mut Vec<String>) -> RgbImage {
-    fit_photo_marked(p, tw, th, fit, fb).0
+    fit_photo_marked(p, p.crop_focus, tw, th, fit, fb).0
 }
 
-/// [`fit_photo`], plus whether a face sits in the cell's bottom band,
-/// where a cell caption would cover it (the caption then goes on top).
+/// [`fit_photo`] centred on `focus` (fractions of the photo) when set,
+/// plus whether a face sits in the cell's bottom band, where a cell
+/// caption would cover it (the caption then goes on top).
 fn fit_photo_marked(
     p: &BookPhoto,
+    focus: Option<(f32, f32)>,
     tw: u32,
     th: u32,
     fit: &Fit,
@@ -1883,7 +1885,7 @@ fn fit_photo_marked(
         f64::from(src.height().max(1)),
     );
     let (tw_f, th_f) = (f64::from(tw), f64::from(th));
-    let (window, cut) = match p.crop_focus {
+    let (window, cut) = match focus {
         // The owner's focus wins: they saw what the detector missed.
         Some((fx, fy)) => (
             focus_window(sw, sh, tw_f, th_f, (f64::from(fx), f64::from(fy))),
@@ -2233,7 +2235,7 @@ fn draw_grid(
             (w.round() as u32).min(tw - x),
             (h.round() as u32).min(th - y),
         );
-        let (fit, face_low) = fit_photo_marked(p, w.max(1), h.max(1), ff, fb);
+        let (fit, face_low) = fit_photo_marked(p, p.crop_focus, w.max(1), h.max(1), ff, fb);
         busy.push(face_low);
         image::imageops::replace(&mut page, &fit, i64::from(x), i64::from(y));
     }
@@ -2311,7 +2313,7 @@ fn typst_text_png(
 
 /// Detected face size (of the photo's shorter side) from which a face is
 /// someone the photo is of, not a stranger in the crowd or a far statue.
-const COVER_FACE: f32 = 0.08;
+const SUBJECT_FACE: f32 = 0.08;
 
 /// How much the cover wants a photo: 2 for a camera original of people
 /// (tagged in the library, or a face big enough to be the subject), 1 for
@@ -2326,7 +2328,7 @@ fn cover_rank(p: &BookPhoto) -> u8 {
     let panorama = p.height > 0 && f64::from(p.width) / f64::from(p.height) >= PANORAMA_ASPECT;
     if png || panorama {
         0
-    } else if p.tagged_people > 0 || p.face_size >= COVER_FACE {
+    } else if p.is_of_people() {
         2
     } else {
         1
@@ -2352,14 +2354,26 @@ fn cover_picks(photos: &[BookPhoto], opening: &[usize]) -> Vec<usize> {
     for k in 0..slots {
         let (from, to) = (k * pool.len() / slots, (k + 1) * pool.len() / slots);
         if let Some(&best) = pool[from..to].iter().max_by(|&&a, &&b| {
-            (cover_rank(&photos[a]), photos[a].score)
-                .partial_cmp(&(cover_rank(&photos[b]), photos[b].score))
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let (a, b) = (&photos[a], &photos[b]);
+            cover_rank(a)
+                .cmp(&cover_rank(b))
+                .then(a.score.total_cmp(&b.score))
         }) {
             picks.push(best);
         }
     }
+    // A book that is nothing but its opening still gets a photo cover.
+    if picks.is_empty() {
+        picks.extend(
+            opening
+                .iter()
+                .copied()
+                .filter(|&i| i < photos.len())
+                .take(want),
+        );
+    }
     picks.sort_unstable();
+    picks.dedup();
     picks
 }
 
@@ -2386,20 +2400,12 @@ fn draw_cover_collage(
     for (k, pi) in picks.iter().enumerate() {
         let (cx, cy) = ((k as u32) % cols, (k as u32) / cols);
         let p = &photos[*pi];
-        let tile = match p.cover_focus {
-            // The owner's focus: the tile shows that part of the photo.
-            Some(fx) => {
-                let src = load(p, fit.ffmpeg, fallbacks);
-                let (sw, sh) = (
-                    f64::from(src.width().max(1)),
-                    f64::from(src.height().max(1)),
-                );
-                let focus = (f64::from(fx), p.crop_focus.map_or(0.5, |c| f64::from(c.1)));
-                let window = focus_window(sw, sh, f64::from(tile_w), f64::from(tile_h), focus);
-                crop_window(&src, window, tile_w, tile_h)
-            }
-            None => fit_photo(p, tile_w, tile_h, fit, fallbacks),
-        };
+        // The owner's cover focus: the tile shows that part of the photo.
+        let focus = p
+            .cover_focus
+            .map(|fx| (fx, p.crop_focus.map_or(0.5, |c| c.1)))
+            .or(p.crop_focus);
+        let tile = fit_photo_marked(p, focus, tile_w, tile_h, fit, fallbacks).0;
         image::imageops::replace(
             &mut canvas,
             &tile,
@@ -2734,7 +2740,7 @@ mod tests {
             caption: Some(cap.to_string()),
             place: Some(place.to_string()),
             keep,
-            ..blank_photo()
+            ..BookPhoto::blank()
         };
         let ramen = shot("Best ramen of the trip.", "Canal City Ramen Stadium", true);
         let other = shot("Fukuoka", "Fukuoka", false);
@@ -2756,7 +2762,7 @@ mod tests {
             width: 100,
             height: 100,
             caption: Some(cap.to_string()),
-            ..blank_photo()
+            ..BookPhoto::blank()
         };
         let a = mk("Day 4 · Sun, Oct 5 · 9:00 AM");
         let b = mk("Day 4 · Sun, Oct 5 · 4:32 PM");
@@ -2795,12 +2801,6 @@ mod tests {
             .collect()
     }
 
-    /// A 0x0 neutral-score photo with nothing set: the base tests fill in
-    /// with struct-update syntax.
-    fn blank_photo() -> BookPhoto {
-        BookPhoto::blank()
-    }
-
     /// A photo of `w`x`h` px in `chapter`.
     fn sized(i: usize, w: u32, h: u32, chapter: Option<usize>, score: f32) -> BookPhoto {
         BookPhoto {
@@ -2809,7 +2809,7 @@ mod tests {
             height: h,
             chapter,
             score,
-            ..blank_photo()
+            ..BookPhoto::blank()
         }
     }
 
@@ -2902,7 +2902,7 @@ mod tests {
             path: PathBuf::from("/x.jpg"),
             width: w,
             height: h,
-            ..blank_photo()
+            ..BookPhoto::blank()
         };
         // Wide shot at index 20 (a later chapter): no spread.
         let mut photos: Vec<BookPhoto> = (0..25).map(|_| bp(100, 100)).collect();
@@ -3123,7 +3123,7 @@ mod tests {
     fn a_day_title_lists_its_places_as_they_came() {
         let at = |place: &str| BookPhoto {
             place: Some(place.to_string()),
-            ..blank_photo()
+            ..BookPhoto::blank()
         };
         let (tokyo, shrine) = (at("Tokyo"), at("Tsurugaoka Hachimangū"));
         let title = "Day 5 · Wed, Oct 7 — Tsurugaoka Hachimangū";
@@ -3142,13 +3142,25 @@ mod tests {
             "Day 11 · Tue, Oct 13 — Carnival Luminosa · Fukuoka · Nanzoin Temple"
         );
         assert_eq!(places_in_time_order("Day 5", &[&tokyo]), "Day 5");
+        // A placeless photo does not shift where the port goes: it comes
+        // after every place on board, however the photos interleave.
+        let mut deck = at("Lido Deck");
+        deck.aboard = true;
+        let blank = BookPhoto::blank();
+        assert_eq!(
+            places_in_time_order(
+                "Day 11 · Tue, Oct 13 — Fukuoka",
+                &[&ship, &blank, &deck, &temple]
+            ),
+            "Day 11 · Tue, Oct 13 — Carnival Luminosa · Lido Deck · Fukuoka · Nanzoin Temple"
+        );
     }
 
     #[test]
     fn pages_are_checked_for_time_order() {
         let at = |t: i64| BookPhoto {
             taken_at: Some(t),
-            ..blank_photo()
+            ..BookPhoto::blank()
         };
         let (a, b, c) = (at(1_000), at(5_000), at(9_000));
         let grid = [
@@ -3263,7 +3275,7 @@ mod tests {
             path,
             width: 64,
             height: 48,
-            ..blank_photo()
+            ..BookPhoto::blank()
         };
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
         let counted = calls.clone();
@@ -3470,7 +3482,7 @@ mod tests {
             width: w,
             height: h,
             people,
-            ..blank_photo()
+            ..BookPhoto::blank()
         };
         let (land, tall) = (photo(4032, 3024, 0), photo(3024, 4032, 0));
         let group = photo(4032, 3024, 6);
@@ -3519,7 +3531,7 @@ mod tests {
                 width: if i == 1 { 6000 } else { 4000 },
                 height: 3000,
                 chapter: chapters[i],
-                ..blank_photo()
+                ..BookPhoto::blank()
             })
             .collect();
         let keep = fitting_count(&pool, true, 60);
@@ -3750,7 +3762,7 @@ mod tests {
             caption: Some("Best ramen of the trip.".into()),
             place: Some("Canal City Ramen Stadium".into()),
             keep: true,
-            ..blank_photo()
+            ..BookPhoto::blank()
         };
         let titles = ["Day 11 — Fukuoka".to_string()];
         assert_eq!(
@@ -3771,7 +3783,7 @@ mod tests {
             height: 100,
             caption: caption.map(String::from),
             chapter,
-            ..blank_photo()
+            ..BookPhoto::blank()
         };
         let titles = ["Tokyo".to_string(), "Kyoto".to_string()];
         let mut seen = Announced::default();
@@ -3810,7 +3822,7 @@ mod tests {
         let photo = |chapter: usize, day: u32| BookPhoto {
             chapter: Some(chapter),
             day: Some(day),
-            ..blank_photo()
+            ..BookPhoto::blank()
         };
         let titles = [
             "Day 3 — Tokyo".to_string(),
@@ -3832,7 +3844,7 @@ mod tests {
         let more = [titles.to_vec(), vec!["Day 4 — Ginza".to_string()]].concat();
         assert_eq!(divider_lines(&photo(3, 4), &more, &mut seen)[0], "Ginza");
         // Unknown day: no banner.
-        assert_eq!(day_banner(&blank_photo(), &titles, &mut seen), None);
+        assert_eq!(day_banner(&BookPhoto::blank(), &titles, &mut seen), None);
     }
 
     #[test]
@@ -3843,7 +3855,7 @@ mod tests {
             width: px,
             height: px,
             chapter: Some(chapter),
-            ..blank_photo()
+            ..BookPhoto::blank()
         };
         // Flow: hero (p0), divider background (p1), photo page (p2).
         // 1200px clears the smallest slot's 200 dpi but prints at 100 dpi full-page.
@@ -3874,7 +3886,7 @@ mod tests {
             path: PathBuf::from(id),
             width: w,
             height: h,
-            ..blank_photo()
+            ..BookPhoto::blank()
         };
         // Flow: hero, then one caption page. Each size clears 200 dpi inside
         // the photo area an inset layout would have, but not at full bleed.
@@ -3952,7 +3964,7 @@ mod tests {
                 width: 3000,
                 height: 3000,
                 caption: (i == 1).then(|| "Lisbon at dusk".to_string()),
-                ..blank_photo()
+                ..BookPhoto::blank()
             })
             .collect();
         let out = dir.path().join("book");
@@ -4026,7 +4038,7 @@ mod tests {
                     width: if is_wide { 6000 } else { 3000 },
                     height: 3000,
                     chapter,
-                    ..blank_photo()
+                    ..BookPhoto::blank()
                 }
             })
             .collect();
@@ -4074,7 +4086,7 @@ mod tests {
             face_size: face,
             width: w,
             height: h,
-            ..blank_photo()
+            ..BookPhoto::blank()
         };
         let photo = (4032, 3024);
         assert_eq!(
@@ -4115,7 +4127,7 @@ mod tests {
             height: 3024,
             tagged_people: tagged,
             score,
-            ..blank_photo()
+            ..BookPhoto::blank()
         };
         // 48 photos, 4 per stretch: a people shot in each, the best-scored
         // one at the stretch's third slot.
@@ -4137,6 +4149,9 @@ mod tests {
         assert!(picks.windows(2).all(|w| w[0] < w[1]));
         // Small trip: every photo but the opening.
         assert_eq!(cover_picks(&photos[..3], &[1]), vec![0, 2]);
+        // Nothing but the opening: the cover still shows it.
+        assert_eq!(cover_picks(&photos[..1], &[0]), vec![0]);
+        assert_eq!(cover_picks(&photos[..2], &[0, 1]), vec![0, 1]);
     }
 
     #[test]
@@ -4171,7 +4186,7 @@ mod tests {
                 path: PathBuf::from(format!("a{i}")),
                 width: 6000,
                 height: 4000,
-                ..blank_photo()
+                ..BookPhoto::blank()
             })
             .collect();
         let at_60 = fitting_count(&pool, false, 60);
