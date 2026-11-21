@@ -312,11 +312,12 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
-    /// Mark a project as just updated, so [`Db::latest_project`] opens it.
+    /// Mark a project as just updated, so [`Db::latest_project`] opens it:
+    /// strictly newer than every project, even within the same second.
     pub fn touch_project(&self, id: &str) -> Result<(), String> {
         self.conn
             .execute(
-                "UPDATE projects SET updated_at=MAX(updated_at + 1, ?2) WHERE id=?1",
+                "UPDATE projects SET updated_at=MAX((SELECT COALESCE(MAX(updated_at), 0) FROM projects) + 1, ?2) WHERE id=?1",
                 params![id, now()],
             )
             .map_err(|e| e.to_string())?;
@@ -1684,9 +1685,10 @@ mod tests {
 
     #[test]
     fn a_folder_finds_its_project_and_a_touch_makes_it_latest() {
-        let db = Db::open_in_memory().unwrap();
+        let db = mem();
         let a = db.create_project("trip", "/trips/japan").unwrap();
-        let b = db.create_project("other", "/trips/peru").unwrap();
+        // Created later, so it is latest until `a` is touched.
+        db.create_project("other", "/trips/peru").unwrap();
         assert_eq!(
             db.project_for_folder("/trips/japan").unwrap().unwrap().id,
             a.id
@@ -1694,7 +1696,35 @@ mod tests {
         assert!(db.project_for_folder("/trips/none").unwrap().is_none());
         db.touch_project(&a.id).unwrap();
         assert_eq!(db.latest_project().unwrap().unwrap().id, a.id);
-        let _ = b;
+    }
+
+    #[test]
+    fn back_to_back_touches_make_the_last_touched_latest() {
+        let db = mem();
+        let a = db.create_project("a", "/a").unwrap();
+        let b = db.create_project("b", "/b").unwrap();
+        db.touch_project(&b.id).unwrap();
+        db.touch_project(&b.id).unwrap();
+        db.touch_project(&a.id).unwrap();
+        assert_eq!(db.latest_project().unwrap().unwrap().id, a.id);
+        db.touch_project(&b.id).unwrap();
+        assert_eq!(db.latest_project().unwrap().unwrap().id, b.id);
+    }
+
+    #[test]
+    fn a_folder_scanned_twice_before_resolves_to_its_latest_project() {
+        let db = mem();
+        let old = db.create_project("trip", "/trips/japan").unwrap();
+        let newer = db.create_project("trip", "/trips/japan").unwrap();
+        assert_eq!(
+            db.project_for_folder("/trips/japan").unwrap().unwrap().id,
+            newer.id
+        );
+        db.touch_project(&old.id).unwrap();
+        assert_eq!(
+            db.project_for_folder("/trips/japan").unwrap().unwrap().id,
+            old.id
+        );
     }
 
     #[test]

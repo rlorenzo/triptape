@@ -156,7 +156,10 @@ fn tool_bin(flags: &HashMap<String, String>, tool: Tool) -> String {
 }
 
 fn scan_cmd(flags: &HashMap<String, String>) {
-    let folder = need(flags, "folder");
+    let raw_folder = need(flags, "folder");
+    // Canonical, so `./japan`, `japan/`, and symlinked paths all find the
+    // same project (the desktop app stores canonical folders too).
+    let folder = std::fs::canonicalize(&raw_folder).unwrap_or_else(|e| die("open folder", e));
     let db_path = need(flags, "db");
     let cache = need(flags, "cache");
     let ffmpeg = tool_bin(flags, Tool::Ffmpeg);
@@ -202,27 +205,34 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     // asset id for every file still there, so Story edits (exclusions,
     // captions) keep pointing at the right photos.
     let folder_key = folder.to_string_lossy().into_owned();
+    // Older CLI scans stored the folder exactly as typed.
+    let raw_key = raw_folder.to_string_lossy().into_owned();
     let existing = db
         .project_for_folder(&folder_key)
+        .and_then(|found| match found {
+            None if raw_key != folder_key => db.project_for_folder(&raw_key),
+            found => Ok(found),
+        })
         .unwrap_or_else(|e| die("find project", e));
-    let rescan = existing.is_some();
-    let project = match existing {
+    let (project, rescan) = match existing {
         Some(p) => {
-            db.touch_project(&p.id)
-                .unwrap_or_else(|e| die("update project", e));
             eprintln!("rescanning project {} in place", p.id);
-            p
+            (p, true)
         }
-        None => db
-            .create_project(&name, &folder_key)
-            .unwrap_or_else(|e| die("create project", e)),
+        None => (
+            db.create_project(&name, &folder_key)
+                .unwrap_or_else(|e| die("create project", e)),
+            false,
+        ),
     };
     let mut ids = AssetIds::new(
         &project.id,
         db.list_assets(&project.id)
             .unwrap_or_else(|e| die("list assets", e))
             .into_iter()
-            .map(|a| (a.path, a.id)),
+            // Canonical like the scan's paths, so assets stored under a
+            // raw folder path keep their ids.
+            .map(|a| (std::fs::canonicalize(&a.path).unwrap_or(a.path), a.id)),
     );
 
     let result = scan::scan_folder(&folder).unwrap_or_else(|e| die("scan", e));
@@ -441,6 +451,8 @@ fn scan_cmd(flags: &HashMap<String, String>) {
             let keep: Vec<String> = final_assets.iter().map(|a| a.id.clone()).collect();
             db.clear_project_clusters(&project.id)?;
             db.delete_stale_assets(&project.id, &keep)?;
+            // Only a committed rescan makes the project latest.
+            db.touch_project(&project.id)?;
         }
         for a in &final_assets {
             db.upsert_asset(&project.id, a)
