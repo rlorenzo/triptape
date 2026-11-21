@@ -597,13 +597,20 @@ pub fn events_for_edit(
         .iter()
         .filter(|i| !before.included.contains(i) && !new_swaps.iter().any(|(_, t)| t == *i));
     for id in pins {
-        // A pin adds to the film; the user still chose it over the shot
-        // the planner rated lowest in its chapter.
-        let rejected =
-            crate::plan::weakest_unchosen_pick(&plan, assets, &cur, id).map(str::to_owned);
+        // Pinning a shot the film already holds changes nothing to learn.
+        let already_picked = plan.hero.iter().any(|e| e.asset_id == *id);
         cur.set_included(id.clone(), true);
         plan = apply_edits(base, assets, &cur);
-        let (Some(chosen), Some(gone)) = (feats(id), rejected.as_deref()) else {
+        if already_picked {
+            continue;
+        }
+        // A pin adds to the film; the user still chose it over the shot
+        // the planner rated lowest in its chapter. Asked of the rebuilt
+        // plan, so a pin that restores an excluded shot finds its chapter.
+        let (Some(chosen), Some(gone)) = (
+            feats(id),
+            crate::plan::weakest_unchosen_pick(&plan, assets, &cur, id),
+        ) else {
             continue;
         };
         if let Some(r) = feats(gone) {
@@ -847,12 +854,35 @@ mod tests {
     }
 
     #[test]
-    fn pin_records_a_win_over_the_shot_it_displaced() {
+    fn pinning_a_shot_already_in_the_film_records_nothing() {
+        let (db, pid, _) = db_with_chapter();
+        let mut edits = PlanEdits::default();
+        edits.set_included("b".into(), true);
+        db.save_plan_edits(&pid, &edits).unwrap();
+        assert!(events(&db, &pid).is_empty());
+    }
+
+    #[test]
+    fn pinning_an_excluded_shot_still_records_a_win() {
+        let (db, pid, _) = db_with_chapter();
+        let mut edits = PlanEdits::default();
+        edits.set_excluded("e".into(), true);
+        db.save_plan_edits(&pid, &edits).unwrap();
+        edits.set_included("e".into(), true);
+        db.save_plan_edits(&pid, &edits).unwrap();
+        assert_eq!(
+            events(&db, &pid),
+            [(EventKind::Include, "e".into(), "a".into())]
+        );
+    }
+
+    #[test]
+    fn pin_records_a_win_over_its_chapters_weakest_pick() {
         let (db, pid, _) = db_with_chapter();
         let mut edits = PlanEdits::default();
         edits.set_included("e".into(), true);
         db.save_plan_edits(&pid, &edits).unwrap();
-        // The weakest unpinned hero pick (a: no people, ties break by order).
+        // The weakest unchosen hero pick (a: no people, ties break by order).
         assert_eq!(
             events(&db, &pid),
             [(EventKind::Include, "e".into(), "a".into())]

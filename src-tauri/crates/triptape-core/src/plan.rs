@@ -1495,13 +1495,18 @@ pub fn weakest_unchosen_pick<'p>(
         .iter()
         .map(String::as_str)
         .collect();
-    let score_of = |id: &str| {
-        assets
-            .iter()
-            .find(|a| a.id == id)
-            .and_then(|a| a.score.as_ref())
-            .map_or(DEFAULT_SCORE, |s| s.total)
-    };
+    // One pass over the assets, not one per comparison.
+    let score: HashMap<&str, f32> = assets
+        .iter()
+        .filter(|a| chapter.contains(a.id.as_str()))
+        .map(|a| {
+            (
+                a.id.as_str(),
+                a.score.as_ref().map_or(DEFAULT_SCORE, |s| s.total),
+            )
+        })
+        .collect();
+    let score_of = |id: &str| score.get(id).copied().unwrap_or(DEFAULT_SCORE);
     plan.hero
         .iter()
         .map(|e| e.asset_id.as_str())
@@ -2716,6 +2721,32 @@ mod tests {
             hero_ids(&apply_edits(&base, &assets, &edits)),
             ["a", "c", "e"]
         );
+    }
+
+    #[test]
+    fn weakest_unchosen_pick_skips_the_users_picks() {
+        // Hero a, c, e (scores 0.2, 0.4, 0.6).
+        let (assets, base) = pin_fixture(&[0, 2, 4]);
+        let mut edits = PlanEdits::default();
+        assert_eq!(
+            weakest_unchosen_pick(&base, &assets, &edits, "d"),
+            Some("a")
+        );
+        // Pins and swap replacements are the user's, never the loser.
+        edits.set_included("a".into(), true);
+        assert_eq!(
+            weakest_unchosen_pick(&base, &assets, &edits, "d"),
+            Some("c")
+        );
+        edits.swap("x".into(), "c".into());
+        assert_eq!(
+            weakest_unchosen_pick(&base, &assets, &edits, "d"),
+            Some("e")
+        );
+        // The pinned asset itself is never its own rival.
+        assert_eq!(weakest_unchosen_pick(&base, &assets, &edits, "e"), None);
+        // Outside the plan's chapters: nothing to compare with.
+        assert_eq!(weakest_unchosen_pick(&base, &assets, &edits, "zz"), None);
     }
 
     #[test]
