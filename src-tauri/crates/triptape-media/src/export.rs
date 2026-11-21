@@ -32,6 +32,9 @@ pub struct ExportOptions {
     pub keep_ambience: bool,
     /// Live Photos in a hero collage play their motion in their cell.
     pub live_collages: bool,
+    /// The hero film shows the route map after its title too (default
+    /// false; the closing recap always plays).
+    pub opening_map: bool,
     /// "all" (default), or one keepsake: "video" | "reels" | "book".
     pub only: String,
     /// Hero film frame size (default 4K). Reels stay 1080x1920.
@@ -565,6 +568,7 @@ fn export_inner(
                 music_paths: opts.music_paths.clone(),
                 keep_ambience: opts.keep_ambience,
                 live_collages: opts.live_collages,
+                opening_map: opts.opening_map,
                 typst_bin: opts.typst_bin.clone(),
                 resolution: opts.resolution,
                 jobs: opts.jobs,
@@ -1112,6 +1116,7 @@ mod tests {
                 music_paths: vec![],
                 keep_ambience: false,
                 live_collages: true,
+                opening_map: false,
                 only: "all".into(),
                 resolution: Resolution::default(),
                 jobs: None,
@@ -1160,6 +1165,7 @@ mod tests {
             music_paths: Vec::new(),
             keep_ambience: false,
             live_collages: true,
+            opening_map: false,
             only: "reels".into(),
             resolution: Default::default(),
             jobs: None,

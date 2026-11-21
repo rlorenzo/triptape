@@ -646,8 +646,11 @@ pub fn parse_film_length(spec: &str) -> Result<FilmLength, String> {
 /// Which fixed cards the renderer will add around the hero entries.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HeroCards {
-    /// Opening and closing route maps (the plan has a GPS route).
+    /// Closing route map (the plan has a GPS route).
     pub route: bool,
+    /// The opening route map card after the title too (off by default:
+    /// the film opens on its first shot and saves the map for the end).
+    pub opening_map: bool,
     /// Chapter stops the closing map travels between; fewer than two keep
     /// the static closing card (see [`crate::route_stops::closing_map_secs`]).
     pub route_stops: usize,
@@ -728,6 +731,7 @@ pub fn estimate_plan_secs(plan: &Plan, assets: &[Asset]) -> f64 {
         .collect();
     let cards = HeroCards {
         route: !plan.map_polyline.is_empty(),
+        opening_map: false,
         route_stops: crate::route_stops::animated_stop_count(
             &crate::route_stops::chapter_route_stops(&plan.chapters, assets, &plan.map_polyline),
         ),
@@ -757,7 +761,7 @@ pub fn estimate_hero_secs_with<'e, 'c>(
     collage: &CollageEdits,
 ) -> f64 {
     let mut segs: Vec<(Seg<'c>, f64)> = vec![(Seg::Title, EST_TITLE_SECS)];
-    if cards.route {
+    if cards.route && cards.opening_map {
         segs.push((Seg::Card, EST_MAP_SECS));
     }
     let first_hero = segs.len();
@@ -1474,6 +1478,7 @@ pub fn build_plan_with_length(
         },
         cards: HeroCards {
             route: !map_polyline.is_empty(),
+            opening_map: false,
             route_stops: crate::route_stops::animated_stop_count(
                 &crate::route_stops::chapter_route_stops(&chapters, assets, &map_polyline),
             ),
@@ -2843,6 +2848,7 @@ mod tests {
             |_| Some(0),
             HeroCards {
                 route: !plan.map_polyline.is_empty(),
+                opening_map: true,
                 route_stops: 0,
                 route_secs: None,
                 places: plan.chapters.iter().any(|c| c.place.is_some()),
@@ -3112,6 +3118,7 @@ mod tests {
         // plain 0.54 x2, hero->closing break 0.5, closing 0.7 = 4.82 s.
         let cards = HeroCards {
             route: true,
+            opening_map: true,
             route_stops: 0,
             route_secs: None,
             places: true,
@@ -3124,6 +3131,7 @@ mod tests {
         // Without a route or places only the title card remains.
         let bare = HeroCards {
             route: false,
+            opening_map: true,
             route_stops: 0,
             route_secs: None,
             places: false,
@@ -3141,6 +3149,7 @@ mod tests {
     fn captioned_stills_play_solo_in_the_estimate() {
         let bare = HeroCards {
             route: false,
+            opening_map: true,
             route_stops: 0,
             route_secs: None,
             places: false,
@@ -3247,6 +3256,7 @@ mod tests {
         // collage 6 + pano 8 = 16.5 s, cuts 0.7 + 0.7 = 1.4 s.
         let bare = HeroCards {
             route: false,
+            opening_map: true,
             route_stops: 0,
             route_secs: None,
             places: false,
@@ -3384,6 +3394,7 @@ mod tests {
 
     const NO_CARDS: HeroCards = HeroCards {
         route: false,
+        opening_map: true,
         route_stops: 0,
         route_secs: None,
         places: false,
@@ -3901,6 +3912,7 @@ mod tests {
             |_| Some(0),
             HeroCards {
                 route: true,
+                opening_map: true,
                 route_stops: 0,
                 route_secs: None,
                 places: true,
@@ -4747,6 +4759,7 @@ mod tests {
         let ch = |id: &str| if id.starts_with('x') { "X" } else { "Y" };
         let bare = HeroCards {
             route: false,
+            opening_map: true,
             route_stops: 0,
             route_secs: None,
             places: false,

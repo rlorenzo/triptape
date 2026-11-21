@@ -261,6 +261,9 @@ pub struct VideoOptions {
     pub overlap_secs: f64,
     pub title_secs: f64,
     pub map_secs: f64,
+    /// Show the route map card right after the title (default false: the
+    /// film opens on its first shot; the closing recap always plays).
+    pub opening_map: bool,
     /// Music playlist in order; crossfaded, cycled only if shorter than the
     /// film. Empty (or all unusable) falls back to the bundled theme.
     pub music_paths: Vec<PathBuf>,
@@ -295,6 +298,7 @@ impl Default for VideoOptions {
             overlap_secs: 0.6,
             title_secs: 2.5,
             map_secs: 3.0,
+            opening_map: false,
             music_paths: Vec::new(),
             keep_ambience: false,
             live_collages: true,
@@ -583,8 +587,10 @@ pub fn render_hero_video(
         "title".into(),
     ));
 
-    // Map push-in when GPS exists and a card was rendered.
-    if let Some(card) = map_card {
+    // Map push-in when asked for, GPS exists and a card was rendered. Off
+    // by default: the title cuts straight to the first shot, and the route
+    // is saved for the closing recap.
+    if let Some(card) = map_card.filter(|_| opts.opening_map) {
         if !plan.map_polyline.is_empty() {
             let map_mp4 = work_dir.join("seg_map.mp4");
             match crate::map::render_map_push_in(
@@ -2819,32 +2825,39 @@ mod tests {
                 .map(|(i, e)| (e.asset_id.as_str(), i as i64 * 540))
                 .collect();
             let taken_of = |id: &str| taken.get(id).copied();
-            for cards in [
-                HeroCards {
-                    route: true,
-                    route_stops: 0,
-                    route_secs: None,
-                    places: true,
-                },
-                HeroCards {
-                    route: false,
-                    route_stops: 0,
-                    route_secs: None,
-                    places: false,
-                },
-                HeroCards {
-                    route: true,
-                    route_stops: 0,
-                    route_secs: None,
-                    places: false,
-                },
-                HeroCards {
-                    route: true,
-                    route_stops: 6,
-                    route_secs: None,
-                    places: true,
-                },
-            ] {
+            // Each card set with and without the opening map.
+            for cards in [false, true].into_iter().flat_map(|opening_map| {
+                [
+                    HeroCards {
+                        route: true,
+                        opening_map,
+                        route_stops: 0,
+                        route_secs: None,
+                        places: true,
+                    },
+                    HeroCards {
+                        route: false,
+                        opening_map,
+                        route_stops: 0,
+                        route_secs: None,
+                        places: false,
+                    },
+                    HeroCards {
+                        route: true,
+                        opening_map,
+                        route_stops: 0,
+                        route_secs: None,
+                        places: false,
+                    },
+                    HeroCards {
+                        route: true,
+                        opening_map,
+                        route_stops: 6,
+                        route_secs: None,
+                        places: true,
+                    },
+                ]
+            }) {
                 // -- renderer replay: the renderer's own grouping.
                 let resolved: Vec<ResolvedEntry> = entries
                     .iter()
@@ -2864,7 +2877,7 @@ mod tests {
                 // (asset id, duration, kind) as in the renderer's `segs`.
                 let mut segs: Vec<(String, f64, &str)> =
                     vec![("title".into(), opts.title_secs, "title")];
-                if cards.route {
+                if cards.route && cards.opening_map {
                     segs.push(("map".into(), opts.map_secs, "map"));
                 }
                 for g in &groups {
@@ -4235,38 +4248,56 @@ mod tests {
                 rationale: "default".into(),
             },
         };
-        let out = dir.join("hero.mp4");
-        let v = render_hero_video(
-            &caps,
-            &plan,
-            &entries,
-            Some(&still),
-            &dir.join("work"),
-            &out,
-            &VideoOptions {
-                short_mode: true,
-                resolution: Resolution::Hd1080,
-                ..Default::default()
-            },
-        )
-        .expect("short film render");
-        assert!(
-            v.duration_secs <= SHORT_FILM_SECS,
-            "short film ran {:.2}s",
-            v.duration_secs
-        );
-        let edl: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&v.edl_path).unwrap()).unwrap();
-        let ids: Vec<&str> = edl["segments"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|s| s["asset_id"].as_str().unwrap())
-            .collect();
-        assert!(
-            ids.contains(&"closing") && ids.contains(&"credits"),
-            "{ids:?}"
-        );
+        // By default the title cuts straight to the first shot; the opening
+        // map only plays when asked for. The closing recap plays either way.
+        for opening_map in [false, true] {
+            let out = dir.join(format!("hero_{opening_map}.mp4"));
+            let v = render_hero_video(
+                &caps,
+                &plan,
+                &entries,
+                Some(&still),
+                &dir.join(format!("work_{opening_map}")),
+                &out,
+                &VideoOptions {
+                    short_mode: true,
+                    resolution: Resolution::Hd1080,
+                    opening_map,
+                    ..Default::default()
+                },
+            )
+            .expect("short film render");
+            assert!(
+                v.duration_secs <= SHORT_FILM_SECS,
+                "short film ran {:.2}s",
+                v.duration_secs
+            );
+            let edl: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&v.edl_path).unwrap()).unwrap();
+            let segs = edl["segments"].as_array().unwrap();
+            let ids: Vec<&str> = segs
+                .iter()
+                .map(|s| s["asset_id"].as_str().unwrap())
+                .collect();
+            let opening: &[&str] = if opening_map {
+                &["title", "map"]
+            } else {
+                &["title"]
+            };
+            assert_eq!(&ids[..opening.len()], opening, "{ids:?}");
+            // ...then straight into the first shot.
+            assert!(ids[opening.len()].starts_with('a'), "{ids:?}");
+            assert_eq!(
+                ids.iter().filter(|&&i| i == "map").count(),
+                usize::from(opening_map)
+            );
+            assert!(
+                ids.contains(&"closing") && ids.contains(&"credits"),
+                "{ids:?}"
+            );
+            // The title opens onto whatever follows with the opening move.
+            assert_eq!(segs[1]["transition_in"], "circle_open", "{ids:?}");
+        }
     }
 
     /// Regression: a clip whose planned trim (4 s) exceeds its real length
