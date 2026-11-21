@@ -127,7 +127,7 @@ impl BookPhoto {
     /// chapter and the same owner-named place, so no swap carries a photo
     /// across a page break between two visits.
     fn same_stretch(&self, other: &BookPhoto) -> bool {
-        self.chapter == other.chapter && self.area == other.area
+        (self.chapter, self.day) == (other.chapter, other.day) && self.area == other.area
     }
 
     /// Whether this photo repeats `other`: the same people at the same
@@ -357,6 +357,17 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
     order
 }
 
+/// Page sizes for `n` photos at up to `per_page` a page, as even as the
+/// fewest pages allow: 9 photos at 4 a page are 3 + 3 + 3, not 4 + 4 + 1,
+/// so no photo (a landscape left over from a day of family shots) is
+/// blown up to a page of its own unless the stretch holds only that one.
+fn even_split(n: usize, per_page: usize) -> Vec<usize> {
+    let pages = n.div_ceil(per_page.max(1));
+    (0..pages)
+        .map(|k| n / pages + usize::from(k < n % pages))
+        .collect()
+}
+
 /// Flow photos into a page plan. `chapter_of` holds each photo's chapter in
 /// story order and `wide_idx` the first wide (≥1.5:1) photo after the hero.
 /// Density adapts so small books still clear the 24-page vendor minimum (one
@@ -476,9 +487,7 @@ pub fn flow_pages(
             });
         }
         for &seg in run {
-            let mut left = seg;
-            while left > 0 {
-                let take = left.min(per_page);
+            for take in even_split(seg, per_page) {
                 pages.push(FlowPage {
                     kind: if take == 1 {
                         PageKind::PhotoCaption
@@ -487,7 +496,6 @@ pub fn flow_pages(
                     },
                     take,
                 });
-                left -= take;
             }
         }
     }
@@ -2632,6 +2640,23 @@ mod tests {
     }
 
     #[test]
+    fn no_photo_is_left_alone_on_a_page() {
+        assert_eq!(even_split(9, 4), vec![3, 3, 3], "not 4 + 4 + 1");
+        assert_eq!(even_split(5, 4), vec![3, 2]);
+        assert_eq!(even_split(8, 4), vec![4, 4]);
+        assert_eq!(even_split(1, 4), vec![1], "a lone photo keeps its page");
+        assert_eq!(even_split(3, 1), vec![1, 1, 1]);
+        assert!(even_split(0, 4).is_empty());
+        // A day of 9 photos in a book dense enough for grids: no solo page.
+        let flow = flow_pages(&[Some(0); 9], &[Some(1); 9], None, false, 4);
+        assert!(
+            flow.iter().all(|p| p.kind != PageKind::PhotoCaption),
+            "{:?}",
+            flow.iter().map(|p| (p.kind, p.take)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn full_pages_prefer_sharp_photos() {
         // 12 MP prints at 252 dpi full-page; 48 MP at 357.
         let (mp12, mp48) = ((4032, 3024), (5712, 4284));
@@ -2686,16 +2711,17 @@ mod tests {
                 })
                 .collect()
         };
-        // Hero plus 130: 4-up pages and a closing 2-up holding the soft one.
-        let photos = book(131, 130);
+        // Hero plus 130: a day of 4-up pages, then a day of two shots on a
+        // closing 2-up holding the soft one, which must not leave its day.
+        let mut photos = book(131, 130);
+        for (i, p) in photos.iter_mut().enumerate() {
+            p.day = Some(if i < 129 { 1 } else { 2 });
+        }
         let pages = pages_of(&photos, 40);
         let (last_kind, last) = &pages[pages.len() - 2];
         assert_eq!((*last_kind, last.len()), (PageKind::Grid, 2));
-        assert!(!last.contains(&130), "soft photo left the 2-up page");
-        let (_, prev) = &pages[pages.len() - 3];
-        assert_eq!(prev.len(), 4);
-        assert!(prev.contains(&130), "it took the nearest 4-up cell");
-        assert_eq!(soft_placements(&photos, 40), 0);
+        assert!(last.contains(&130), "no other day's page takes it");
+        assert_eq!(soft_placements(&photos, 40), 1);
         // All pages 2-up: no small cell to move to, so it stays (and warns).
         let photos = book(21, 20);
         let pages = pages_of(&photos, 24);
