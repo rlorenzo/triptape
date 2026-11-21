@@ -681,16 +681,20 @@ async fn run_ingest(
             // all see the paired set. The motion file is not hashed as its
             // own asset (the Live Photo row hashes its still).
             assets = apply_live_photo_pairing(assets);
+            // Hold the store from here through the save: a rescan reads the
+            // project's ids and saves the rows it assigned under one lock,
+            // so two overlapping rescans can never give one new file two
+            // ids (the later save would orphan edits made against the
+            // first). Grouping and the plan below are quick, in-memory work.
+            let db = lock()?;
             if refresh {
-                let known = lock()?.list_assets(&pid)?;
+                let known = db.list_assets(&pid)?;
                 keep_known_asset_ids(&pid, &mut assets, known.into_iter().map(|a| (a.path, a.id)));
             }
             // Short foreground phases; the background task continues from
             // `FOREGROUND_DONE_PROGRESS` once the command returns.
-            if let Ok(db) = lock() {
-                report_ingest(&worker_app, &db, &worker_job, 0.05, "Grouping photos…");
-                last_progress = 0.05;
-            }
+            report_ingest(&worker_app, &db, &worker_job, 0.05, "Grouping photos…");
+            last_progress = 0.05;
             let mut clusters = cluster::cluster_assets(&assets);
             for c in &mut clusters {
                 c.id = format!("{pid}_{}", c.id);
@@ -703,11 +707,8 @@ async fn run_ingest(
             // this path, so the library opens fast); the background task
             // scores every asset and rebuilds the plan before marking Done.
             let plan = planmod::build_plan(&assets, &cluster_of, &HashMap::new());
-            if let Ok(db) = lock() {
-                report_ingest(&worker_app, &db, &worker_job, 0.10, "Building story plan…");
-                last_progress = 0.10;
-            }
-            let db = lock()?;
+            report_ingest(&worker_app, &db, &worker_job, 0.10, "Building story plan…");
+            last_progress = 0.10;
             db.in_transaction(|db| {
                 if refresh {
                     // In-place refresh: drop the previous cluster graph
