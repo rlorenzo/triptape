@@ -268,11 +268,20 @@ fn port_day_order(at: &[Whereabouts]) -> Vec<usize> {
             out.extend(day);
             continue;
         }
-        let mut members: HashMap<usize, Vec<usize>> = HashMap::new();
-        let mut area_of: HashMap<usize, usize> = HashMap::new();
+        // An area's group ends at a shot on board: back ashore later in
+        // the same area is a new visit, after that shipboard shot.
+        let leg = |i: usize| {
+            day.iter()
+                .take_while(|&&d| d < i)
+                .filter(|&&d| at[d].aboard)
+                .count()
+        };
+        let mut members: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+        let mut area_of: HashMap<usize, (usize, usize)> = HashMap::new();
         for (&i, &r) in ashore.iter().zip(&roots) {
-            members.entry(r).or_default().push(i);
-            area_of.insert(i, r);
+            let key = (r, leg(i));
+            members.entry(key).or_default().push(i);
+            area_of.insert(i, key);
         }
         for &i in &day {
             match area_of.get(&i) {
@@ -1106,6 +1115,19 @@ mod tests {
         // Two parties' shots interleave: areas group; the dawn deck shot
         // opens the day and the return aboard closes it.
         assert_eq!(port_day_order(&at), [0, 1, 2, 4, 5, 7, 3, 6, 8, 9, 10]);
+        // Interleaved areas still split at a shot on board: the later
+        // visits come after it.
+        let split = vec![
+            w(16, true, false, Some(central)), // 0 city
+            w(16, true, false, Some(disney)),  // 1 Disneyland
+            w(16, true, false, Some(central)), // 2 city
+            w(16, true, false, Some(disney)),  // 3 Disneyland
+            w(16, true, true, Some(central)),  // 4 lunch aboard
+            w(16, true, false, Some(central)), // 5 city
+            w(16, true, false, Some(disney)),  // 6 Disneyland
+            w(16, true, false, Some(central)), // 7 city
+        ];
+        assert_eq!(port_day_order(&split), [0, 2, 1, 3, 4, 5, 7, 6]);
         // A day that moves on and comes back once keeps time order.
         let jeju = vec![
             w(14, true, false, Some(central)), // waterfall

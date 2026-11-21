@@ -1197,7 +1197,7 @@ pub fn render_book(
                 }
                 let cells = match fp.kind {
                     PageKind::Grid => grid_cells(&slot, f64::from(tw), f64::from(th)),
-                    _ => vec![(0.0, 0.0, 1.0, 1.0); slot.len()],
+                    _ => vec![FULL_PAGE; slot.len()],
                 };
                 // The hero is the opening's best shot pulled to the front,
                 // not its earliest, so it neither checks nor sets the time
@@ -1222,6 +1222,13 @@ pub fn render_book(
                     .min(&photos.len().saturating_sub(1))];
                 shown.push(p);
                 if fp.kind == PageKind::SpreadLeft {
+                    // One photo across both pages: checked once.
+                    fallbacks.extend(time_order_notes(
+                        page_no,
+                        &[p],
+                        &[FULL_PAGE],
+                        &mut last_time,
+                    ));
                     let (sw, sh) = slot_inches(opts.preset, fp.kind, 1);
                     placements.push((page_no, dpi_verdict(p.width, p.height, sw, sh)));
                     // Title only a chapter this spread uses up: otherwise
@@ -1267,6 +1274,12 @@ pub fn render_book(
                 cursor += fp.take;
                 let (sw, sh) = slot_inches(opts.preset, fp.kind, fp.take);
                 placements.push((page_no, dpi_verdict(bg.width, bg.height, sw, sh)));
+                fallbacks.extend(time_order_notes(
+                    page_no,
+                    &[bg],
+                    &[FULL_PAGE],
+                    &mut last_time,
+                ));
                 // Full brightness: the title sits in the caption strip, which
                 // carries its own dark backing.
                 draw_fullbleed(bg, tw, th, &out, &fit, &mut fallbacks)?;
@@ -1762,36 +1775,58 @@ fn face_window(
 ) -> ((f64, f64, f64, f64), bool) {
     let scale = (tw / sw).max(th / sh);
     let (cw, ch) = ((tw / scale).min(sw), (th / scale).min(sh));
-    let mut by_size: Vec<(f64, f64, f64, f64)> = faces
+    type Box4 = (f64, f64, f64, f64);
+    // Each face as (with head room, bare), biggest first.
+    let mut by_size: Vec<(Box4, Box4)> = faces
         .iter()
         .map(|f| {
             let (x, y, w, h) = (f.x, f.y, f.w, f.h);
-            (
+            let padded = (
                 f64::from(x - FACE_SIDE * w).max(0.0) * sw,
                 f64::from(y - HEAD_ABOVE * h).max(0.0) * sh,
                 f64::from(x + w + FACE_SIDE * w).min(1.0) * sw,
                 f64::from(y + h + FACE_BELOW * h).min(1.0) * sh,
-            )
+            );
+            let bare = (
+                f64::from(x) * sw,
+                f64::from(y) * sh,
+                f64::from(x + w).min(1.0) * sw,
+                f64::from(y + h).min(1.0) * sh,
+            );
+            (padded, bare)
         })
         .collect();
-    by_size.sort_by(|a, b| ((b.2 - b.0) * (b.3 - b.1)).total_cmp(&((a.2 - a.0) * (a.3 - a.1))));
-    let mut keep: Option<(f64, f64, f64, f64)> = None;
-    let mut cut = false;
-    for b in by_size {
-        let u = keep.map_or(b, |k| {
+    let area = |b: &Box4| (b.2 - b.0) * (b.3 - b.1);
+    by_size.sort_by(|a, b| area(&b.1).total_cmp(&area(&a.1)));
+    let union = |k: Option<Box4>, b: Box4| {
+        k.map_or(b, |k| {
             (k.0.min(b.0), k.1.min(b.1), k.2.max(b.2), k.3.max(b.3))
-        });
-        if u.2 - u.0 <= cw + 0.5 && u.3 - u.1 <= ch + 0.5 {
-            keep = Some(u);
+        })
+    };
+    let fits = |u: Box4| u.2 - u.0 <= cw + 0.5 && u.3 - u.1 <= ch + 0.5;
+    let mut keep: Option<Box4> = None;
+    // The highest head room the kept faces want: the window rises toward
+    // it as far as the faces allow.
+    let mut head_top = f64::INFINITY;
+    let mut cut = false;
+    for (padded, bare) in by_size {
+        // With its head room if that fits, else the face itself (a close-up
+        // whose head room is taller than the cell).
+        if fits(union(keep, padded)) {
+            keep = Some(union(keep, padded));
+        } else if fits(union(keep, bare)) {
+            keep = Some(union(keep, bare));
         } else {
             cut = true;
             if keep.is_none() {
-                // The biggest face alone overflows the cell: centre on it
-                // rather than on a small background face or the photo.
-                keep = Some(b);
+                // The biggest face alone overflows the cell: aim at it (and
+                // its head room) rather than at a small background face.
+                keep = Some(padded);
                 break;
             }
+            continue;
         }
+        head_top = head_top.min(padded.1);
     }
     // Along each axis: centre on the kept faces, slid to hold them all.
     let place = |lo: f64, hi: f64, win: f64, full: f64| {
@@ -1809,7 +1844,16 @@ fn face_window(
         held.clamp(0.0, max_origin)
     };
     let (x, y) = match keep {
-        Some(k) => (place(k.0, k.2, cw, sw), place(k.1, k.3, ch, sh)),
+        Some(k) => {
+            // Vertically: as much head room as fits above the faces.
+            let max_origin = (sh - ch).max(0.0);
+            let y = if fits(k) {
+                head_top.max(k.3 - ch).min(k.1).clamp(0.0, max_origin)
+            } else {
+                place(k.1, k.3, ch, sh)
+            };
+            (place(k.0, k.2, cw, sw), y)
+        }
         None => ((sw - cw) / 2.0, (sh - ch) / 2.0),
     };
     ((x, y, cw, ch), cut)
@@ -1866,6 +1910,9 @@ fn draw_half(
 
 /// A cell `(x, y, w, h)`.
 type Rect = (f64, f64, f64, f64);
+
+/// The whole page as one cell (any unit: the time check only compares).
+const FULL_PAGE: Rect = (0.0, 0.0, 1.0, 1.0);
 
 /// Row arrangements for `n` photos: up to 3 rows of 1–3 photos each.
 fn row_splits(n: usize) -> Vec<Vec<usize>> {
@@ -2984,6 +3031,14 @@ mod tests {
         let mid = (0.4 - 0.4 * HEAD_ABOVE + 0.4 + 0.4 + 0.4 * FACE_BELOW) as f64 / 2.0 * 4000.0;
         assert!((y + h / 2.0 - mid).abs() < 1.0, "on the close-up: y={y}");
         assert!(cut);
+        // A close-up whose head room is taller than the cell: the face
+        // still stays whole, with what head room fits.
+        let ((_, y, _, h), cut) = face_window(3000.0, 4000.0, 2.0, 1.0, &[face(0.3, 0.15, 0.25)]);
+        assert!(
+            y <= 0.15 * 4000.0 && y + h >= 0.4 * 4000.0,
+            "face kept: y={y}"
+        );
+        assert!(!cut);
         // No faces: centred, as before.
         let ((x, y, _, _), cut) = face_window(4000.0, 3000.0, 1.0, 1.0, &[]);
         assert_eq!((x, y, cut), (500.0, 0.0, false));
