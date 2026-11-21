@@ -156,7 +156,10 @@ fn tool_bin(flags: &HashMap<String, String>, tool: Tool) -> String {
 }
 
 fn scan_cmd(flags: &HashMap<String, String>) {
-    let folder = need(flags, "folder");
+    let raw_folder = need(flags, "folder");
+    // Canonical, so `./japan`, `japan/`, and symlinked paths all find the
+    // same project (the desktop app stores canonical folders too).
+    let folder = std::fs::canonicalize(&raw_folder).unwrap_or_else(|e| die("open folder", e));
     let db_path = need(flags, "db");
     let cache = need(flags, "cache");
     let ffmpeg = tool_bin(flags, Tool::Ffmpeg);
@@ -194,13 +197,54 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         eprintln!("{note}");
     }
 
+    // Plan flags are checked before any write, so a typo never leaves a
+    // half-refreshed project behind.
+    let (overrides, length) = plan_flags(flags);
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
     let name = folder
         .file_name()
         .map_or_else(|| "trip".into(), |s| s.to_string_lossy());
-    let project = db
-        .create_project(&name, &folder.to_string_lossy())
-        .unwrap_or_else(|e| die("create project", e));
+    // A folder scanned before is refreshed in place: same project, same
+    // asset id for every file still there, so Story edits (exclusions,
+    // captions) keep pointing at the right photos.
+    let folder_key = folder.to_string_lossy().into_owned();
+    // Older CLI scans stored the folder exactly as typed. Only an absolute
+    // spelling names the same folder for sure (a relative `photos` could
+    // be any trip's); a project found that way moves to the canonical path.
+    let raw_key = raw_folder.to_string_lossy().into_owned();
+    let mut relocate = false;
+    let existing = db
+        .project_for_folder(&folder_key)
+        .and_then(|found| match found {
+            None if raw_key != folder_key && raw_folder.is_absolute() => {
+                let legacy = db.project_for_folder(&raw_key)?;
+                relocate = legacy.is_some();
+                Ok(legacy)
+            }
+            found => Ok(found),
+        })
+        .unwrap_or_else(|e| die("find project", e));
+    let (project, rescan) = match existing {
+        Some(p) => {
+            eprintln!("rescanning project {} in place", p.id);
+            (p, true)
+        }
+        None => (
+            db.create_project(&name, &folder_key)
+                .unwrap_or_else(|e| die("create project", e)),
+            false,
+        ),
+    };
+    let mut ids = AssetIds::new(
+        &project.id,
+        rescan,
+        db.list_assets(&project.id)
+            .unwrap_or_else(|e| die("list assets", e))
+            .into_iter()
+            // Canonical like the scan's paths, so assets stored under a
+            // raw folder path keep their ids.
+            .map(|a| (std::fs::canonicalize(&a.path).unwrap_or(a.path), a.id)),
+    );
 
     let result = scan::scan_folder(&folder).unwrap_or_else(|e| die("scan", e));
     // Captions/people from an `osxphotos export` without sidecars (loaded
@@ -213,7 +257,7 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     let mut probes: HashMap<PathBuf, metadata::FfprobeOutput> = HashMap::new();
     let mut assets: Vec<Asset> = vec![];
 
-    for (i, f) in result.files.iter().enumerate() {
+    for f in &result.files {
         let content_hash = hash::blake3_file(&f.path).ok();
         if scan::VIDEO_EXTS.contains(&f.ext.as_str()) {
             let probe = metadata::probe_video(&ffprobe, &f.path).ok();
@@ -227,8 +271,7 @@ fn scan_cmd(flags: &HashMap<String, String>) {
                 probes.insert(f.path.clone(), p);
             }
             assets.push(base_asset(
-                &project.id,
-                i,
+                ids.id_for(&f.path),
                 f,
                 AssetKind::Video,
                 content_hash,
@@ -239,8 +282,7 @@ fn scan_cmd(flags: &HashMap<String, String>) {
                 content_id: None, // still UUIDs need container tags; basename fallback covers CLI
             });
             assets.push(base_asset(
-                &project.id,
-                i,
+                ids.id_for(&f.path),
                 f,
                 AssetKind::Photo,
                 content_hash,
@@ -413,8 +455,41 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         a.score = scores.get(&a.id).cloned();
     }
 
-    // Persist assets, clusters, and links in one transaction.
+    let cluster_of = cluster::chapter_labels(&clusters);
+    let plan_assets: Vec<Asset> = final_assets
+        .iter()
+        .filter(|a| !suppressed.contains(&a.id))
+        .cloned()
+        .collect();
+    let p = planmod::build_plan_with_length(&plan_assets, &cluster_of, &scores, &overrides, length);
+    let elig = planmod::plan_eligibility(
+        plan_assets.len(),
+        plan_assets
+            .iter()
+            .filter(|a| a.kind != AssetKind::Video)
+            .count(),
+        clusters.len(),
+    );
+
+    // Persist assets, clusters, links and the plan in one transaction: a
+    // failure leaves the project exactly as it was.
+    let mut plan_id = String::new();
     let persisted = db.in_transaction(|db| {
+        if rescan {
+            // Files gone from the folder leave, unless the walk was partial
+            // (an unreadable folder is not a deleted one); the day clusters
+            // rebuild.
+            db.clear_project_clusters(&project.id)?;
+            if result.errors.is_empty() {
+                let keep: Vec<String> = final_assets.iter().map(|a| a.id.clone()).collect();
+                db.delete_stale_assets(&project.id, &keep)?;
+            }
+            if relocate {
+                db.set_project_folder(&project.id, &folder_key)?;
+            }
+            // Only a committed rescan makes the project latest.
+            db.touch_project(&project.id)?;
+        }
         for a in &final_assets {
             db.upsert_asset(&project.id, a)
                 .map_err(|e| format!("upsert {}: {e}", a.id))?;
@@ -427,6 +502,9 @@ fn scan_cmd(flags: &HashMap<String, String>) {
                     .map_err(|e| format!("link {id} -> {}: {e}", c.id))?;
             }
         }
+        plan_id = db
+            .insert_plan(&project.id, &p, "local")
+            .map_err(|e| format!("insert plan: {e}"))?;
         Ok(())
     });
     if let Err(e) = persisted {
@@ -457,26 +535,6 @@ fn scan_cmd(flags: &HashMap<String, String>) {
             }
         }
     }
-
-    let cluster_of = cluster::chapter_labels(&clusters);
-    let plan_assets: Vec<Asset> = final_assets
-        .iter()
-        .filter(|a| !suppressed.contains(&a.id))
-        .cloned()
-        .collect();
-    let (overrides, length) = plan_flags(flags);
-    let p = planmod::build_plan_with_length(&plan_assets, &cluster_of, &scores, &overrides, length);
-    let elig = planmod::plan_eligibility(
-        plan_assets.len(),
-        plan_assets
-            .iter()
-            .filter(|a| a.kind != AssetKind::Video)
-            .count(),
-        clusters.len(),
-    );
-    let plan_id = db
-        .insert_plan(&project.id, &p, "local")
-        .unwrap_or_else(|e| die("insert plan", e));
 
     println!("project: {}", project.id);
     println!("files: {}", result.files.len());
@@ -519,15 +577,54 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     }
 }
 
+/// Asset ids for one scan: a file the project already holds keeps its id.
+/// A new file in a fresh project takes `{project}_a{n:05}` in walk order;
+/// one added on a rescan takes a never-reused unique id, so a deleted
+/// file's id (and any edit still naming it) can never land on another.
+/// (`assets.id` is database-wide, hence the project prefix.)
+struct AssetIds {
+    project: String,
+    rescan: bool,
+    by_path: HashMap<PathBuf, String>,
+    next: usize,
+}
+
+impl AssetIds {
+    fn new(
+        project_id: &str,
+        rescan: bool,
+        known: impl IntoIterator<Item = (PathBuf, String)>,
+    ) -> Self {
+        Self {
+            project: project_id.to_string(),
+            rescan,
+            by_path: known.into_iter().collect(),
+            next: 0,
+        }
+    }
+
+    fn id_for(&mut self, path: &Path) -> String {
+        if let Some(id) = self.by_path.get(path) {
+            return id.clone();
+        }
+        let id = if self.rescan {
+            format!("{}_{}", self.project, triptape_core::db::new_id("a"))
+        } else {
+            self.next += 1;
+            format!("{}_a{:05}", self.project, self.next - 1)
+        };
+        self.by_path.insert(path.to_path_buf(), id.clone());
+        id
+    }
+}
+
 fn base_asset(
-    project_id: &str,
-    i: usize,
+    id: String,
     f: &scan::ScannedFile,
     kind: AssetKind,
     content_hash: Option<String>,
 ) -> Asset {
-    // Scan-local index prefixed by project id: `assets.id` is database-wide.
-    let mut a = Asset::new(format!("{project_id}_a{i:05}"), f.path.clone(), kind);
+    let mut a = Asset::new(id, f.path.clone(), kind);
     a.size_bytes = f.size_bytes;
     a.mtime = f.mtime_secs;
     a.content_hash = content_hash;
@@ -1588,6 +1685,26 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rescan_keeps_each_files_id_and_never_reuses_one() {
+        let known = [
+            (PathBuf::from("/t/IMG_1.HEIC"), "prj_x_a00000".to_string()),
+            (PathBuf::from("/t/IMG_3.HEIC"), "prj_x_a00002".to_string()),
+        ];
+        let mut ids = AssetIds::new("prj_x", true, known);
+        // IMG_2 left the folder: IMG_3 keeps its id, nothing shifts.
+        assert_eq!(ids.id_for(Path::new("/t/IMG_3.HEIC")), "prj_x_a00002");
+        assert_eq!(ids.id_for(Path::new("/t/IMG_1.HEIC")), "prj_x_a00000");
+        // A new file never takes a number a deleted file once had.
+        let new = ids.id_for(Path::new("/t/IMG_9.HEIC"));
+        assert!(new.starts_with("prj_x_a_") && new.len() > 20, "{new}");
+        assert_eq!(ids.id_for(Path::new("/t/IMG_9.HEIC")), new);
+        // A fresh project numbers in walk order.
+        let mut fresh = AssetIds::new("prj_y", false, []);
+        assert_eq!(fresh.id_for(Path::new("/t/a.jpg")), "prj_y_a00000");
+        assert_eq!(fresh.id_for(Path::new("/t/b.jpg")), "prj_y_a00001");
+    }
 
     #[test]
     fn music_flag_repeats_and_semicolons() {
