@@ -787,6 +787,14 @@ fn export_inner(
                     .map(|&(x, y)| (f32::from(x) / 100.0, f32::from(y) / 100.0)),
             });
         }
+        // A cover pin outside the book's photos can't show: say so.
+        for id in plan.cover.keys() {
+            if !book_photos.iter().any(|p| &p.asset_id == id) {
+                report.fallbacks.push(format!(
+                    "cover: pinned {id} is not among the book's photos (a near-duplicate or an excluded shot); pin a photo the book uses"
+                ));
+            }
+        }
         // A photo and the owner's `_edited` version of it are one photo:
         // the edit stays.
         drop_originals_of_edits(&mut book_photos);

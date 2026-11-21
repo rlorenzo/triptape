@@ -2351,14 +2351,23 @@ fn cover_picks(photos: &[BookPhoto], opening: &[usize]) -> Vec<usize> {
         .filter(|i| !picks.contains(i) && !opening.contains(i))
         .collect();
     let slots = (want - picks.len()).min(pool.len());
+    // One tile per day where the trip allows: two tiles of one scene (a
+    // pinned waterfall beside another shot of it) waste the cover.
+    let mut days: HashSet<u32> = picks.iter().filter_map(|&i| photos[i].day).collect();
+    let better = |a: &usize, b: &usize| {
+        let (a, b) = (&photos[*a], &photos[*b]);
+        cover_rank(a)
+            .cmp(&cover_rank(b))
+            .then(a.score.total_cmp(&b.score))
+    };
     for k in 0..slots {
-        let (from, to) = (k * pool.len() / slots, (k + 1) * pool.len() / slots);
-        if let Some(&best) = pool[from..to].iter().max_by(|&&a, &&b| {
-            let (a, b) = (&photos[a], &photos[b]);
-            cover_rank(a)
-                .cmp(&cover_rank(b))
-                .then(a.score.total_cmp(&b.score))
-        }) {
+        let stretch = &pool[k * pool.len() / slots..(k + 1) * pool.len() / slots];
+        let fresh = stretch
+            .iter()
+            .filter(|&&i| photos[i].day.is_none_or(|d| !days.contains(&d)))
+            .max_by(|a, b| better(a, b));
+        if let Some(&best) = fresh.or_else(|| stretch.iter().max_by(|a, b| better(a, b))) {
+            days.extend(photos[best].day);
             picks.push(best);
         }
     }
@@ -4147,6 +4156,15 @@ mod tests {
         assert_eq!(picks.len(), 12);
         assert!(picks.contains(&0) && !picks.contains(&2), "{picks:?}");
         assert!(picks.windows(2).all(|w| w[0] < w[1]));
+        // A pinned day gives no second tile while other days remain.
+        let mut days = photos.clone();
+        for (i, p) in days.iter_mut().enumerate() {
+            p.day = Some((i / 4) as u32);
+        }
+        days[2].cover_focus = Some(0.5);
+        let picks = cover_picks(&days, &[]);
+        let first_day: Vec<_> = picks.iter().filter(|&&i| i < 4).collect();
+        assert_eq!(first_day, [&2], "{picks:?}");
         // Small trip: every photo but the opening.
         assert_eq!(cover_picks(&photos[..3], &[1]), vec![0, 2]);
         // Nothing but the opening: the cover still shows it.
