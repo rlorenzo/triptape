@@ -7,8 +7,9 @@
 //! Sec 5.4 degradation eligibility lives here too.
 
 use crate::clip_window::MAX_WINDOW_SECS;
-use crate::cluster::{gps_outliers, story_key, story_order};
+use crate::cluster::{day_of, gps_outliers_in, same_day, story_positions, story_tracks};
 use crate::embedding::{same_scene, Embedding};
+use crate::party::Track;
 use crate::types::{
     distinct_assets, Asset, AssetKind, Chapter, CollageEdits, MusicPick, Plan, PlanEntry,
     Rendition, Score,
@@ -208,6 +209,13 @@ pub fn collage_hold_secs(n: usize, still_secs: f64) -> f64 {
 /// segments (roughly 10-20 s of film), and never into another chapter.
 pub const COLLAGE_REACH: usize = 3;
 
+/// Most seconds of capture time between a collage's first photo and any
+/// other photo it joins automatically. A chapter can be a whole day, and a
+/// sparse evening pick must not be pulled into a midday collage; half an
+/// hour keeps a collage to one outing. A photo with no capture time never
+/// joins automatically. The user's own joins are not bound by it.
+pub const COLLAGE_WINDOW_SECS: i64 = 30 * 60;
+
 /// One hero entry, in playback order, as [`collage_groups`] sees it.
 /// Build them with [`collage_slots`], which applies the user's edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,10 +230,13 @@ pub struct GroupSlot<C> {
     /// entries lie between them. Honoured within one chapter, and while the
     /// photos joined this way in a row number at most [`MAX_COLLAGE`].
     pub join_prev: bool,
+    /// Capture time (unix seconds): automatic collages stay within
+    /// [`COLLAGE_WINDOW_SECS`] of their first photo.
+    pub taken_at: Option<i64>,
 }
 
 /// Grouping slots for hero entries in playback order, given as
-/// `(asset id, chapter, eligible)`, with the user's collage `edits`
+/// `(asset id, chapter, eligible, capture time)`, with the user's collage `edits`
 /// applied: a `solo` photo arrives ineligible, so it plays on its own, and a
 /// `joins` link between a photo and the previous collage photo sets its
 /// `join_prev`. Links between
@@ -234,13 +245,13 @@ pub struct GroupSlot<C> {
 /// like a swap whose asset is gone. The planner estimate, the renderer and
 /// the Story editor all build their slots here.
 pub fn collage_slots<'a, C>(
-    entries: impl IntoIterator<Item = (&'a str, C, bool)>,
+    entries: impl IntoIterator<Item = (&'a str, C, bool, Option<i64>)>,
     edits: &CollageEdits,
 ) -> Vec<GroupSlot<C>> {
     let mut prev: Option<&str> = None;
     entries
         .into_iter()
-        .map(|(id, chapter, eligible)| {
+        .map(|(id, chapter, eligible, taken_at)| {
             let eligible = eligible && !edits.is_solo(id);
             let join_prev = eligible && prev.is_some_and(|p| edits.linked(p, id));
             if eligible {
@@ -250,9 +261,17 @@ pub fn collage_slots<'a, C>(
                 chapter,
                 eligible,
                 join_prev,
+                taken_at,
             }
         })
         .collect()
+}
+
+/// Whether `b` is close enough in capture time to `a` (a collage's first
+/// photo, or the shot that last showed a caption) to count as the same
+/// moment: both dated, within [`COLLAGE_WINDOW_SECS`].
+pub fn within_window(a: Option<i64>, b: Option<i64>) -> bool {
+    matches!((a, b), (Some(x), Some(y)) if (x - y).abs() <= COLLAGE_WINDOW_SECS)
 }
 
 /// Why a hero entry always plays on its own, whatever the user's collage
@@ -304,7 +323,7 @@ pub fn entry_plays_alone(
 }
 
 /// Each asset's chapter in `plan`: the first of `plan.chapters` holding it.
-fn chapter_index(plan: &Plan) -> HashMap<&str, usize> {
+pub fn chapter_index(plan: &Plan) -> HashMap<&str, usize> {
     let mut out: HashMap<&str, usize> = HashMap::new();
     for (i, c) in plan.chapters.iter().enumerate() {
         for id in &c.asset_ids {
@@ -336,6 +355,7 @@ pub struct HeroGrouping {
     chapter: Vec<usize>,
     alone: Vec<Option<PlaysAlone>>,
     ids: Vec<String>,
+    taken_at: Vec<Option<i64>>,
 }
 
 impl HeroGrouping {
@@ -346,15 +366,17 @@ impl HeroGrouping {
         Self::new(
             plan,
             |id| by_id.get(id).and_then(|a| a.display_aspect()),
+            |id| by_id.get(id).and_then(|a| a.taken_at),
             |id| by_id.get(id).is_some_and(|a| a.path.exists()),
         )
     }
 
-    /// `aspect_of` gives an asset's display aspect, `present` whether its
-    /// source is on disk.
+    /// `aspect_of` gives an asset's display aspect, `taken_of` its capture
+    /// time, `present` whether its source is on disk.
     pub fn new(
         plan: &Plan,
         aspect_of: impl Fn(&str) -> Option<f64>,
+        taken_of: impl Fn(&str) -> Option<i64>,
         present: impl Fn(&str) -> bool,
     ) -> Self {
         let chapter_of = chapter_index(plan);
@@ -383,6 +405,7 @@ impl HeroGrouping {
                 })
                 .collect(),
             ids: hero.iter().map(|e| e.asset_id.clone()).collect(),
+            taken_at: hero.iter().map(|e| taken_of(&e.asset_id)).collect(),
         }
     }
 
@@ -446,6 +469,7 @@ impl HeroGrouping {
                     self.ids[i].as_str(),
                     self.chapter[i],
                     self.alone[i].is_none(),
+                    self.taken_at[i],
                 )
             }),
             collage,
@@ -465,16 +489,17 @@ impl HeroGrouping {
 ///
 /// Eligible stills of one chapter are grouped even when other entries sit
 /// between them, as long as a group spans at most [`COLLAGE_REACH`] other
-/// entries and no entry of another chapter; those entries keep their own
-/// positions. Among the ways to split a chapter's stills into groups of at
+/// entries and no entry of another chapter, and every member was taken
+/// within [`COLLAGE_WINDOW_SECS`] of the group's first; those entries keep
+/// their own positions. Among the ways to split a chapter's stills into groups of at
 /// most [`MAX_COLLAGE`], the chosen one leaves the fewest stills solo, then
 /// moves stills across the fewest entries, then makes the fewest segments,
 /// then balances group sizes (five stills in a row play as 3 + 2, not 4 + 1).
 ///
 /// The user's overrides come first: a photo set solo arrives ineligible
 /// (see [`collage_slots`]), and a `join_prev` link keeps its photo in the previous
-/// collage photo's group even beyond the reach (entries it crosses do not
-/// count against the reach); links still never cross a chapter, and a row
+/// collage photo's group even beyond the reach and the time window
+/// (entries it crosses do not count against the reach); links still never cross a chapter, and a row
 /// of linked photos longer than [`MAX_COLLAGE`] drops the links past it.
 /// The planner's length estimate, the renderer and the Story editor all
 /// group through this, so the planned length matches the film.
@@ -494,7 +519,11 @@ pub fn collage_groups<C: PartialEq>(slots: &[GroupSlot<C>]) -> Vec<Vec<usize>> {
         let prev = runs.last().and_then(|(r, _)| r.last().copied());
         let same_chapter = prev.is_some_and(|p| slots[p..i].iter().all(|o| o.chapter == s.chapter));
         let linked = same_chapter && s.join_prev && linked_row < MAX_COLLAGE;
-        let joins = linked || (same_chapter && prev.is_some_and(|p| i - p - 1 <= COLLAGE_REACH));
+        let joins = linked
+            || (same_chapter
+                && prev.is_some_and(|p| {
+                    i - p - 1 <= COLLAGE_REACH && within_window(slots[p].taken_at, s.taken_at)
+                }));
         linked_row = if linked { linked_row + 1 } else { 1 };
         match runs.last_mut() {
             Some((r, l)) if joins => {
@@ -505,16 +534,19 @@ pub fn collage_groups<C: PartialEq>(slots: &[GroupSlot<C>]) -> Vec<Vec<usize>> {
         }
     }
     for (run, linked) in &runs {
-        groups.extend(split_run(run, linked));
+        let times: Vec<Option<i64>> = run.iter().map(|&i| slots[i].taken_at).collect();
+        groups.extend(split_run(run, linked, &times));
     }
     groups.sort_unstable_by_key(|g| g[0]);
     groups
 }
 
 /// Best split of one run (ascending entry indices) into consecutive
-/// groups, never between a photo and the one it is `linked` to; see
-/// [`collage_groups`] for the order of preferences.
-fn split_run(run: &[usize], linked: &[bool]) -> Vec<Vec<usize>> {
+/// groups, never between a photo and the one it is `linked` to, with every
+/// unlinked member within [`COLLAGE_WINDOW_SECS`] of its group's first
+/// (`times`, per run member); see [`collage_groups`] for the order of
+/// preferences.
+fn split_run(run: &[usize], linked: &[bool], times: &[Option<i64>]) -> Vec<Vec<usize>> {
     // Cost of a split, compared in order: solo stills, entries crossed,
     // segments, sum of squared sizes (lower is more balanced). On a full
     // tie the larger group comes first (3 + 2, not 2 + 3).
@@ -529,6 +561,9 @@ fn split_run(run: &[usize], linked: &[bool]) -> Vec<Vec<usize>> {
                 continue;
             }
             let n = j - start;
+            if !(start + 1..j).all(|k| linked[k] || within_window(times[start], times[k])) {
+                continue;
+            }
             // Entries crossed between members; a user link crosses freely.
             let crossed: usize = (start + 1..j)
                 .filter(|&k| !linked[k])
@@ -552,7 +587,8 @@ fn split_run(run: &[usize], linked: &[bool]) -> Vec<Vec<usize>> {
     let mut j = run.len();
     while j > 0 {
         // Each row of linked photos (at most MAX_COLLAGE, crossing nothing
-        // that counts) can be a group of its own, so the run always splits.
+        // that counts, bound by no window) can be a group of its own, and a
+        // lone photo always can, so the run always splits.
         let (_, start) = best[j].expect("every run splits");
         out.push(run[start..j].to_vec());
         j = start;
@@ -611,8 +647,11 @@ pub fn parse_film_length(spec: &str) -> Result<FilmLength, String> {
 /// Which fixed cards the renderer will add around the hero entries.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HeroCards {
-    /// Opening and closing route maps (the plan has a GPS route).
+    /// Closing route map (the plan has a GPS route).
     pub route: bool,
+    /// The opening route map card after the title too (off by default:
+    /// the film opens on its first shot and saves the map for the end).
+    pub opening_map: bool,
     /// Chapter stops the closing map travels between; fewer than two keep
     /// the static closing card (see [`crate::route_stops::closing_map_secs`]).
     pub route_stops: usize,
@@ -659,6 +698,7 @@ pub fn estimate_hero_secs<'e, 'c>(
     chapter_of: impl Fn(&str) -> &'c str,
     pano_secs_of: impl Fn(&str) -> Option<f64>,
     captioned: impl Fn(&str) -> bool,
+    taken_of: impl Fn(&str) -> Option<i64>,
     cards: HeroCards,
 ) -> f64 {
     estimate_hero_secs_with(
@@ -666,6 +706,7 @@ pub fn estimate_hero_secs<'e, 'c>(
         chapter_of,
         pano_secs_of,
         captioned,
+        taken_of,
         cards,
         &CollageEdits::default(),
     )
@@ -685,8 +726,13 @@ pub fn estimate_plan_secs(plan: &Plan, assets: &[Asset]) -> f64 {
             Some((a.id.as_str(), pano_motion(asp).hold_secs))
         })
         .collect();
+    let taken: HashMap<&str, i64> = assets
+        .iter()
+        .filter_map(|a| Some((a.id.as_str(), a.taken_at?)))
+        .collect();
     let cards = HeroCards {
         route: !plan.map_polyline.is_empty(),
+        opening_map: false,
         route_stops: crate::route_stops::animated_stop_count(
             &crate::route_stops::chapter_route_stops(&plan.chapters, assets, &plan.map_polyline),
         ),
@@ -698,6 +744,7 @@ pub fn estimate_plan_secs(plan: &Plan, assets: &[Asset]) -> f64 {
         |id| labels[chapter.get(id).copied().unwrap_or(plan.chapters.len())].as_str(),
         |id| pano.get(id).copied(),
         |id| has_caption(plan.captions.get(id).map(String::as_str)),
+        |id| taken.get(id).copied(),
         cards,
         &plan.collage,
     )
@@ -710,11 +757,12 @@ pub fn estimate_hero_secs_with<'e, 'c>(
     chapter_of: impl Fn(&str) -> &'c str,
     pano_secs_of: impl Fn(&str) -> Option<f64>,
     captioned: impl Fn(&str) -> bool,
+    taken_of: impl Fn(&str) -> Option<i64>,
     cards: HeroCards,
     collage: &CollageEdits,
 ) -> f64 {
     let mut segs: Vec<(Seg<'c>, f64)> = vec![(Seg::Title, EST_TITLE_SECS)];
-    if cards.route {
+    if cards.route && cards.opening_map {
         segs.push((Seg::Card, EST_MAP_SECS));
     }
     let first_hero = segs.len();
@@ -729,6 +777,7 @@ pub fn estimate_hero_secs_with<'e, 'c>(
                     pano_secs_of(&e.asset_id).is_some(),
                     captioned(&e.asset_id),
                 ),
+                taken_of(&e.asset_id),
             )
         }),
         collage,
@@ -785,12 +834,15 @@ struct HeroBudget {
 
 /// Pick hero entries (given in story order) to fill `budget`.
 ///
-/// Every chapter first gets its best entry (dropping the weakest chapters'
-/// picks only if even those overrun the ceiling). Remaining time is dealt
+/// Every chapter first gets its best entry, one per unit (dropping the
+/// weakest chapters' picks only if even those overrun the ceiling). Remaining time is dealt
 /// out one entry at a time to the chapter with the least estimated screen
 /// time relative to `size^CHAPTER_TIME_EXPONENT`, taking that chapter's
 /// best remaining entry, so big days get more screen time without crowding
-/// out small ones.
+/// out small ones. Where `unit_of` puts a chapter's entries in several
+/// units (a split day's capture-order clusters), the chapter's weight is the
+/// sum over its units instead, so telling a day party by party, in fewer
+/// and larger chapters, does not shrink its share of the film.
 ///
 /// An entry that would overrun the ceiling is skipped and the chapter's
 /// next-best, cheaper entry tried, so the film fills the budget instead of
@@ -801,13 +853,16 @@ struct HeroBudget {
 /// same moment, but they would play back to back); when every chapter has
 /// run dry the budget is plentiful, and a second pass allows both. Keeps
 /// story order.
+#[allow(clippy::too_many_arguments)]
 fn select_hero_by_budget<'a>(
     cands: Vec<PlanEntry>,
     chapter_of: impl Fn(&str) -> &'a str + Copy,
+    unit_of: impl Fn(&str) -> Option<usize>,
     score_of: impl Fn(&PlanEntry) -> f32,
     similar: impl Fn(&str, &str) -> bool,
     pano_secs_of: impl Fn(&str) -> Option<f64> + Copy,
     captioned: impl Fn(&str) -> bool + Copy,
+    taken_of: impl Fn(&str) -> Option<i64> + Copy,
     budget: HeroBudget,
 ) -> Vec<PlanEntry> {
     // Chapters in story order, each with its candidates best-first.
@@ -826,6 +881,32 @@ fn select_hero_by_budget<'a>(
                 .then(x.cmp(&y))
         });
     }
+    // Each chapter's members grouped by unit, units in order of their best
+    // member, members best first.
+    let units: Vec<Vec<Vec<usize>>> = chapters
+        .iter()
+        .map(|(_, m)| {
+            let mut slot: HashMap<Option<usize>, usize> = HashMap::new();
+            let mut groups: Vec<Vec<usize>> = vec![];
+            for &i in m {
+                let k = *slot.entry(unit_of(&cands[i].asset_id)).or_insert_with(|| {
+                    groups.push(vec![]);
+                    groups.len() - 1
+                });
+                groups[k].push(i);
+            }
+            groups
+        })
+        .collect();
+    // Share weight per chapter: size^exponent, summed over its units.
+    let weight: Vec<f64> = units
+        .iter()
+        .map(|u| {
+            u.iter()
+                .map(|g| (g.len() as f64).powf(CHAPTER_TIME_EXPONENT))
+                .sum()
+        })
+        .collect();
     let mut picked = vec![false; cands.len()];
     let estimate = |picked: &[bool]| {
         estimate_hero_secs(
@@ -837,12 +918,14 @@ fn select_hero_by_budget<'a>(
             chapter_of,
             pano_secs_of,
             captioned,
+            taken_of,
             budget.cards,
         )
     };
-    // Every chapter's best entry, weakest dropped first if over budget
-    // (the strongest always stays, so the film is never empty).
-    let mut reps: Vec<usize> = chapters.iter().map(|(_, m)| m[0]).collect();
+    // Every chapter's best entry (each unit's, on a split day), weakest
+    // dropped first if over budget (the strongest always stays, so the film
+    // is never empty).
+    let mut reps: Vec<usize> = units.iter().flatten().map(|g| g[0]).collect();
     for &r in &reps {
         picked[r] = true;
     }
@@ -877,12 +960,9 @@ fn select_hero_by_budget<'a>(
                 .iter()
                 .enumerate()
                 .filter(|(ci, _)| !closed[*ci])
-                .min_by(|(a, (_, ma)), (b, (_, mb))| {
-                    let share =
-                        |ci: usize, n: usize| secs[ci] / (n as f64).powf(CHAPTER_TIME_EXPONENT);
-                    share(*a, ma.len())
-                        .total_cmp(&share(*b, mb.len()))
-                        .then(a.cmp(b))
+                .min_by(|(a, _), (b, _)| {
+                    let share = |ci: usize| secs[ci] / weight[ci];
+                    share(*a).total_cmp(&share(*b)).then(a.cmp(b))
                 })
                 .map(|(ci, _)| ci);
             let Some(ci) = next else { break };
@@ -1000,6 +1080,12 @@ pub struct PlanEdits {
     /// Asset id -> user caption (beats the caption embedded in the file).
     #[serde(default)]
     pub caption_overrides: BTreeMap<String, String>,
+    /// Film picks the user placed right before or after another film pick
+    /// of the same day, oldest first, at most one per moved asset. Film
+    /// order only: chapters, reels and the book are untouched. Ignored
+    /// while either asset is out of the film. See [`apply_moves`].
+    #[serde(default)]
+    pub moves: Vec<FilmMove>,
     /// Film photos the user set to play on their own ("Show on its own")
     /// or joined into one collage ("Join with next"), oldest first. Stored
     /// flat (`solo`, `joins`) beside the other edits. See [`collage_slots`].
@@ -1014,7 +1100,26 @@ impl PlanEdits {
             && self.swaps.is_empty()
             && self.place_overrides.is_empty()
             && self.caption_overrides.is_empty()
+            && self.moves.is_empty()
             && self.collage.is_empty()
+    }
+
+    /// Play `asset` right after (or before) `anchor` in the film,
+    /// replacing any earlier move of `asset`.
+    pub fn set_move(&mut self, asset: String, anchor: String, after: bool) {
+        self.unmove(&asset);
+        self.moves.push(FilmMove {
+            asset,
+            anchor,
+            after,
+        });
+    }
+
+    /// Undo the move of `asset`; false when it had none.
+    pub fn unmove(&mut self, asset: &str) -> bool {
+        let before = self.moves.len();
+        self.moves.retain(|m| m.asset != asset);
+        self.moves.len() != before
     }
 
     /// Set or (when blank) clear the place label for a chapter.
@@ -1074,6 +1179,113 @@ impl PlanEdits {
     }
 }
 
+/// "Play this one right before/after that one" in the film.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FilmMove {
+    /// The film pick that moves.
+    pub asset: String,
+    /// The film pick it plays next to (same day).
+    pub anchor: String,
+    /// Right after the anchor (`true`) or right before it.
+    pub after: bool,
+}
+
+/// Why a film move of `asset` next to `anchor` can't apply to `hero`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveRejection {
+    /// The moving shot (`anchor: false`) or its anchor isn't a film pick.
+    NotInFilm { anchor: bool },
+    /// A shot can't move next to itself.
+    SameShot,
+    /// The two aren't on one capture-local day.
+    OtherDay,
+}
+
+/// Check a film move against `hero` ([`FilmMove`]); `None` when it applies.
+pub fn move_rejection(hero: &[PlanEntry], asset: &Asset, anchor: &Asset) -> Option<MoveRejection> {
+    let in_film = |a: &Asset| hero.iter().any(|e| e.asset_id == a.id);
+    if !in_film(asset) {
+        Some(MoveRejection::NotInFilm { anchor: false })
+    } else if !in_film(anchor) {
+        Some(MoveRejection::NotInFilm { anchor: true })
+    } else if asset.id == anchor.id {
+        Some(MoveRejection::SameShot)
+    } else if !same_day(asset, anchor) {
+        Some(MoveRejection::OtherDay)
+    } else {
+        None
+    }
+}
+
+/// Apply the user's film moves to `hero` ([`PlanEdits::moves`]).
+///
+/// A move applies only while both assets are film picks of one capture-
+/// local day and neither is removed (`dead`); otherwise it is skipped and
+/// kept for when it fits again. All of a clip's windows move together, in
+/// their order, landing after the anchor's last window or before its first.
+/// Deterministic when moves chain: a move whose anchor was moved itself is
+/// applied after the anchor's own move (so "B after A, C after B" plays A,
+/// B, C whatever order they were made in); in a loop, the oldest move is
+/// applied last and wins.
+fn apply_moves(
+    hero: &mut Vec<PlanEntry>,
+    by_id: &HashMap<&str, &Asset>,
+    moves: &[FilmMove],
+    dead: &HashSet<&str>,
+) {
+    let move_of: HashMap<&str, usize> = moves
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.asset.as_str(), i))
+        .collect();
+    // Dependency order: each move after the move of its anchor.
+    let mut order: Vec<usize> = Vec::with_capacity(moves.len());
+    let mut state = vec![0u8; moves.len()]; // 0 new, 1 visiting, 2 done
+    for root in 0..moves.len() {
+        let mut stack = vec![(root, false)];
+        while let Some((i, expanded)) = stack.pop() {
+            if expanded {
+                state[i] = 2;
+                order.push(i);
+                continue;
+            }
+            if state[i] != 0 {
+                continue;
+            }
+            state[i] = 1;
+            stack.push((i, true));
+            if let Some(&j) = move_of.get(moves[i].anchor.as_str()) {
+                if state[j] == 0 {
+                    stack.push((j, false));
+                }
+            }
+        }
+    }
+    for i in order {
+        let m = &moves[i];
+        let (x, y) = (m.asset.as_str(), m.anchor.as_str());
+        if dead.contains(x) || dead.contains(y) {
+            continue;
+        }
+        let (Some(a), Some(b)) = (by_id.get(x), by_id.get(y)) else {
+            continue;
+        };
+        if move_rejection(hero, a, b).is_some() {
+            continue;
+        }
+        let moved: Vec<PlanEntry> = hero.iter().filter(|e| e.asset_id == x).cloned().collect();
+        hero.retain(|e| e.asset_id != x);
+        let at = if m.after {
+            hero.iter()
+                .rposition(|e| e.asset_id == y)
+                .map_or(0, |p| p + 1)
+        } else {
+            hero.iter().position(|e| e.asset_id == y).unwrap_or(0)
+        };
+        hero.splice(at..at, moved);
+    }
+}
+
 fn set_override(map: &mut BTreeMap<String, String>, key: String, value: Option<String>) {
     match value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
         Some(v) => map.insert(key, v.to_string()),
@@ -1113,10 +1325,11 @@ fn with_user_captions_only(plan: &Plan, by_id: &HashMap<&str, &Asset>) -> Plan {
 ///
 /// Apply user edits to a stored plan. Pure and deterministic:
 /// place overrides first (they rename whole chapters), then swaps,
-/// then pinned inclusions, then exclusions, then caption overrides on top.
+/// then pinned inclusions, then film moves ([`apply_moves`]), then
+/// exclusions, then caption overrides on top.
 ///
 /// Inclusions (hero only) put each pinned asset into `hero` at its
-/// story-order position (capture time, then id: [`story_order`]) with the
+/// story-order position ([`crate::cluster::story_order`]) with the
 /// same rendition rules as a swap-in (clips keep their window, Live
 /// Photos are stills). Pins must belong to this plan's chapters and are
 /// skipped when already picked. To keep the film at the length the user
@@ -1186,7 +1399,8 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
         }
     }
 
-    include_pins(&mut out, &by_id, edits, &dead);
+    include_pins(&mut out, assets, &by_id, edits, &dead);
+    apply_moves(&mut out.hero, &by_id, &edits.moves, &dead);
 
     // Exclusions: out of every pick and out of the book flow.
     out.hero.retain(|e| !dead.contains(e.asset_id.as_str()));
@@ -1227,6 +1441,7 @@ fn user_hero_entry(asset: &Asset) -> PlanEntry {
 /// Insert the user's pinned assets into the hero (see [`apply_edits`]).
 fn include_pins(
     out: &mut Plan,
+    assets: &[Asset],
     by_id: &HashMap<&str, &Asset>,
     edits: &PlanEdits,
     dead: &HashSet<&str>,
@@ -1244,8 +1459,12 @@ fn include_pins(
             .and_then(|a| a.score.as_ref())
             .map_or(DEFAULT_SCORE, |s| s.total)
     };
-    // Unknown assets sort last.
-    let key_of = |id: &str| by_id.get(id).map_or((i64::MAX, ""), |a| story_key(a));
+    if edits.included.is_empty() {
+        return;
+    }
+    // Story positions over the project's assets; unknown assets sort last.
+    let pos = story_positions(assets);
+    let key_of = |id: &str| pos.get(id).copied().unwrap_or(usize::MAX);
     for id in &edits.included {
         let Some(asset) = by_id.get(id.as_str()) else {
             continue;
@@ -1271,9 +1490,9 @@ fn include_pins(
             out.hero.remove(i);
         }
         // Swaps keep their slot, so the hero may be out of story order:
-        // land right after the last earlier capture, so nothing captured
-        // before the pin plays after it.
-        let key = story_key(asset);
+        // land right after the last entry earlier in story order, so
+        // nothing told before the pin plays after it.
+        let key = key_of(&asset.id);
         let at = out
             .hero
             .iter()
@@ -1317,8 +1536,10 @@ pub fn build_plan_with_length(
     overrides: &[PlaceOverride],
     length: FilmLength,
 ) -> Plan {
-    let ordered = story_order(assets);
+    // Story order: capture time, a split day told party by party.
+    let tracked = story_tracks(assets);
     let chapter_label = |id: &str| cluster_of.get(id).map_or(UNGROUPED, String::as_str);
+    let ordered = chapters_together(&tracked, chapter_label);
     // Story score per asset: technical quality relative to its chapter plus
     // the story bonuses (people, caption, clip). Assets without a score keep
     // the neutral default.
@@ -1372,7 +1593,10 @@ pub fn build_plan_with_length(
 
     // Map polyline: GPS fixes in story order, minus fixes that imply
     // impossible speed. Capture times separate those from real flights.
-    let outliers = gps_outliers(assets);
+    // On a split day the line follows one party's stretch, then the next
+    // party's (one hop between them), as the film tells it, instead of
+    // zig-zagging between parties in capture order.
+    let outliers = gps_outliers_in(&tracked);
     let map_polyline: Vec<(f64, f64)> = ordered
         .iter()
         .filter(|a| !outliers.contains(&a.id))
@@ -1428,6 +1652,7 @@ pub fn build_plan_with_length(
         },
         cards: HeroCards {
             route: !map_polyline.is_empty(),
+            opening_map: false,
             route_stops: crate::route_stops::animated_stop_count(
                 &crate::route_stops::chapter_route_stops(&chapters, assets, &map_polyline),
             ),
@@ -1467,13 +1692,33 @@ pub fn build_plan_with_length(
     // collages by playback order, and selection keeps candidate order, so
     // every budget check sees the order that will be rendered.
     place_sibling_windows(&mut hero, &by_id, chapter_label);
+    // A split day's capture-order clusters, which keep its share of the
+    // film (see `select_hero_by_budget`); every other day is one unit per
+    // chapter, exactly as before.
+    let split_days: HashSet<String> = tracked
+        .iter()
+        .filter(|(_, t)| *t != Track::Shared)
+        .map(|(a, _)| day_of(a))
+        .collect();
+    let capture_unit: HashMap<String, usize> = crate::cluster::cluster_by_capture(
+        ordered
+            .iter()
+            .copied()
+            .filter(|a| split_days.contains(&day_of(a))),
+    )
+    .into_iter()
+    .enumerate()
+    .flat_map(|(k, c)| c.asset_ids.into_iter().map(move |id| (id, k)))
+    .collect();
     let hero = select_hero_by_budget(
         hero,
         chapter_label,
+        |id| capture_unit.get(id).copied(),
         entry_score,
         similar,
         pano_secs_of,
         |id| has_caption(by_id.get(id).and_then(|a| a.user_caption.as_deref())),
+        |id| by_id.get(id).and_then(|a| a.taken_at),
         budget,
     );
 
@@ -1549,6 +1794,40 @@ pub fn build_plan_with_length(
                 .to_string(),
         },
     }
+}
+
+/// Story order with each chapter of a split day kept in one piece.
+///
+/// Chapters come from clustering every asset, while the plan sees only the
+/// kept ones (near-dupes suppressed), so a shot told with one party here
+/// can belong to another party's chapter: a captioned copy of a photo
+/// whose original was the only nearby shot of its phone. On a day with a
+/// split stretch, the day's shots are regrouped by chapter, chapters in
+/// the order of their median member, each chapter's shots in story order.
+/// Every other day is untouched.
+fn chapters_together<'a, 'c>(
+    tracked: &[(&'a Asset, Track)],
+    chapter_of: impl Fn(&str) -> &'c str,
+) -> Vec<&'a Asset> {
+    let mut out = Vec::with_capacity(tracked.len());
+    for run in tracked.chunk_by(|(a, _), (b, _)| same_day(a, b)) {
+        if run.iter().all(|(_, t)| *t == Track::Shared) {
+            out.extend(run.iter().map(|(a, _)| *a));
+            continue;
+        }
+        let mut members: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (p, (a, _)) in run.iter().enumerate() {
+            members.entry(chapter_of(&a.id)).or_default().push(p);
+        }
+        let median: HashMap<&str, usize> = members
+            .iter()
+            .map(|(c, ps)| (*c, ps[(ps.len() - 1) / 2]))
+            .collect();
+        let mut idx: Vec<usize> = (0..run.len()).collect();
+        idx.sort_by_key(|&p| (median[chapter_of(&run[p].0.id)], p));
+        out.extend(idx.into_iter().map(|p| run[p].0));
+    }
+    out
 }
 
 /// Move each further window of a clip to where it was captured: the clip's
@@ -2799,8 +3078,10 @@ mod tests {
             |id| clusters.get(id).map_or(UNGROUPED, String::as_str),
             |_| None,
             |id| has_caption(plan.captions.get(id).map(String::as_str)),
+            |_| Some(0),
             HeroCards {
                 route: !plan.map_polyline.is_empty(),
+                opening_map: true,
                 route_stops: 0,
                 route_secs: None,
                 places: plan.chapters.iter().any(|c| c.place.is_some()),
@@ -3070,29 +3351,38 @@ mod tests {
         // plain 0.54 x2, hero->closing break 0.5, closing 0.7 = 4.82 s.
         let cards = HeroCards {
             route: true,
+            opening_map: true,
             route_stops: 0,
             route_secs: None,
             places: true,
         };
         assert!(
-            (estimate_hero_secs(&entries, ch, |_| None, |_| false, cards) - 33.18).abs() < 1e-9
+            (estimate_hero_secs(&entries, ch, |_| None, |_| false, |_| Some(0), cards) - 33.18)
+                .abs()
+                < 1e-9
         );
         // Without a route or places only the title card remains.
         let bare = HeroCards {
             route: false,
+            opening_map: true,
             route_stops: 0,
             route_secs: None,
             places: false,
         };
         // 2.5 + 7 + 4 + 6 + 2.5 + 4 = 26 s; cuts 0.7 + 0.54 + 0.8 + 0.54 +
         // 0.7 = 3.28 s.
-        assert!((estimate_hero_secs(&entries, ch, |_| None, |_| false, bare) - 22.72).abs() < 1e-9);
+        assert!(
+            (estimate_hero_secs(&entries, ch, |_| None, |_| false, |_| Some(0), bare) - 22.72)
+                .abs()
+                < 1e-9
+        );
     }
 
     #[test]
     fn captioned_stills_play_solo_in_the_estimate() {
         let bare = HeroCards {
             route: false,
+            opening_map: true,
             route_stops: 0,
             route_secs: None,
             places: false,
@@ -3105,6 +3395,7 @@ mod tests {
                 |_| "X",
                 |_| None,
                 |id| has_caption(caps.get(id).copied()),
+                |_| Some(0),
                 bare,
             )
         };
@@ -3198,11 +3489,16 @@ mod tests {
         // collage 6 + pano 8 = 16.5 s, cuts 0.7 + 0.7 = 1.4 s.
         let bare = HeroCards {
             route: false,
+            opening_map: true,
             route_stops: 0,
             route_secs: None,
             places: false,
         };
-        assert!((estimate_hero_secs(&entries, |_| "X", pano, |_| false, bare) - 15.1).abs() < 1e-9);
+        assert!(
+            (estimate_hero_secs(&entries, |_| "X", pano, |_| false, |_| Some(0), bare) - 15.1)
+                .abs()
+                < 1e-9
+        );
     }
 
     #[test]
@@ -3331,6 +3627,7 @@ mod tests {
 
     const NO_CARDS: HeroCards = HeroCards {
         route: false,
+        opening_map: true,
         route_stops: 0,
         route_secs: None,
         places: false,
@@ -3351,10 +3648,12 @@ mod tests {
         select_hero_by_budget(
             cands,
             letter,
+            |_| None,
             score_of,
             similar,
             |_| None,
             |_| false,
+            |_| Some(0),
             HeroBudget {
                 ceiling_secs,
                 cards: NO_CARDS,
@@ -3363,6 +3662,54 @@ mod tests {
         .into_iter()
         .map(|e| e.asset_id)
         .collect()
+    }
+
+    /// A split day's chapter keeps the share its capture-order clusters
+    /// had: each unit gets a pick, and the chapter weighs as its units.
+    #[test]
+    fn a_chapter_split_into_units_keeps_their_share() {
+        let ids: Vec<String> = ["a", "b"]
+            .iter()
+            .flat_map(|l| (1..=8).map(move |k| format!("{l}{k}")))
+            .collect();
+        let cands: Vec<PlanEntry> = ids.iter().map(|id| clip_entry(id, 5.0)).collect();
+        // Within each chapter the lower numbers score higher.
+        let score_of = |e: &PlanEntry| 1.0 - e.asset_id[1..].parse::<f32>().unwrap() / 10.0;
+        let run = |unit_of: &dyn Fn(&str) -> Option<usize>| -> Vec<String> {
+            select_hero_by_budget(
+                cands.clone(),
+                letter,
+                unit_of,
+                score_of,
+                |_, _| false,
+                |_| None,
+                |_| false,
+                |_| Some(0),
+                HeroBudget {
+                    ceiling_secs: 60.0,
+                    cards: NO_CARDS,
+                },
+            )
+            .into_iter()
+            .map(|e| e.asset_id)
+            .collect()
+        };
+        let count = |v: &[String], l: &str| v.iter().filter(|id| id.starts_with(l)).count();
+        let plain = run(&|_| None);
+        assert!(!plain.contains(&"a7".to_string()), "{plain:?}");
+        // Chapter a was four capture-order clusters of two.
+        let split = run(&|id: &str| {
+            id.starts_with('a')
+                .then(|| (id[1..].parse::<usize>().unwrap() - 1) / 2)
+        });
+        assert!(
+            count(&split, "a") > count(&plain, "a"),
+            "{plain:?} {split:?}"
+        );
+        assert!(count(&split, "a") > count(&split, "b"), "{split:?}");
+        for unit_rep in ["a1", "a3", "a5", "a7"] {
+            assert!(split.contains(&unit_rep.to_string()), "{split:?}");
+        }
     }
 
     #[test]
@@ -3379,6 +3726,7 @@ mod tests {
             letter,
             |_| None,
             |_| false,
+            |_| Some(0),
             NO_CARDS,
         );
         // Room for a still after the reps, not for a second 8 s clip.
@@ -3402,7 +3750,14 @@ mod tests {
             let pair = |p: &str, q: &str| (x == p && y == q) || (x == q && y == p);
             pair("a1", "a2")
         };
-        let reps = estimate_hero_secs([&cands()[0]], letter, |_| None, |_| false, NO_CARDS);
+        let reps = estimate_hero_secs(
+            [&cands()[0]],
+            letter,
+            |_| None,
+            |_| false,
+            |_| Some(0),
+            NO_CARDS,
+        );
         let tight = pick(cands(), &scores, reps + 7.0, twin);
         assert_eq!(tight, vec!["a1", "a3", "a4"], "twin skipped: {tight:?}");
         // With budget to spare the twin comes back in the second pass.
@@ -3417,8 +3772,14 @@ mod tests {
             .map(|i| clip_entry(&format!("a{i:02}"), 3.0))
             .collect();
         cands.extend((0..4).map(|i| clip_entry(&format!("b{i:02}"), 3.0)));
-        let ceiling =
-            estimate_hero_secs(&cands[..0], letter, |_| None, |_| false, NO_CARDS) + 20.0 * 2.5;
+        let ceiling = estimate_hero_secs(
+            &cands[..0],
+            letter,
+            |_| None,
+            |_| false,
+            |_| Some(0),
+            NO_CARDS,
+        ) + 20.0 * 2.5;
         let got = pick(cands, &[], ceiling, |_, _| false);
         let big = got.iter().filter(|i| i.starts_with('a')).count() as f64;
         let small = got.iter().filter(|i| i.starts_with('b')).count() as f64;
@@ -3524,6 +3885,7 @@ mod tests {
             |_| UNGROUPED,
             |_| None,
             |_| false,
+            |_| Some(0),
             NO_CARDS,
         );
         let plan = build_plan_with_length(
@@ -3823,14 +4185,16 @@ mod tests {
     #[test]
     fn route_and_places_cards_shift_the_estimate() {
         let e = [still_entry("a1")];
-        let bare = estimate_hero_secs(&e, letter, |_| None, |_| false, NO_CARDS);
+        let bare = estimate_hero_secs(&e, letter, |_| None, |_| false, |_| Some(0), NO_CARDS);
         let full = estimate_hero_secs(
             &e,
             letter,
             |_| None,
             |_| false,
+            |_| Some(0),
             HeroCards {
                 route: true,
+                opening_map: true,
                 route_stops: 0,
                 route_secs: None,
                 places: true,
@@ -3841,7 +4205,7 @@ mod tests {
         assert!((full - bare - 10.0).abs() < 1e-9, "{full}");
         // No entries: nothing but the title, and no overlap to subtract.
         assert_eq!(
-            estimate_hero_secs([], letter, |_| None, |_| false, NO_CARDS),
+            estimate_hero_secs([], letter, |_| None, |_| false, |_| Some(0), NO_CARDS),
             EST_TITLE_SECS
         );
     }
@@ -3982,10 +4346,12 @@ mod tests {
             select_hero_by_budget(
                 cands.clone(),
                 letter,
+                |_| None,
                 score_of,
                 |_, _| false,
                 |_| None,
                 |_| false,
+                |_| Some(0),
                 budget(ceiling),
             )
             .iter()
@@ -4170,6 +4536,7 @@ mod tests {
                 chapter,
                 eligible: matches!(c, 's' | 'j'),
                 join_prev: c == 'j',
+                taken_at: Some(0),
             }));
         }
         out
@@ -4207,12 +4574,12 @@ mod tests {
             joins: vec![("a".into(), "c".into()), ("c".into(), "e".into())],
         };
         let entries = [
-            ("a", 0, true),
-            ("b", 0, true),
-            ("c", 0, true),
-            ("clip", 0, false),
-            ("d", 0, true),
-            ("e", 0, true),
+            ("a", 0, true, Some(0)),
+            ("b", 0, true, Some(0)),
+            ("c", 0, true, Some(0)),
+            ("clip", 0, false, Some(0)),
+            ("d", 0, true, Some(0)),
+            ("e", 0, true, Some(0)),
         ];
         let s = collage_slots(entries, &edits);
         let flags: Vec<(bool, bool)> = s.iter().map(|g| (g.eligible, g.join_prev)).collect();
@@ -4290,7 +4657,15 @@ mod tests {
     fn estimate_follows_collage_overrides() {
         let entries: Vec<PlanEntry> = ["a1", "a2", "a3"].map(still_entry).to_vec();
         let est = |c: &CollageEdits| {
-            estimate_hero_secs_with(&entries, letter, |_| None, |_| false, NO_CARDS, c)
+            estimate_hero_secs_with(
+                &entries,
+                letter,
+                |_| None,
+                |_| false,
+                |_| Some(0),
+                NO_CARDS,
+                c,
+            )
         };
         let auto = est(&CollageEdits::default());
         let solo = est(&CollageEdits {
@@ -4302,7 +4677,7 @@ mod tests {
         assert!(solo - auto > 2.0, "{auto} -> {solo}");
         assert_eq!(
             auto,
-            estimate_hero_secs(&entries, letter, |_| None, |_| false, NO_CARDS)
+            estimate_hero_secs(&entries, letter, |_| None, |_| false, |_| Some(0), NO_CARDS)
         );
     }
 
@@ -4316,15 +4691,19 @@ mod tests {
         for _ in 0..2000 {
             let len = 1 + next(40) as usize;
             let mut chapter = 0;
+            let mut t = 0i64;
             // Links land anywhere, even on entries collage_slots would
-            // never mark: grouping must still be sound.
+            // never mark: grouping must still be sound. Shots come 0-19
+            // minutes apart, a few undated.
             let v: Vec<GroupSlot<usize>> = (0..len)
                 .map(|_| {
                     chapter += usize::from(next(8) == 0);
+                    t += next(20) as i64 * 60;
                     GroupSlot {
                         chapter,
                         eligible: next(3) != 0,
                         join_prev: next(3) == 0,
+                        taken_at: (next(12) != 0).then_some(t),
                     }
                 })
                 .collect();
@@ -4342,9 +4721,15 @@ mod tests {
                     assert!(g.len() <= MAX_COLLAGE, "{g:?}");
                     assert!(g.iter().all(|&i| photo(i)), "solo or ineligible in {g:?}");
                     assert!(v[a..=b].iter().all(|s| s.chapter == v[a].chapter));
-                    // Without links among them, the reach still holds.
+                    // Without links among them, the reach and the time
+                    // window still hold.
                     if g[1..].iter().all(|&i| !v[i].join_prev) {
                         assert!(b - a + 1 - g.len() <= COLLAGE_REACH, "{g:?}");
+                        assert!(
+                            g.iter()
+                                .all(|&i| within_window(v[a].taken_at, v[i].taken_at)),
+                            "{g:?}"
+                        );
                     }
                 }
             }
@@ -4367,6 +4752,46 @@ mod tests {
 
     fn groups_of(spec: &str) -> Vec<Vec<usize>> {
         collage_groups(&slots(spec))
+    }
+
+    #[test]
+    fn collages_stay_within_the_time_window_unless_the_user_joins() {
+        let at = |spec: &str, mins: &[Option<i64>]| {
+            let mut v = slots(spec);
+            for (s, m) in v.iter_mut().zip(mins) {
+                s.taken_at = m.map(|m| m * 60);
+            }
+            collage_groups(&v)
+        };
+        // Midday stills and one from that evening, one entry apart: the
+        // evening shot plays alone.
+        assert_eq!(
+            at("sscs", &[Some(0), Some(5), Some(6), Some(8 * 60)]),
+            vec![vec![0, 1], vec![2], vec![3]]
+        );
+        // Within 30 minutes of the first photo: one collage.
+        assert_eq!(
+            at("sss", &[Some(0), Some(20), Some(30)]),
+            vec![vec![0, 1, 2]]
+        );
+        // 31 minutes from the first, though 11 from the second: split.
+        assert_eq!(
+            at("ssss", &[Some(0), Some(20), Some(31), Some(40)]),
+            vec![vec![0, 1], vec![2, 3]]
+        );
+        // An undated still never joins on its own (and, as a photo in
+        // between, ends the run like a change of chapter would).
+        assert_eq!(
+            at("sss", &[Some(0), None, Some(1)]),
+            vec![vec![0], vec![1], vec![2]]
+        );
+        assert_eq!(
+            at("ssss", &[Some(0), Some(1), None, Some(2)]),
+            vec![vec![0, 1], vec![2], vec![3]]
+        );
+        // The user's join overrides the window.
+        assert_eq!(at("sj", &[Some(0), Some(8 * 60)]), vec![vec![0, 1]]);
+        assert_eq!(at("sj", &[Some(0), None]), vec![vec![0, 1]]);
     }
 
     #[test]
@@ -4470,18 +4895,18 @@ mod tests {
         let all = |_: &str| true;
         let none = CollageEdits::default();
         assert_eq!(
-            HeroGrouping::new(&plan, pano, all).groups(&none),
+            HeroGrouping::new(&plan, pano, |_| Some(0), all).groups(&none),
             vec![vec![0, 2], vec![1], vec![3], vec![4, 6], vec![5]]
         );
         // Without the panorama, a4 joins a1 and a3.
-        let plain = HeroGrouping::new(&plan, |_| None, all);
+        let plain = HeroGrouping::new(&plan, |_| None, |_| Some(0), all);
         assert_eq!(plain.groups(&none)[0], vec![0, 2, 3]);
         assert_eq!(
             (plain.chapter(4), plain.plays_alone(5)),
             (1, Some(PlaysAlone::Caption))
         );
         // A missing a3 does not play: a1 and a4 group without it.
-        let gone = HeroGrouping::new(&plan, |_| None, |id| id != "a3");
+        let gone = HeroGrouping::new(&plan, |_| None, |_| Some(0), |id| id != "a3");
         assert_eq!(gone.groups(&none)[0], vec![0, 3]);
         assert!(gone.groups(&none).iter().all(|g| !g.contains(&2)));
         // The user's edits regroup it.
@@ -4546,13 +4971,17 @@ mod tests {
         for _ in 0..500 {
             let len = 1 + next(40) as usize;
             let mut chapter = 0;
+            let mut t = 0i64;
+            // Shots 0-19 minutes apart, a few undated.
             let v: Vec<GroupSlot<usize>> = (0..len)
                 .map(|_| {
                     chapter += usize::from(next(8) == 0);
+                    t += next(20) as i64 * 60;
                     GroupSlot {
                         chapter,
                         eligible: next(3) != 0,
                         join_prev: false,
+                        taken_at: (next(12) != 0).then_some(t),
                     }
                 })
                 .collect();
@@ -4567,6 +4996,8 @@ mod tests {
                 g.len() <= MAX_COLLAGE
                     && b - a + 1 - g.len() <= COLLAGE_REACH
                     && v[a..=b].iter().all(|s| s.chapter == v[a].chapter)
+                    && g.iter()
+                        .all(|&i| within_window(v[a].taken_at, v[i].taken_at))
             };
             for g in &groups {
                 assert!(g.windows(2).all(|w| w[0] < w[1]), "chronological {g:?}");
@@ -4611,18 +5042,213 @@ mod tests {
         let ch = |id: &str| if id.starts_with('x') { "X" } else { "Y" };
         let bare = HeroCards {
             route: false,
+            opening_map: true,
             route_stops: 0,
             route_secs: None,
             places: false,
         };
         // Title 2.5, x1+x3 collage 5, clip 6, y1 solo 4 = 17.5 s; cuts
         // opening 0.7, plain 0.54, closing 0.7 = 1.94 s.
-        let est = estimate_hero_secs(&entries, ch, |_| None, |_| false, bare);
+        let est = estimate_hero_secs(&entries, ch, |_| None, |_| false, |_| Some(0), bare);
         assert!((est - 15.56).abs() < 1e-9, "{est}");
         // Captioning x3 leaves x1 nobody to pair with: x1 solo 4, clip 6,
         // x3 solo 4, y1 solo 4 + title 2.5 = 20.5 s; cuts 0.7 + 0.54 +
         // 0.54 + 0.7 = 2.48 s.
-        let est = estimate_hero_secs(&entries, ch, |_| None, |id| id == "x3", bare);
+        let est = estimate_hero_secs(&entries, ch, |_| None, |id| id == "x3", |_| Some(0), bare);
         assert!((est - 18.02).abs() < 1e-9, "{est}");
+    }
+
+    fn split_fixture() -> Vec<Asset> {
+        let (city, park) = ((22.282, 114.154), (22.313, 114.043));
+        let t0 = 1_792_285_200;
+        let mut assets = vec![];
+        for k in 0..8 {
+            let mut c = asset(
+                &format!("IMG_{}", 1502 + k),
+                t0 + k * 3000,
+                AssetKind::Photo,
+            );
+            c.gps = Some(city);
+            let mut p = asset(
+                &format!("IMG_{}", 5801 + k),
+                t0 + k * 3000 + 1500,
+                AssetKind::Photo,
+            );
+            p.gps = Some(park);
+            assets.extend([c, p]);
+        }
+        assets[0].user_caption = Some("I toured the city".into());
+        assets
+    }
+
+    fn split_plan(assets: &[Asset]) -> Plan {
+        let cluster_of = crate::cluster::chapter_labels(&crate::cluster::cluster_assets(assets));
+        build_plan_with_length(
+            assets,
+            &cluster_of,
+            &HashMap::new(),
+            &[],
+            FilmLength::Secs(3600.0),
+        )
+    }
+
+    fn owned(ids: Vec<&str>) -> Vec<String> {
+        ids.into_iter().map(String::from).collect()
+    }
+
+    #[test]
+    fn a_split_day_plays_the_owners_party_then_the_others() {
+        let assets = split_fixture();
+        let plan = split_plan(&assets);
+        let hero = hero_ids(&plan);
+        let first_park = hero.iter().position(|id| id.starts_with("IMG_58")).unwrap();
+        assert!(
+            hero[..first_park].iter().all(|id| id.starts_with("IMG_15")),
+            "{hero:?}"
+        );
+        assert!(
+            hero[first_park..].iter().all(|id| id.starts_with("IMG_58")),
+            "{hero:?}"
+        );
+        assert_eq!(plan.chapters.len(), 2);
+        assert_eq!(
+            plan.chapters[1].place.as_deref(),
+            Some("Hong Kong Disneyland")
+        );
+        assert_ne!(plan.chapters[0].place, plan.chapters[1].place);
+        // The route follows one party, then hops once to the other.
+        let hops = plan
+            .map_polyline
+            .windows(2)
+            .filter(|w| crate::geo::haversine_m(w[0], w[1]) > 3000.0)
+            .count();
+        assert_eq!(hops, 1, "{:?}", plan.map_polyline);
+    }
+
+    fn moved(plan: &Plan, assets: &[Asset], moves: &[(&str, &str, bool)]) -> Vec<String> {
+        let mut edits = PlanEdits::default();
+        for (x, y, after) in moves {
+            edits.set_move(x.to_string(), y.to_string(), *after);
+        }
+        owned(hero_ids(&apply_edits(plan, assets, &edits)))
+    }
+
+    #[test]
+    fn a_move_places_a_shot_next_to_another_of_its_day() {
+        let assets = split_fixture();
+        let plan = split_plan(&assets);
+        let base = owned(hero_ids(&plan));
+        let at = |v: &[String], id: &str| v.iter().position(|x| x == id).unwrap();
+        // Within a chapter: the fourth city shot opens the day.
+        let v = moved(&plan, &assets, &[("IMG_1505", "IMG_1502", false)]);
+        assert_eq!(at(&v, "IMG_1505") + 1, at(&v, "IMG_1502"));
+        assert_eq!(v.len(), base.len());
+        // Across the day's chapters: a park shot right after a city shot.
+        let v = moved(&plan, &assets, &[("IMG_5803", "IMG_1504", true)]);
+        assert_eq!(at(&v, "IMG_1504") + 1, at(&v, "IMG_5803"));
+        // Chapters are untouched.
+        let mut edits = PlanEdits::default();
+        edits.set_move("IMG_5803".into(), "IMG_1504".into(), true);
+        let members = |p: &Plan| -> Vec<Vec<String>> {
+            p.chapters.iter().map(|c| c.asset_ids.clone()).collect()
+        };
+        assert_eq!(
+            members(&apply_edits(&plan, &assets, &edits)),
+            members(&plan)
+        );
+        // Chained, in either order of making: 1502, then 1507, then 1506.
+        for moves in [
+            [
+                ("IMG_1507", "IMG_1502", true),
+                ("IMG_1506", "IMG_1507", true),
+            ],
+            [
+                ("IMG_1506", "IMG_1507", true),
+                ("IMG_1507", "IMG_1502", true),
+            ],
+        ] {
+            let v = moved(&plan, &assets, &moves);
+            let (a, b, c) = (at(&v, "IMG_1502"), at(&v, "IMG_1507"), at(&v, "IMG_1506"));
+            assert_eq!((b, c), (a + 1, a + 2), "{v:?}");
+        }
+        // Undone cleanly.
+        let mut edits = PlanEdits::default();
+        edits.set_move("IMG_1505".into(), "IMG_1502".into(), false);
+        assert!(edits.unmove("IMG_1505"));
+        assert!(!edits.unmove("IMG_1505"));
+        assert!(edits.is_empty());
+        assert_eq!(
+            hero_ids(&apply_edits(&plan, &assets, &edits)),
+            hero_ids(&plan)
+        );
+    }
+
+    #[test]
+    fn moves_across_days_or_out_of_the_film_are_ignored() {
+        let mut assets = split_fixture();
+        let mut next_day = asset("IMG_1600", 1_792_285_200 + 86_400, AssetKind::Photo);
+        next_day.gps = Some((22.282, 114.154));
+        assets.push(next_day);
+        let plan = split_plan(&assets);
+        assert!(hero_ids(&plan).contains(&"IMG_1600"));
+        let base = owned(hero_ids(&plan));
+        assert_eq!(
+            moved(&plan, &assets, &[("IMG_1600", "IMG_1502", false)]),
+            base
+        );
+        assert_eq!(moved(&plan, &assets, &[("IMG_1502", "gone", true)]), base);
+        // A removed anchor leaves the shot where it was.
+        let mut edits = PlanEdits::default();
+        edits.set_move("IMG_1505".into(), "IMG_1502".into(), false);
+        edits.set_excluded("IMG_1502".into(), true);
+        let mut want = base.clone();
+        want.retain(|id| id != "IMG_1502");
+        assert_eq!(owned(hero_ids(&apply_edits(&plan, &assets, &edits))), want);
+    }
+
+    #[test]
+    fn move_rejection_names_why_a_move_cant_apply() {
+        let mut assets = split_fixture();
+        let mut next_day = asset("IMG_1600", 1_792_285_200 + 86_400, AssetKind::Photo);
+        next_day.gps = Some((22.282, 114.154));
+        assets.push(next_day);
+        let plan = split_plan(&assets);
+        let get = |id: &str| assets.iter().find(|a| a.id == id).unwrap();
+        let outside = asset("IMG_9999", 1_792_285_200, AssetKind::Photo);
+        let check = |x: &Asset, y: &Asset| move_rejection(&plan.hero, x, y);
+        assert_eq!(check(get("IMG_1505"), get("IMG_1502")), None);
+        assert_eq!(
+            check(&outside, get("IMG_1502")),
+            Some(MoveRejection::NotInFilm { anchor: false })
+        );
+        assert_eq!(
+            check(get("IMG_1502"), &outside),
+            Some(MoveRejection::NotInFilm { anchor: true })
+        );
+        assert_eq!(
+            check(get("IMG_1502"), get("IMG_1502")),
+            Some(MoveRejection::SameShot)
+        );
+        assert_eq!(
+            check(get("IMG_1600"), get("IMG_1502")),
+            Some(MoveRejection::OtherDay)
+        );
+    }
+
+    #[test]
+    fn moves_survive_a_replan_and_old_edits_still_load() {
+        let assets = split_fixture();
+        let mut edits = PlanEdits::default();
+        edits.set_move("IMG_1505".into(), "IMG_1502".into(), false);
+        let json = serde_json::to_string(&edits).unwrap();
+        let loaded: PlanEdits = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, edits);
+        // A rebuilt plan of the same assets takes the stored move.
+        let replanned = split_plan(&assets);
+        let v = owned(hero_ids(&apply_edits(&replanned, &assets, &loaded)));
+        let at = |id: &str| v.iter().position(|x| x == id).unwrap();
+        assert_eq!(at("IMG_1505") + 1, at("IMG_1502"));
+        let old: PlanEdits = serde_json::from_str(r#"{"excluded":["a"]}"#).unwrap();
+        assert!(old.moves.is_empty());
     }
 }

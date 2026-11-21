@@ -279,7 +279,13 @@ impl Db {
 
     // -- projects ---------------------------------------------------------
     pub fn create_project(&self, name: &str, folder: &str) -> Result<Project, String> {
-        let t = now();
+        // Ordered with [`Db::touch_project`]: a new project is the latest
+        // even when a touch has run ahead of the clock.
+        let top: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(updated_at) FROM projects", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        let t = now().max(top.map_or(0, |t| t + 1));
         let p = Project {
             id: new_id("prj"),
             name: name.to_string(),
@@ -297,6 +303,42 @@ impl Db {
             )
             .map_err(|e| e.to_string())?;
         Ok(p)
+    }
+
+    /// The most recently updated project for `folder`, so a rescan
+    /// refreshes it (and keeps its Story edits) instead of starting over.
+    pub fn project_for_folder(&self, folder: &str) -> Result<Option<Project>, String> {
+        self.conn
+            .query_row(
+                "SELECT id,name,folder,created_at,updated_at,cloud_consent,book_preset,music_pick FROM projects WHERE folder=?1 ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT 1",
+                params![folder],
+                project_from_row,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Point a project at its folder's canonical path.
+    pub fn set_project_folder(&self, id: &str, folder: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE projects SET folder=?2 WHERE id=?1",
+                params![id, folder],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Mark a project as just updated, so [`Db::latest_project`] opens it:
+    /// strictly newer than every project, even within the same second.
+    pub fn touch_project(&self, id: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE projects SET updated_at=MAX((SELECT COALESCE(MAX(updated_at), 0) FROM projects) + 1, ?2) WHERE id=?1",
+                params![id, now()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn get_project(&self, id: &str) -> Result<Option<Project>, String> {
@@ -1068,6 +1110,11 @@ mod tests {
             swaps: vec![("a2".into(), "a3".into())],
             place_overrides: [("a1".to_string(), "Our Hotel".to_string())].into(),
             caption_overrides: [("a3".to_string(), "Sunset".to_string())].into(),
+            moves: vec![crate::plan::FilmMove {
+                asset: "a7".into(),
+                anchor: "a8".into(),
+                after: true,
+            }],
             collage: crate::types::CollageEdits {
                 solo: vec!["a4".into()],
                 joins: vec![("a5".into(), "a6".into())],
@@ -1656,6 +1703,62 @@ mod tests {
         assert_eq!(back.state, JobState::Running);
         assert_eq!(back.current_step.as_deref(), Some("xfade"));
         assert!(db.get_job("job_missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_folder_finds_its_project_and_a_touch_makes_it_latest() {
+        let db = mem();
+        let a = db.create_project("trip", "/trips/japan").unwrap();
+        // Created later, so it is latest until `a` is touched.
+        db.create_project("other", "/trips/peru").unwrap();
+        assert_eq!(
+            db.project_for_folder("/trips/japan").unwrap().unwrap().id,
+            a.id
+        );
+        assert!(db.project_for_folder("/trips/none").unwrap().is_none());
+        db.touch_project(&a.id).unwrap();
+        assert_eq!(db.latest_project().unwrap().unwrap().id, a.id);
+    }
+
+    #[test]
+    fn a_new_project_is_latest_even_after_a_touch_ran_ahead() {
+        let db = mem();
+        let a = db.create_project("a", "/a").unwrap();
+        db.touch_project(&a.id).unwrap();
+        db.touch_project(&a.id).unwrap();
+        let b = db.create_project("b", "/b").unwrap();
+        assert_eq!(db.latest_project().unwrap().unwrap().id, b.id);
+        db.set_project_folder(&b.id, "/b2").unwrap();
+        assert_eq!(db.project_for_folder("/b2").unwrap().unwrap().id, b.id);
+    }
+
+    #[test]
+    fn back_to_back_touches_make_the_last_touched_latest() {
+        let db = mem();
+        let a = db.create_project("a", "/a").unwrap();
+        let b = db.create_project("b", "/b").unwrap();
+        db.touch_project(&b.id).unwrap();
+        db.touch_project(&b.id).unwrap();
+        db.touch_project(&a.id).unwrap();
+        assert_eq!(db.latest_project().unwrap().unwrap().id, a.id);
+        db.touch_project(&b.id).unwrap();
+        assert_eq!(db.latest_project().unwrap().unwrap().id, b.id);
+    }
+
+    #[test]
+    fn a_folder_scanned_twice_before_resolves_to_its_latest_project() {
+        let db = mem();
+        let old = db.create_project("trip", "/trips/japan").unwrap();
+        let newer = db.create_project("trip", "/trips/japan").unwrap();
+        assert_eq!(
+            db.project_for_folder("/trips/japan").unwrap().unwrap().id,
+            newer.id
+        );
+        db.touch_project(&old.id).unwrap();
+        assert_eq!(
+            db.project_for_folder("/trips/japan").unwrap().unwrap().id,
+            old.id
+        );
     }
 
     #[test]

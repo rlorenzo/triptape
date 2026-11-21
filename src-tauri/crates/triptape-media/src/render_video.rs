@@ -261,6 +261,9 @@ pub struct VideoOptions {
     pub overlap_secs: f64,
     pub title_secs: f64,
     pub map_secs: f64,
+    /// Show the route map card right after the title (default false: the
+    /// film opens on its first shot; the closing recap always plays).
+    pub opening_map: bool,
     /// Music playlist in order; crossfaded, cycled only if shorter than the
     /// film. Empty (or all unusable) falls back to the bundled theme.
     pub music_paths: Vec<PathBuf>,
@@ -295,6 +298,7 @@ impl Default for VideoOptions {
             overlap_secs: 0.6,
             title_secs: 2.5,
             map_secs: 3.0,
+            opening_map: false,
             music_paths: Vec::new(),
             keep_ambience: false,
             live_collages: true,
@@ -528,12 +532,8 @@ pub fn render_hero_video(
     }
 
     // Chapter breaks: cut into segment i when its chapter differs.
-    let chapter_of = |id: &str| {
-        plan.chapters
-            .iter()
-            .position(|c| c.asset_ids.iter().any(|a| a == id))
-            .unwrap_or(usize::MAX)
-    };
+    let chapter_index = plan::chapter_index(plan);
+    let chapter_of = |id: &str| chapter_index.get(id).copied().unwrap_or(usize::MAX);
 
     // 1. Normalize segments (skip missing sources, never fail the film).
     let still_secs = if opts.short_mode {
@@ -583,8 +583,10 @@ pub fn render_hero_video(
         "title".into(),
     ));
 
-    // Map push-in when GPS exists and a card was rendered.
-    if let Some(card) = map_card {
+    // Map push-in when asked for, GPS exists and a card was rendered. Off
+    // by default: the title cuts straight to the first shot, and the route
+    // is saved for the closing recap.
+    if let Some(card) = map_card.filter(|_| opts.opening_map) {
         if !plan.map_polyline.is_empty() {
             let map_mp4 = work_dir.join("seg_map.mp4");
             match crate::map::render_map_push_in(
@@ -607,9 +609,10 @@ pub fn render_hero_video(
     }
 
     let mut places: Vec<String> = vec![];
+    let ships = opts.journey.as_ref().map(|j| j.ships()).unwrap_or_default();
+    // A ship is where we slept, not a place we went.
+    let is_ship = |p: &String| triptape_core::itinerary::is_ship_place(&ships, p);
     for c in &plan.chapters {
-        // A ship is where we slept, not a place we went.
-        let is_ship = |p: &String| opts.journey.as_ref().is_some_and(|j| j.ships().contains(p));
         if let Some(p) = c.place.as_ref().filter(|p| !is_ship(p)) {
             if !places.contains(p) {
                 places.push(p.clone());
@@ -1016,7 +1019,21 @@ pub fn render_hero_video(
         .chain(offsets.iter().copied())
         .collect();
     let srt_path = out_mp4.with_extension("srt");
-    let srt_count = write_captions_srt(&segs, &starts, &srt_path)?;
+    // The same caption on a run of shots (seven panoramas all "Some fun
+    // multiple person panoramas") is shown once, on the first.
+    let repeats = repeated_captions(
+        &segs
+            .iter()
+            .map(|(r, ..)| {
+                (
+                    r.caption.as_deref(),
+                    chapter_index.get(r.entry.asset_id.as_str()).copied(),
+                    r.taken_at,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    let srt_count = write_captions_srt(&segs, &starts, &repeats, &srt_path)?;
     let srt_opt = if srt_count > 0 {
         // A file name: the film may be moved after rendering.
         srt_path
@@ -1207,16 +1224,46 @@ fn overlay_key(
     k.finish()
 }
 
+/// Which segments' captions repeat the caption last shown, so only the
+/// first of a run is shown. Per segment: its caption, chapter and capture
+/// time. A caption repeats when its text (trimmed, case-insensitive) is
+/// the last shown one's and it is in the same chapter or taken within
+/// [`plan::COLLAGE_WINDOW_SECS`] of it ([`plan::within_window`]).
+/// Uncaptioned segments in between do not break the run; a different
+/// caption does. A skipped caption only loses
+/// its text on screen: the shot still counts as captioned for layout.
+fn repeated_captions(segs: &[(Option<&str>, Option<usize>, Option<i64>)]) -> Vec<bool> {
+    let mut last: Option<(String, Option<usize>, Option<i64>)> = None;
+    segs.iter()
+        .map(|&(caption, chapter, taken)| {
+            let Some(text) = caption.map(str::trim).filter(|c| !c.is_empty()) else {
+                return false;
+            };
+            let text = text.to_lowercase();
+            let repeat = last.as_ref().is_some_and(|(t, ch, at)| {
+                *t == text && ((ch.is_some() && *ch == chapter) || plan::within_window(*at, taken))
+            });
+            if !repeat {
+                last = Some((text, chapter, taken));
+            }
+            repeat
+        })
+        .collect()
+}
+
+/// Write the film's captions as SRT cues timed to each segment's `starts`,
+/// leaving out the captions `repeats` marks ([`repeated_captions`]).
 fn write_captions_srt(
     segs: &[(ResolvedEntry, PathBuf, f64, String)],
     starts: &[f64],
+    repeats: &[bool],
     out: &Path,
 ) -> Result<usize, crate::MediaError> {
     let mut n = 0;
     let mut body = String::new();
     for (i, (r, _, d, _)) in segs.iter().enumerate() {
         if let Some(c) = &r.caption {
-            if c.trim().is_empty() {
+            if c.trim().is_empty() || repeats.get(i).copied().unwrap_or(false) {
                 continue;
             }
             n += 1;
@@ -1783,7 +1830,7 @@ fn render_collage_segment(
         if live {
             // The motion recipe is not in the hold arguments; bump this
             // tag whenever the moving-cell graph or timing changes.
-            k.part("live", "8");
+            k.part("live", "9");
             // The tone-map chain follows these, which the ffmpeg version
             // line does not record.
             k.part("tonemap", &format!("{}:{}", caps.tonemap, caps.zscale));
@@ -1866,6 +1913,7 @@ fn hero_groups<'a, C: PartialEq>(
                 r.entry.asset_id.as_str(),
                 chapter_of(&r.entry.asset_id),
                 collage_eligible(r),
+                r.taken_at,
             )
         }),
         collage,
@@ -2250,13 +2298,23 @@ fn live_motion(m: &ResolvedEntry) -> Option<&Path> {
 
 /// Seconds cut from the end of a Live Photo's motion in a collage when
 /// its steadiness cannot be measured: the phone is often being lowered
-/// there, and the cell freezes on its last frame.
+/// there.
 const LIVE_TAIL_TRIM: f64 = 0.6;
 /// Shortest motion worth playing in a collage cell.
 const LIVE_MIN_SECS: f64 = 0.8;
 
 /// Seconds a collage rests after its last moving cell has stopped.
 const LIVE_LINGER: f64 = 1.0;
+/// Seconds over which a moving cell's motion dissolves in over its still
+/// when its turn comes. The motion file is low resolution and often
+/// blurred, so a cell waiting its turn shows the sharp still, never the
+/// motion's first frame.
+const LIVE_FADE_IN: f64 = 0.25;
+/// Seconds over which a finished motion dissolves back into its sharp
+/// still, where the cell rests (a Live Photo on a phone ends on its key
+/// photo). The dissolve also hides any framing difference between the
+/// motion's last frame and the still.
+const LIVE_FADE_OUT: f64 = 0.3;
 
 /// When each moving cell of a collage starts, given their playable
 /// seconds in playing order and the collage's hold. All starting at once
@@ -2346,10 +2404,12 @@ fn live_cells(
 
 /// Filter graph of a collage whose `live` cells move: input 0 is the
 /// composed canvas, inputs 1.. the motion files in `live` order. Each
-/// motion is cover-cropped like its still and shows from the collage's
-/// first frame (the still never shows in that cell): it waits on its
-/// first frame until its start, plays, then freezes on its last frame
-/// while the whole canvas glides.
+/// motion is cover-cropped like its still. Until its start the cell shows
+/// the sharp still the canvas holds (nothing is overlaid); then the motion
+/// dissolves in over [`LIVE_FADE_IN`], plays from its first frame, and
+/// dissolves back out over [`LIVE_FADE_OUT`] to the still, where the cell
+/// rests while the whole canvas glides. No cell ever rests on a video
+/// frame.
 fn live_collage_graph(
     caps: &Capabilities,
     live: &[LiveCell],
@@ -2369,16 +2429,17 @@ fn live_collage_graph(
             .tonemap
             .as_ref()
             .map_or(String::new(), |t| format!("{t},"));
-        // A cell waiting its turn shows its motion's first frame, so it
-        // starts moving without a jump from the still.
-        let wait = if c.start > 0.0 {
-            format!(",tpad=start_mode=clone:start_duration={:.3}", c.start)
-        } else {
-            String::new()
-        };
+        // Alpha fades in and out so the still shows through on either side;
+        // the motion is shifted to its start and the overlay only runs in
+        // its window, so outside it the canvas passes through untouched.
+        let fade_in = LIVE_FADE_IN.min(c.secs / 4.0);
+        let fade_out = LIVE_FADE_OUT.min(c.secs / 4.0);
         g.push_str(&format!(
-            "[{n}:v]fps=30,trim=duration={secs:.3},setpts=PTS-STARTPTS,{tone}format=rgb24,scale={cw}:{ch}:force_original_aspect_ratio=increase:flags=lanczos,crop={cw}:{ch}:(iw-{cw})/2:(ih-{ch})*{fy}:exact=1,setsar=1{wait}[m{n}];[c{i}][m{n}]overlay={x}:{y}:eof_action=repeat[c{n}];",
+            "[{n}:v]fps=30,trim=duration={secs:.3},setpts=PTS-STARTPTS,{tone}format=rgb24,scale={cw}:{ch}:force_original_aspect_ratio=increase:flags=lanczos,crop={cw}:{ch}:(iw-{cw})/2:(ih-{ch})*{fy}:exact=1,setsar=1,format=rgba,fade=t=in:st=0:d={fade_in:.3}:alpha=1,fade=t=out:st={out_st:.3}:d={fade_out:.3}:alpha=1,setpts=PTS+{start:.3}/TB[m{n}];[c{i}][m{n}]overlay={x}:{y}:eof_action=pass:enable='between(t,{start:.3},{end:.3})'[c{n}];",
             secs = c.secs,
+            out_st = c.secs - fade_out,
+            start = c.start,
+            end = c.start + c.secs,
             cw = c.w,
             ch = c.h,
             fy = CROP_FOCUS_Y,
@@ -2741,38 +2802,55 @@ mod tests {
                 }
             }
             let chapter_of = |id: &str| id[..3].to_string();
-            for cards in [
-                HeroCards {
-                    route: true,
-                    route_stops: 0,
-                    route_secs: None,
-                    places: true,
-                },
-                HeroCards {
-                    route: false,
-                    route_stops: 0,
-                    route_secs: None,
-                    places: false,
-                },
-                HeroCards {
-                    route: true,
-                    route_stops: 0,
-                    route_secs: None,
-                    places: false,
-                },
-                HeroCards {
-                    route: true,
-                    route_stops: 6,
-                    route_secs: None,
-                    places: true,
-                },
-            ] {
+            // Shots 9 minutes apart, so the collage time window splits
+            // some runs; every tenth undated.
+            let taken: HashMap<&str, i64> = entries
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % 10 != 9)
+                .map(|(i, e)| (e.asset_id.as_str(), i as i64 * 540))
+                .collect();
+            let taken_of = |id: &str| taken.get(id).copied();
+            // Each card set with and without the opening map.
+            for cards in [false, true].into_iter().flat_map(|opening_map| {
+                [
+                    HeroCards {
+                        route: true,
+                        opening_map,
+                        route_stops: 0,
+                        route_secs: None,
+                        places: true,
+                    },
+                    HeroCards {
+                        route: false,
+                        opening_map,
+                        route_stops: 0,
+                        route_secs: None,
+                        places: false,
+                    },
+                    HeroCards {
+                        route: true,
+                        opening_map,
+                        route_stops: 0,
+                        route_secs: None,
+                        places: false,
+                    },
+                    HeroCards {
+                        route: true,
+                        opening_map,
+                        route_stops: 6,
+                        route_secs: None,
+                        places: true,
+                    },
+                ]
+            }) {
                 // -- renderer replay: the renderer's own grouping.
                 let resolved: Vec<ResolvedEntry> = entries
                     .iter()
                     .map(|e| ResolvedEntry {
                         entry: e.clone(),
                         caption: captions.get(&e.asset_id).cloned(),
+                        taken_at: taken_of(&e.asset_id),
                         ..card_entry(&e.asset_id, Path::new("x.jpg"))
                     })
                     .collect();
@@ -2785,7 +2863,7 @@ mod tests {
                 // (asset id, duration, kind) as in the renderer's `segs`.
                 let mut segs: Vec<(String, f64, &str)> =
                     vec![("title".into(), opts.title_secs, "title")];
-                if cards.route {
+                if cards.route && cards.opening_map {
                     segs.push(("map".into(), opts.map_secs, "map"));
                 }
                 for g in &groups {
@@ -2851,6 +2929,7 @@ mod tests {
                     |id| CHAPTER_LABELS[id[1..3].parse::<usize>().unwrap()],
                     |_| None,
                     |id| has_caption(captions.get(id).map(String::as_str)),
+                    taken_of,
                     cards,
                 );
                 let err = (est - actual).abs() / actual;
@@ -3474,7 +3553,7 @@ mod tests {
     }
 
     #[test]
-    fn live_collage_graph_starts_on_the_video_and_freezes() {
+    fn live_collage_graph_waits_on_the_still_and_dissolves_in_and_out() {
         let caps = Capabilities {
             perspective: true,
             ..Default::default()
@@ -3482,28 +3561,35 @@ mod tests {
         let mut live = [live_cell("a.mov", 9, 2.5), live_cell("b.mov", 1449, 3.0)];
         live[1].start = 1.5;
         let g = live_collage_graph(&caps, &live, 150, 0, Resolution::Hd1080);
-        // The first cell moves at once; the second waits on its own first
-        // frame (never the still), then plays.
-        assert_eq!(g.matches("tpad=").count(), 1, "{g}");
+        // Still staggered, but a waiting cell is never padded with its
+        // motion's (blurred) first frame: the motion is shifted to its
+        // start and the still shows until then.
+        assert!(!g.contains("tpad="), "{g}");
+        assert!(g.contains("setpts=PTS+0.000/TB[m1]"), "{g}");
+        assert!(g.contains("setpts=PTS+1.500/TB[m2]"), "{g}");
+        // Each motion dissolves in over the still and back out to it.
         assert!(
-            g.contains("setsar=1,tpad=start_mode=clone:start_duration=1.500[m2]"),
+            g.contains("format=rgba,fade=t=in:st=0:d=0.250:alpha=1,fade=t=out:st=2.200:d=0.300:alpha=1,setpts=PTS+0.000/TB[m1]"),
             "{g}"
         );
-        // Canvas held once, each motion laid over it in input order.
+        assert!(
+            g.contains("format=rgba,fade=t=in:st=0:d=0.250:alpha=1,fade=t=out:st=2.700:d=0.300:alpha=1,setpts=PTS+1.500/TB[m2]"),
+            "{g}"
+        );
+        // Canvas held once, each motion laid over it in input order, only
+        // during its own window; outside it the canvas passes through.
         assert!(g.starts_with("[0:v]scale=2880:1620"), "{g}");
         assert!(
-            g.contains("[c0][m1]overlay=9:9:eof_action=repeat[c1]"),
+            g.contains("[c0][m1]overlay=9:9:eof_action=pass:enable='between(t,0.000,2.500)'[c1]"),
             "{g}"
         );
         assert!(
-            g.contains("[c1][m2]overlay=1449:9:eof_action=repeat[c2]"),
+            g.contains(
+                "[c1][m2]overlay=1449:9:eof_action=pass:enable='between(t,1.500,4.500)'[c2]"
+            ),
             "{g}"
         );
-        // From the first frame, no cross-fade with the still, and the last
-        // frame holds: no delay, no fade, never back to the canvas.
-        assert!(!g.contains("fade="), "{g}");
-        assert!(!g.contains("/TB"), "{g}");
-        assert!(!g.contains("eof_action=pass"), "{g}");
+        assert!(!g.contains("eof_action=repeat"), "{g}");
         assert!(g.contains("trim=duration=2.500"), "{g}");
         // Cover-cropped to the tile with the stills' top-biased focus.
         assert!(g.contains("crop=1422:1602:(iw-1422)/2:(ih-1602)*0.35:exact=1"));
@@ -3603,22 +3689,26 @@ mod tests {
         assert_eq!(args.last().unwrap(), "out.mp4");
     }
 
+    /// The frame of `video` at `t` s, scaled to 320x180, saved as `png`.
+    fn grab_frame(caps: &Capabilities, video: &Path, t: f64, png: &Path) -> image::RgbImage {
+        let ok = std::process::Command::new(&caps.ffmpeg_bin)
+            .args(["-v", "error", "-y", "-ss", &format!("{t}"), "-i"])
+            .arg(video)
+            .args(["-frames:v", "1", "-vf", "scale=320:180"])
+            .arg(png)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        image::open(png).unwrap().to_rgb8()
+    }
+
     /// Mean absolute difference, 0..255, between the frame of `va` at `a`
     /// seconds and the frame of `vb` at `b` seconds.
     fn frame_diff(caps: &Capabilities, va: &Path, a: f64, vb: &Path, b: f64, dir: &Path) -> f64 {
-        let grab = |video: &Path, t: f64, name: &str| {
-            let png = dir.join(name);
-            let ok = std::process::Command::new(&caps.ffmpeg_bin)
-                .args(["-v", "error", "-y", "-ss", &format!("{t}"), "-i"])
-                .arg(video)
-                .args(["-frames:v", "1", "-vf", "scale=320:180"])
-                .arg(&png)
-                .status()
-                .unwrap();
-            assert!(ok.success());
-            image::open(&png).unwrap().to_rgb8()
-        };
-        let (fa, fb) = (grab(va, a, "fa.png"), grab(vb, b, "fb.png"));
+        let (fa, fb) = (
+            grab_frame(caps, va, a, &dir.join("fa.png")),
+            grab_frame(caps, vb, b, &dir.join("fb.png")),
+        );
         let sum: u64 = fa
             .as_raw()
             .iter()
@@ -3628,10 +3718,10 @@ mod tests {
         sum as f64 / fa.as_raw().len() as f64
     }
 
-    /// A Live Photo in a collage moves from the first frame, then holds its
-    /// last frame; with the option off the same collage stays still.
+    /// A Live Photo in a collage dissolves into motion from the start, then
+    /// rests on its still; with the option off the same collage stays still.
     #[test]
-    fn collage_live_photo_moves_then_freezes() {
+    fn collage_live_photo_moves_then_rests() {
         let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
         if !caps.libx264 || !caps.perspective {
             eprintln!("ffmpeg caps insufficient; skipping live collage test");
@@ -3677,8 +3767,8 @@ mod tests {
         let frozen = frame_diff(&caps, &moving, 3.0, &moving, 4.0, dir);
         let off = render(false, "off");
         let still_only = frame_diff(&caps, &off, 0.3, &off, 1.3, dir);
-        // The frozen frame still drifts with the canvas glide, so it is
-        // not zero; playback changes the cell far more.
+        // The rested still drifts with the canvas glide, so it is not
+        // zero; playback changes the cell far more.
         assert!(
             playing > 2.0 * frozen.max(0.2),
             "playing {playing} frozen {frozen}"
@@ -3687,12 +3777,120 @@ mod tests {
             playing > 4.0 * still_only.max(0.2),
             "playing {playing} still {still_only}"
         );
-        // The first frame already shows the video, not the still.
-        let first = frame_diff(&caps, &moving, 0.0, &off, 0.0, dir);
+        // Once dissolved in, the cell shows the video, not the still.
+        let early = frame_diff(&caps, &moving, 0.3, &off, 0.3, dir);
         assert!(
-            first > 10.0,
-            "first frame matches the still collage: {first}"
+            early > 10.0,
+            "the motion never shows over the still collage: {early}"
         );
+    }
+
+    /// Mean absolute difference, 0..255, of the left and right halves of
+    /// the frames of `va` and `vb` at `t` seconds (scaled to 320x180).
+    /// When `TRIPTAPE_FRAME_DIR` is set the frames are kept there to look at.
+    fn half_diffs(caps: &Capabilities, va: &Path, vb: &Path, t: f64, dir: &Path) -> (f64, f64) {
+        let keep = std::env::var_os("TRIPTAPE_FRAME_DIR").map(PathBuf::from);
+        let grab = |video: &Path, tag: &str| {
+            let png = dir.join(format!("{tag}_{t:.2}.png"));
+            let frame = grab_frame(caps, video, t, &png);
+            if let Some(k) = &keep {
+                std::fs::create_dir_all(k).unwrap();
+                std::fs::copy(&png, k.join(png.file_name().unwrap())).unwrap();
+            }
+            frame
+        };
+        let (fa, fb) = (grab(va, "moving"), grab(vb, "still"));
+        let half = |left: bool| {
+            let (mut sum, mut n) = (0u64, 0u64);
+            for (x, y, pa) in fa.enumerate_pixels() {
+                if (x < fa.width() / 2) == left {
+                    let pb = fb.get_pixel(x, y);
+                    sum +=
+                        pa.0.iter()
+                            .zip(pb.0)
+                            .map(|(a, b)| u64::from(a.abs_diff(b)))
+                            .sum::<u64>();
+                    n += 3;
+                }
+            }
+            sum as f64 / n as f64
+        };
+        (half(true), half(false))
+    }
+
+    /// Two Live Photos side by side play one after the other: the second
+    /// shows its sharp still (not its motion's first frame) while the first
+    /// moves, then moves in its own turn, and both end resting on their
+    /// stills.
+    #[test]
+    fn collage_live_photos_wait_and_rest_on_their_stills() {
+        let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
+        if !caps.libx264 || !caps.perspective {
+            eprintln!("ffmpeg caps insufficient; skipping live collage test");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let member = |name: &str, rgb: [u8; 3], src: &str| {
+            let still = dir.join(format!("{name}.png"));
+            image::RgbImage::from_pixel(480, 640, image::Rgb(rgb))
+                .save(&still)
+                .unwrap();
+            let motion = dir.join(format!("{name}.mov"));
+            let made = std::process::Command::new(&caps.ffmpeg_bin)
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+                .arg(src)
+                .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+                .arg(&motion)
+                .status()
+                .unwrap();
+            assert!(made.success());
+            let mut e = card_entry(name, &still);
+            e.motion_path = Some(motion);
+            e
+        };
+        let a = member("a", [40, 90, 160], "testsrc2=s=480x640:r=30:d=2");
+        let b = member("b", [160, 90, 40], "testsrc=s=480x640:r=30:d=2");
+        let members = [&a, &b];
+        // When the second (right-hand) cell starts, as the render will.
+        let canvas = dir.join("canvas.png");
+        let photos =
+            compose_collage(&caps.ffmpeg_bin, &members, Resolution::Hd1080, &canvas).unwrap();
+        let cells = live_cells(&caps, &members, &photos, 5.0);
+        assert_eq!(cells.len(), 2, "both motions play");
+        let second = cells[1].start;
+        assert!(second >= 1.0, "the second cell waits its turn: {second}");
+        let render = |on: bool, sub: &str| {
+            let work = dir.join(sub);
+            std::fs::create_dir_all(&work).unwrap();
+            let (out, secs, _) =
+                render_collage_segment(&caps, &members, 0, 0, 4.0, on, Resolution::Hd1080, &work)
+                    .unwrap();
+            assert!((secs - 5.0).abs() < 0.01);
+            out
+        };
+        let moving = render(true, "on");
+        let still = render(false, "off");
+        if let Some(k) = std::env::var_os("TRIPTAPE_FRAME_DIR") {
+            std::fs::create_dir_all(&k).unwrap();
+            std::fs::copy(&moving, Path::new(&k).join("moving.mp4")).unwrap();
+        }
+        // (a) Before its turn the second cell is its sharp still while the
+        // first moves.
+        let (l, r) = half_diffs(&caps, &moving, &still, second - 0.4, dir);
+        assert!(l > 10.0, "the first cell moves: {l}");
+        assert!(r < 2.0, "the waiting cell shows its still: {r}");
+        // (b) In its window the second cell moves.
+        let (_, r) = half_diffs(&caps, &moving, &still, second + 0.6, dir);
+        assert!(r > 10.0, "the second cell moves in its turn: {r}");
+        // (c) Both rest sharp on their stills at the end.
+        for t in [4.5, 4.75, 4.95] {
+            let (l, r) = half_diffs(&caps, &moving, &still, t, dir);
+            assert!(
+                l < 2.0 && r < 2.0,
+                "both cells rest sharp at {t} s: {l} {r}"
+            );
+        }
     }
 
     /// Real iPhone clip with an `apple_apac` track: `TRIPTAPE_APAC_CLIP=<copy of
@@ -3774,8 +3972,9 @@ mod tests {
                 } else {
                     None
                 },
-                // Oct 6/7/8 2026 12:00 UTC.
-                taken_at: Some(1791288000 + i as i64 * 86400),
+                // Oct 6 2026 12:00 and 12:10 UTC (one moment, so a0 and
+                // a1 collage), then Oct 8 12:00.
+                taken_at: Some(1791288000 + [0, 600, 2 * 86400][i]),
                 tz_offset_secs: None,
                 aspect: None,
             });
@@ -4033,38 +4232,56 @@ mod tests {
                 rationale: "default".into(),
             },
         };
-        let out = dir.join("hero.mp4");
-        let v = render_hero_video(
-            &caps,
-            &plan,
-            &entries,
-            Some(&still),
-            &dir.join("work"),
-            &out,
-            &VideoOptions {
-                short_mode: true,
-                resolution: Resolution::Hd1080,
-                ..Default::default()
-            },
-        )
-        .expect("short film render");
-        assert!(
-            v.duration_secs <= SHORT_FILM_SECS,
-            "short film ran {:.2}s",
-            v.duration_secs
-        );
-        let edl: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&v.edl_path).unwrap()).unwrap();
-        let ids: Vec<&str> = edl["segments"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|s| s["asset_id"].as_str().unwrap())
-            .collect();
-        assert!(
-            ids.contains(&"closing") && ids.contains(&"credits"),
-            "{ids:?}"
-        );
+        // By default the title cuts straight to the first shot; the opening
+        // map only plays when asked for. The closing recap plays either way.
+        for opening_map in [false, true] {
+            let out = dir.join(format!("hero_{opening_map}.mp4"));
+            let v = render_hero_video(
+                &caps,
+                &plan,
+                &entries,
+                Some(&still),
+                &dir.join(format!("work_{opening_map}")),
+                &out,
+                &VideoOptions {
+                    short_mode: true,
+                    resolution: Resolution::Hd1080,
+                    opening_map,
+                    ..Default::default()
+                },
+            )
+            .expect("short film render");
+            assert!(
+                v.duration_secs <= SHORT_FILM_SECS,
+                "short film ran {:.2}s",
+                v.duration_secs
+            );
+            let edl: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&v.edl_path).unwrap()).unwrap();
+            let segs = edl["segments"].as_array().unwrap();
+            let ids: Vec<&str> = segs
+                .iter()
+                .map(|s| s["asset_id"].as_str().unwrap())
+                .collect();
+            let opening: &[&str] = if opening_map {
+                &["title", "map"]
+            } else {
+                &["title"]
+            };
+            assert_eq!(&ids[..opening.len()], opening, "{ids:?}");
+            // ...then straight into the first shot.
+            assert!(ids[opening.len()].starts_with('a'), "{ids:?}");
+            assert_eq!(
+                ids.iter().filter(|&&i| i == "map").count(),
+                usize::from(opening_map)
+            );
+            assert!(
+                ids.contains(&"closing") && ids.contains(&"credits"),
+                "{ids:?}"
+            );
+            // The title opens onto whatever follows with the opening move.
+            assert_eq!(segs[1]["transition_in"], "circle_open", "{ids:?}");
+        }
     }
 
     /// Regression: a clip whose planned trim (4 s) exceeds its real length
@@ -4513,7 +4730,7 @@ mod tests {
                 still_path: p,
                 motion_path: None,
                 caption: (i % 3 == 0).then(|| format!("Caption {i}")),
-                taken_at: None,
+                taken_at: Some(1791288000 + i as i64 * 60),
                 tz_offset_secs: None,
                 aspect: Some(f64::from(320 + 16 * i as u32) / 240.0),
             });
@@ -5161,6 +5378,46 @@ mod tests {
         let out = dir.join(format!("vis_{}_map.mp4", res.label()));
         crate::map::render_map_push_in(&caps, &card, &out, 3.0, 0, res).unwrap();
         eprintln!("fallbacks: {fb:?}");
+    }
+
+    #[test]
+    fn a_repeated_caption_is_shown_once() {
+        let h = 3600;
+        let cap = |c: Option<&'static str>, ch: usize, t: i64| (c, Some(ch), Some(t));
+        // A A A -> A _ _, case and spacing aside, an uncaptioned shot
+        // between them or not.
+        let a = Some("Some fun multiple person panoramas");
+        let a2 = Some("  some fun Multiple person panoramas ");
+        assert_eq!(
+            repeated_captions(&[
+                cap(a, 0, 0),
+                cap(a2, 0, 60),
+                cap(None, 0, 90),
+                cap(a, 0, 120)
+            ]),
+            [false, true, false, true]
+        );
+        // A B A -> all shown.
+        let b = Some("Lunch");
+        assert_eq!(
+            repeated_captions(&[cap(a, 0, 0), cap(b, 0, 60), cap(a, 0, 120)]),
+            [false, false, false]
+        );
+        // The same words in another chapter hours later are a new showing;
+        // minutes later across a chapter change, still a repeat.
+        assert_eq!(
+            repeated_captions(&[cap(a, 0, 0), cap(a, 1, 5 * h)]),
+            [false, false]
+        );
+        assert_eq!(
+            repeated_captions(&[cap(a, 0, 0), cap(a, 1, 600)]),
+            [false, true]
+        );
+        // Unknown chapter and time: never a repeat.
+        assert_eq!(
+            repeated_captions(&[(a, None, None), (a, None, None)]),
+            [false, false]
+        );
     }
 
     #[test]

@@ -33,6 +33,9 @@ CLI (`triptape-media` bin `triptape` — headless, no UI):
 cargo run -p triptape-media --bin triptape -- scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|600|10m]
 cargo run -p triptape-media --bin triptape -- plan --db trip.db --out plan.json
 cargo run -p triptape-media --bin triptape -- export --db trip.db --out ~/Movies/TripTape/trip
+# The film opens on its first shot and ends on the route recap; --opening-map
+# also shows the route map right after the title.
+cargo run -p triptape-media --bin triptape -- export --db trip.db --out ~/Movies/TripTape/trip --opening-map
 # Bigger photo book (24–400 pages; default 60 for P1, 80 for P2):
 cargo run -p triptape-media --bin triptape -- export --db trip.db --out ~/Movies/TripTape/trip --only book --pages 111
 # Copy the trip's best 800 photos (with their Live Photo motion) into a new folder.

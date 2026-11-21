@@ -19,6 +19,15 @@ pub const DOCK_RADIUS_M: f64 = 1_500.0;
 /// Seogwipo sits 3-14 km from the Gangjeong cruise terminal.
 pub const PORT_SHORE_RADIUS_M: f64 = 30_000.0;
 
+/// [`PORT_SHORE_RADIUS_M`] for a city a cruise starts or ends in: enough
+/// for Singapore's Marina Bay (reclaimed land the land grid reads as
+/// water, 2-3 km from the terminal), not for deck shots of the strait.
+pub const CITY_SHORE_RADIUS_M: f64 = 5_000.0;
+
+/// What a cruise's first and last days are named for
+/// (`Carnival Luminosa Embarkation`).
+const BOARDING_SUFFIXES: [&str; 2] = [" Embarkation", " Disembarkation"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LegMode {
@@ -207,10 +216,12 @@ impl Itinerary {
 
     /// The owner-named place a shot was taken in: one whose time window
     /// holds its local time, else the nearest whose radius reaches its GPS.
+    /// A shot without a time zone has no local time to place it by.
     pub fn place_of(&self, a: &Asset) -> Option<&str> {
         let when = a
             .taken_at
-            .and_then(|t| crate::metadata::local_datetime(t, a.tz_offset_secs));
+            .zip(a.tz_offset_secs)
+            .and_then(|(t, tz)| crate::metadata::local_datetime(t, Some(tz)));
         let timed = self.places.iter().find(|pl| {
             pl.window()
                 .zip(when)
@@ -404,8 +415,10 @@ impl Itinerary {
     /// The label for a shot taken on `day` at `gps` (`None`: no fix).
     ///
     /// On a cruise day the shot is on board when it was taken at sea (but
-    /// not within [`PORT_SHORE_RADIUS_M`] of the day's port), within
-    /// [`DOCK_RADIUS_M`] of a dock, or has no GPS; otherwise it is ashore and
+    /// not within [`PORT_SHORE_RADIUS_M`] of the day's port call, or
+    /// [`CITY_SHORE_RADIUS_M`] of a city the cruise starts or ends in),
+    /// within [`DOCK_RADIUS_M`] of a dock, or has no GPS on a day without a
+    /// port call (on a port day most shots are ashore); otherwise it is ashore and
     /// takes the city of the stop the owner is at that day. Off the cruise
     /// the city of the active stop applies. Never a place-of-interest name.
     pub fn label_for(&self, day: NaiveDate, gps: Option<(f64, f64)>) -> Option<DayLabel> {
@@ -434,8 +447,9 @@ impl Itinerary {
         // reclaimed land the coarse grid reads as water).
         let docks = self.docks();
         let port = docks.iter().find(|s| s.active_on(day));
+        let port_call = port.is_some_and(|s| s.kind == StopKind::Port);
         let on_board = match gps {
-            None => true,
+            None => !port_call,
             Some(p) => {
                 let at_dock = self
                     .docks()
@@ -444,8 +458,12 @@ impl Itinerary {
                 // The land grid is ~5 km cells, so a seaside town reads as
                 // water. On a port day the ship is tied up at the dock, so
                 // a fix near the port but away from the dock is ashore.
-                let ashore_near_port =
-                    port.is_some_and(|s| haversine_m(p, s.pos()) <= PORT_SHORE_RADIUS_M);
+                let shore_m = if port_call {
+                    PORT_SHORE_RADIUS_M
+                } else {
+                    CITY_SHORE_RADIUS_M
+                };
+                let ashore_near_port = port.is_some_and(|s| haversine_m(p, s.pos()) <= shore_m);
                 at_dock || (land_fraction(p) < 0.5 && !ashore_near_port)
             }
         };
@@ -475,10 +493,11 @@ impl Itinerary {
     /// and Shiokaze Park face Tokyo's Aomi terminal).
     pub fn boarding(&self, day: NaiveDate) -> Option<String> {
         self.cruises().into_iter().find_map(|c| {
+            let [on, off] = BOARDING_SUFFIXES;
             if c.start == day {
-                Some(format!("{} Embarkation", c.ship))
+                Some(format!("{}{on}", c.ship))
             } else if c.end == day {
-                Some(format!("{} Disembarkation", c.ship))
+                Some(format!("{}{off}", c.ship))
             } else {
                 None
             }
@@ -526,6 +545,17 @@ fn parse_range(s: &str) -> Result<(NaiveDate, NaiveDate), String> {
 /// Local calendar day of an asset.
 pub fn asset_day(a: &Asset) -> Option<NaiveDate> {
     crate::metadata::local_date(a.taken_at?, a.tz_offset_secs)
+}
+
+/// Whether `place` is one of `ships` or a cruise's boarding day named
+/// for one (`Carnival Luminosa Embarkation`): where the owner slept, not a
+/// place they went.
+pub fn is_ship_place(ships: &[String], place: &str) -> bool {
+    ships.iter().any(|ship| {
+        place
+            .strip_prefix(ship.as_str())
+            .is_some_and(|rest| rest.is_empty() || BOARDING_SUFFIXES.contains(&rest))
+    })
 }
 
 /// Relabel a plan under the itinerary: each chapter takes the label most
@@ -739,6 +769,9 @@ mod tests {
             .label_for(day("2026-10-11"), Some((34.6687, 135.4986)))
             .unwrap();
         assert_eq!((ashore.place.as_str(), ashore.on_ship), ("Osaka", false));
+        // No GPS on a port day: most shots that day are ashore.
+        let unfixed = it.label_for(day("2026-10-11"), None).unwrap();
+        assert_eq!((unfixed.place.as_str(), unfixed.on_ship), ("Osaka", false));
         // At sea, or with no GPS, on a sea day: the ship.
         let sea = it
             .label_for(day("2026-10-10"), Some((30.0, 140.0)))
@@ -768,6 +801,17 @@ mod tests {
         assert_eq!(d.place, "Disney Adventure");
         let d = it.label_for(day("2026-10-27"), Some((1.8, 105.6))).unwrap();
         assert_eq!(d.place, "Disney Adventure");
+        // Sailing day from Singapore: Marina Bay, read as water, is ashore;
+        // the strait 12 km out is on deck, not 30 km of "near the port".
+        let bay = it
+            .label_for(day("2026-10-26"), Some((1.2834, 103.8607)))
+            .unwrap();
+        assert!(!bay.on_ship, "{bay:?}");
+        assert!(
+            it.label_for(day("2026-10-26"), Some((1.22, 103.97)))
+                .unwrap()
+                .on_ship
+        );
     }
 
     fn photo(id: &str, day: &str, gps: Option<(f64, f64)>) -> Asset {
@@ -840,9 +884,14 @@ mod tests {
         // Between the two, outside both radii; or no GPS.
         assert_eq!(it.place_of(&at(Some((25.0420, 121.5700)))), None);
         assert_eq!(it.place_of(&at(None)), None);
-        // In the window (noon on Oct 23), whatever the GPS says.
-        let dome = photo("d", "2026-10-23", Some((25.0343, 121.5648)));
+        // In the window (noon on Oct 23), whatever the GPS says; a shot
+        // with no time zone has no local time to match it by.
+        let mut dome = photo("d", "2026-10-23", Some((25.0343, 121.5648)));
+        dome.tz_offset_secs = Some(0);
         assert_eq!(it.place_of(&dome), Some("Flower Dome"));
+        dome.gps = None;
+        dome.tz_offset_secs = None;
+        assert_eq!(it.place_of(&dome), None);
         // A malformed window is refused when loading.
         let bad = JSON.replacen(
             "\"legs\"",
@@ -943,6 +992,21 @@ mod tests {
     }
 
     #[test]
+    fn ships_and_their_boarding_days_are_not_places_visited() {
+        let ships = ["Carnival Luminosa".to_string()];
+        for p in [
+            "Carnival Luminosa",
+            "Carnival Luminosa Embarkation",
+            "Carnival Luminosa Disembarkation",
+        ] {
+            assert!(is_ship_place(&ships, p), "{p}");
+        }
+        for p in ["Osaka", "Carnival Luminosa Deck 9", "Carnival"] {
+            assert!(!is_ship_place(&ships, p), "{p}");
+        }
+    }
+
+    #[test]
     fn port_on_names_port_days_only() {
         assert_eq!(itin().port_on(day("2026-10-11")).as_deref(), Some("Osaka"));
         assert_eq!(itin().port_on(day("2026-10-10")), None);
@@ -1014,9 +1078,13 @@ mod tests {
         assert_eq!(ashore.place, "Osaka");
         let at_sea = itin().label_for(day("2026-10-10"), Some(seaside)).unwrap();
         assert_eq!(at_sea.place, "Carnival Luminosa");
-        // No GPS anywhere: the no-fix rule (on board on a cruise day).
+        // No GPS anywhere: the no-fix rule (ashore on a port day, on board
+        // on a sea day).
         let blind = photo("x", "2026-10-11", None);
         let label = chapter_label(&itin(), day("2026-10-11"), &[&blind]).unwrap();
+        assert_eq!(label.place, "Osaka");
+        let blind = photo("x", "2026-10-10", None);
+        let label = chapter_label(&itin(), day("2026-10-10"), &[&blind]).unwrap();
         assert_eq!(label.place, "Carnival Luminosa");
     }
 }

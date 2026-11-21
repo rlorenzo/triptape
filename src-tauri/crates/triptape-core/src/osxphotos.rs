@@ -332,14 +332,37 @@ mod tests {
         assert_eq!(still.rotation_deg, 90);
         assert_eq!((still.width, still.height), (Some(40), Some(30)));
 
-        // Unprobeable video: mtime, guessed, but story fields still land.
+        // Unprobeable video: the library's date and offset (not mtime),
+        // and story fields still land.
         let mut clip = Asset::new("v", dir.path().join("IMG_1.mov"), AssetKind::Video);
         clip.mtime = 2_000_000_001;
         fill_video(&mut clip, None, Some(&idx), "prj");
-        assert_eq!(clip.taken_at, Some(2_000_000_001));
-        assert!(clip.time_guessed);
+        assert_eq!(clip.taken_at, Some(1_793_066_738));
+        assert!(!clip.time_guessed);
+        assert_eq!(clip.tz_offset_secs, Some(8 * 3600));
         assert_eq!(clip.user_caption.as_deref(), Some("River"));
         assert_eq!(clip.people_sig, still.people_sig);
+
+        // A probed video's own dates beat the library: Apple's creation
+        // date first, then the container's creation_time.
+        let probe = |tags: &str| {
+            crate::metadata::FfprobeOutput::parse(&format!(r#"{{"format":{{"tags":{{{tags}}}}}}}"#))
+                .unwrap()
+        };
+        let mut clip = Asset::new("v", dir.path().join("IMG_1.mov"), AssetKind::Video);
+        let p = probe(r#""creation_time":"2026-10-15T19:19:09.000000Z""#);
+        fill_video(&mut clip, Some(&p), Some(&idx), "prj");
+        assert_eq!(clip.taken_at, Some(1_792_091_949));
+        assert_eq!(clip.tz_offset_secs, None);
+        let p = probe(
+            r#""creation_time":"2026-10-15T19:19:09.000000Z","com.apple.quicktime.creationdate":"2026-10-14T13:30:00+0900""#,
+        );
+        fill_video(&mut clip, Some(&p), Some(&idx), "prj");
+        assert_eq!(clip.taken_at, Some(1_791_952_200));
+        assert_eq!(clip.tz_offset_secs, Some(9 * 3600));
+        // A probe with no date at all falls to the library.
+        fill_video(&mut clip, Some(&probe("")), Some(&idx), "prj");
+        assert_eq!(clip.taken_at, Some(1_793_066_738));
     }
 
     #[test]

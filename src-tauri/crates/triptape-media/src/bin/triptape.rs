@@ -7,7 +7,7 @@
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
 //!                [--solo REF...] [--unsolo REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
-//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--itinerary itinerary.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
 //! triptape cache stats|clear [--segment-cache DIR]
 //! triptape pick --db trip.db --out /path/to/new-folder [--count 800] [--project ID] [--stills-only]
@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use triptape_ai_local::local::{LocalModels, ModelPaths};
-use triptape_core::plan::PlanEdits;
+use triptape_core::plan::{MoveRejection, PlanEdits};
 use triptape_core::{
     asset_ref, cluster,
     db::{Db, EditedPlan},
@@ -156,7 +156,10 @@ fn tool_bin(flags: &HashMap<String, String>, tool: Tool) -> String {
 }
 
 fn scan_cmd(flags: &HashMap<String, String>) {
-    let folder = need(flags, "folder");
+    let raw_folder = need(flags, "folder");
+    // Canonical, so `./japan`, `japan/`, and symlinked paths all find the
+    // same project (the desktop app stores canonical folders too).
+    let folder = std::fs::canonicalize(&raw_folder).unwrap_or_else(|e| die("open folder", e));
     let db_path = need(flags, "db");
     let cache = need(flags, "cache");
     let ffmpeg = tool_bin(flags, Tool::Ffmpeg);
@@ -190,13 +193,54 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         eprintln!("{note}");
     }
 
+    // Plan flags are checked before any write, so a typo never leaves a
+    // half-refreshed project behind.
+    let (overrides, length) = plan_flags(flags);
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
     let name = folder
         .file_name()
         .map_or_else(|| "trip".into(), |s| s.to_string_lossy());
-    let project = db
-        .create_project(&name, &folder.to_string_lossy())
-        .unwrap_or_else(|e| die("create project", e));
+    // A folder scanned before is refreshed in place: same project, same
+    // asset id for every file still there, so Story edits (exclusions,
+    // captions) keep pointing at the right photos.
+    let folder_key = folder.to_string_lossy().into_owned();
+    // Older CLI scans stored the folder exactly as typed. Only an absolute
+    // spelling names the same folder for sure (a relative `photos` could
+    // be any trip's); a project found that way moves to the canonical path.
+    let raw_key = raw_folder.to_string_lossy().into_owned();
+    let mut relocate = false;
+    let existing = db
+        .project_for_folder(&folder_key)
+        .and_then(|found| match found {
+            None if raw_key != folder_key && raw_folder.is_absolute() => {
+                let legacy = db.project_for_folder(&raw_key)?;
+                relocate = legacy.is_some();
+                Ok(legacy)
+            }
+            found => Ok(found),
+        })
+        .unwrap_or_else(|e| die("find project", e));
+    let (project, rescan) = match existing {
+        Some(p) => {
+            eprintln!("rescanning project {} in place", p.id);
+            (p, true)
+        }
+        None => (
+            db.create_project(&name, &folder_key)
+                .unwrap_or_else(|e| die("create project", e)),
+            false,
+        ),
+    };
+    let mut ids = AssetIds::new(
+        &project.id,
+        rescan,
+        db.list_assets(&project.id)
+            .unwrap_or_else(|e| die("list assets", e))
+            .into_iter()
+            // Canonical like the scan's paths, so assets stored under a
+            // raw folder path keep their ids.
+            .map(|a| (std::fs::canonicalize(&a.path).unwrap_or(a.path), a.id)),
+    );
 
     let result = scan::scan_folder(&folder).unwrap_or_else(|e| die("scan", e));
     // Captions/people from an `osxphotos export` without sidecars (loaded
@@ -209,7 +253,7 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     let mut probes: HashMap<PathBuf, metadata::FfprobeOutput> = HashMap::new();
     let mut assets: Vec<Asset> = vec![];
 
-    for (i, f) in result.files.iter().enumerate() {
+    for f in &result.files {
         let content_hash = hash::blake3_file(&f.path).ok();
         if scan::VIDEO_EXTS.contains(&f.ext.as_str()) {
             let probe = metadata::probe_video(&ffprobe, &f.path).ok();
@@ -223,8 +267,7 @@ fn scan_cmd(flags: &HashMap<String, String>) {
                 probes.insert(f.path.clone(), p);
             }
             assets.push(base_asset(
-                &project.id,
-                i,
+                ids.id_for(&f.path),
                 f,
                 AssetKind::Video,
                 content_hash,
@@ -235,8 +278,7 @@ fn scan_cmd(flags: &HashMap<String, String>) {
                 content_id: None, // still UUIDs need container tags; basename fallback covers CLI
             });
             assets.push(base_asset(
-                &project.id,
-                i,
+                ids.id_for(&f.path),
                 f,
                 AssetKind::Photo,
                 content_hash,
@@ -384,6 +426,13 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     // in the photo's local time, not UTC.
     metadata::fill_tz_offsets(&mut final_assets);
 
+    // The same file in the library twice: its copies share their caption,
+    // people tags and score, and an edit takes what it lacks from its
+    // original, so the one kept below carries all of them. Before
+    // clustering, so an edit that lost its date sits in its original's
+    // chapter.
+    cluster::share_identical_metadata(&mut final_assets, &mut scores);
+
     // Cluster + near-dupe hero picks.
     // Cluster ids restart per scan; prefix with the project id so they stay
     // unique across projects sharing one database.
@@ -391,9 +440,6 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     for c in &mut clusters {
         c.id = format!("{}_{}", project.id, c.id);
     }
-    // The same file in the library twice: its copies share their caption,
-    // people tags and score, so the one kept below carries all of them.
-    cluster::share_identical_metadata(&mut final_assets, &mut scores);
     let groups = cluster::collapse_near_dupes(&final_assets, &scores);
     let best: HashSet<String> = groups.iter().map(|g| g.best_id.clone()).collect();
     // Non-best near-dupe members stay in the DB but are kept out of the plan.
@@ -405,8 +451,41 @@ fn scan_cmd(flags: &HashMap<String, String>) {
         a.score = scores.get(&a.id).cloned();
     }
 
-    // Persist assets, clusters, and links in one transaction.
+    let cluster_of = cluster::chapter_labels(&clusters);
+    let plan_assets: Vec<Asset> = final_assets
+        .iter()
+        .filter(|a| !suppressed.contains(&a.id))
+        .cloned()
+        .collect();
+    let p = planmod::build_plan_with_length(&plan_assets, &cluster_of, &scores, &overrides, length);
+    let elig = planmod::plan_eligibility(
+        plan_assets.len(),
+        plan_assets
+            .iter()
+            .filter(|a| a.kind != AssetKind::Video)
+            .count(),
+        clusters.len(),
+    );
+
+    // Persist assets, clusters, links and the plan in one transaction: a
+    // failure leaves the project exactly as it was.
+    let mut plan_id = String::new();
     let persisted = db.in_transaction(|db| {
+        if rescan {
+            // Files gone from the folder leave, unless the walk was partial
+            // (an unreadable folder is not a deleted one); the day clusters
+            // rebuild.
+            db.clear_project_clusters(&project.id)?;
+            if result.errors.is_empty() {
+                let keep: Vec<String> = final_assets.iter().map(|a| a.id.clone()).collect();
+                db.delete_stale_assets(&project.id, &keep)?;
+            }
+            if relocate {
+                db.set_project_folder(&project.id, &folder_key)?;
+            }
+            // Only a committed rescan makes the project latest.
+            db.touch_project(&project.id)?;
+        }
         for a in &final_assets {
             db.upsert_asset(&project.id, a)
                 .map_err(|e| format!("upsert {}: {e}", a.id))?;
@@ -419,6 +498,9 @@ fn scan_cmd(flags: &HashMap<String, String>) {
                     .map_err(|e| format!("link {id} -> {}: {e}", c.id))?;
             }
         }
+        plan_id = db
+            .insert_plan(&project.id, &p, "local")
+            .map_err(|e| format!("insert plan: {e}"))?;
         Ok(())
     });
     if let Err(e) = persisted {
@@ -449,26 +531,6 @@ fn scan_cmd(flags: &HashMap<String, String>) {
             }
         }
     }
-
-    let cluster_of = cluster::chapter_labels(&clusters);
-    let plan_assets: Vec<Asset> = final_assets
-        .iter()
-        .filter(|a| !suppressed.contains(&a.id))
-        .cloned()
-        .collect();
-    let (overrides, length) = plan_flags(flags);
-    let p = planmod::build_plan_with_length(&plan_assets, &cluster_of, &scores, &overrides, length);
-    let elig = planmod::plan_eligibility(
-        plan_assets.len(),
-        plan_assets
-            .iter()
-            .filter(|a| a.kind != AssetKind::Video)
-            .count(),
-        clusters.len(),
-    );
-    let plan_id = db
-        .insert_plan(&project.id, &p, "local")
-        .unwrap_or_else(|e| die("insert plan", e));
 
     println!("project: {}", project.id);
     println!("files: {}", result.files.len());
@@ -511,15 +573,54 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     }
 }
 
+/// Asset ids for one scan: a file the project already holds keeps its id.
+/// A new file in a fresh project takes `{project}_a{n:05}` in walk order;
+/// one added on a rescan takes a never-reused unique id, so a deleted
+/// file's id (and any edit still naming it) can never land on another.
+/// (`assets.id` is database-wide, hence the project prefix.)
+struct AssetIds {
+    project: String,
+    rescan: bool,
+    by_path: HashMap<PathBuf, String>,
+    next: usize,
+}
+
+impl AssetIds {
+    fn new(
+        project_id: &str,
+        rescan: bool,
+        known: impl IntoIterator<Item = (PathBuf, String)>,
+    ) -> Self {
+        Self {
+            project: project_id.to_string(),
+            rescan,
+            by_path: known.into_iter().collect(),
+            next: 0,
+        }
+    }
+
+    fn id_for(&mut self, path: &Path) -> String {
+        if let Some(id) = self.by_path.get(path) {
+            return id.clone();
+        }
+        let id = if self.rescan {
+            format!("{}_{}", self.project, triptape_core::db::new_id("a"))
+        } else {
+            self.next += 1;
+            format!("{}_a{:05}", self.project, self.next - 1)
+        };
+        self.by_path.insert(path.to_path_buf(), id.clone());
+        id
+    }
+}
+
 fn base_asset(
-    project_id: &str,
-    i: usize,
+    id: String,
     f: &scan::ScannedFile,
     kind: AssetKind,
     content_hash: Option<String>,
 ) -> Asset {
-    // Scan-local index prefixed by project id: `assets.id` is database-wide.
-    let mut a = Asset::new(format!("{project_id}_a{i:05}"), f.path.clone(), kind);
+    let mut a = Asset::new(id, f.path.clone(), kind);
     a.size_bytes = f.size_bytes;
     a.mtime = f.mtime_secs;
     a.content_hash = content_hash;
@@ -757,6 +858,9 @@ fn export_cmd(flags: &HashMap<String, String>) {
     let keep_ambience = flags.get("keep-ambience").is_some_and(|v| v != "false");
     // Live Photos move inside hero collages unless switched off.
     let live_collages = !flags.get("no-live-collages").is_some_and(|v| v != "false");
+    // The route map after the title is off unless asked for; the closing
+    // recap always plays.
+    let opening_map = flags.get("opening-map").is_some_and(|v| v != "false");
     // Hero segments rendered at once (default: cores / 4, memory permitting).
     let jobs = flags.get("jobs").map(|v| match v.parse::<usize>() {
         Ok(n) if n >= 1 => n,
@@ -787,6 +891,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             music_paths: music,
             keep_ambience,
             live_collages,
+            opening_map,
             only,
             resolution,
             jobs,
@@ -930,7 +1035,8 @@ fn cache_cmd(sub: &str, flags: &HashMap<String, String>) {
 /// Parsed `edit` arguments. `--include`, `--exclude`, `--uninclude`,
 /// `--unexclude`, `--solo`, `--unsolo` and `--unjoin` each take one or more
 /// asset references (id, file name or path) and may repeat; `--join` takes
-/// exactly two and may repeat.
+/// exactly two and may repeat. `--move REF` is followed by `--after REF` or
+/// `--before REF`; `--unmove` takes one or more references.
 #[derive(Debug, Default, PartialEq)]
 struct EditArgs {
     db: Option<PathBuf>,
@@ -946,10 +1052,16 @@ struct EditArgs {
     unjoin: Vec<String>,
     /// (asset, caption); an empty caption clears the override.
     caption: Vec<(String, String)>,
+    /// (asset, anchor, after): play the asset right after/before the anchor.
+    moves: Vec<(String, String, bool)>,
+    unmove: Vec<String>,
 }
+
+const MOVE_USAGE: &str = "--move wants --after REF or --before REF";
 
 fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
     let mut out = EditArgs::default();
+    let mut pending_move: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i]
@@ -983,7 +1095,20 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     )
                 }
             },
-            "include" | "exclude" | "uninclude" | "unexclude" | "solo" | "unsolo" | "unjoin" => {
+            "move" => {
+                if pending_move.is_some() {
+                    return Err(MOVE_USAGE.to_string());
+                }
+                pending_move = Some(single(values)?);
+            }
+            "after" | "before" => {
+                let asset = pending_move
+                    .take()
+                    .ok_or_else(|| format!("--{flag} follows --move REF"))?;
+                out.moves.push((asset, single(values)?, flag == "after"));
+            }
+            "include" | "exclude" | "uninclude" | "unexclude" | "solo" | "unsolo" | "unjoin"
+            | "unmove" => {
                 if values.is_empty() {
                     return Err(format!("--{flag} wants at least one asset"));
                 }
@@ -994,11 +1119,15 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     "unexclude" => out.unexclude.extend(values),
                     "solo" => out.solo.extend(values),
                     "unsolo" => out.unsolo.extend(values),
+                    "unmove" => out.unmove.extend(values),
                     _ => out.unjoin.extend(values),
                 }
             }
             other => return Err(format!("unknown flag --{other}")),
         }
+    }
+    if pending_move.is_some() {
+        return Err(MOVE_USAGE.to_string());
     }
     Ok(out)
 }
@@ -1034,6 +1163,11 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
         edits.place_overrides.len(),
         edits.caption_overrides.len()
     );
+    println!("moves: {}", edits.moves.len());
+    for m in &edits.moves {
+        let side = if m.after { "after" } else { "before" };
+        println!("  {} {side} {}", show(&m.asset), show(&m.anchor));
+    }
     let collage = &edits.collage;
     println!("on their own: {}", collage.solo.len());
     for id in &collage.solo {
@@ -1085,8 +1219,20 @@ fn edit_cmd(args: &[String]) {
         .unwrap_or_else(|e| die("plan", e))
         .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
     let by_id: HashMap<&str, &Asset> = ep.assets.iter().map(|x| (x.id.as_str(), x)).collect();
+    // A copy the scan left out stands for its byte-identical twin in the
+    // plan, so either file name works.
     let resolve_one = |q: &str| -> &Asset {
-        asset_ref::resolve_asset(&ep.assets, q).unwrap_or_else(|e| die("edit", e))
+        let named = asset_ref::resolve_asset(&ep.assets, q).unwrap_or_else(|e| die("edit", e));
+        let twin =
+            asset_ref::planned_twin(&ep.assets, named, |id| ep.base.chapter_of(id).is_some());
+        if twin.id != named.id {
+            println!(
+                "{} is an identical copy of {}, which is in the plan: using it",
+                asset_label(named),
+                asset_label(twin)
+            );
+        }
+        twin
     };
     let resolve =
         |refs: &[String]| -> Vec<&Asset> { refs.iter().map(|q| resolve_one(q)).collect() };
@@ -1140,14 +1286,22 @@ fn edit_cmd(args: &[String]) {
         .iter()
         .map(|(q, text)| (resolve_one(q), text))
         .collect();
+    let moves: Vec<(&Asset, &Asset, bool)> = a
+        .moves
+        .iter()
+        .map(|(x, y, after)| (resolve_one(x), resolve_one(y), *after))
+        .collect();
+    let unmoves = resolve(&a.unmove);
     let changed = ops.iter().any(|(assets, ..)| !assets.is_empty())
         || !unjoins.is_empty()
         || !joins.is_empty()
-        || !captions.is_empty();
+        || !captions.is_empty()
+        || !moves.is_empty()
+        || !unmoves.is_empty();
     if !changed && !a.list {
         die(
             "edit",
-            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin/--caption or --list",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin/--caption/--move/--unmove or --list",
         );
     }
     let mut edits = ep.edits.clone();
@@ -1169,11 +1323,44 @@ fn edit_cmd(args: &[String]) {
         );
         println!("caption: {} = {text:?}", asset_label(asset));
     }
+    for asset in &unmoves {
+        if edits.unmove(&asset.id) {
+            println!("unmove: {}", asset_label(asset));
+        } else {
+            println!("unmove: {} had no move", asset_label(asset));
+        }
+    }
     // Each solo photo must be in the film; each join must leave the two in
     // one collage of the film (neighbouring collage photos of one day).
     // Collage edits never change which photos are in the film.
     let edited = |edits: &PlanEdits| planmod::apply_edits(&ep.base, &ep.assets, edits);
     let mut plan = edited(&edits);
+    // A move places one film pick next to another of the same day, in the
+    // film only (pins above count, so --include X --move X works).
+    for (x, y, after) in &moves {
+        match planmod::move_rejection(&plan.hero, x, y) {
+            None => {}
+            Some(MoveRejection::NotInFilm { anchor }) => {
+                let a = if anchor { y } else { x };
+                die("edit", format!("{} is not in the film", asset_label(a)));
+            }
+            Some(MoveRejection::SameShot) => die("edit", "a shot can't move next to itself"),
+            Some(MoveRejection::OtherDay) => die(
+                "edit",
+                format!(
+                    "{} and {} are on different days: a shot moves only within its day",
+                    asset_label(x),
+                    asset_label(y)
+                ),
+            ),
+        }
+        edits.set_move(x.id.clone(), y.id.clone(), *after);
+        let side = if *after { "after" } else { "before" };
+        println!("move: {} {side} {}", asset_label(x), asset_label(y));
+    }
+    if !moves.is_empty() {
+        plan = edited(&edits);
+    }
     for asset in &solos {
         if !plan.hero.iter().any(|e| e.asset_id == asset.id) {
             die("edit", format!("{} is not in the film", asset_label(asset)));
@@ -1218,12 +1405,38 @@ fn edit_cmd(args: &[String]) {
         return;
     }
     // Show where each included shot landed in the film.
-    let hero = plan.hero;
+    let hero = &plan.hero;
     let label_at = |j: Option<usize>| {
         j.and_then(|j| hero.get(j))
             .and_then(|e| by_id.get(e.asset_id.as_str()))
             .map_or_else(|| "(start/end)".to_string(), |x| asset_label(x))
     };
+    let chapter_index = planmod::chapter_index(&plan);
+    let chapter_of = |id: &str| chapter_index.get(id);
+    for (asset, ..) in &moves {
+        let Some(i) = hero.iter().position(|e| e.asset_id == asset.id) else {
+            continue;
+        };
+        let last = hero
+            .iter()
+            .rposition(|e| e.asset_id == asset.id)
+            .unwrap_or(i);
+        let (prev, next) = (i.checked_sub(1).map(|j| &hero[j]), hero.get(last + 1));
+        println!(
+            "film: {} after {} before {}",
+            asset_label(asset),
+            label_at(i.checked_sub(1)),
+            label_at(Some(last + 1))
+        );
+        if let (Some(p), Some(n)) = (prev, next) {
+            let (cp, cn) = (chapter_of(&p.asset_id), chapter_of(&n.asset_id));
+            if cp == cn && cp != chapter_of(&asset.id) {
+                println!(
+                    "note: it plays inside another chapter, whose place is shown again after it"
+                );
+            }
+        }
+    }
     for asset in &ops[3].0 {
         match hero.iter().position(|e| e.asset_id == asset.id) {
             Some(i) => println!(
@@ -1503,6 +1716,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_rescan_keeps_each_files_id_and_never_reuses_one() {
+        let known = [
+            (PathBuf::from("/t/IMG_1.HEIC"), "prj_x_a00000".to_string()),
+            (PathBuf::from("/t/IMG_3.HEIC"), "prj_x_a00002".to_string()),
+        ];
+        let mut ids = AssetIds::new("prj_x", true, known);
+        // IMG_2 left the folder: IMG_3 keeps its id, nothing shifts.
+        assert_eq!(ids.id_for(Path::new("/t/IMG_3.HEIC")), "prj_x_a00002");
+        assert_eq!(ids.id_for(Path::new("/t/IMG_1.HEIC")), "prj_x_a00000");
+        // A new file never takes a number a deleted file once had.
+        let new = ids.id_for(Path::new("/t/IMG_9.HEIC"));
+        assert!(new.starts_with("prj_x_a_") && new.len() > 20, "{new}");
+        assert_eq!(ids.id_for(Path::new("/t/IMG_9.HEIC")), new);
+        // A fresh project numbers in walk order.
+        let mut fresh = AssetIds::new("prj_y", false, []);
+        assert_eq!(fresh.id_for(Path::new("/t/a.jpg")), "prj_y_a00000");
+        assert_eq!(fresh.id_for(Path::new("/t/b.jpg")), "prj_y_a00001");
+    }
+
+    #[test]
     fn music_flag_repeats_and_semicolons() {
         let mut f = HashMap::new();
         insert_flag(&mut f, "music".into(), "A.wav".into());
@@ -1607,6 +1840,35 @@ mod tests {
         assert!(parse_edit_args(&args("--join a")).is_err());
         assert!(parse_edit_args(&args("--join a b c")).is_err());
         assert!(parse_edit_args(&args("--solo")).is_err());
+    }
+
+    #[test]
+    fn edit_args_take_moves() {
+        let a = parse_edit_args(&args(
+            "--db x.db --move IMG_1620.HEIC --before IMG_1613.HEIC --move b --after c --unmove d e",
+        ))
+        .unwrap();
+        assert_eq!(
+            a.moves,
+            vec![
+                (
+                    "IMG_1620.HEIC".to_string(),
+                    "IMG_1613.HEIC".to_string(),
+                    false
+                ),
+                ("b".to_string(), "c".to_string(), true),
+            ]
+        );
+        assert_eq!(a.unmove, vec!["d".to_string(), "e".to_string()]);
+        for bad in [
+            "--move a",
+            "--after b",
+            "--move a --move b --after c",
+            "--move a b --after c",
+            "--unmove",
+        ] {
+            assert!(parse_edit_args(&args(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]
