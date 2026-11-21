@@ -304,7 +304,28 @@ fn finish(accs: Vec<Acc>) -> Vec<Cluster> {
 /// clusters into a same-day neighbour ([`MERGE_MAX_ASSETS`]). On a split
 /// day each party's stretch gets clusters of its own.
 pub fn cluster_assets(assets: &[Asset]) -> Vec<Cluster> {
-    let ordered = story_tracks(assets);
+    cluster_tracks(story_tracks(assets))
+}
+
+/// Clusters as if no day were split (capture order, one shared timeline),
+/// with tiny clusters left unmerged. A split day's chapters are fewer and
+/// larger than these: the planner weighs a split day by them so it keeps
+/// the share of the film it had before it was told party by party.
+pub fn cluster_by_capture(assets: &[Asset]) -> Vec<Cluster> {
+    let mut ordered: Vec<&Asset> = assets.iter().collect();
+    ordered.sort_by(|a, b| story_key(a).cmp(&story_key(b)));
+    finish(split_clusters(
+        ordered.into_iter().map(|a| (a, Track::Shared)).collect(),
+    ))
+}
+
+fn cluster_tracks(ordered: Vec<(&Asset, Track)>) -> Vec<Cluster> {
+    finish(merge_small(split_clusters(ordered)))
+}
+
+/// Start a new cluster on day change, time gap, place drift or party
+/// handover, before any merging.
+fn split_clusters(ordered: Vec<(&Asset, Track)>) -> Vec<Acc> {
     let outliers = gps_outliers_in(&ordered);
 
     let mut clusters: Vec<Acc> = vec![];
@@ -329,7 +350,7 @@ pub fn cluster_assets(assets: &[Asset]) -> Vec<Cluster> {
         acc.push(&a.id, a.taken_at, gps, track);
     }
     acc.flush(&mut clusters, String::new());
-    finish(merge_small(clusters))
+    clusters
 }
 
 /// One near-dupe stack: members plus the best-shot pick.

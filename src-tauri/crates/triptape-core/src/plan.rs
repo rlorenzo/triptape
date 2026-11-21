@@ -833,12 +833,15 @@ struct HeroBudget {
 
 /// Pick hero entries (given in story order) to fill `budget`.
 ///
-/// Every chapter first gets its best entry (dropping the weakest chapters'
-/// picks only if even those overrun the ceiling). Remaining time is dealt
+/// Every chapter first gets its best entry, one per unit (dropping the
+/// weakest chapters' picks only if even those overrun the ceiling). Remaining time is dealt
 /// out one entry at a time to the chapter with the least estimated screen
 /// time relative to `size^CHAPTER_TIME_EXPONENT`, taking that chapter's
 /// best remaining entry, so big days get more screen time without crowding
-/// out small ones.
+/// out small ones. Where `unit_of` puts a chapter's entries in several
+/// units (a split day's capture-order clusters), the chapter's weight is the
+/// sum over its units instead, so telling a day party by party, in fewer
+/// and larger chapters, does not shrink its share of the film.
 ///
 /// An entry that would overrun the ceiling is skipped and the chapter's
 /// next-best, cheaper entry tried, so the film fills the budget instead of
@@ -853,6 +856,7 @@ struct HeroBudget {
 fn select_hero_by_budget<'a>(
     cands: Vec<PlanEntry>,
     chapter_of: impl Fn(&str) -> &'a str + Copy,
+    unit_of: impl Fn(&str) -> Option<usize>,
     score_of: impl Fn(&PlanEntry) -> f32,
     similar: impl Fn(&str, &str) -> bool,
     pano_secs_of: impl Fn(&str) -> Option<f64> + Copy,
@@ -876,6 +880,20 @@ fn select_hero_by_budget<'a>(
                 .then(x.cmp(&y))
         });
     }
+    // Share weight per chapter: size^exponent, summed over its units.
+    let weight: Vec<f64> = chapters
+        .iter()
+        .map(|(_, m)| {
+            let mut units: HashMap<Option<usize>, usize> = HashMap::new();
+            for &i in m {
+                *units.entry(unit_of(&cands[i].asset_id)).or_default() += 1;
+            }
+            units
+                .values()
+                .map(|&n| (n as f64).powf(CHAPTER_TIME_EXPONENT))
+                .sum()
+        })
+        .collect();
     let mut picked = vec![false; cands.len()];
     let estimate = |picked: &[bool]| {
         estimate_hero_secs(
@@ -891,9 +909,19 @@ fn select_hero_by_budget<'a>(
             budget.cards,
         )
     };
-    // Every chapter's best entry, weakest dropped first if over budget
-    // (the strongest always stays, so the film is never empty).
-    let mut reps: Vec<usize> = chapters.iter().map(|(_, m)| m[0]).collect();
+    // Every chapter's best entry (each unit's, on a split day), weakest
+    // dropped first if over budget (the strongest always stays, so the film
+    // is never empty).
+    let mut reps: Vec<usize> = chapters
+        .iter()
+        .flat_map(|(_, m)| {
+            let mut seen = HashSet::new();
+            m.iter()
+                .copied()
+                .filter(|&i| seen.insert(unit_of(&cands[i].asset_id)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
     for &r in &reps {
         picked[r] = true;
     }
@@ -928,12 +956,9 @@ fn select_hero_by_budget<'a>(
                 .iter()
                 .enumerate()
                 .filter(|(ci, _)| !closed[*ci])
-                .min_by(|(a, (_, ma)), (b, (_, mb))| {
-                    let share =
-                        |ci: usize, n: usize| secs[ci] / (n as f64).powf(CHAPTER_TIME_EXPONENT);
-                    share(*a, ma.len())
-                        .total_cmp(&share(*b, mb.len()))
-                        .then(a.cmp(b))
+                .min_by(|(a, _), (b, _)| {
+                    let share = |ci: usize| secs[ci] / weight[ci];
+                    share(*a).total_cmp(&share(*b)).then(a.cmp(b))
                 })
                 .map(|(ci, _)| ci);
             let Some(ci) = next else { break };
@@ -1638,9 +1663,33 @@ pub fn build_plan_with_length(
     // collages by playback order, and selection keeps candidate order, so
     // every budget check sees the order that will be rendered.
     place_sibling_windows(&mut hero, &by_id, chapter_label);
+    // A split day's capture-order clusters, which keep its share of the
+    // film (see `select_hero_by_budget`); every other day is one unit per
+    // chapter, exactly as before.
+    let split_days: HashSet<String> = tracked
+        .iter()
+        .filter(|(_, t)| *t != crate::party::Track::Shared)
+        .map(|(a, _)| crate::cluster::day_key(a.taken_at, a.tz_offset_secs))
+        .collect();
+    let capture_unit: HashMap<&str, usize> = if split_days.is_empty() {
+        HashMap::new()
+    } else {
+        let split: Vec<Asset> = ordered
+            .iter()
+            .filter(|a| split_days.contains(&crate::cluster::day_key(a.taken_at, a.tz_offset_secs)))
+            .map(|a| (*a).clone())
+            .collect();
+        crate::cluster::cluster_by_capture(&split)
+            .into_iter()
+            .enumerate()
+            .flat_map(|(k, c)| c.asset_ids.into_iter().map(move |id| (id, k)))
+            .filter_map(|(id, k)| Some((*by_id.get_key_value(id.as_str())?.0, k)))
+            .collect()
+    };
     let hero = select_hero_by_budget(
         hero,
         chapter_label,
+        |id| capture_unit.get(id).copied(),
         entry_score,
         similar,
         pano_secs_of,
@@ -3584,6 +3633,7 @@ mod tests {
         select_hero_by_budget(
             cands,
             letter,
+            |_| None,
             score_of,
             similar,
             |_| None,
@@ -3597,6 +3647,54 @@ mod tests {
         .into_iter()
         .map(|e| e.asset_id)
         .collect()
+    }
+
+    /// A split day's chapter keeps the share its capture-order clusters
+    /// had: each unit gets a pick, and the chapter weighs as its units.
+    #[test]
+    fn a_chapter_split_into_units_keeps_their_share() {
+        let ids: Vec<String> = ["a", "b"]
+            .iter()
+            .flat_map(|l| (1..=8).map(move |k| format!("{l}{k}")))
+            .collect();
+        let cands: Vec<PlanEntry> = ids.iter().map(|id| clip_entry(id, 5.0)).collect();
+        // Within each chapter the lower numbers score higher.
+        let score_of = |e: &PlanEntry| 1.0 - e.asset_id[1..].parse::<f32>().unwrap() / 10.0;
+        let run = |unit_of: &dyn Fn(&str) -> Option<usize>| -> Vec<String> {
+            select_hero_by_budget(
+                cands.clone(),
+                letter,
+                unit_of,
+                score_of,
+                |_, _| false,
+                |_| None,
+                |_| false,
+                |_| Some(0),
+                HeroBudget {
+                    ceiling_secs: 60.0,
+                    cards: NO_CARDS,
+                },
+            )
+            .into_iter()
+            .map(|e| e.asset_id)
+            .collect()
+        };
+        let count = |v: &[String], l: &str| v.iter().filter(|id| id.starts_with(l)).count();
+        let plain = run(&|_| None);
+        assert!(!plain.contains(&"a7".to_string()), "{plain:?}");
+        // Chapter a was four capture-order clusters of two.
+        let split = run(&|id: &str| {
+            id.starts_with('a')
+                .then(|| (id[1..].parse::<usize>().unwrap() - 1) / 2)
+        });
+        assert!(
+            count(&split, "a") > count(&plain, "a"),
+            "{plain:?} {split:?}"
+        );
+        assert!(count(&split, "a") > count(&split, "b"), "{split:?}");
+        for unit_rep in ["a1", "a3", "a5", "a7"] {
+            assert!(split.contains(&unit_rep.to_string()), "{split:?}");
+        }
     }
 
     #[test]
@@ -4233,6 +4331,7 @@ mod tests {
             select_hero_by_budget(
                 cands.clone(),
                 letter,
+                |_| None,
                 score_of,
                 |_, _| false,
                 |_| None,
