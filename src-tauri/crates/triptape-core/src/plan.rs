@@ -884,7 +884,8 @@ fn select_hero_by_budget<'a>(
     let weight: Vec<f64> = chapters
         .iter()
         .map(|(_, m)| {
-            let mut units: HashMap<Option<usize>, usize> = HashMap::new();
+            let mut units: std::collections::BTreeMap<Option<usize>, usize> =
+                std::collections::BTreeMap::new();
             for &i in m {
                 *units.entry(unit_of(&cands[i].asset_id)).or_default() += 1;
             }
@@ -1186,6 +1187,33 @@ pub struct FilmMove {
     pub after: bool,
 }
 
+/// Why a film move of `asset` next to `anchor` can't apply to `hero`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveRejection {
+    /// The moving shot (`anchor: false`) or its anchor isn't a film pick.
+    NotInFilm { anchor: bool },
+    /// A shot can't move next to itself.
+    SameShot,
+    /// The two aren't on one capture-local day.
+    OtherDay,
+}
+
+/// Check a film move against `hero` ([`FilmMove`]); `None` when it applies.
+pub fn move_rejection(hero: &[PlanEntry], asset: &Asset, anchor: &Asset) -> Option<MoveRejection> {
+    let in_film = |a: &Asset| hero.iter().any(|e| e.asset_id == a.id);
+    if !in_film(asset) {
+        Some(MoveRejection::NotInFilm { anchor: false })
+    } else if !in_film(anchor) {
+        Some(MoveRejection::NotInFilm { anchor: true })
+    } else if asset.id == anchor.id {
+        Some(MoveRejection::SameShot)
+    } else if !crate::cluster::same_day(asset, anchor) {
+        Some(MoveRejection::OtherDay)
+    } else {
+        None
+    }
+}
+
 /// Apply the user's film moves to `hero` ([`PlanEdits::moves`]).
 ///
 /// A move applies only while both assets are film picks of one capture-
@@ -1233,15 +1261,13 @@ fn apply_moves(
     for i in order {
         let m = &moves[i];
         let (x, y) = (m.asset.as_str(), m.anchor.as_str());
-        let in_film = |id: &str| hero.iter().any(|e| e.asset_id == id);
-        if x == y || dead.contains(x) || dead.contains(y) || !in_film(x) || !in_film(y) {
+        if dead.contains(x) || dead.contains(y) {
             continue;
         }
-        let same_day = by_id
-            .get(x)
-            .zip(by_id.get(y))
-            .is_some_and(|(a, b)| crate::cluster::same_day(a, b));
-        if !same_day {
+        let (Some(a), Some(b)) = (by_id.get(x), by_id.get(y)) else {
+            continue;
+        };
+        if move_rejection(hero, a, b).is_some() {
             continue;
         }
         let moved: Vec<PlanEntry> = hero.iter().filter(|e| e.asset_id == x).cloned().collect();
@@ -1669,23 +1695,18 @@ pub fn build_plan_with_length(
     let split_days: HashSet<String> = tracked
         .iter()
         .filter(|(_, t)| *t != crate::party::Track::Shared)
-        .map(|(a, _)| crate::cluster::day_key(a.taken_at, a.tz_offset_secs))
+        .map(|(a, _)| crate::cluster::day_of(a))
         .collect();
-    let capture_unit: HashMap<&str, usize> = if split_days.is_empty() {
-        HashMap::new()
-    } else {
-        let split: Vec<Asset> = ordered
+    let capture_unit: HashMap<String, usize> = crate::cluster::cluster_by_capture(
+        ordered
             .iter()
-            .filter(|a| split_days.contains(&crate::cluster::day_key(a.taken_at, a.tz_offset_secs)))
-            .map(|a| (*a).clone())
-            .collect();
-        crate::cluster::cluster_by_capture(&split)
-            .into_iter()
-            .enumerate()
-            .flat_map(|(k, c)| c.asset_ids.into_iter().map(move |id| (id, k)))
-            .filter_map(|(id, k)| Some((*by_id.get_key_value(id.as_str())?.0, k)))
-            .collect()
-    };
+            .copied()
+            .filter(|a| split_days.contains(&crate::cluster::day_of(a))),
+    )
+    .into_iter()
+    .enumerate()
+    .flat_map(|(k, c)| c.asset_ids.into_iter().map(move |id| (id, k)))
+    .collect();
     let hero = select_hero_by_budget(
         hero,
         chapter_label,
@@ -1785,17 +1806,9 @@ fn chapters_together<'a, 'c>(
     tracked: &[(&'a Asset, crate::party::Track)],
     chapter_of: impl Fn(&str) -> &'c str,
 ) -> Vec<&'a Asset> {
-    let day = |a: &Asset| crate::cluster::day_key(a.taken_at, a.tz_offset_secs);
+    let day = crate::cluster::day_of;
     let mut out = Vec::with_capacity(tracked.len());
-    let mut i = 0;
-    while i < tracked.len() {
-        let d = day(tracked[i].0);
-        let len = tracked[i..]
-            .iter()
-            .position(|(a, _)| day(a) != d)
-            .unwrap_or(tracked.len() - i);
-        let run = &tracked[i..i + len];
-        i += len;
+    for run in tracked.chunk_by(|(a, _), (b, _)| day(a) == day(b)) {
         if run.iter().all(|(_, t)| *t == crate::party::Track::Shared) {
             out.extend(run.iter().map(|(a, _)| *a));
             continue;
@@ -5189,6 +5202,35 @@ mod tests {
         let mut want = base.clone();
         want.retain(|id| id != "IMG_1502");
         assert_eq!(owned(hero_ids(&apply_edits(&plan, &assets, &edits))), want);
+    }
+
+    #[test]
+    fn move_rejection_names_why_a_move_cant_apply() {
+        let mut assets = split_fixture();
+        let mut next_day = asset("IMG_1600", 1_792_285_200 + 86_400, AssetKind::Photo);
+        next_day.gps = Some((22.282, 114.154));
+        assets.push(next_day);
+        let plan = split_plan(&assets);
+        let get = |id: &str| assets.iter().find(|a| a.id == id).unwrap();
+        let outside = asset("IMG_9999", 1_792_285_200, AssetKind::Photo);
+        let check = |x: &Asset, y: &Asset| move_rejection(&plan.hero, x, y);
+        assert_eq!(check(get("IMG_1505"), get("IMG_1502")), None);
+        assert_eq!(
+            check(&outside, get("IMG_1502")),
+            Some(MoveRejection::NotInFilm { anchor: false })
+        );
+        assert_eq!(
+            check(get("IMG_1502"), &outside),
+            Some(MoveRejection::NotInFilm { anchor: true })
+        );
+        assert_eq!(
+            check(get("IMG_1502"), get("IMG_1502")),
+            Some(MoveRejection::SameShot)
+        );
+        assert_eq!(
+            check(get("IMG_1600"), get("IMG_1502")),
+            Some(MoveRejection::OtherDay)
+        );
     }
 
     #[test]

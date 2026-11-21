@@ -52,11 +52,15 @@ pub fn day_key(taken_at: Option<i64>, tz_offset_secs: Option<i32>) -> String {
         .unwrap_or_else(|| "unknown-date".to_string())
 }
 
+/// An asset's capture-local day ([`day_key`]).
+pub fn day_of(a: &Asset) -> String {
+    day_key(a.taken_at, a.tz_offset_secs)
+}
+
 /// Whether two assets share a capture-local day ([`day_key`]); an unknown
 /// date matches nothing.
 pub fn same_day(a: &Asset, b: &Asset) -> bool {
-    a.taken_at.is_some()
-        && day_key(a.taken_at, a.tz_offset_secs) == day_key(b.taken_at, b.tz_offset_secs)
+    a.taken_at.is_some() && day_of(a) == day_of(b)
 }
 
 /// Capture-time sort key: capture time (unknown last), then id. This is
@@ -286,8 +290,8 @@ pub fn cluster_assets(assets: &[Asset]) -> Vec<Cluster> {
 /// with tiny clusters left unmerged. A split day's chapters are fewer and
 /// larger than these: the planner weighs a split day by them so it keeps
 /// the share of the film it had before it was told party by party.
-pub fn cluster_by_capture(assets: &[Asset]) -> Vec<Cluster> {
-    let mut ordered: Vec<&Asset> = assets.iter().collect();
+pub fn cluster_by_capture<'a>(assets: impl IntoIterator<Item = &'a Asset>) -> Vec<Cluster> {
+    let mut ordered: Vec<&Asset> = assets.into_iter().collect();
     ordered.sort_by(|a, b| story_key(a).cmp(&story_key(b)));
     finish(split_clusters(
         ordered.into_iter().map(|a| (a, Track::Shared)).collect(),
@@ -306,7 +310,7 @@ fn split_clusters(ordered: Vec<(&Asset, Track)>) -> Vec<Acc> {
     let mut clusters: Vec<Acc> = vec![];
     let mut acc = Acc::default();
     for (a, track) in ordered {
-        let day = day_key(a.taken_at, a.tz_offset_secs);
+        let day = day_of(a);
         let gps = a.gps.filter(|_| !outliers.contains(&a.id));
         if acc.ids.is_empty() {
             acc.day = day;

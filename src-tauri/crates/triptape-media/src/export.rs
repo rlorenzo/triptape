@@ -749,7 +749,12 @@ fn export_inner(
         }
         // The film's story order (stable, so ties keep db order).
         let story_pos = book_story_positions(plan, assets);
-        book_photos.sort_by_key(|p| story_pos.get(p.asset_id.as_str()).copied());
+        book_photos.sort_by_key(|p| {
+            story_pos
+                .get(p.asset_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
         let book_dir = out_dir.join("book");
         let staged_book = stage.join("book");
         // Day-marker titles: day once, with the location.

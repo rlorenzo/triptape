@@ -35,7 +35,7 @@
 //!    The primary stream is the one holding the most user captions (ties:
 //!    most files): the owner's phone.
 
-use crate::cluster::{day_key, speed_jump, story_key};
+use crate::cluster::{day_of, same_day, speed_jump, story_key};
 use crate::geo::haversine_m;
 use crate::plan::has_caption;
 use crate::types::Asset;
@@ -321,10 +321,11 @@ fn position(track: &[Fix], t: i64) -> Option<(f64, f64)> {
     if let (Some(p), Some(n)) = (prev, next) {
         if n.t - p.t <= MATCH_BRACKET_SECS {
             let f = (t - p.t) as f64 / (n.t - p.t) as f64;
-            return Some((
-                p.gps.0 + f * (n.gps.0 - p.gps.0),
-                p.gps.1 + f * (n.gps.1 - p.gps.1),
-            ));
+            // Longitude the short way round, so a crossing of ±180° stays
+            // near it instead of swinging through 0°.
+            let dlon = (n.gps.1 - p.gps.1 + 540.0).rem_euclid(360.0) - 180.0;
+            let lon = (p.gps.1 + f * dlon + 540.0).rem_euclid(360.0) - 180.0;
+            return Some((p.gps.0 + f * (n.gps.0 - p.gps.0), lon));
         }
     }
     [prev, next]
@@ -457,28 +458,21 @@ pub fn story_layout(assets: &[Asset]) -> StoryLayout {
         primary,
     };
     // Runs of one capture-local day (undated assets sort last, untouched).
-    let mut i = 0;
-    while i < timeline.len() {
-        let a = &assets[timeline[i]];
-        if a.taken_at.is_none() {
-            layout.order.extend(&timeline[i..]);
-            layout
-                .tracks
-                .extend(std::iter::repeat_n(Track::Shared, timeline.len() - i));
-            break;
-        }
-        let day = day_key(a.taken_at, a.tz_offset_secs);
-        let mut j = i + 1;
-        while j < timeline.len() && {
-            let b = &assets[timeline[j]];
-            b.taken_at.is_some() && day_key(b.taken_at, b.tz_offset_secs) == day
-        } {
-            j += 1;
-        }
-        lay_out_day(assets, &timeline[i..j], day, &mut layout);
-        i = j;
+    let dated = timeline.partition_point(|&x| assets[x].taken_at.is_some());
+    for run in timeline[..dated].chunk_by(|&x, &y| same_day(&assets[x], &assets[y])) {
+        lay_out_day(assets, run, day_of(&assets[run[0]]), &mut layout);
     }
+    layout.push_shared(&timeline[dated..]);
     layout
+}
+
+impl StoryLayout {
+    /// Append `run` as told by the whole group.
+    fn push_shared(&mut self, run: &[usize]) {
+        self.order.extend(run);
+        self.tracks
+            .extend(std::iter::repeat_n(Track::Shared, run.len()));
+    }
 }
 
 /// A party's shot in a split stretch: capture time, GPS, party turn.
@@ -487,15 +481,9 @@ type PartyShot = (i64, Option<(f64, f64)>, u32);
 /// Append one day's run (time order) to `layout`, split party by party
 /// where the parties were apart.
 fn lay_out_day(assets: &[Asset], run: &[usize], day: String, layout: &mut StoryLayout) {
-    let shared = |layout: &mut StoryLayout| {
-        layout.order.extend(run);
-        layout
-            .tracks
-            .extend(std::iter::repeat_n(Track::Shared, run.len()));
-    };
     let tracks = day_tracks(assets, run, &layout.streams);
     if tracks.len() < 2 {
-        return shared(layout);
+        return layout.push_shared(run);
     }
     let ids: Vec<u32> = tracks.keys().copied().collect();
     let mut obs: BTreeMap<(u32, u32), Vec<Obs>> = BTreeMap::new();
@@ -508,7 +496,7 @@ fn lay_out_day(assets: &[Asset], run: &[usize], day: String, layout: &mut StoryL
         }
     }
     if apart.is_empty() {
-        return shared(layout);
+        return layout.push_shared(run);
     }
     // Split stretches: overlapping apart runs merged.
     let mut spans: Vec<(i64, i64)> = apart.iter().map(|a| (a.start, a.end)).collect();
@@ -1043,5 +1031,15 @@ mod tests {
                 assert_eq!(layout.order, plain, "seed {seed}");
             }
         }
+    }
+
+    #[test]
+    fn positions_interpolate_across_the_antimeridian() {
+        let fix = |t, lon| Fix { t, gps: (0.0, lon) };
+        let track = [fix(0, 179.0), fix(100, -179.0)];
+        let (_, lon) = position(&track, 50).unwrap();
+        assert!(lon.abs() > 179.9, "{lon}");
+        let (_, lon) = position(&[fix(0, 10.0), fix(100, 20.0)], 50).unwrap();
+        assert!((lon - 15.0).abs() < 1e-9, "{lon}");
     }
 }

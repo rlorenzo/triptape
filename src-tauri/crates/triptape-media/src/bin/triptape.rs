@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use triptape_ai_local::local::{LocalModels, ModelPaths};
-use triptape_core::plan::PlanEdits;
+use triptape_core::plan::{MoveRejection, PlanEdits};
 use triptape_core::{
     asset_ref, cluster,
     db::{Db, EditedPlan},
@@ -1212,24 +1212,21 @@ fn edit_cmd(args: &[String]) {
     // A move places one film pick next to another of the same day, in the
     // film only (pins above count, so --include X --move X works).
     for (x, y, after) in &moves {
-        let in_film = |a: &Asset| plan.hero.iter().any(|e| e.asset_id == a.id);
-        for asset in [x, y] {
-            if !in_film(asset) {
-                die("edit", format!("{} is not in the film", asset_label(asset)));
+        match planmod::move_rejection(&plan.hero, x, y) {
+            None => {}
+            Some(MoveRejection::NotInFilm { anchor }) => {
+                let a = if anchor { y } else { x };
+                die("edit", format!("{} is not in the film", asset_label(a)));
             }
-        }
-        if x.id == y.id {
-            die("edit", "a shot can't move next to itself");
-        }
-        if !cluster::same_day(x, y) {
-            die(
+            Some(MoveRejection::SameShot) => die("edit", "a shot can't move next to itself"),
+            Some(MoveRejection::OtherDay) => die(
                 "edit",
                 format!(
                     "{} and {} are on different days: a shot moves only within its day",
                     asset_label(x),
                     asset_label(y)
                 ),
-            );
+            ),
         }
         edits.set_move(x.id.clone(), y.id.clone(), *after);
         let side = if *after { "after" } else { "before" };
@@ -1282,17 +1279,14 @@ fn edit_cmd(args: &[String]) {
         return;
     }
     // Show where each included shot landed in the film.
-    let hero = plan.hero;
+    let hero = &plan.hero;
     let label_at = |j: Option<usize>| {
         j.and_then(|j| hero.get(j))
             .and_then(|e| by_id.get(e.asset_id.as_str()))
             .map_or_else(|| "(start/end)".to_string(), |x| asset_label(x))
     };
-    let chapter_of = |id: &str| {
-        plan.chapters
-            .iter()
-            .position(|c| c.asset_ids.iter().any(|a| a == id))
-    };
+    let chapter_index = planmod::chapter_index(&plan);
+    let chapter_of = |id: &str| chapter_index.get(id);
     for (asset, ..) in &moves {
         let Some(i) = hero.iter().position(|e| e.asset_id == asset.id) else {
             continue;
