@@ -987,14 +987,26 @@ impl Db {
         let edits = self.get_plan_edits(&project_id)?;
         let assets = self.list_assets(&project_id)?;
         let relabelled = itinerary.map(|i| crate::itinerary::apply_itinerary(&base, &assets, i));
-        let mut edited =
-            crate::plan::apply_edits(relabelled.as_ref().unwrap_or(&base), &assets, &edits);
+        let source = relabelled.as_ref().unwrap_or(&base);
+        let mut edited = crate::plan::apply_edits(source, &assets, &edits);
         if let Some(itin) = itinerary {
-            // A chapter the user renamed keeps their name in the film too.
+            // A chapter the user renamed keeps their name in the film too,
+            // even when the asset keying the rename was later removed: the
+            // rename is matched before exclusions, as in `apply_edits`.
+            let renamed_members: std::collections::HashSet<&str> = source
+                .chapters
+                .iter()
+                .filter(|ch| {
+                    ch.asset_ids
+                        .iter()
+                        .any(|id| edits.place_overrides.contains_key(id))
+                })
+                .flat_map(|ch| ch.asset_ids.iter().map(String::as_str))
+                .collect();
             let renamed = |ch: &crate::types::Chapter| {
                 ch.asset_ids
                     .iter()
-                    .any(|id| edits.place_overrides.contains_key(id))
+                    .any(|id| renamed_members.contains(id.as_str()))
             };
             crate::itinerary::name_film_chapters(&mut edited, &assets, itin, renamed);
         }

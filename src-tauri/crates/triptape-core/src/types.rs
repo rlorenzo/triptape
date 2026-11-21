@@ -220,6 +220,14 @@ pub struct Chapter {
     pub film_place: Option<String>,
 }
 
+impl Chapter {
+    /// The place the film names for this chapter: [`Self::film_place`]
+    /// when set, else [`Self::place`].
+    pub fn film_heading_place(&self) -> Option<&str> {
+        self.film_place.as_deref().or(self.place.as_deref())
+    }
+}
+
 /// Music pick with a human-readable rationale ("vibe fit", never fake emotion).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MusicPick {

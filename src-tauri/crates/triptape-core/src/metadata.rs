@@ -944,6 +944,9 @@ pub fn local_date(taken_at: i64, tz_offset_secs: Option<i32>) -> Option<jiff::ci
 /// offset, so its nearest neighbor is found per candidate offset: the time
 /// is normalized with that offset, then compared to the assets carrying it.
 pub fn fill_tz_offsets(assets: &mut [crate::types::Asset]) {
+    // Correct stray zones first so no neighbor inherits one; again after,
+    // once GPS shots that lacked an offset can serve as anchors.
+    align_stray_offsets(assets);
     let mut known: Vec<(i64, i32)> = assets
         .iter()
         .filter_map(|a| Some((a.taken_at?, a.tz_offset_secs?)))
@@ -1004,7 +1007,8 @@ fn align_stray_offsets(assets: &mut [crate::types::Asset]) {
         let before = i.checked_sub(1).map(|j| anchors[j]);
         let after = anchors.get(i).copied();
         if let (Some((bt, bo)), Some((nt, no))) = (before, after) {
-            let close = t - bt <= STRAY_OFFSET_WINDOW_SECS && nt - t <= STRAY_OFFSET_WINDOW_SECS;
+            let window = STRAY_OFFSET_WINDOW_SECS.unsigned_abs();
+            let close = t.abs_diff(bt) <= window && nt.abs_diff(t) <= window;
             if close && bo == no && bo != own {
                 a.tz_offset_secs = Some(bo);
             }

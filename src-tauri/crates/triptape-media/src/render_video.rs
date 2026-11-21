@@ -611,12 +611,11 @@ pub fn render_hero_video(
     let mut places: Vec<String> = vec![];
     let ships = opts.journey.as_ref().map(|j| j.ships()).unwrap_or_default();
     // A ship is where we slept, not a place we went.
-    let is_ship = |p: &String| triptape_core::itinerary::is_ship_place(&ships, p);
+    let is_ship = |p: &str| triptape_core::itinerary::is_ship_place(&ships, p);
     for c in &plan.chapters {
-        let shown = c.film_place.as_ref().or(c.place.as_ref());
-        if let Some(p) = shown.filter(|p| !is_ship(p)) {
-            if !places.contains(p) {
-                places.push(p.clone());
+        if let Some(p) = c.film_heading_place().filter(|p| !is_ship(p)) {
+            if !places.iter().any(|q| q == p) {
+                places.push(p.to_string());
             }
         }
     }
@@ -3348,6 +3347,37 @@ mod tests {
         let mut blank = legacy;
         blank.title = "  ".into();
         assert_eq!(chapter_lines(&blank), None);
+    }
+
+    #[test]
+    fn the_film_heading_names_the_film_place_and_the_book_keeps_the_chapter_place() {
+        use crate::titlecard::{chapter_book_title, chapter_film_lines};
+        let mut ch = triptape_core::types::Chapter {
+            title: "Osaka Castle".into(),
+            place: Some("Osaka Castle".into()),
+            day_index: Some(3),
+            ..Default::default()
+        };
+        // No film place: the film names the chapter's own place.
+        assert_eq!(
+            chapter_film_lines(&ch),
+            Some(("Day 3".to_string(), Some("Osaka Castle".to_string())))
+        );
+        ch.film_place = Some("Dotonbori".into());
+        assert_eq!(
+            chapter_film_lines(&ch),
+            Some(("Day 3".to_string(), Some("Dotonbori".to_string())))
+        );
+        assert_eq!(chapter_book_title(&ch), "Day 3 \u{2014} Osaka Castle");
+        // Legacy chapters with nothing but a title still fall back to it.
+        let legacy = triptape_core::types::Chapter {
+            title: "Coast".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            chapter_film_lines(&legacy),
+            Some(("Coast".to_string(), None))
+        );
     }
 
     #[test]

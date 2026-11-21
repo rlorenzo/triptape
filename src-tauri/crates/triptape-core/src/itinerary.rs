@@ -610,10 +610,10 @@ pub fn name_film_chapters(
             .copied()
             .filter(|a| shown.contains(a.id.as_str()))
             .collect();
-        let (Some(day), false) = (
-            members.iter().filter_map(|a| asset_day(a)).min(),
-            on_screen.is_empty(),
-        ) else {
+        if on_screen.is_empty() {
+            continue;
+        }
+        let Some(day) = members.iter().filter_map(|a| asset_day(a)).min() else {
             continue;
         };
         let Some(label) = chapter_label(itin, day, &on_screen) else {
@@ -690,11 +690,7 @@ fn chapter_name(
     let named = crate::places::tally(members.iter().filter_map(|a| itin.place_of(a)));
     // A chapter spanning several named places (the Flower Dome, then the
     // Cloud Forest) is named for what holds them, not its biggest part.
-    let several = named
-        .iter()
-        .filter(|(_, c)| *c >= crate::places::PLACE_MIN_SHOTS)
-        .count()
-        > 1;
+    let several = named.iter().filter(|(_, c)| *c >= min_shots.max(1)).count() > 1;
     if let Some((name, _)) =
         crate::places::most_counted(named).filter(|(_, c)| !several && 2 * c >= members.len())
     {
