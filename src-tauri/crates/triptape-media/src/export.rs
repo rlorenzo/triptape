@@ -84,16 +84,6 @@ pub struct ExportReport {
     pub segment_cache: Option<SegmentCacheReport>,
 }
 
-/// The place of the chapter holding `asset_id`, for keepsakes that print or
-/// overlay it (reels, book). The hero film never uses it: its lower third
-/// already names the place.
-fn chapter_place<'a>(plan: &'a Plan, asset_id: &str) -> Option<&'a str> {
-    plan.chapters
-        .iter()
-        .find(|c| c.asset_ids.iter().any(|id| id == asset_id))
-        .and_then(|c| c.place.as_deref())
-}
-
 /// Resolve a plan entry to files from the asset map.
 fn resolve_entry(
     plan: &Plan,
@@ -157,99 +147,10 @@ fn book_chapter_of(plan: &Plan) -> HashMap<&str, usize> {
         .collect()
 }
 
-/// How close a photo must be to an attraction to be captioned with it.
-/// Measured on the Japan to Singapore trip: shots at places visited sat a
-/// median 35-440 m from the attraction's point (Kōtoku-in, DisneySea,
-/// Universal Studios), while places merely walked past or near sat 650-
-/// 1000 m away (Hamarikyu beside Tsukiji, Hibiya, Sensō-ji from the hotel).
-const PHOTO_PLACE_RADIUS_M: f64 = 600.0;
-
-/// Photos a day needs at an attraction before it names any of them: one
-/// shot on the walk to the station is not a visit.
-const PHOTO_PLACE_MIN_SHOTS: usize = 3;
-
-/// Attractions visited per trip day: (day, name) -> photos within
-/// [`PHOTO_PLACE_RADIUS_M`].
-type Visits = HashMap<(u32, String), usize>;
-
-fn photo_attraction(a: &triptape_core::types::Asset) -> Option<String> {
-    triptape_core::geo::attraction_within(a.gps?, PHOTO_PLACE_RADIUS_M)
-}
-
-/// What a photo's own place says, before its chapter's: a place the owner
-/// named in the itinerary, else the attraction it was taken at when that
-/// day's photos show a real visit. Shots the
-/// itinerary puts on board (at sea, or at a dock such as Tokyo's Aomi
-/// terminal beside Miraikan) name no attraction.
-fn photo_place(
-    itin: Option<&triptape_core::itinerary::Itinerary>,
-    visits: &Visits,
-    day: Option<u32>,
-    a: &triptape_core::types::Asset,
-) -> Option<String> {
-    // A place the owner named wins: they were there.
-    if let Some(named) = itin.and_then(|i| i.place_of(a)) {
-        return Some(named.to_string());
-    }
-    let aboard = itin
-        .zip(asset_day(a))
-        .and_then(|(i, d)| i.label_for(d, a.gps))
-        .is_some_and(|l| l.on_ship);
-    if aboard {
-        return None;
-    }
-    photo_attraction(a)
-        .filter(|poi| !itin.is_some_and(|i| i.hides_attraction(poi)))
-        .filter(|poi| {
-            day.and_then(|d| visits.get(&(d, poi.clone())))
-                .is_some_and(|&n| n >= PHOTO_PLACE_MIN_SHOTS)
-        })
-}
-
-/// `ch` retitled when it is on the ship on a cruise's first or last day
-/// (`Carnival Luminosa Embarkation`) or on a port day (the port). Only the
-/// title changes; its photos keep the ship as their place.
-fn boarding_chapter(
-    itin: Option<&triptape_core::itinerary::Itinerary>,
-    assets: &[triptape_core::types::Asset],
-    ch: &triptape_core::types::Chapter,
-) -> triptape_core::types::Chapter {
-    let mut out = ch.clone();
-    let Some(itin) = itin else {
-        return out;
-    };
-    let first_day = assets
-        .iter()
-        .filter(|a| ch.asset_ids.contains(&a.id))
-        .filter_map(asset_day)
-        .min();
-    // Boarding on a cruise's first or last day; else, on a port day, the
-    // port (Hong Kong, not the ship its morning was spent on).
-    let label = first_day.and_then(|d| itin.boarding(d).or_else(|| itin.port_on(d)));
-    if let (Some(label), Some(place)) = (label, &ch.place) {
-        if itin.ships().contains(place) {
-            out.place = Some(label);
-        }
-    }
-    out
-}
-
-/// A book photo's place: its own ([`photo_place`]: Tokyo DisneySea says
-/// more than the itinerary's "Tokyo"), else its chapter's.
-fn book_place(plan: &Plan, chapter: Option<usize>, own_place: Option<String>) -> Option<String> {
-    let place = chapter.and_then(|i| plan.chapters[i].place.clone());
-    own_place
-        .filter(|p| place.as_deref() != Some(p.as_str()))
-        .or(place)
-}
-
-/// A book photo's caption: the user's, else its place.
-fn book_caption(
-    plan: &Plan,
-    place: Option<String>,
-    a: &triptape_core::types::Asset,
-) -> Option<String> {
-    plan.captions.get(&a.id).cloned().or(place)
+/// A book photo's caption: the user's, else its shared place
+/// ([`triptape_core::places::photo_places`]).
+fn book_caption(plan: &Plan, places: &HashMap<String, String>, id: &str) -> Option<String> {
+    plan.captions.get(id).or_else(|| places.get(id)).cloned()
 }
 
 /// Book score added to a sharp, well-exposed panorama: on a grid page it
@@ -575,6 +476,9 @@ fn export_inner(
     let usable = distinct_assets(&plan.hero);
     let photos = assets.iter().filter(|a| a.kind != AssetKind::Video).count();
     let elig = plan_eligibility(usable, photos, plan.chapters.len());
+    // Every keepsake reads its places from here (chapter names are already
+    // in the plan): none names a place on its own.
+    let places = triptape_core::places::photo_places(plan, assets, opts.itinerary.as_ref());
 
     // Validated here too, so a bad cap fails before the free-space check.
     let book_cap = opts
@@ -728,7 +632,7 @@ fn export_inner(
             .map(|mut r| {
                 // A reel names where it is; the user's caption wins.
                 if r.caption.is_none() {
-                    r.caption = chapter_place(plan, &r.entry.asset_id).map(String::from);
+                    r.caption = places.get(&r.entry.asset_id).cloned();
                 }
                 r
             })
@@ -827,16 +731,6 @@ fn export_inner(
             days.clone().min().zip(days.max())
         };
         let trip_start = photo_span.map(|(s, _)| s);
-        let mut visits: Visits = HashMap::new();
-        for a in assets
-            .iter()
-            .filter(|a| a.kind != AssetKind::Video && in_book_flow(&chapter_of, &a.id))
-        {
-            let day = asset_day(a).zip(trip_start).map(|(d, s)| trip_day(d, s));
-            if let (Some(d), Some(poi)) = (day, photo_attraction(a)) {
-                *visits.entry((d, poi)).or_default() += 1;
-            }
-        }
         let mut book_photos: Vec<BookPhoto> = vec![];
         let mut whereabouts: Vec<Whereabouts> = vec![];
         for a in assets
@@ -868,11 +762,7 @@ fn export_inner(
             };
             let chapter = chapter_of.get(a.id.as_str()).copied();
             let day = asset_day(a).zip(trip_start).map(|(d, s)| trip_day(d, s));
-            let place = book_place(
-                plan,
-                chapter,
-                photo_place(opts.itinerary.as_ref(), &visits, day, a),
-            );
+            let place = places.get(&a.id).cloned();
             let itin = opts.itinerary.as_ref();
             let date = asset_day(a);
             whereabouts.push(Whereabouts {
@@ -890,7 +780,7 @@ fn export_inner(
                 path: a.path.clone(),
                 width: w,
                 height: h,
-                caption: book_caption(plan, place.clone(), a),
+                caption: book_caption(plan, &places, &a.id),
                 place,
                 area: itin.and_then(|i| i.place_of(a)).map(String::from),
                 day,
@@ -926,13 +816,7 @@ fn export_inner(
         let chapter_titles: Vec<String> = plan
             .chapters
             .iter()
-            .map(|c| {
-                crate::titlecard::chapter_book_title(&boarding_chapter(
-                    opts.itinerary.as_ref(),
-                    assets,
-                    c,
-                ))
-            })
+            .map(crate::titlecard::chapter_book_title)
             .collect();
         match render_book::render_book(
             &book_photos,
@@ -1120,49 +1004,18 @@ mod tests {
     }
 
     #[test]
-    fn book_captions_prefer_user_text_then_own_place_then_chapter() {
-        use triptape_core::types::{Asset, Chapter};
+    fn book_captions_prefer_user_text_then_the_shared_place() {
         let mut plan = empty_plan();
-        plan.chapters = vec![Chapter {
-            title: "Tokyo".into(),
-            asset_ids: vec!["a".into()],
-            place: Some("Tokyo".into()),
-            day_index: None,
-            date_label: None,
-        }];
-        let disneysea = "Tokyo DisneySea".to_string();
-        let visited: Visits = [((4, disneysea.clone()), 3)].into();
-        let passed: Visits = [((4, disneysea.clone()), 1)].into();
-        let mut a = Asset::new("a", "a.jpg".into(), AssetKind::Photo);
-        let caption = |plan: &Plan, visits: &Visits, a: &Asset| {
-            let place = book_place(plan, Some(0), photo_place(None, visits, Some(4), a));
-            book_caption(plan, place, a)
-        };
-        // No GPS: the chapter place.
-        assert_eq!(caption(&plan, &visited, &a).as_deref(), Some("Tokyo"));
-        // Inside Tokyo DisneySea on a day spent there: the attraction.
-        a.gps = Some((35.6267, 139.8881));
+        let places: HashMap<String, String> =
+            [("a".to_string(), "Tokyo DisneySea".to_string())].into();
         assert_eq!(
-            caption(&plan, &visited, &a).as_deref(),
+            book_caption(&plan, &places, "a").as_deref(),
             Some("Tokyo DisneySea")
         );
-        // One shot there that day is passing by, not a visit.
-        assert_eq!(caption(&plan, &passed, &a).as_deref(), Some("Tokyo"));
-        // A Day 5 shot on the way to the station, 749 m from the National
-        // Museum of Western Art: too far to caption a walk past it.
-        let mut ueno = Asset::new("u", "u.jpg".into(), AssetKind::Photo);
-        ueno.gps = Some((35.71139, 139.78256));
-        assert_eq!(photo_attraction(&ueno), None);
-        // An attraction that is the chapter place already is not repeated.
-        plan.chapters[0].place = Some(disneysea.clone());
-        assert_eq!(
-            caption(&plan, &visited, &a).as_deref(),
-            Some("Tokyo DisneySea")
-        );
-        // The user's caption always wins.
+        assert_eq!(book_caption(&plan, &places, "b"), None);
         plan.captions.insert("a".into(), "Rain all day".into());
         assert_eq!(
-            caption(&plan, &visited, &a).as_deref(),
+            book_caption(&plan, &places, "a").as_deref(),
             Some("Rain all day")
         );
     }
@@ -1201,60 +1054,6 @@ mod tests {
             })
             .collect();
         assert_eq!(port_day_order(&plain), (0..9).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn embarkation_day_reads_as_boarding_and_names_no_terminal_sights() {
-        use triptape_core::types::{Asset, Chapter};
-        let itin = triptape_core::itinerary::Itinerary::from_json(
-            r#"{
-              "stops": [
-                { "id": "tokyo", "label": "Tokyo", "lat": 35.71, "lon": 139.80, "arrive": "2026-10-04", "depart": "2026-10-09" },
-                { "id": "port", "label": "Tokyo", "lat": 35.6177, "lon": 139.771, "arrive": "2026-10-09", "depart": "2026-10-09", "kind": "port" },
-                { "id": "osaka", "label": "Osaka", "lat": 34.656, "lon": 135.4306, "arrive": "2026-10-11", "depart": "2026-10-11", "kind": "port" },
-                { "id": "fukuoka", "label": "Fukuoka", "lat": 33.6036, "lon": 130.4038, "arrive": "2026-10-13", "depart": "2026-10-13", "kind": "port" }
-              ],
-              "legs": [
-                { "from": "tokyo", "to": "port", "mode": "ground" },
-                { "from": "port", "to": "osaka", "mode": "ship", "ship": "Carnival Luminosa" },
-                { "from": "osaka", "to": "fukuoka", "mode": "ship", "ship": "Carnival Luminosa" }
-              ]
-            }"#,
-        )
-        .unwrap();
-        // Noon UTC (no offset stored, so UTC is the local day).
-        let at = |id: &str, gps: (f64, f64), noon_utc: i64| {
-            let mut a = Asset::new(id, format!("{id}.jpg").into(), AssetKind::Photo);
-            a.taken_at = Some(noon_utc);
-            a.gps = Some(gps);
-            a
-        };
-        let (oct9, oct10) = (1_791_547_200, 1_791_633_600);
-        // Miraikan faces the Aomi terminal: on board by the dock rule, so
-        // no Miraikan caption even with Miraikan "visited" that day.
-        let miraikan = at("m", (35.6190, 139.7766), oct9);
-        let visits: Visits = [((7, "Miraikan".to_string()), 9)].into();
-        assert_eq!(photo_place(Some(&itin), &visits, Some(7), &miraikan), None);
-        // The day's title reads as boarding; a sea day stays the ship.
-        let ship_day = |id: &str| Chapter {
-            title: "Carnival Luminosa".into(),
-            asset_ids: vec![id.into()],
-            place: Some("Carnival Luminosa".into()),
-            day_index: None,
-            date_label: None,
-        };
-        let assets = vec![miraikan, at("s", (33.0, 137.0), oct10)];
-        let titled = |id: &str| boarding_chapter(Some(&itin), &assets, &ship_day(id)).place;
-        assert_eq!(
-            titled("m").as_deref(),
-            Some("Carnival Luminosa Embarkation")
-        );
-        assert_eq!(titled("s").as_deref(), Some("Carnival Luminosa"));
-        // A port day's ship chapter is titled for the port.
-        let osaka_day = vec![at("o", (34.6, 135.3), 1_791_720_000)];
-        let port_day = boarding_chapter(Some(&itin), &osaka_day, &ship_day("o")).place;
-        assert_eq!(port_day.as_deref(), Some("Osaka"));
-        assert_eq!(photo_place(Some(&itin), &visits, Some(8), &assets[1]), None);
     }
 
     #[test]
@@ -1453,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn chapter_place_names_the_chapter_not_the_hero_caption() {
+    fn reel_places_name_the_chapter_not_the_hero_caption() {
         let mut plan = empty_plan();
         plan.chapters.push(triptape_core::types::Chapter {
             title: "Sensō-ji".into(),
@@ -1462,7 +1261,11 @@ mod tests {
             day_index: None,
             date_label: None,
         });
-        assert_eq!(chapter_place(&plan, "a0"), Some("Sensō-ji"));
-        assert_eq!(chapter_place(&plan, "other"), None);
+        plan.captions.insert("a0".into(), "Overlook".into());
+        let a0 =
+            triptape_core::types::Asset::new("a0", PathBuf::from("/tmp/a0.jpg"), AssetKind::Photo);
+        let places = triptape_core::places::photo_places(&plan, &[a0], None);
+        assert_eq!(places.get("a0").map(String::as_str), Some("Sensō-ji"));
+        assert_eq!(places.get("other"), None);
     }
 }

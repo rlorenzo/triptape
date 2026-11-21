@@ -1741,7 +1741,10 @@ fn motion_picks<'a, 'c>(
 /// A raw mean breaks at the antimeridian and is dragged by outliers. The
 /// search is quadratic, so large chapters use an even sample of their fixes.
 fn chapter_place(gps: &[(f64, f64)]) -> Option<String> {
-    crate::geo::place_name(medoid(gps)?)
+    // An attraction only when the chapter's photos visited it (see
+    // `places`), else the city at the medoid: 2 km around the medoid named
+    // whatever the day walked past.
+    crate::places::chapter_attraction(gps).or_else(|| crate::geo::city_name(medoid(gps)?))
 }
 
 /// Geographic medoid of `gps`: the fix minimizing total distance to the

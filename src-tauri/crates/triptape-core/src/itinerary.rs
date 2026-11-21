@@ -409,11 +409,11 @@ impl Itinerary {
                 on_ship: false,
             });
         };
-        // Today's port call, if the ship is docked somewhere today.
-        let port = self
-            .stops
-            .iter()
-            .find(|s| s.kind == StopKind::Port && s.active_on(day));
+        // Today's dock, if the ship ties up somewhere today: a port call,
+        // or the city a cruise starts or ends in (Singapore's Marina Bay is
+        // reclaimed land the coarse grid reads as water).
+        let docks = self.docks();
+        let port = docks.iter().find(|s| s.active_on(day));
         let on_board = match gps {
             None => true,
             Some(p) => {
@@ -578,13 +578,54 @@ fn relabel_chapter(
     let Some(day) = members.iter().filter_map(|a| asset_day(a)).min() else {
         return;
     };
-    match chapter_label(itin, day, &members) {
-        Some(l) => {
-            ch.title.clone_from(&l.place);
-            ch.place = Some(l.place);
+    let Some(label) = chapter_label(itin, day, &members) else {
+        ch.place = None;
+        return;
+    };
+    let place = chapter_name(itin, day, &members, label);
+    ch.title.clone_from(&place);
+    ch.place = Some(place);
+}
+
+/// A relabelled chapter's name, shared by every keepsake: a place the
+/// owner named when most of its photos are there; on board, the boarding
+/// (`Carnival Luminosa Embarkation`) on a cruise's first or last day, else
+/// the port on a port day, else the ship; ashore, the attraction its
+/// photos visited (see [`crate::places`]), else the stop's city.
+fn chapter_name(itin: &Itinerary, day: NaiveDate, members: &[&Asset], label: DayLabel) -> String {
+    let mut named: Vec<(&str, usize)> = vec![];
+    for name in members.iter().filter_map(|a| itin.place_of(a)) {
+        match named.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, c)) => *c += 1,
+            None => named.push((name, 1)),
         }
-        None => ch.place = None,
     }
+    // A chapter spanning several named places (the Flower Dome, then the
+    // Cloud Forest) is named for what holds them, not its biggest part.
+    let several = named
+        .iter()
+        .filter(|(_, c)| *c >= crate::places::PLACE_MIN_SHOTS)
+        .count()
+        > 1;
+    if let Some((name, _)) = named
+        .into_iter()
+        .rev()
+        .max_by_key(|(_, c)| *c)
+        .filter(|(_, c)| !several && 2 * c >= members.len())
+    {
+        return name.to_string();
+    }
+    if label.on_ship {
+        return itin
+            .boarding(day)
+            .or_else(|| itin.port_on(day))
+            .unwrap_or(label.place);
+    }
+    let fixes: Vec<(f64, f64)> = members.iter().filter_map(|a| a.gps).collect();
+    crate::places::visited_attraction(&fixes, crate::places::PLACE_MIN_SHOTS, |n| {
+        itin.hides_attraction(n)
+    })
+    .unwrap_or(label.place)
 }
 
 #[cfg(test)]
@@ -813,6 +854,63 @@ mod tests {
             1,
         );
         assert!(Itinerary::from_json(&bad).is_err());
+    }
+
+    #[test]
+    fn chapter_names_are_shared_place_names() {
+        let mut it = itin();
+        it.places = serde_json::from_str(
+            r#"[{ "name": "Dotonbori", "lat": 34.6687, "lon": 135.5013, "radius_m": 200 }]"#,
+        )
+        .unwrap();
+        let name = |it: &Itinerary, date: &str, gps: (f64, f64), n: usize| {
+            let members: Vec<Asset> = (0..n)
+                .map(|i| photo(&format!("p{i}"), date, Some(gps)))
+                .collect();
+            let refs: Vec<&Asset> = members.iter().collect();
+            let label = chapter_label(it, day(date), &refs).unwrap();
+            chapter_name(it, day(date), &refs, label)
+        };
+        // On board on the cruise's first day, and on a port day.
+        assert_eq!(
+            name(&it, "2026-10-09", (35.6190, 139.7766), 3),
+            "Carnival Luminosa Embarkation"
+        );
+        assert_eq!(name(&it, "2026-10-11", (34.656, 135.4306), 3), "Osaka");
+        // At sea: the ship.
+        assert_eq!(
+            name(&it, "2026-10-10", (30.0, 140.0), 3),
+            "Carnival Luminosa"
+        );
+        // Ashore: a named place, then a visited attraction, then the city.
+        assert_eq!(name(&it, "2026-10-11", (34.6687, 135.5013), 3), "Dotonbori");
+        // Two named places in one chapter: neither names it.
+        it.places.push(
+            serde_json::from_str(
+                r#"{ "name": "Kuromon Market", "lat": 34.6655, "lon": 135.5065, "radius_m": 200 }"#,
+            )
+            .unwrap(),
+        );
+        let mixed: Vec<Asset> = (0..6)
+            .map(|i| {
+                let gps = if i < 3 {
+                    (34.6687, 135.5013)
+                } else {
+                    (34.6655, 135.5065)
+                };
+                photo(&format!("q{i}"), "2026-10-11", Some(gps))
+            })
+            .collect();
+        let refs: Vec<&Asset> = mixed.iter().collect();
+        let label = chapter_label(&it, day("2026-10-11"), &refs).unwrap();
+        assert_eq!(chapter_name(&it, day("2026-10-11"), &refs, label), "Osaka");
+        assert_eq!(
+            name(&it, "2026-10-06", (35.6267, 139.8881), 3),
+            "Tokyo DisneySea"
+        );
+        assert_eq!(name(&it, "2026-10-06", (35.6267, 139.8881), 2), "Tokyo");
+        it.hide_attractions = vec!["Tokyo DisneySea".into()];
+        assert_eq!(name(&it, "2026-10-06", (35.6267, 139.8881), 3), "Tokyo");
     }
 
     #[test]
