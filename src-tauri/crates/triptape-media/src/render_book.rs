@@ -2733,7 +2733,7 @@ mod tests {
         let photos: Vec<BookPhoto> = (0..60)
             .map(|i| BookPhoto {
                 day: Some(1),
-                area: areas[i % 9 / 1].filter(|_| i >= 30).map(String::from),
+                area: areas[i % 9].filter(|_| i >= 30).map(String::from),
                 ..sized(i, 4032, 3024, Some(0), NEUTRAL_SCORE)
             })
             .collect();
