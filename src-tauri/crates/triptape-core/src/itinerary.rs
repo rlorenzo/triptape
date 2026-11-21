@@ -358,10 +358,15 @@ impl Itinerary {
     }
 
     /// First and last day of the trip: the earliest and latest dates of
-    /// any stop. `None` when no stop carries a date.
+    /// any stop or dated leg (a cruise may give only its leg's `dates`).
+    /// `None` when nothing carries a date.
     pub fn span(&self) -> Option<(NaiveDate, NaiveDate)> {
-        let windows = self.stops.iter().filter_map(ItinStop::window);
-        windows.fold(None, |acc, (a, d)| {
+        let stops = self.stops.iter().filter_map(ItinStop::window);
+        let legs = self
+            .legs
+            .iter()
+            .filter_map(|l| l.dates.as_deref().and_then(|d| parse_range(d).ok()));
+        stops.chain(legs).fold(None, |acc, (a, d)| {
             Some(match acc {
                 None => (a, d),
                 Some((s, e)) => (s.min(a), e.max(d)),
@@ -660,6 +665,20 @@ mod tests {
     #[test]
     fn span_runs_from_departure_to_homecoming() {
         assert_eq!(itin().span(), Some((day("2026-10-03"), day("2026-10-30"))));
+        // A cruise dated only on its leg still sets the span.
+        let cruise = Itinerary::from_json(
+            r#"{
+              "stops": [
+                { "id": "sg", "label": "Singapore", "lat": 1.2655, "lon": 103.864 },
+                { "id": "pk", "label": "Penang", "lat": 5.41, "lon": 100.34 }
+              ],
+              "legs": [
+                { "from": "sg", "to": "pk", "mode": "ship", "ship": "Disney Adventure", "dates": "2026-12-20..2026-12-24" }
+              ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(cruise.span(), Some((day("2026-12-20"), day("2026-12-24"))));
     }
 
     #[test]
