@@ -37,3 +37,11 @@ being named after the nearest coastal town.
 Source: https://github.com/nvkelso/natural-earth-vector (`ne_50m_land.geojson`)
 License: public domain (Natural Earth).
 Regenerate with `scripts/make-gazetteer.sh` (see its land-grid section).
+
+`coast.bin` holds the world's coastlines as polygon rings (about 6,000
+rings, simplified to roughly 400 m) from Natural Earth 10m land polygons.
+The parchment travel maps draw land from it.
+
+Source: https://github.com/nvkelso/natural-earth-vector (`ne_10m_land.geojson`)
+License: public domain (Natural Earth).
+Regenerate with `scripts/make-coast.sh`, which also documents the format.

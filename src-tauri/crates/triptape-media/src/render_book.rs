@@ -640,6 +640,11 @@ pub struct BookOptions {
     /// Face detection for crops that keep heads in frame; `None` (no
     /// models installed) crops every photo around its centre.
     pub faces: Option<FaceFinder>,
+    /// The owner's itinerary as a journey: its whole route, on a parchment
+    /// map, becomes the back cover.
+    pub journey: Option<triptape_core::journey::Journey>,
+    /// The owner's own back-cover picture, used in place of the drawn map.
+    pub back_cover_image: Option<PathBuf>,
 }
 
 /// Finds the faces in a decoded photo, as boxes normalised to 0..1.
@@ -669,6 +674,8 @@ pub struct BookOutput {
     pub dir: PathBuf,
     /// Photo-collage cover (proof/press first page; not a counted page).
     pub cover: Option<PathBuf>,
+    /// Route-map back cover (proof/press last page; not a counted page).
+    pub back_cover: Option<PathBuf>,
     pub jpeg_pages: Vec<PathBuf>,
     pub proof_pdf: Option<PathBuf>,
     pub press_pdf: Option<PathBuf>,
@@ -1127,6 +1134,13 @@ pub fn render_book(
         &out_dir.join("cover.jpg"),
         &mut fallbacks,
     );
+    let back_cover_jpg = out_dir.join("back-cover.jpg");
+    let back_cover = match (&opts.back_cover_image, &opts.journey) {
+        (Some(src), _) => adopt_back_cover(src, (tw, th), &back_cover_jpg, &mut fallbacks),
+        (None, Some(j)) => draw_back_cover(j, (tw, th), opts, &back_cover_jpg, &mut fallbacks),
+        (None, None) => None,
+    };
+    let covers = (cover.as_deref(), back_cover.as_deref());
     let mut cursor = 0usize;
     let mut page_no = 0usize;
     let mut announced = Announced::default();
@@ -1355,18 +1369,16 @@ pub fn render_book(
     };
     opts.progress.check_cancelled()?;
     opts.progress.step("book", "proof and press PDFs", None);
-    let proof =
-        match write_typst_and_compile(&jpegs, &texts, opts, out_dir, false, cover.as_deref()) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                // Never leave a previous export's PDF beside the new pages.
-                let _ = std::fs::remove_file(out_dir.join("proof.pdf"));
-                fallbacks.push(format!("proof.pdf skipped: {e}"));
-                None
-            }
-        };
-    let press = match write_typst_and_compile(&jpegs, &texts, opts, out_dir, true, cover.as_deref())
-    {
+    let proof = match write_typst_and_compile(&jpegs, &texts, opts, out_dir, false, covers) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            // Never leave a previous export's PDF beside the new pages.
+            let _ = std::fs::remove_file(out_dir.join("proof.pdf"));
+            fallbacks.push(format!("proof.pdf skipped: {e}"));
+            None
+        }
+    };
+    let press = match write_typst_and_compile(&jpegs, &texts, opts, out_dir, true, covers) {
         Ok(p) => Some(p),
         Err(e) => {
             // Never leave a previous export's PDF beside the new pages.
@@ -1411,7 +1423,13 @@ pub fn render_book(
     let guide_path = out_dir.join("GUIDE.txt");
     std::fs::write(
         &guide_path,
-        guide_text(opts.preset, &opts.trip_name, counted, captions_burned),
+        guide_text(
+            opts.preset,
+            &opts.trip_name,
+            counted,
+            captions_burned,
+            back_cover.is_some(),
+        ),
     )
     .map_err(|e| crate::MediaError::Io(e.to_string()))?;
     let manifest = serde_json::json!({
@@ -1419,6 +1437,7 @@ pub fn render_book(
         "preset": opts.preset.name(),
         "trim_px": {"w": tw, "h": th},
         "cover": cover.as_ref().map(|c| c.file_name().unwrap().to_string_lossy().into_owned()),
+        "back_cover": back_cover.as_ref().map(|c| c.file_name().unwrap().to_string_lossy().into_owned()),
         "counted_pages": counted,
         "pages": jpegs.iter().enumerate().map(|(i, p)| serde_json::json!({
             "page": i + 1,
@@ -1441,6 +1460,7 @@ pub fn render_book(
     Ok(BookOutput {
         dir: out_dir.to_path_buf(),
         cover,
+        back_cover,
         jpeg_pages: jpegs,
         proof_pdf: proof,
         press_pdf: press,
@@ -2258,6 +2278,57 @@ fn draw_cover_collage(
     }
 }
 
+/// Build `back-cover.jpg` from the owner's own picture, cropped to fill
+/// the page. `None` (with a note) when it cannot be read.
+fn adopt_back_cover(
+    src: &Path,
+    (tw, th): (u32, u32),
+    out: &Path,
+    fallbacks: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let _ = std::fs::remove_file(out);
+    let made = image::open(src)
+        .map_err(|e| crate::MediaError::Io(format!("{}: {e}", src.display())))
+        .and_then(|img| save_jpg(&cover_fit(&img.to_rgb8(), tw, th), out));
+    match made {
+        Ok(()) => Some(out.to_path_buf()),
+        Err(e) => {
+            fallbacks.push(format!("back cover skipped: {e}"));
+            None
+        }
+    }
+}
+
+/// Build `back-cover.jpg`: the journey's whole route on a parchment map,
+/// under the trip's name. `None` (with a note) when it cannot be drawn.
+fn draw_back_cover(
+    journey: &triptape_core::journey::Journey,
+    size: (u32, u32),
+    opts: &BookOptions,
+    out: &Path,
+    fallbacks: &mut Vec<String>,
+) -> Option<PathBuf> {
+    // A previous export's map must not survive beside new pages.
+    let _ = std::fs::remove_file(out);
+    let work = out.with_file_name(".back-cover-work");
+    let drawn = crate::parchment::render_overview(
+        journey,
+        Some(&opts.trip_name),
+        size,
+        &opts.typst_bin,
+        &work,
+    )
+    .and_then(|img| save_jpg(&img, out));
+    let _ = std::fs::remove_dir(&work);
+    match drawn {
+        Ok(()) => Some(out.to_path_buf()),
+        Err(e) => {
+            fallbacks.push(format!("back cover map skipped: {e}"));
+            None
+        }
+    }
+}
+
 fn save_jpg(img: &RgbImage, out: &Path) -> Result<(), crate::MediaError> {
     let f = std::fs::File::create(out)
         .map_err(|e| crate::MediaError::Io(format!("save {}: {e}", out.display())))?;
@@ -2280,7 +2351,7 @@ fn write_typst_and_compile(
     opts: &BookOptions,
     out_dir: &Path,
     bleed: bool,
-    cover: Option<&Path>,
+    (cover, back_cover): (Option<&Path>, Option<&Path>),
 ) -> Result<PathBuf, crate::MediaError> {
     let (tw_in, th_in) = opts.preset.trim_inches();
     let (pw, ph) = if bleed {
@@ -2354,6 +2425,12 @@ fn write_typst_and_compile(
         if i + 1 < jpegs.len() {
             typ.push_str("#pagebreak()\n");
         }
+    }
+    if let Some(b) = back_cover {
+        typ.push_str(&format!(
+            "#pagebreak()\n#image(\"{}\", width: 100%, height: 100%, fit: \"cover\")\n",
+            b.file_name().unwrap().to_string_lossy()
+        ));
     }
     let typ_path = out_dir.join(typ_name);
     std::fs::write(&typ_path, &typ).map_err(|e| crate::MediaError::Io(e.to_string()))?;
@@ -2478,7 +2555,18 @@ fn typ_escape(t: &str) -> String {
         .replace('#', "\\#")
 }
 
-fn guide_text(preset: BookPreset, trip: &str, counted: usize, captions_burned: bool) -> String {
+fn guide_text(
+    preset: BookPreset,
+    trip: &str,
+    counted: usize,
+    captions_burned: bool,
+    back_cover: bool,
+) -> String {
+    let back_note = if back_cover {
+        "\nback-cover.jpg is the trip's route map, for the back cover (not counted)."
+    } else {
+        ""
+    };
     let (tw, th) = preset.trim_px();
     let caption_note = if captions_burned {
         "Captions are burned into the page JPEGs exactly as shown in proof.pdf."
@@ -2490,7 +2578,7 @@ fn guide_text(preset: BookPreset, trip: &str, counted: usize, captions_burned: b
         "TripTape book export — {trip} ({}, {counted} interior pages)\n\
         \n\
         These page JPEGs are rendered at exact trim size ({tw}x{th}px, 300 dpi sRGB, quality ~90).\n\
-        cover.jpg is a suggested photo-collage cover (not counted); use it as the vendor cover or design your own in the vendor designer.\n\
+        cover.jpg is a suggested photo-collage cover (not counted); use it as the vendor cover or design your own in the vendor designer.{back_note}\n\
         \n\
         MIXBOOK / MILK / VISTAPRINT (generic steps; confirm against the vendor gate record):\n\
         1. Create a {} book with {counted} pages (above the 24-page vendor minimum; cover done separately).\n\
@@ -3745,6 +3833,8 @@ mod tests {
             progress: Default::default(),
             dates: None,
             faces: None,
+            journey: None,
+            back_cover_image: None,
         };
         let res = render_book(&photos, None, &[], &out, &opts).unwrap();
         assert!(
@@ -3823,6 +3913,8 @@ mod tests {
             progress: Default::default(),
             dates: None,
             faces: None,
+            journey: None,
+            back_cover_image: None,
         };
         render_book(&photos, None, &titles, &out, &opts).unwrap();
         let typ = std::fs::read_to_string(out.join("proof.typ")).unwrap();
@@ -3843,6 +3935,31 @@ mod tests {
             .collect();
         // Hero (Lisbon), spread (Sintra, used up), then dividers in order.
         assert!(at.windows(2).all(|w| w[0] < w[1]), "{titles:?} at {at:?}");
+    }
+
+    #[test]
+    fn an_owners_picture_becomes_the_back_cover_at_page_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("map.png");
+        RgbImage::from_pixel(300, 200, Rgb([200, 150, 90]))
+            .save(&src)
+            .unwrap();
+        let out = dir.path().join("back-cover.jpg");
+        let mut notes = vec![];
+        let made = adopt_back_cover(&src, (120, 120), &out, &mut notes);
+        assert_eq!(made.as_deref(), Some(out.as_path()));
+        assert_eq!(
+            image::open(&out).unwrap().to_rgb8().dimensions(),
+            (120, 120)
+        );
+        assert!(notes.is_empty());
+        // A picture that cannot be read is noted, and no stale file is left.
+        let missing = adopt_back_cover(&dir.path().join("nope.png"), (120, 120), &out, &mut notes);
+        assert!(missing.is_none() && !out.exists());
+        assert!(notes[0].starts_with("back cover skipped"), "{notes:?}");
+        let guide = guide_text(BookPreset::P1, "Trip", 24, true, true);
+        assert!(guide.contains("back-cover.jpg"));
+        assert!(!guide_text(BookPreset::P1, "Trip", 24, true, false).contains("back-cover"));
     }
 
     #[test]

@@ -51,6 +51,12 @@ pub struct ExportOptions {
     pub itinerary: Option<triptape_core::itinerary::Itinerary>,
     /// Face detection for book crops; `None` crops around the centre.
     pub faces: Option<render_book::FaceFinder>,
+    /// How the itinerary's travel is shown in the film.
+    pub map_style: crate::render_video::MapStyle,
+    /// The owner's own hop clips, one per hop of the itinerary, in order.
+    pub hop_clips: Vec<PathBuf>,
+    /// The owner's own picture for the book's back cover.
+    pub back_cover: Option<PathBuf>,
 }
 
 /// How the segment cache served one export.
@@ -518,6 +524,8 @@ fn export_inner(
                 typst_bin: opts.typst_bin.clone(),
                 resolution: opts.resolution,
                 jobs: opts.jobs,
+                map_style: opts.map_style,
+                hop_clips: opts.hop_clips.clone(),
                 journey: opts
                     .itinerary
                     .as_ref()
@@ -785,6 +793,11 @@ fn export_inner(
                     .or(photo_span)
                     .map(|(a, b)| triptape_core::plan::date_range_label(a, b)),
                 faces: opts.faces.clone(),
+                journey: opts
+                    .itinerary
+                    .as_ref()
+                    .map(|i| triptape_core::journey::Journey::build(i, assets)),
+                back_cover_image: opts.back_cover.clone(),
             },
         ) {
             Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
@@ -1062,6 +1075,9 @@ mod tests {
                 segment_cache: None,
                 itinerary: None,
                 faces: None,
+                map_style: Default::default(),
+                hop_clips: vec![],
+                back_cover: None,
             },
         );
         assert!(matches!(err, Err(crate::MediaError::Cancelled)), "{err:?}");
@@ -1112,6 +1128,9 @@ mod tests {
             segment_cache: Some(SegmentCacheConfig::roomy(t.path().join("cache"))),
             itinerary: None,
             faces: None,
+            map_style: Default::default(),
+            hop_clips: vec![],
+            back_cover: None,
         };
         let report = export_all(&Default::default(), &empty_plan(), &[], &out, &opts).unwrap();
         assert!(!out.join(".work").exists(), "{:?}", report.fallbacks);

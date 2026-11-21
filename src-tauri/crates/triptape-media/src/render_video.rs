@@ -253,6 +253,30 @@ pub struct ResolvedEntry {
     pub aspect: Option<f64>,
 }
 
+/// How an itinerary's travel is shown in the film.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MapStyle {
+    /// Parchment maps: a hop plays where the trip reaches each stop, and
+    /// the whole route closes the film (see [`crate::parchment`]).
+    #[default]
+    Parchment,
+    /// One travelling recap of the whole route at the end, on the dark map
+    /// (see [`crate::routetravel`]).
+    Night,
+}
+
+impl MapStyle {
+    pub fn from_flag(s: &str) -> Result<Self, crate::MediaError> {
+        match s.to_ascii_lowercase().as_str() {
+            "parchment" => Ok(Self::Parchment),
+            "night" => Ok(Self::Night),
+            _ => Err(crate::MediaError::InvalidArg(format!(
+                "unknown map style {s:?} (want parchment|night)"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VideoOptions {
     pub trip_name: String,
@@ -287,6 +311,12 @@ pub struct VideoOptions {
     /// it (flights, ships, camera) instead of the photo-derived stops, and
     /// ship names stay off the places card.
     pub journey: Option<triptape_core::journey::Journey>,
+    /// How the journey is shown (default: parchment hops through the film).
+    pub map_style: MapStyle,
+    /// The owner's own clip for each hop, in journey order, played in
+    /// place of the drawn ones (one per [`triptape_core::journey::Hop`]).
+    /// The film then has no closing route map.
+    pub hop_clips: Vec<PathBuf>,
 }
 
 impl Default for VideoOptions {
@@ -307,6 +337,8 @@ impl Default for VideoOptions {
             jobs: None,
             route_stops: vec![],
             journey: None,
+            map_style: MapStyle::default(),
+            hop_clips: vec![],
         }
     }
 }
@@ -367,6 +399,10 @@ fn closing_map_secs(route_stops: usize, map_secs: f64) -> f64 {
 /// Seconds the closing map segment will run for these options.
 fn closing_map_len(opts: &VideoOptions) -> f64 {
     match &opts.journey {
+        Some(_) if opts.map_style == MapStyle::Parchment && !opts.hop_clips.is_empty() => 0.0,
+        Some(_) if opts.map_style == MapStyle::Parchment => {
+            triptape_core::journey::HOP_OVERVIEW_SECS
+        }
         Some(j) => j.duration_secs(),
         None => closing_map_secs(
             triptape_core::route_stops::animated_stop_count(&opts.route_stops),
@@ -447,8 +483,11 @@ fn collage_caption(members: &[&ResolvedEntry]) -> Option<String> {
 
 /// Synthetic segment ids for fixed cards in the hero's segment list.
 fn is_card(id: &str) -> bool {
-    matches!(id, "title" | "map" | "closing" | "credits")
+    matches!(id, "title" | "map" | "closing" | "route" | "credits") || id.starts_with(HOP_ID)
 }
+
+/// Segment id prefix of a travel-map hop (`hop-01`...).
+const HOP_ID: &str = "hop-";
 
 /// Segment entry for a fixed card (not backed by a project asset).
 fn card_entry(id: &str, path: &Path) -> ResolvedEntry {
@@ -776,10 +815,104 @@ pub fn render_hero_video(
         ));
     }
 
+    // Travel maps: each hop of the itinerary plays where the trip reaches
+    // it, and the whole route closes the film. A map that fails to render
+    // is left out; the film never fails for one.
+    let own_clips = !opts.hop_clips.is_empty();
+    let parchment = opts
+        .journey
+        .as_ref()
+        .filter(|_| (typst_ok || own_clips) && opts.map_style == MapStyle::Parchment);
+    // The owner's clips tell the whole journey; no route map follows them.
+    let mut route_closed = parchment.is_some() && own_clips;
+    if let Some(journey) = parchment {
+        let hops = if opts.short_mode {
+            vec![]
+        } else {
+            journey.hops()
+        };
+        let first_shot = segs
+            .iter()
+            .position(|s| !is_card(&s.0.entry.asset_id))
+            .unwrap_or(segs.len());
+        let shots: Vec<Option<(i64, Option<i32>)>> = segs[first_shot..]
+            .iter()
+            .map(|s| s.0.taken_at.map(|t| (t, s.0.tz_offset_secs)))
+            .collect();
+        let cuts = triptape_core::journey::hop_cuts(&hops, &shots);
+        let adopt = own_clips && opts.hop_clips.len() == hops.len();
+        if own_clips && !adopt && !hops.is_empty() {
+            fallbacks.push(format!(
+                "{} hop clips for {} hops: the maps are drawn instead",
+                opts.hop_clips.len(),
+                hops.len()
+            ));
+        }
+        progress.counted("video", "travel map", 0, hops.len());
+        let mut made = vec![];
+        for (i, cut) in cuts.iter().enumerate() {
+            let mp4 = work_dir.join(format!("seg_hop_{i:02}.mp4"));
+            let hop = if adopt {
+                crate::parchment::adopt_hop_clip(caps, &opts.hop_clips[i], opts.resolution, &mp4)
+            } else {
+                crate::parchment::render_hop(
+                    caps,
+                    journey,
+                    i,
+                    opts.resolution,
+                    &opts.typst_bin,
+                    work_dir,
+                    &mp4,
+                )
+            };
+            match hop {
+                Ok(rep) => {
+                    fallbacks.extend(rep.notes);
+                    made.push((first_shot + cut, i, mp4, rep.secs));
+                }
+                Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
+                Err(e) => fallbacks.push(format!("travel map {} skipped: {e}", i + 1)),
+            }
+            progress.counted("video", "travel map", i + 1, hops.len());
+        }
+        // Back to front, so an insertion never shifts the ones before it.
+        for (at, i, mp4, secs) in made.into_iter().rev() {
+            let entry = card_entry(&format!("{HOP_ID}{:02}", i + 1), &mp4);
+            segs.insert(at, (entry, mp4, secs, "map".into()));
+        }
+    }
+    if let Some(journey) = parchment.filter(|_| !own_clips) {
+        let png = work_dir.join("route.png");
+        let close_mp4 = work_dir.join("seg_closing.mp4");
+        let dur = triptape_core::journey::HOP_OVERVIEW_SECS;
+        let drawn = crate::parchment::render_overview(
+            journey,
+            None,
+            opts.resolution.dims(),
+            &opts.typst_bin,
+            work_dir,
+        )
+        .and_then(|img| {
+            img.save(&png)
+                .map_err(|e| crate::MediaError::Io(format!("save route map: {e}")))
+        })
+        .and_then(|()| {
+            crate::map::render_map_push_in(caps, &png, &close_mp4, dur, 1, opts.resolution)
+        });
+        match drawn {
+            Ok(()) => {
+                segs.push((card_entry("route", &png), close_mp4, dur, "still".into()));
+                route_closed = true;
+            }
+            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
+            Err(e) => fallbacks.push(format!("parchment route map failed: {e}")),
+        }
+    }
+
     // Closing: pull back over the route card for a map recap, then a
     // places card, so the film ends deliberately instead of stopping on
     // the last photo. Both are fixed cards, like the title.
-    if let Some(card) = map_card {
+    if let Some(card) = map_card.filter(|_| !route_closed) {
         if !plan.map_polyline.is_empty() {
             let close_mp4 = work_dir.join("seg_closing.mp4");
             // Animated travel recap; the static pull-out card is the fallback.
@@ -4108,6 +4241,31 @@ mod tests {
         assert_eq!(stops(40), 14.0);
         // An itinerary journey sets its own length.
         assert_eq!(stops(0), 4.5);
+        let itin = triptape_core::itinerary::Itinerary::from_json(
+            r#"{"stops": [
+                {"id": "a", "label": "Los Angeles", "lat": 33.9, "lon": -118.4, "kind": "home"},
+                {"id": "b", "label": "Tokyo", "lat": 35.7, "lon": 139.8, "arrive": "2026-10-04"}],
+              "legs": [{"from": "a", "to": "b", "mode": "flight"}]}"#,
+        )
+        .unwrap();
+        let journey = triptape_core::journey::Journey::build(&itin, &[]);
+        let with = |map_style| {
+            closing_map_len(&VideoOptions {
+                journey: Some(journey.clone()),
+                map_style,
+                ..Default::default()
+            })
+        };
+        // Told in hops, the film closes on the whole-route sheet; the
+        // night style travels the route in one recap.
+        assert_eq!(
+            with(MapStyle::Parchment),
+            triptape_core::journey::HOP_OVERVIEW_SECS
+        );
+        assert_eq!(with(MapStyle::Night), journey.duration_secs());
+        assert_eq!(MapStyle::from_flag("Night").unwrap(), MapStyle::Night);
+        assert!(MapStyle::from_flag("sepia").is_err());
+        assert!(is_card("hop-03") && is_card("route") && !is_card("a1b2"));
     }
 
     #[test]

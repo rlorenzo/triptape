@@ -61,6 +61,10 @@ pub struct ItinStop {
     /// no pin label on the map.
     #[serde(default)]
     pub hide_label: bool,
+    /// Artwork for the stop on the parchment travel maps (a PNG or JPEG;
+    /// a path relative to the itinerary file is resolved on load).
+    #[serde(default)]
+    pub sticker: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -211,7 +215,16 @@ impl Itinerary {
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("read itinerary {}: {e}", path.display()))?;
-        Self::from_json(&text)
+        let mut it = Self::from_json(&text)?;
+        // Sticker paths are written relative to the itinerary file.
+        if let Some(dir) = path.parent() {
+            for stop in &mut it.stops {
+                if let Some(s) = &mut stop.sticker {
+                    *s = dir.join(&*s).to_string_lossy().into_owned();
+                }
+            }
+        }
+        Ok(it)
     }
 
     /// The owner-named place a shot was taken in: one whose time window
