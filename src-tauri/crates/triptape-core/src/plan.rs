@@ -267,9 +267,9 @@ pub fn collage_slots<'a, C>(
 }
 
 /// Whether `b` is close enough in capture time to `a` (a collage's first
-/// photo) to join it automatically: both dated, within
-/// [`COLLAGE_WINDOW_SECS`].
-fn within_window(a: Option<i64>, b: Option<i64>) -> bool {
+/// photo, or the shot that last showed a caption) to count as the same
+/// moment: both dated, within [`COLLAGE_WINDOW_SECS`].
+pub fn within_window(a: Option<i64>, b: Option<i64>) -> bool {
     matches!((a, b), (Some(x), Some(y)) if (x - y).abs() <= COLLAGE_WINDOW_SECS)
 }
 
@@ -322,7 +322,7 @@ pub fn entry_plays_alone(
 }
 
 /// Each asset's chapter in `plan`: the first of `plan.chapters` holding it.
-fn chapter_index(plan: &Plan) -> HashMap<&str, usize> {
+pub fn chapter_index(plan: &Plan) -> HashMap<&str, usize> {
     let mut out: HashMap<&str, usize> = HashMap::new();
     for (i, c) in plan.chapters.iter().enumerate() {
         for id in &c.asset_ids {

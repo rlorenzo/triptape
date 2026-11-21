@@ -532,12 +532,8 @@ pub fn render_hero_video(
     }
 
     // Chapter breaks: cut into segment i when its chapter differs.
-    let chapter_of = |id: &str| {
-        plan.chapters
-            .iter()
-            .position(|c| c.asset_ids.iter().any(|a| a == id))
-            .unwrap_or(usize::MAX)
-    };
+    let chapter_index = plan::chapter_index(plan);
+    let chapter_of = |id: &str| chapter_index.get(id).copied().unwrap_or(usize::MAX);
 
     // 1. Normalize segments (skip missing sources, never fail the film).
     let still_secs = if opts.short_mode {
@@ -1024,12 +1020,6 @@ pub fn render_hero_video(
     let srt_path = out_mp4.with_extension("srt");
     // The same caption on a run of shots (seven panoramas all "Some fun
     // multiple person panoramas") is shown once, on the first.
-    let chapter_index: HashMap<&str, usize> = plan
-        .chapters
-        .iter()
-        .enumerate()
-        .flat_map(|(k, c)| c.asset_ids.iter().map(move |id| (id.as_str(), k)))
-        .collect();
     let repeats = repeated_captions(
         &segs
             .iter()
@@ -1233,16 +1223,13 @@ fn overlay_key(
     k.finish()
 }
 
-/// Seconds within which a caption repeated in another chapter still counts
-/// as the same showing (see [`repeated_captions`]).
-const CAPTION_REPEAT_SECS: i64 = 30 * 60;
-
 /// Which segments' captions repeat the caption last shown, so only the
 /// first of a run is shown. Per segment: its caption, chapter and capture
 /// time. A caption repeats when its text (trimmed, case-insensitive) is
 /// the last shown one's and it is in the same chapter or taken within
-/// [`CAPTION_REPEAT_SECS`] of it. Uncaptioned segments in between do not
-/// break the run; a different caption does. A skipped caption only loses
+/// [`plan::COLLAGE_WINDOW_SECS`] of it ([`plan::within_window`]).
+/// Uncaptioned segments in between do not break the run; a different
+/// caption does. A skipped caption only loses
 /// its text on screen: the shot still counts as captioned for layout.
 fn repeated_captions(segs: &[(Option<&str>, Option<usize>, Option<i64>)]) -> Vec<bool> {
     let mut last: Option<(String, Option<usize>, Option<i64>)> = None;
@@ -1253,9 +1240,7 @@ fn repeated_captions(segs: &[(Option<&str>, Option<usize>, Option<i64>)]) -> Vec
             };
             let text = text.to_lowercase();
             let repeat = last.as_ref().is_some_and(|(t, ch, at)| {
-                *t == text
-                    && ((ch.is_some() && *ch == chapter)
-                        || matches!((at, taken), (Some(a), Some(b)) if (a - b).abs() <= CAPTION_REPEAT_SECS))
+                *t == text && ((ch.is_some() && *ch == chapter) || plan::within_window(*at, taken))
             });
             if !repeat {
                 last = Some((text, chapter, taken));
@@ -3703,22 +3688,26 @@ mod tests {
         assert_eq!(args.last().unwrap(), "out.mp4");
     }
 
+    /// The frame of `video` at `t` s, scaled to 320x180, saved as `png`.
+    fn grab_frame(caps: &Capabilities, video: &Path, t: f64, png: &Path) -> image::RgbImage {
+        let ok = std::process::Command::new(&caps.ffmpeg_bin)
+            .args(["-v", "error", "-y", "-ss", &format!("{t}"), "-i"])
+            .arg(video)
+            .args(["-frames:v", "1", "-vf", "scale=320:180"])
+            .arg(png)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        image::open(png).unwrap().to_rgb8()
+    }
+
     /// Mean absolute difference, 0..255, between the frame of `va` at `a`
     /// seconds and the frame of `vb` at `b` seconds.
     fn frame_diff(caps: &Capabilities, va: &Path, a: f64, vb: &Path, b: f64, dir: &Path) -> f64 {
-        let grab = |video: &Path, t: f64, name: &str| {
-            let png = dir.join(name);
-            let ok = std::process::Command::new(&caps.ffmpeg_bin)
-                .args(["-v", "error", "-y", "-ss", &format!("{t}"), "-i"])
-                .arg(video)
-                .args(["-frames:v", "1", "-vf", "scale=320:180"])
-                .arg(&png)
-                .status()
-                .unwrap();
-            assert!(ok.success());
-            image::open(&png).unwrap().to_rgb8()
-        };
-        let (fa, fb) = (grab(va, a, "fa.png"), grab(vb, b, "fb.png"));
+        let (fa, fb) = (
+            grab_frame(caps, va, a, &dir.join("fa.png")),
+            grab_frame(caps, vb, b, &dir.join("fb.png")),
+        );
         let sum: u64 = fa
             .as_raw()
             .iter()
@@ -3802,19 +3791,12 @@ mod tests {
         let keep = std::env::var_os("TRIPTAPE_FRAME_DIR").map(PathBuf::from);
         let grab = |video: &Path, tag: &str| {
             let png = dir.join(format!("{tag}_{t:.2}.png"));
-            let ok = std::process::Command::new(&caps.ffmpeg_bin)
-                .args(["-v", "error", "-y", "-ss", &format!("{t}"), "-i"])
-                .arg(video)
-                .args(["-frames:v", "1", "-vf", "scale=320:180"])
-                .arg(&png)
-                .status()
-                .unwrap();
-            assert!(ok.success());
+            let frame = grab_frame(caps, video, t, &png);
             if let Some(k) = &keep {
                 std::fs::create_dir_all(k).unwrap();
                 std::fs::copy(&png, k.join(png.file_name().unwrap())).unwrap();
             }
-            image::open(&png).unwrap().to_rgb8()
+            frame
         };
         let (fa, fb) = (grab(va, "moving"), grab(vb, "still"));
         let half = |left: bool| {
@@ -3989,8 +3971,9 @@ mod tests {
                 } else {
                     None
                 },
-                // Oct 6/7/8 2026 12:00 UTC.
-                taken_at: Some(1791288000 + i as i64 * 86400),
+                // Oct 6 2026 12:00 and 12:10 UTC (one moment, so a0 and
+                // a1 collage), then Oct 8 12:00.
+                taken_at: Some(1791288000 + [0, 600, 2 * 86400][i]),
                 tz_offset_secs: None,
                 aspect: None,
             });
@@ -4746,7 +4729,7 @@ mod tests {
                 still_path: p,
                 motion_path: None,
                 caption: (i % 3 == 0).then(|| format!("Caption {i}")),
-                taken_at: None,
+                taken_at: Some(1791288000 + i as i64 * 60),
                 tz_offset_secs: None,
                 aspect: Some(f64::from(320 + 16 * i as u32) / 240.0),
             });
