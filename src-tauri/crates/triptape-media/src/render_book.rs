@@ -1797,6 +1797,26 @@ fn typst_text_png(
     img
 }
 
+/// Indices of up to 12 cover tiles. People make the cover: tiles come from
+/// photos with people in them (`has_people[i]`), evenly through the trip,
+/// topped up from the rest only when too few. Returned in trip order.
+fn cover_picks(has_people: &[bool]) -> Vec<usize> {
+    let (with_people, rest): (Vec<usize>, Vec<usize>) =
+        (0..has_people.len()).partition(|&i| has_people[i]);
+    let want = has_people.len().min(12);
+    if with_people.len() >= want {
+        return evenly_spaced(with_people.len(), want)
+            .into_iter()
+            .map(|j| with_people[j])
+            .collect();
+    }
+    let top_up = evenly_spaced(rest.len(), want - with_people.len());
+    let mut picks = with_people;
+    picks.extend(top_up.into_iter().map(|j| rest[j]));
+    picks.sort_unstable();
+    picks
+}
+
 /// Build `cover.jpg`: a mosaic of evenly-spaced trip photos with a darkened
 /// title band. Returns None (with a fallback note) when no photo decodes.
 fn draw_cover_collage(
@@ -1810,30 +1830,7 @@ fn draw_cover_collage(
     if photos.is_empty() {
         return None;
     }
-    // People make the cover: tiles come from photos with people in them,
-    // evenly through the trip, topped up from the rest only when too few.
-    let with_people: Vec<usize> = (0..photos.len())
-        .filter(|&i| photos[i].people > 0)
-        .collect();
-    let want = photos.len().min(12);
-    let picks: Vec<usize> = if with_people.len() >= want {
-        evenly_spaced(with_people.len(), want)
-            .into_iter()
-            .map(|j| with_people[j])
-            .collect()
-    } else {
-        let mut picks = with_people.clone();
-        let rest: Vec<usize> = (0..photos.len())
-            .filter(|i| !with_people.contains(i))
-            .collect();
-        picks.extend(
-            evenly_spaced(rest.len(), want - picks.len())
-                .into_iter()
-                .map(|j| rest[j]),
-        );
-        picks.sort_unstable();
-        picks
-    };
+    let picks = cover_picks(&photos.iter().map(|p| p.people > 0).collect::<Vec<_>>());
     let (cols, rows) = cover_grid(picks.len());
     let gap = 14u32;
     let tile_w = (tw - gap * (cols + 1)) / cols;
@@ -1999,8 +1996,8 @@ fn write_typst_and_compile(
 
 /// Rasterize the captioned proof pages at 300 ppi and overwrite the
 /// matching page JPEGs. Proof page N+1+[`PROOF_LEAD_BLANKS`] is interior
-/// page N (page 1 is the
-/// uncounted cover-proxy); proof geometry equals trim, so sizes match.
+/// page N (page 1 is the uncounted cover-proxy); proof geometry equals
+/// trim, so sizes match.
 fn burn_captions(
     jpegs: &[PathBuf],
     captioned: &[usize],
@@ -2011,9 +2008,10 @@ fn burn_captions(
     let raster = out_dir.join(".caption_raster");
     let _ = std::fs::remove_dir_all(&raster);
     std::fs::create_dir_all(&raster).map_err(|e| crate::MediaError::Io(e.to_string()))?;
+    let proof_page = |n: usize| n + 1 + PROOF_LEAD_BLANKS;
     let pages = captioned
         .iter()
-        .map(|n| (n + 1 + PROOF_LEAD_BLANKS).to_string())
+        .map(|&n| proof_page(n).to_string())
         .collect::<Vec<_>>()
         .join(",");
     let result = (|| {
@@ -2034,7 +2032,7 @@ fn burn_captions(
             )));
         }
         for &n in captioned {
-            let png = raster.join(format!("p{}.png", n + 1 + PROOF_LEAD_BLANKS));
+            let png = raster.join(format!("p{}.png", proof_page(n)));
             let img = image::open(&png)
                 .map_err(|e| crate::MediaError::Io(format!("read {}: {e}", png.display())))?
                 .to_rgb8();
@@ -3150,6 +3148,14 @@ mod tests {
         };
         render_book(&photos, None, &titles, &out, &opts).unwrap();
         let typ = std::fs::read_to_string(out.join("proof.typ")).unwrap();
+        // Proof opens page 1 on the right; press files have no blanks.
+        assert_eq!(
+            typ.matches("#box()\n#pagebreak()").count(),
+            PROOF_LEAD_BLANKS
+        );
+        if let Ok(press) = std::fs::read_to_string(out.join("press.typ")) {
+            assert!(!press.contains("#box()\n#pagebreak()"));
+        }
         let at: Vec<usize> = titles
             .iter()
             .map(|t| {
@@ -3159,6 +3165,24 @@ mod tests {
             .collect();
         // Hero (Lisbon), spread (Sintra, used up), then dividers in order.
         assert!(at.windows(2).all(|w| w[0] < w[1]), "{titles:?} at {at:?}");
+    }
+
+    #[test]
+    fn cover_picks_prefer_people_and_top_up_in_trip_order() {
+        // Plenty of people photos: only those, spread through the trip.
+        let mostly: Vec<bool> = (0..40).map(|i| i % 3 != 0).collect();
+        let picks = cover_picks(&mostly);
+        assert_eq!(picks.len(), 12);
+        assert!(picks.iter().all(|&i| mostly[i]), "{picks:?}");
+        assert!(picks.windows(2).all(|w| w[0] < w[1]));
+        // Too few: every people photo, topped up from the rest, sorted.
+        let few: Vec<bool> = (0..20).map(|i| i == 5 || i == 15).collect();
+        let picks = cover_picks(&few);
+        assert_eq!(picks.len(), 12);
+        assert!(picks.contains(&5) && picks.contains(&15));
+        assert!(picks.windows(2).all(|w| w[0] < w[1]), "{picks:?}");
+        // Small trip: every photo.
+        assert_eq!(cover_picks(&[false, true, false]), vec![0, 1, 2]);
     }
 
     #[test]
