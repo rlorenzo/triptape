@@ -461,19 +461,16 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
             // a tie goes to the first in story order. Byte-identical
             // copies always tie (they share their score), so the earliest
             // dated copy is kept: a later re-import carries a later date.
-            let rank = |i: usize| (is_edit[i], score_of(i));
-            let mut best = idx[0];
-            for &m in &idx[1..] {
-                let better = match rank(m).partial_cmp(&rank(best)) {
-                    Some(std::cmp::Ordering::Equal) | None => {
-                        story_key(&assets[m]) < story_key(&assets[best])
-                    }
-                    Some(o) => o.is_gt(),
-                };
-                if better {
-                    best = m;
-                }
-            }
+            let best = idx
+                .iter()
+                .copied()
+                .min_by(|&a, &b| {
+                    is_edit[b]
+                        .cmp(&is_edit[a])
+                        .then_with(|| score_of(b).total_cmp(&score_of(a)))
+                        .then_with(|| story_key(&assets[a]).cmp(&story_key(&assets[b])))
+                })
+                .expect("a union-find group has at least one member");
             let members: Vec<String> = idx.iter().map(|&i| assets[i].id.clone()).collect();
             DupeGroup {
                 members,
