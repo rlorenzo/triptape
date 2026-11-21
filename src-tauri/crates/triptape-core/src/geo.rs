@@ -233,8 +233,39 @@ fn attractions() -> &'static [Attraction] {
 /// known attraction is that close. The nearest wins: on the 2026 Japan to
 /// Singapore trip, a notability weight or a 1 km radius for the tail of the
 /// list changed none of the 72 chapter names.
-pub fn attraction_name(gps: (f64, f64)) -> Option<String> {
-    nearest_within(attractions(), |a| (a.lat, a.lon), gps, 2_000.0).map(|a| a.name.to_string())
+fn attraction_name(gps: (f64, f64)) -> Option<String> {
+    attraction_within(gps, 2_000.0)
+}
+
+/// Attractions this close together are one place under several names.
+const SAME_PLACE_M: f64 = 100.0;
+
+/// The nearest known attraction within `max_m` of `gps`. Chapter names use
+/// 2 km (a day centred near a place); captioning one photo needs to be much
+/// closer, since a 2 km reach names whatever a walk passed by.
+///
+/// Wikidata files one spot under several names: Osaka Castle, Osaka Castle
+/// Park and Ishiyama Hongan-ji (the temple the castle replaced) sit within
+/// 20 m, and plain nearest picks among them by chance. Among names within
+/// [`SAME_PLACE_M`] of the nearest, the best known wins (the list is most
+/// notable first), and a name that contains it ("Osaka Castle Park" around
+/// "Osaka Castle") wins over that: the grounds hold every shot there, the
+/// building only some.
+pub fn attraction_within(gps: (f64, f64), max_m: f64) -> Option<String> {
+    let items = attractions();
+    let nearest = nearest_within(items, |a| (a.lat, a.lon), gps, max_m)?;
+    let reach = haversine_m(gps, (nearest.lat, nearest.lon)) + SAME_PLACE_M;
+    let here: Vec<&Attraction> = items
+        .iter()
+        .filter(|a| haversine_m((a.lat, a.lon), (nearest.lat, nearest.lon)) <= SAME_PLACE_M)
+        .filter(|a| haversine_m(gps, (a.lat, a.lon)) <= reach.min(max_m))
+        .collect();
+    let best = here.first().copied().unwrap_or(nearest);
+    let area = here
+        .iter()
+        .filter(|a| a.name.len() > best.name.len() && a.name.contains(best.name))
+        .min_by_key(|a| a.name.len());
+    Some(area.map_or(best, |a| *a).name.to_string())
 }
 
 /// The item nearest `gps` within `max_m`, by `coords` (`(lat, lon)`).
@@ -268,6 +299,22 @@ fn nearest_within<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_spot_under_several_names_reads_as_its_grounds() {
+        // Osaka Castle, Osaka Castle Park and Ishiyama Hongan-ji share a spot.
+        for gps in [
+            (34.6873, 135.5258),
+            (34.6874, 135.5257),
+            (34.6866, 135.5262),
+        ] {
+            assert_eq!(
+                attraction_within(gps, 600.0).as_deref(),
+                Some("Osaka Castle Park"),
+                "{gps:?}"
+            );
+        }
+    }
 
     #[test]
     fn place_name_prefers_attraction_over_city() {
