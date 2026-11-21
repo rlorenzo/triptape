@@ -436,34 +436,26 @@ fn ship_svg(ship: usize) -> String {
     )
 }
 
-/// Rasterize `svg` (design size `(dw, dh)`) to `px` pixels through Typst.
-fn rasterize(
-    typst_bin: &str,
-    svg_body: &str,
-    px: (u32, u32),
-    stem: &Path,
-) -> Result<RgbaImage, MediaError> {
+/// Rasterize `svg` to `px` pixels through Typst. The SVG, the Typst
+/// source and the PNG live in a fresh folder under the system's temp
+/// directory, removed when this returns.
+fn rasterize(typst_bin: &str, svg_body: &str, px: (u32, u32)) -> Result<RgbaImage, MediaError> {
     let io = |e: std::io::Error| MediaError::Io(e.to_string());
-    if let Some(dir) = stem.parent() {
-        std::fs::create_dir_all(dir).map_err(io)?;
-    }
-    let (svg, png) = (stem.with_extension("svg"), stem.with_extension("png"));
+    let tmp = tempfile::Builder::new()
+        .prefix("triptape-map-")
+        .tempdir()
+        .map_err(io)?;
+    let (svg, png) = (tmp.path().join("map.svg"), tmp.path().join("map.png"));
     std::fs::write(&svg, svg_body).map_err(io)?;
     let doc = format!(
-        "#set page(width: {}pt, height: {}pt, margin: 0pt, fill: none)\n#image(\"{}\", width: 100%, height: 100%)\n",
-        px.0,
-        px.1,
-        crate::titlecard::esc(&svg.file_name().unwrap_or_default().to_string_lossy()),
+        "#set page(width: {}pt, height: {}pt, margin: 0pt, fill: none)\n#image(\"map.svg\", width: 100%, height: 100%)\n",
+        px.0, px.1,
     );
-    let made = crate::titlecard::render_text_png(typst_bin, &doc, &png, 72).and_then(|()| {
+    let img = crate::titlecard::render_text_png(typst_bin, &doc, &png, 72).and_then(|()| {
         image::open(&png)
             .map(|im| im.to_rgba8())
             .map_err(|e| MediaError::Io(format!("read map: {e}")))
-    });
-    let _ = std::fs::remove_file(&svg);
-    let _ = std::fs::remove_file(&png);
-    let _ = std::fs::remove_file(stem.with_extension("typ"));
-    let img = made?;
+    })?;
     Ok(if img.dimensions() == px {
         img
     } else {
@@ -478,7 +470,6 @@ fn sprite(
     box_: (f64, f64),
     origin: P,
     u: f64,
-    stem: &Path,
 ) -> Result<RgbaImage, MediaError> {
     let svg = format!(
         "<svg xmlns='http://www.w3.org/2000/svg' width='{0}' height='{1}' viewBox='0 0 {0} {1}'><g transform='translate({2},{3})'>{body}</g></svg>",
@@ -488,7 +479,7 @@ fn sprite(
         (box_.0 * u).round().max(1.0) as u32,
         (box_.1 * u).round().max(1.0) as u32,
     );
-    rasterize(typst_bin, &svg, px, stem)
+    rasterize(typst_bin, &svg, px)
 }
 
 fn flatten(img: RgbaImage) -> RgbImage {
@@ -889,8 +880,6 @@ impl HopScene {
         hop: &Hop,
         (w, h): (u32, u32),
         typst_bin: &str,
-        work_dir: &Path,
-        tag_name: &str,
         notes: &mut Vec<String>,
     ) -> Result<Self, MediaError> {
         let u = f64::from(h) / DESIGN_H;
@@ -919,13 +908,7 @@ impl HopScene {
                 "<circle cx='{x:.1}' cy='{y:.1}' r='4.5' fill='{RED}' opacity='.55'/>"
             );
         }
-        let stem = |part: &str| work_dir.join(format!("parchment_{tag_name}_{part}"));
-        let sheet = flatten(rasterize(
-            typst_bin,
-            &sheet_svg(&view, &under, ""),
-            (w, h),
-            &stem("sheet"),
-        )?);
+        let sheet = flatten(rasterize(typst_bin, &sheet_svg(&view, &under, ""), (w, h))?);
 
         // The hop's own line, in pixels, and what travels each part of it.
         let mut pts: Vec<P> = vec![];
@@ -976,7 +959,6 @@ impl HopScene {
                         PLANE_BOX,
                         (PLANE_BOX.0 / 2.0, PLANE_BOX.1 / 2.0),
                         u,
-                        &stem("plane"),
                     ),
                 )
             })
@@ -989,14 +971,7 @@ impl HopScene {
                     .then(|| {
                         try_sprite(
                             "ship",
-                            sprite(
-                                typst_bin,
-                                &ship_svg(i),
-                                SHIP_BOX,
-                                (0.0, 0.0),
-                                u,
-                                &stem(&format!("ship{i}")),
-                            ),
+                            sprite(typst_bin, &ship_svg(i), SHIP_BOX, (0.0, 0.0), u),
                         )
                     })
                     .flatten()
@@ -1022,7 +997,6 @@ impl HopScene {
                     (lw + 6.0, lh + 8.0),
                     (1.5, 1.5),
                     u,
-                    &stem(part),
                 ),
             )
             .map(|img| {
@@ -1194,27 +1168,16 @@ impl HopScene {
 /// Render `hop` of the journey (see [`Journey::hops`]; `index` is its
 /// place there) at `size` pixels into `out_mp4`: H.264 with stereo
 /// silence, like the other map segments.
-#[allow(clippy::too_many_arguments)]
 pub fn render_hop(
     caps: &Capabilities,
     journey: &Journey,
     hop: &Hop,
-    index: usize,
     size: (u32, u32),
     typst_bin: &str,
-    work_dir: &Path,
     out_mp4: &Path,
 ) -> Result<RecapReport, MediaError> {
     let mut notes = vec![];
-    let mut scene = HopScene::build(
-        journey,
-        hop,
-        size,
-        typst_bin,
-        work_dir,
-        &format!("hop{index:02}"),
-        &mut notes,
-    )?;
+    let mut scene = HopScene::build(journey, hop, size, typst_bin, &mut notes)?;
     let frames = frame_count(hop.secs);
     let secs = f64::from(frames) / f64::from(FPS);
     encode(caps, size, frames, secs, out_mp4, |f| {
@@ -1297,7 +1260,6 @@ pub fn render_overview(
     title: Option<&str>,
     size: (u32, u32),
     typst_bin: &str,
-    work_dir: &Path,
 ) -> Result<RgbImage, MediaError> {
     let u = f64::from(size.1) / DESIGN_H;
     let frame = (f64::from(size.0) / u, DESIGN_H);
@@ -1406,7 +1368,6 @@ pub fn render_overview(
         typst_bin,
         &sheet_svg(&view, &under, &over),
         size,
-        &work_dir.join("parchment_overview"),
     )?))
 }
 
@@ -1590,25 +1551,15 @@ mod tests {
         if !crate::titlecard::typst_available(&typst) {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
         let j = journey();
-        let img = render_overview(&j, Some("Asia 2026"), (640, 640), &typst, dir.path()).unwrap();
+        let img = render_overview(&j, Some("Asia 2026"), (640, 640), &typst).unwrap();
         assert_eq!(img.dimensions(), (640, 640));
         // Paper, not a blank page: warm and light in the middle of the sea.
         let mid = img.get_pixel(320, 520).0;
         assert!(mid[0] > mid[2] && mid[0] > 120, "{mid:?}");
         let mut notes = vec![];
         let hops = j.hops();
-        let mut scene = HopScene::build(
-            &j,
-            &hops[1],
-            (640, 360),
-            &typst,
-            dir.path(),
-            "t",
-            &mut notes,
-        )
-        .unwrap();
+        let mut scene = HopScene::build(&j, &hops[1], (640, 360), &typst, &mut notes).unwrap();
         assert!(notes.is_empty(), "{notes:?}");
         let frames = frame_count(hops[1].secs);
         let first = scene.frame(0, frames);
@@ -1619,7 +1570,5 @@ mod tests {
                 .count()
         };
         assert!(red(&last) > red(&first) + 50, "the line was drawn");
-        // Nothing is left behind in the work dir.
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }

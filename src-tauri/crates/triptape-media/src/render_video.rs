@@ -885,10 +885,8 @@ pub fn render_hero_video(
                     caps,
                     journey,
                     hop,
-                    i,
                     opts.resolution.dims(),
                     &opts.typst_bin,
-                    work_dir,
                     &mp4,
                 )
             };
@@ -917,7 +915,6 @@ pub fn render_hero_video(
             None,
             opts.resolution.dims(),
             &opts.typst_bin,
-            work_dir,
         )
         .and_then(|img| {
             img.save(&png)

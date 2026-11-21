@@ -1707,15 +1707,14 @@ fn maps_cmd(flags: &HashMap<String, String>) {
         .unwrap_or_else(|| die("page", "want WIDTHxHEIGHT in pixels, e.g. 3600x3600"));
     let typst_bin = tool_bin(flags, Tool::Typst);
     std::fs::create_dir_all(&out).unwrap_or_else(|e| die("out", e));
-    let work = out.join(".work");
     let title = flags.get("title").map(String::as_str);
-    let route = parchment::render_overview(&journey, None, resolution.dims(), &typst_bin, &work)
+    let route = parchment::render_overview(&journey, None, resolution.dims(), &typst_bin)
         .unwrap_or_else(|e| die("route map", e));
     route
         .save(out.join("route.png"))
         .unwrap_or_else(|e| die("route map", e));
     println!("map: {}", out.join("route.png").display());
-    let cover = parchment::render_overview(&journey, title, page, &typst_bin, &work)
+    let cover = parchment::render_overview(&journey, title, page, &typst_bin)
         .unwrap_or_else(|e| die("back cover", e));
     cover
         .save(out.join("back-cover.jpg"))
@@ -1739,24 +1738,15 @@ fn maps_cmd(flags: &HashMap<String, String>) {
         }
         for (i, hop) in journey.hops().iter().enumerate() {
             let mp4 = out.join(format!("hop-{:02}.mp4", i + 1));
-            let report = parchment::render_hop(
-                &caps,
-                &journey,
-                hop,
-                i,
-                resolution.dims(),
-                &typst_bin,
-                &work,
-                &mp4,
-            )
-            .unwrap_or_else(|e| die("hop", e));
+            let report =
+                parchment::render_hop(&caps, &journey, hop, resolution.dims(), &typst_bin, &mp4)
+                    .unwrap_or_else(|e| die("hop", e));
             for note in report.notes {
                 eprintln!("note: {note}");
             }
             println!("map: {} ({:.1} s)", mp4.display(), report.secs);
         }
     }
-    let _ = std::fs::remove_dir(&work);
 }
 
 fn main() {

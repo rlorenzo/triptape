@@ -2290,16 +2290,7 @@ fn make_back_cover(
             .map(|img| cover_fit(&img.to_rgb8(), size.0, size.1))
             .map_err(|e| crate::MediaError::Io(format!("{}: {e}", src.display()))),
         (None, Some(journey)) => {
-            let work = out.with_file_name(".back-cover-work");
-            let drawn = crate::parchment::render_overview(
-                journey,
-                Some(&opts.trip_name),
-                size,
-                &opts.typst_bin,
-                &work,
-            );
-            let _ = std::fs::remove_dir(&work);
-            drawn
+            crate::parchment::render_overview(journey, Some(&opts.trip_name), size, &opts.typst_bin)
         }
         (None, None) => return None,
     };
