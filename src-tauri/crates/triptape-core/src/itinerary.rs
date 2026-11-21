@@ -848,6 +848,9 @@ mod tests {
                 track: String::new(),
                 rationale: String::new(),
             },
+            cover: Default::default(),
+            crop: Default::default(),
+            book: Default::default(),
         };
         let out = apply_itinerary(&plan, &assets, &itin());
         let places: Vec<_> = out

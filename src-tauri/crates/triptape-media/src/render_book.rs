@@ -121,9 +121,50 @@ pub struct BookPhoto {
     /// People (or detected faces) in the photo: cropping a group shot's
     /// edges cuts faces, so grid layouts give such photos room.
     pub people: u32,
+    /// People tagged in the photo library (no statues or strangers).
+    pub tagged_people: u32,
+    /// Largest detected face's side as a fraction of the photo's shorter
+    /// side (0 when unknown): a big face is someone the photo is of.
+    pub face_size: f32,
+    /// Pinned to the cover by the owner, with the tile's horizontal focus
+    /// (0 left edge .. 1 right edge).
+    pub cover_focus: Option<f32>,
+    /// The owner's crop focus, (x, y) as fractions of the photo: crops
+    /// centre there instead of on detected faces.
+    pub crop_focus: Option<(f32, f32)>,
+    /// The itinerary puts the shot on board the ship.
+    pub aboard: bool,
 }
 
 impl BookPhoto {
+    /// A photo with nothing set but defaults, for building one field by
+    /// field (tests, mostly).
+    pub fn blank() -> Self {
+        Self {
+            asset_id: String::new(),
+            path: PathBuf::new(),
+            width: 0,
+            height: 0,
+            caption: None,
+            chapter: None,
+            score: NEUTRAL_SCORE,
+            keep: false,
+            taken_at: None,
+            phash: None,
+            people_sig: None,
+            embedding: None,
+            day: None,
+            people: 0,
+            place: None,
+            area: None,
+            tagged_people: 0,
+            face_size: 0.0,
+            cover_focus: None,
+            crop_focus: None,
+            aboard: false,
+        }
+    }
+
     /// The photo's file name for render notes, else its asset id.
     fn display_name(&self) -> String {
         self.path.file_name().map_or_else(
@@ -319,12 +360,24 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
         // The earliest that prints well enough full-page (soft is allowed,
         // blocked is not), so the title page does not jump ahead of the
         // photos taken before it (a castle view from the end of the visit
-        // opening the day).
+        // opening the day). A title page is a portrait of the day: of the
+        // section's first few shots, the earliest with people (not a plate
+        // of food) comes first.
         let (w, h) = slot_inches(preset, PageKind::Divider, 1);
-        if let Some(pos) = run.iter().copied().find(|&pos| {
+        let printable = |pos: usize| {
             let p = &photos[order[pos]];
             dpi_verdict(p.width, p.height, w, h) != DpiVerdict::Block
-        }) {
+        };
+        let of_people = |pos: usize| {
+            let p = &photos[order[pos]];
+            p.tagged_people > 0 || p.face_size >= COVER_FACE
+        };
+        if let Some(pos) = run[..run.len().min(DIVIDER_WINDOW)]
+            .iter()
+            .copied()
+            .find(|&pos| printable(pos) && of_people(pos))
+            .or_else(|| run.iter().copied().find(|&pos| printable(pos)))
+        {
             order[at..=pos].rotate_right(1);
         }
     }
@@ -676,6 +729,9 @@ pub struct BookOutput {
     pub counted_pages: usize,
     pub fallbacks: Vec<String>,
 }
+
+/// How many of a section's first photos may back its title page.
+const DIVIDER_WINDOW: usize = 4;
 
 /// How many photos after the hero may supply the opening spread.
 const SPREAD_WINDOW: usize = 11;
@@ -1118,10 +1174,18 @@ pub fn render_book(
         faces: opts.faces.as_ref(),
         found: Default::default(),
     };
+    // The hero and the opening spread already open the book: the cover
+    // shows other photos.
+    let has_spread = flow.iter().any(|p| p.kind == PageKind::SpreadLeft);
+    let opening: Vec<usize> = order
+        .iter()
+        .take(if has_spread { 2 } else { 1 })
+        .copied()
+        .collect();
     let cover = draw_cover_collage(
         photos,
-        tw,
-        th,
+        &opening,
+        (tw, th),
         opts,
         &fit,
         &out_dir.join("cover.jpg"),
@@ -1158,6 +1222,9 @@ pub fn render_book(
                 for (p, (sw, sh)) in slot.iter().zip(slot_sizes(opts.preset, fp.kind, &slot)) {
                     placements.push((page_no, dpi_verdict(p.width, p.height, sw, sh)));
                 }
+                // Captions on grid cells, placed once the page is drawn
+                // and its faces are known.
+                let mut pending_cells: Vec<(usize, Rect, String)> = vec![];
                 let mut page_caps = if fp.kind == PageKind::Grid {
                     let (page, cells) = grid_captions(&slot);
                     if !cells.is_empty() {
@@ -1168,13 +1235,10 @@ pub fn render_book(
                             .into_iter()
                             .map(|(x, y, cw, ch)| (x / w, y / h, cw / w, ch / h))
                             .collect();
-                        cell_captions.insert(
-                            page_no,
-                            cells
-                                .into_iter()
-                                .map(|(k, text)| (rects[k], text))
-                                .collect(),
-                        );
+                        pending_cells = cells
+                            .into_iter()
+                            .map(|(k, text)| (k, rects[k], text))
+                            .collect();
                     }
                     page
                 } else {
@@ -1191,6 +1255,7 @@ pub fn render_book(
                 if title.is_some() {
                     bannered.insert(page_no);
                 }
+                let title = title.map(|t| places_in_time_order(&t, &slot));
                 page_caps = titled(title, page_caps);
                 if !page_caps.is_empty() {
                     captions.entry(page_no).or_default().extend(page_caps);
@@ -1211,7 +1276,20 @@ pub fn render_book(
                     PageKind::Hero | PageKind::PhotoCaption => {
                         draw_fullbleed(slot[0], tw, th, &out, &fit, &mut fallbacks)?
                     }
-                    _ => draw_grid(&slot, &cells, tw, th, &out, &fit, &mut fallbacks)?,
+                    _ => {
+                        let busy = draw_grid(&slot, &cells, tw, th, &out, &fit, &mut fallbacks)?;
+                        if !pending_cells.is_empty() {
+                            cell_captions.insert(
+                                page_no,
+                                pending_cells
+                                    .drain(..)
+                                    .map(|(k, rect, text)| {
+                                        (rect, text, busy.get(k).copied().unwrap_or(false))
+                                    })
+                                    .collect(),
+                            );
+                        }
+                    }
                 }
             }
             PageKind::SpreadLeft | PageKind::SpreadRight => {
@@ -1549,6 +1627,47 @@ fn titled(title: Option<String>, caps: Vec<String>) -> Vec<String> {
     std::iter::once(title.clone()).chain(rest).collect()
 }
 
+/// A day title (`Day 5 · Wed, Oct 7 — Tsurugaoka Hachimangū`) with the
+/// places of its page's photos in the order they were taken, the title's
+/// own place among them: a day that began in Tokyo reads `— Tokyo ·
+/// Tsurugaoka Hachimangū`. A title whose place no photo on the page has
+/// keeps its place first.
+fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
+    let Some((head, place)) = title.split_once(" — ") else {
+        return title.to_string();
+    };
+    let mut seen: Vec<&str> = vec![];
+    for p in slot {
+        if let Some(pl) = p.place.as_deref() {
+            if !seen.contains(&pl) {
+                seen.push(pl);
+            }
+        }
+    }
+    if !seen.contains(&place) {
+        // No photo here is at the day's place itself: it comes where the
+        // page first goes ashore (after the morning on board, before the
+        // temple), or first when nothing is on board.
+        let at = slot
+            .iter()
+            .filter_map(|p| p.place.as_deref().map(|pl| (pl, p.aboard)))
+            .position(|(_, aboard)| !aboard)
+            .map_or(0, |k| {
+                let before: Vec<&str> = slot[..k]
+                    .iter()
+                    .filter_map(|p| p.place.as_deref())
+                    .collect();
+                seen.iter().filter(|s| before.contains(s)).count()
+            });
+        let aboard_first = slot.first().is_some_and(|p| p.aboard);
+        if !aboard_first {
+            return title.to_string();
+        }
+        seen.insert(at.min(seen.len()), place);
+    }
+    format!("{head} — {}", seen.join(" · "))
+}
+
 /// Caption lines for a divider page: its background photo's chapter title
 /// plus that photo's own caption, since the photo is consumed here.
 fn divider_lines(bg: &BookPhoto, chapters: &[String], announced: &mut Announced) -> Vec<String> {
@@ -1564,7 +1683,8 @@ type CellCaption = (usize, String);
 
 /// Per page number: captions on grid photos, each with its photo's cell
 /// `(x, y, w, h)` as fractions of the page.
-type CellCaptions = HashMap<usize, Vec<(Rect, String)>>;
+/// The bool puts the caption at the cell's top (a face is low in it).
+type CellCaptions = HashMap<usize, Vec<(Rect, String, bool)>>;
 
 /// Everything burned over the page JPEGs, keyed by page number.
 struct PageTexts {
@@ -1736,6 +1856,18 @@ pub(crate) fn cover_fit(src: &RgbImage, tw: u32, th: u32) -> RgbImage {
 /// faces (with room above for the head) in frame. When they cannot all
 /// fit, the biggest stay and the render notes the photo.
 fn fit_photo(p: &BookPhoto, tw: u32, th: u32, fit: &Fit, fb: &mut Vec<String>) -> RgbImage {
+    fit_photo_marked(p, tw, th, fit, fb).0
+}
+
+/// [`fit_photo`], plus whether a face sits in the cell's bottom band,
+/// where a cell caption would cover it (the caption then goes on top).
+fn fit_photo_marked(
+    p: &BookPhoto,
+    tw: u32,
+    th: u32,
+    fit: &Fit,
+    fb: &mut Vec<String>,
+) -> (RgbImage, bool) {
     let src = load(p, fit.ffmpeg, fb);
     let faces = match fit.faces {
         Some(f) => fit
@@ -1746,14 +1878,59 @@ fn fit_photo(p: &BookPhoto, tw: u32, th: u32, fit: &Fit, fb: &mut Vec<String>) -
             .clone(),
         None => vec![],
     };
-    let (img, cut) = cover_fit_faces(&src, tw, th, &faces);
+    let (sw, sh) = (
+        f64::from(src.width().max(1)),
+        f64::from(src.height().max(1)),
+    );
+    let (tw_f, th_f) = (f64::from(tw), f64::from(th));
+    let (window, cut) = match p.crop_focus {
+        // The owner's focus wins: they saw what the detector missed.
+        Some((fx, fy)) => (
+            focus_window(sw, sh, tw_f, th_f, (f64::from(fx), f64::from(fy))),
+            false,
+        ),
+        None if !faces.is_empty() => face_window(sw, sh, tw_f, th_f, &faces),
+        None => (focus_window(sw, sh, tw_f, th_f, (0.5, 0.5)), false),
+    };
     if cut {
         fb.push(format!(
             "crop: {} cannot keep every face in its cell; the biggest stay",
             p.display_name()
         ));
     }
-    img
+    let (x, y, w, h) = window;
+    let busy = faces.iter().any(|f| {
+        let (fx0, fx1) = (f64::from(f.x) * sw, f64::from(f.x + f.w) * sw);
+        let (fy0, fy1) = (f64::from(f.y) * sh, f64::from(f.y + f.h) * sh);
+        let seen = fx1 > x && fx0 < x + w;
+        let (top, bottom) = ((fy0 - y) / h, (fy1 - y) / h);
+        seen && top < 1.0 && bottom > CAPTION_BAND
+    });
+    (crop_window(&src, window, tw, th), busy)
+}
+
+/// Where a cell caption sits, as a fraction of the cell's height from its
+/// top: a face reaching below this would be covered.
+const CAPTION_BAND: f64 = 0.75;
+
+/// The source window a cover-fit into `tw`x`th` keeps, centred on `focus`
+/// (fractions of the photo) as far as the photo's edges allow.
+fn focus_window(sw: f64, sh: f64, tw: f64, th: f64, focus: (f64, f64)) -> (f64, f64, f64, f64) {
+    let scale = (tw / sw).max(th / sh);
+    let (cw, ch) = ((tw / scale).min(sw), (th / scale).min(sh));
+    let x = (focus.0.clamp(0.0, 1.0) * sw - cw / 2.0).clamp(0.0, (sw - cw).max(0.0));
+    let y = (focus.1.clamp(0.0, 1.0) * sh - ch / 2.0).clamp(0.0, (sh - ch).max(0.0));
+    (x, y, cw, ch)
+}
+
+/// `src`'s `window` (x, y, w, h in pixels) scaled to `tw`x`th`.
+fn crop_window(src: &RgbImage, (x, y, w, h): (f64, f64, f64, f64), tw: u32, th: u32) -> RgbImage {
+    let x = (x.round() as u32).min(src.width().saturating_sub(1));
+    let y = (y.round() as u32).min(src.height().saturating_sub(1));
+    let w = (w.round() as u32).clamp(1, src.width().saturating_sub(x).max(1));
+    let h = (h.round() as u32).clamp(1, src.height().saturating_sub(y).max(1));
+    let window = image::imageops::crop_imm(src, x, y, w, h).to_image();
+    image::imageops::resize(&window, tw, th, image::imageops::FilterType::Triangle)
 }
 
 /// Room kept around a face, as fractions of its box: the detector boxes
@@ -1857,27 +2034,6 @@ fn face_window(
         None => ((sw - cw) / 2.0, (sh - ch) / 2.0),
     };
     ((x, y, cw, ch), cut)
-}
-
-/// [`cover_fit`] that keeps faces in frame (see [`face_window`]).
-fn cover_fit_faces(src: &RgbImage, tw: u32, th: u32, faces: &[FaceBox]) -> (RgbImage, bool) {
-    if faces.is_empty() {
-        return (cover_fit(src, tw, th), false);
-    }
-    let (sw, sh) = (
-        f64::from(src.width().max(1)),
-        f64::from(src.height().max(1)),
-    );
-    let ((x, y, w, h), cut) = face_window(sw, sh, f64::from(tw), f64::from(th), faces);
-    let x = (x.round() as u32).min(src.width().saturating_sub(1));
-    let y = (y.round() as u32).min(src.height().saturating_sub(1));
-    let (w, h) = (
-        (w.round() as u32).clamp(1, src.width().saturating_sub(x).max(1)),
-        (h.round() as u32).clamp(1, src.height().saturating_sub(y).max(1)),
-    );
-    let window = image::imageops::crop_imm(src, x, y, w, h).to_image();
-    let out = image::imageops::resize(&window, tw, th, image::imageops::FilterType::Triangle);
-    (out, cut)
 }
 
 fn draw_fullbleed(
@@ -2067,7 +2223,9 @@ fn draw_grid(
     out: &Path,
     ff: &Fit,
     fb: &mut Vec<String>,
-) -> Result<(), crate::MediaError> {
+) -> Result<Vec<bool>, crate::MediaError> {
+    // Per photo: a face low in its cell, where a caption would cover it.
+    let mut busy = vec![];
     let mut page = solid(tw, th, Rgb([18, 20, 26]));
     for (p, &(x, y, w, h)) in slot.iter().zip(cells) {
         let (x, y) = (x.round() as u32, y.round() as u32);
@@ -2075,10 +2233,12 @@ fn draw_grid(
             (w.round() as u32).min(tw - x),
             (h.round() as u32).min(th - y),
         );
-        let fit = fit_photo(p, w.max(1), h.max(1), ff, fb);
+        let (fit, face_low) = fit_photo_marked(p, w.max(1), h.max(1), ff, fb);
+        busy.push(face_low);
         image::imageops::replace(&mut page, &fit, i64::from(x), i64::from(y));
     }
-    save_jpg(&page, out)
+    save_jpg(&page, out)?;
+    Ok(busy)
 }
 
 fn draw_map_page(card: &Path, tw: u32, th: u32, out: &Path) -> Result<(), crate::MediaError> {
@@ -2149,34 +2309,55 @@ fn typst_text_png(
     img
 }
 
-/// How much the cover wants a photo: 2 for a camera original with people,
-/// 1 for one without, 0 for a PNG. A PNG is a screenshot or an edit saved
-/// as an image (a "2009 vs 2026" side-by-side), which reads as clutter in
-/// a cover tile, so it fills one only when the camera photos run out.
+/// Detected face size (of the photo's shorter side) from which a face is
+/// someone the photo is of, not a stranger in the crowd or a far statue.
+const COVER_FACE: f32 = 0.08;
+
+/// How much the cover wants a photo: 2 for a camera original of people
+/// (tagged in the library, or a face big enough to be the subject), 1 for
+/// another camera photo, 0 for a PNG (a screenshot or a "2009 vs 2026"
+/// composite) or a panorama, whose middle slice in a square tile is
+/// rarely its best part (the owner can pin one with a focus instead).
 fn cover_rank(p: &BookPhoto) -> u8 {
     let png = p
         .path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("png"));
-    match (png, p.people > 0) {
-        (true, _) => 0,
-        (false, false) => 1,
-        (false, true) => 2,
+    let panorama = p.height > 0 && f64::from(p.width) / f64::from(p.height) >= PANORAMA_ASPECT;
+    if png || panorama {
+        0
+    } else if p.tagged_people > 0 || p.face_size >= COVER_FACE {
+        2
+    } else {
+        1
     }
 }
 
-/// Indices of up to 12 cover tiles. People make the cover: tiles come from
-/// the best [`cover_rank`] first, evenly through the trip, and each lower
-/// rank only tops up what the ones above could not fill. Returned in trip
-/// order.
-fn cover_picks(ranks: &[u8]) -> Vec<usize> {
-    let mut left = ranks.len().min(12);
-    let mut picks = vec![];
-    for rank in (0..=2).rev() {
-        let tier: Vec<usize> = (0..ranks.len()).filter(|&i| ranks[i] == rank).collect();
-        let take = tier.len().min(left);
-        picks.extend(evenly_spaced(tier.len(), take).into_iter().map(|j| tier[j]));
-        left -= take;
+/// Indices of up to 12 cover tiles, in trip order. The owner's pins come
+/// first. The rest split the trip into even stretches and take each
+/// stretch's best photo: the best [`cover_rank`], then the best score, so
+/// a stretch's tile is its strongest people shot, never just whichever
+/// photo sat at the stretch's edge. `opening` (the hero and the spread)
+/// never repeats on the cover.
+fn cover_picks(photos: &[BookPhoto], opening: &[usize]) -> Vec<usize> {
+    let want = photos.len().min(12);
+    let mut picks: Vec<usize> = (0..photos.len())
+        .filter(|&i| photos[i].cover_focus.is_some())
+        .take(want)
+        .collect();
+    let pool: Vec<usize> = (0..photos.len())
+        .filter(|i| !picks.contains(i) && !opening.contains(i))
+        .collect();
+    let slots = (want - picks.len()).min(pool.len());
+    for k in 0..slots {
+        let (from, to) = (k * pool.len() / slots, (k + 1) * pool.len() / slots);
+        if let Some(&best) = pool[from..to].iter().max_by(|&&a, &&b| {
+            (cover_rank(&photos[a]), photos[a].score)
+                .partial_cmp(&(cover_rank(&photos[b]), photos[b].score))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            picks.push(best);
+        }
     }
     picks.sort_unstable();
     picks
@@ -2186,8 +2367,8 @@ fn cover_picks(ranks: &[u8]) -> Vec<usize> {
 /// title band. Returns None (with a fallback note) when no photo decodes.
 fn draw_cover_collage(
     photos: &[BookPhoto],
-    tw: u32,
-    th: u32,
+    opening: &[usize],
+    (tw, th): (u32, u32),
     opts: &BookOptions,
     fit: &Fit,
     out: &Path,
@@ -2196,7 +2377,7 @@ fn draw_cover_collage(
     if photos.is_empty() {
         return None;
     }
-    let picks = cover_picks(&photos.iter().map(cover_rank).collect::<Vec<_>>());
+    let picks = cover_picks(photos, opening);
     let (cols, rows) = cover_grid(picks.len());
     let gap = 14u32;
     let tile_w = (tw - gap * (cols + 1)) / cols;
@@ -2204,7 +2385,21 @@ fn draw_cover_collage(
     let mut canvas = solid(tw, th, Rgb([18, 20, 26]));
     for (k, pi) in picks.iter().enumerate() {
         let (cx, cy) = ((k as u32) % cols, (k as u32) / cols);
-        let tile = fit_photo(&photos[*pi], tile_w, tile_h, fit, fallbacks);
+        let p = &photos[*pi];
+        let tile = match p.cover_focus {
+            // The owner's focus: the tile shows that part of the photo.
+            Some(fx) => {
+                let src = load(p, fit.ffmpeg, fallbacks);
+                let (sw, sh) = (
+                    f64::from(src.width().max(1)),
+                    f64::from(src.height().max(1)),
+                );
+                let focus = (f64::from(fx), p.crop_focus.map_or(0.5, |c| f64::from(c.1)));
+                let window = focus_window(sw, sh, f64::from(tile_w), f64::from(tile_h), focus);
+                crop_window(&src, window, tile_w, tile_h)
+            }
+            None => fit_photo(p, tile_w, tile_h, fit, fallbacks),
+        };
         image::imageops::replace(
             &mut canvas,
             &tile,
@@ -2336,9 +2531,11 @@ fn write_typst_and_compile(
                 typ_escape(&text)
             ));
         }
-        for (rect, text) in texts.cells.get(&page_no).into_iter().flatten() {
+        for (rect, text, top) in texts.cells.get(&page_no).into_iter().flatten() {
             // A bottom-row photo's caption sits above the page strip.
-            let lift = if rect.1 + rect.3 > 0.95 {
+            let lift = if *top {
+                0.0
+            } else if rect.1 + rect.3 > 0.95 {
                 strip_pt
             } else {
                 0.0
@@ -2348,6 +2545,7 @@ fn write_typst_and_compile(
                 (tw_in, th_in),
                 *rect,
                 lift,
+                *top,
                 text,
             ));
         }
@@ -2451,6 +2649,7 @@ fn cell_caption_typ(
     trim: (f64, f64),
     (x, y, w, h): Rect,
     lift_pt: f64,
+    top: bool,
     text: &str,
 ) -> String {
     let scale = (page.0 / trim.0).max(page.1 / trim.1);
@@ -2460,12 +2659,13 @@ fn cell_caption_typ(
     );
     let (sw, sh) = (trim.0 * scale, trim.1 * scale);
     format!(
-        "#place(top + left, dx: {:.4}in, dy: {:.4}in)[#box(width: {:.4}in, height: {:.4}in)[#place(bottom + center, dy: {:.1}pt)[#block(fill: rgb(18, 20, 26).transparentize(20%), inset: 6pt, radius: 2pt)[#text(size: 11pt)[{}]]]]]\n",
+        "#place(top + left, dx: {:.4}in, dy: {:.4}in)[#box(width: {:.4}in, height: {:.4}in)[#place({} + center, dy: {:.1}pt)[#block(fill: rgb(18, 20, 26).transparentize(20%), inset: 6pt, radius: 2pt)[#text(size: 11pt)[{}]]]]]\n",
         ox + x * sw,
         oy + y * sh,
         w * sw,
         h * sh,
-        -6.0 - lift_pt,
+        if top { "top" } else { "bottom" },
+        if top { 6.0 } else { -6.0 - lift_pt },
         typ_escape(text)
     )
 }
@@ -2598,24 +2798,7 @@ mod tests {
     /// A 0x0 neutral-score photo with nothing set: the base tests fill in
     /// with struct-update syntax.
     fn blank_photo() -> BookPhoto {
-        BookPhoto {
-            asset_id: String::new(),
-            path: PathBuf::new(),
-            width: 0,
-            height: 0,
-            caption: None,
-            chapter: None,
-            score: NEUTRAL_SCORE,
-            keep: false,
-            taken_at: None,
-            phash: None,
-            people_sig: None,
-            embedding: None,
-            day: None,
-            people: 0,
-            place: None,
-            area: None,
-        }
+        BookPhoto::blank()
     }
 
     /// A photo of `w`x`h` px in `chapter`.
@@ -2937,6 +3120,31 @@ mod tests {
     }
 
     #[test]
+    fn a_day_title_lists_its_places_as_they_came() {
+        let at = |place: &str| BookPhoto {
+            place: Some(place.to_string()),
+            ..blank_photo()
+        };
+        let (tokyo, shrine) = (at("Tokyo"), at("Tsurugaoka Hachimangū"));
+        let title = "Day 5 · Wed, Oct 7 — Tsurugaoka Hachimangū";
+        assert_eq!(
+            places_in_time_order(title, &[&tokyo, &shrine, &shrine]),
+            "Day 5 · Wed, Oct 7 — Tokyo · Tsurugaoka Hachimangū"
+        );
+        // The title's place not on the page: unchanged.
+        assert_eq!(places_in_time_order(title, &[&tokyo]), title);
+        // A port morning on board, then ashore: the ship, then the port.
+        let mut ship = at("Carnival Luminosa");
+        ship.aboard = true;
+        let temple = at("Nanzoin Temple");
+        assert_eq!(
+            places_in_time_order("Day 11 · Tue, Oct 13 — Fukuoka", &[&ship, &ship, &temple]),
+            "Day 11 · Tue, Oct 13 — Carnival Luminosa · Fukuoka · Nanzoin Temple"
+        );
+        assert_eq!(places_in_time_order("Day 5", &[&tokyo]), "Day 5");
+    }
+
+    #[test]
     fn pages_are_checked_for_time_order() {
         let at = |t: i64| BookPhoto {
             taken_at: Some(t),
@@ -3200,6 +3408,7 @@ mod tests {
             (12.0, 12.0),
             (0.0, 0.5, 0.5, 0.49),
             strip,
+            false,
             "Tea",
         );
         assert!(
@@ -3211,9 +3420,20 @@ mod tests {
             (12.0, 12.0),
             (0.0, 0.0, 0.5, 0.49),
             0.0,
+            false,
             "Tea",
         );
         assert!(level.contains("dy: -6.0pt"), "{level}");
+        // A face low in the cell: the caption goes on top instead.
+        let high = cell_caption_typ(
+            (12.0, 12.0),
+            (12.0, 12.0),
+            (0.0, 0.5, 0.5, 0.49),
+            strip,
+            true,
+            "Tea",
+        );
+        assert!(high.contains("#place(top + center, dy: 6.0pt)"), "{high}");
     }
 
     #[test]
@@ -3847,41 +4067,76 @@ mod tests {
 
     #[test]
     fn cover_prefers_camera_photos_of_people() {
-        let shot = |path: &str, people: u32| BookPhoto {
+        let shot = |path: &str, tagged: u32, face: f32, (w, h): (u32, u32)| BookPhoto {
             path: PathBuf::from(path),
-            people,
+            tagged_people: tagged,
+            people: tagged,
+            face_size: face,
+            width: w,
+            height: h,
             ..blank_photo()
         };
-        assert_eq!(cover_rank(&shot("IMG_1028.HEIC", 3)), 2);
-        assert_eq!(cover_rank(&shot("IMG_1.HEIC", 0)), 1, "no people");
-        assert_eq!(cover_rank(&shot("E5B14CFD.png", 3)), 0, "composite");
-        assert_eq!(cover_rank(&shot("SHOT.PNG", 1)), 0);
+        let photo = (4032, 3024);
+        assert_eq!(
+            cover_rank(&shot("IMG_1028.HEIC", 3, 0.0, photo)),
+            2,
+            "tagged"
+        );
+        assert_eq!(
+            cover_rank(&shot("IMG_2.HEIC", 0, 0.2, photo)),
+            2,
+            "a big face"
+        );
+        // A stranger far off or a distant statue is not the subject.
+        assert_eq!(cover_rank(&shot("IMG_3.HEIC", 0, 0.02, photo)), 1);
+        assert_eq!(
+            cover_rank(&shot("IMG_1.HEIC", 0, 0.0, photo)),
+            1,
+            "no people"
+        );
+        assert_eq!(
+            cover_rank(&shot("E5B14CFD.png", 3, 0.3, photo)),
+            0,
+            "composite"
+        );
+        assert_eq!(
+            cover_rank(&shot("PANO.HEIC", 2, 0.1, (16000, 3800))),
+            0,
+            "panorama"
+        );
     }
 
     #[test]
-    fn cover_picks_prefer_people_and_top_up_in_trip_order() {
-        // Plenty of people photos: only those, spread through the trip.
-        let mostly: Vec<u8> = (0..40).map(|i| if i % 3 != 0 { 2 } else { 1 }).collect();
-        let picks = cover_picks(&mostly);
-        assert_eq!(picks.len(), 12);
-        assert!(picks.iter().all(|&i| mostly[i] == 2), "{picks:?}");
-        assert!(picks.windows(2).all(|w| w[0] < w[1]));
-        // Too few: every people photo, topped up from camera photos before
-        // any PNG, sorted.
-        let few: Vec<u8> = (0..30)
-            .map(|i| match i {
-                5 | 15 => 2,
-                _ if i % 2 == 0 => 0,
-                _ => 1,
+    fn cover_picks_take_each_stretchs_best_and_honour_pins() {
+        let shot = |i: usize, tagged: u32, score: f32| BookPhoto {
+            asset_id: format!("a{i}"),
+            path: PathBuf::from(format!("IMG_{i}.HEIC")),
+            width: 4032,
+            height: 3024,
+            tagged_people: tagged,
+            score,
+            ..blank_photo()
+        };
+        // 48 photos, 4 per stretch: a people shot in each, the best-scored
+        // one at the stretch's third slot.
+        let photos: Vec<BookPhoto> = (0..48)
+            .map(|i| match i % 4 {
+                2 => shot(i, 2, 0.9),
+                1 => shot(i, 1, 0.5),
+                _ => shot(i, 0, 0.95),
             })
             .collect();
-        let picks = cover_picks(&few);
+        let picks = cover_picks(&photos, &[]);
+        assert_eq!(picks, (0..12).map(|k| 4 * k + 2).collect::<Vec<_>>());
+        // The hero never repeats; a pin always shows.
+        let mut pinned = photos.clone();
+        pinned[0].cover_focus = Some(0.8);
+        let picks = cover_picks(&pinned, &[2]);
         assert_eq!(picks.len(), 12);
-        assert!(picks.contains(&5) && picks.contains(&15));
-        assert!(picks.iter().all(|&i| few[i] > 0), "no PNG: {picks:?}");
-        assert!(picks.windows(2).all(|w| w[0] < w[1]), "{picks:?}");
-        // Small trip: every photo, PNGs included.
-        assert_eq!(cover_picks(&[1, 2, 0]), vec![0, 1, 2]);
+        assert!(picks.contains(&0) && !picks.contains(&2), "{picks:?}");
+        assert!(picks.windows(2).all(|w| w[0] < w[1]));
+        // Small trip: every photo but the opening.
+        assert_eq!(cover_picks(&photos[..3], &[1]), vec![0, 2]);
     }
 
     #[test]

@@ -199,6 +199,42 @@ fn book_story_positions<'a>(
         .collect()
 }
 
+/// The name a photo and its edits share: the file stem without a
+/// `_edited` suffix or a ` (1)` copy number, lower-cased.
+fn edit_stem(p: &std::path::Path) -> (String, bool) {
+    let stem = p
+        .file_stem()
+        .map_or_else(String::new, |s| s.to_string_lossy().to_lowercase());
+    let (stem, edited) = match stem.strip_suffix("_edited") {
+        Some(s) => (s.to_string(), true),
+        None => (stem, false),
+    };
+    let base = match stem.rsplit_once(" (") {
+        Some((b, n))
+            if n.ends_with(')') && n[..n.len() - 1].bytes().all(|c| c.is_ascii_digit()) =>
+        {
+            b.to_string()
+        }
+        _ => stem,
+    };
+    (base, edited)
+}
+
+/// Drop every photo whose `_edited` version is in the book too (Photos
+/// exports both, and they read as one photo printed twice).
+fn drop_originals_of_edits(photos: &mut Vec<render_book::BookPhoto>) {
+    let edited: HashSet<String> = photos
+        .iter()
+        .map(|p| edit_stem(&p.path))
+        .filter(|(_, e)| *e)
+        .map(|(s, _)| s)
+        .collect();
+    photos.retain(|p| {
+        let (stem, is_edit) = edit_stem(&p.path);
+        is_edit || !edited.contains(&stem)
+    });
+}
+
 /// Whether the book may use this asset. The plan's chapters hold near-dupe
 /// winners only, minus everything removed in the Story editor, so the book
 /// and the film draw from the same photos. A plan without chapters (nothing
@@ -722,6 +758,7 @@ fn export_inner(
                 height: h,
                 caption: book_caption(plan, &places, &a.id),
                 place,
+                aboard: matches!(spot, Spot::Aboard(_)),
                 area: match spot {
                     Spot::Named(name) => Some(name.to_string()),
                     _ => None,
@@ -733,10 +770,12 @@ fn export_inner(
                 score: a.score.as_ref().map_or(render_book::NEUTRAL_SCORE, |s| {
                     s.tech_quality() + s.bonus + panorama_bonus(a, s.tech_quality())
                 }),
-                keep: plan
-                    .captions
-                    .get(&a.id)
-                    .is_some_and(|c| !c.trim().is_empty()),
+                // Captioned or pinned by the owner: always placed.
+                keep: plan.book.contains(&a.id)
+                    || plan
+                        .captions
+                        .get(&a.id)
+                        .is_some_and(|c| !c.trim().is_empty()),
                 taken_at: a.taken_at,
                 phash: a.phash,
                 people_sig: a.people_sig,
@@ -747,8 +786,18 @@ fn export_inner(
                     .people_count
                     .unwrap_or(0)
                     .max(a.faces.as_ref().map_or(0, |f| f.count)),
+                tagged_people: a.people_count.unwrap_or(0),
+                face_size: a.faces.as_ref().map_or(0.0, |f| f.largest),
+                cover_focus: plan.cover.get(&a.id).map(|&f| f32::from(f) / 100.0),
+                crop_focus: plan
+                    .crop
+                    .get(&a.id)
+                    .map(|&(x, y)| (f32::from(x) / 100.0, f32::from(y) / 100.0)),
             });
         }
+        // A photo and the owner's `_edited` version of it are one photo:
+        // the edit stays.
+        drop_originals_of_edits(&mut book_photos);
         // The film's story order (stable, so ties keep db order).
         let story_pos = book_story_positions(plan, assets);
         book_photos.sort_by_key(|p| {
@@ -1019,6 +1068,26 @@ mod tests {
     }
 
     #[test]
+    fn an_edited_photo_replaces_its_original_in_the_book() {
+        let photo = |name: &str| render_book::BookPhoto {
+            path: PathBuf::from(format!("/t/{name}")),
+            ..render_book::BookPhoto::blank()
+        };
+        let mut photos = vec![
+            photo("IMG_6448.HEIC"),
+            photo("IMG_6448 (1).HEIC"),
+            photo("IMG_6448_edited.heic"),
+            photo("IMG_7000.HEIC"),
+        ];
+        drop_originals_of_edits(&mut photos);
+        let names: Vec<String> = photos
+            .iter()
+            .map(|p| p.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["IMG_6448_edited.heic", "IMG_7000.HEIC"]);
+    }
+
+    #[test]
     fn a_cancelled_export_writes_nothing_and_cleans_up() {
         let d = tempfile::tempdir().unwrap();
         let out = d.path().join("trip");
@@ -1087,6 +1156,9 @@ mod tests {
                 track: "t".into(),
                 rationale: "r".into(),
             },
+            cover: Default::default(),
+            crop: Default::default(),
+            book: Default::default(),
         }
     }
 

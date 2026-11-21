@@ -4005,6 +4005,9 @@ mod tests {
                 track: "bundled".into(),
                 rationale: "default".into(),
             },
+            cover: Default::default(),
+            crop: Default::default(),
+            book: Default::default(),
         };
         let out = dir.join("hero.mp4");
         let v = render_hero_video(
@@ -4231,6 +4234,9 @@ mod tests {
                 track: "bundled".into(),
                 rationale: "default".into(),
             },
+            cover: Default::default(),
+            crop: Default::default(),
+            book: Default::default(),
         };
         // By default the title cuts straight to the first shot; the opening
         // map only plays when asked for. The closing recap plays either way.
@@ -4382,6 +4388,9 @@ mod tests {
                 track: "bundled".into(),
                 rationale: "default".into(),
             },
+            cover: Default::default(),
+            crop: Default::default(),
+            book: Default::default(),
         };
         let out = dir.join("hero.mp4");
         render_hero_video(
@@ -4475,6 +4484,9 @@ mod tests {
                 track: "bundled".into(),
                 rationale: "default".into(),
             },
+            cover: Default::default(),
+            crop: Default::default(),
+            book: Default::default(),
         };
         let out = dir.join("hero4k.mp4");
         // No `resolution` override: the default must be 4K.
@@ -4596,6 +4608,9 @@ mod tests {
                 track: "bundled".into(),
                 rationale: "default".into(),
             },
+            cover: Default::default(),
+            crop: Default::default(),
+            book: Default::default(),
         };
         let (cw, ch_) = res.dims();
         let card = out_dir.join("card.png");
@@ -4748,6 +4763,9 @@ mod tests {
                 track: "bundled".into(),
                 rationale: "default".into(),
             },
+            cover: Default::default(),
+            crop: Default::default(),
+            book: Default::default(),
         };
         (plan, entries)
     }
