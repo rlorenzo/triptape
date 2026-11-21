@@ -73,17 +73,19 @@ pub const HOME_BASE_DAYS: usize = 3;
 /// photo. A sight visited once in depth (Sensō-ji: 22 photos on one day,
 /// a stray shot on two others) stays.
 pub fn home_bases(assets: &[Asset]) -> HashSet<String> {
-    let visits = tally(
-        assets
-            .iter()
-            .filter_map(|a| Some((asset_day(a)?, photo_attraction(a)?))),
-    );
-    let days = tally(
-        visits
-            .into_iter()
-            .filter(|(_, n)| *n >= PLACE_MIN_SHOTS)
-            .map(|((_, poi), _)| poi),
-    );
+    let mut visits: HashMap<(jiff::civil::Date, String), usize> = HashMap::new();
+    for key in assets
+        .iter()
+        .filter_map(|a| Some((asset_day(a)?, photo_attraction(a)?)))
+    {
+        *visits.entry(key).or_default() += 1;
+    }
+    let mut days: HashMap<String, usize> = HashMap::new();
+    for ((_, poi), n) in visits {
+        if n >= PLACE_MIN_SHOTS {
+            *days.entry(poi).or_default() += 1;
+        }
+    }
     days.into_iter()
         .filter(|(_, d)| *d >= HOME_BASE_DAYS)
         .map(|(poi, _)| poi)
@@ -234,6 +236,12 @@ mod tests {
             !home_bases(&seen(&[0, 1])).contains(&name),
             "two days is a visit"
         );
+        let plan = plan_of(vec![]);
+        assert!(
+            photo_places(&plan, &seen(&[0, 1, 2]), None).is_empty(),
+            "a home base captions no photo"
+        );
+        assert_eq!(photo_places(&plan, &seen(&[0, 1]), None).len(), 6);
     }
 
     #[test]

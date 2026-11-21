@@ -1841,9 +1841,6 @@ fn typst_text_png(
     img
 }
 
-/// Indices of up to 12 cover tiles. People make the cover: tiles come from
-/// photos with people in them (`has_people[i]`), evenly through the trip,
-/// topped up from the rest only when too few. Returned in trip order.
 /// A photo the cover prefers: people in it, and a camera original. A PNG
 /// is a screenshot or an edit saved as an image (a "2009 vs 2026"
 /// side-by-side), which reads as clutter in a cover tile.
@@ -1855,10 +1852,13 @@ fn cover_worthy(p: &BookPhoto) -> bool {
     p.people > 0 && !png
 }
 
-fn cover_picks(has_people: &[bool]) -> Vec<usize> {
+/// Indices of up to 12 cover tiles. People make the cover: tiles come from
+/// [`cover_worthy`] photos (`preferred[i]`), evenly through the trip,
+/// topped up from the rest only when too few. Returned in trip order.
+fn cover_picks(preferred: &[bool]) -> Vec<usize> {
     let (with_people, rest): (Vec<usize>, Vec<usize>) =
-        (0..has_people.len()).partition(|&i| has_people[i]);
-    let want = has_people.len().min(12);
+        (0..preferred.len()).partition(|&i| preferred[i]);
+    let want = preferred.len().min(12);
     if with_people.len() >= want {
         return evenly_spaced(with_people.len(), want)
             .into_iter()
