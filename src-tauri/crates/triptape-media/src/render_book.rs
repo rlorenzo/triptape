@@ -242,7 +242,7 @@ fn story_order(n_photos: usize, spread: Option<usize>) -> Vec<usize> {
 /// [`flow_pages`] planned for it:
 /// - the hero is the best-scored of the opening chapter's first
 ///   [`HERO_WINDOW`] photos that reaches 300 dpi full-page (else the first);
-/// - a divider is backed by its chapter's best-scored photo that reaches
+/// - a divider is backed by its chapter's earliest photo that reaches
 ///   300 dpi full-page (else its first), pulled to the chapter's front;
 /// - a photo that would print soft on a 1- or 2-up page but sharp in a
 ///   3/4-up cell trades places with the nearest photo of its chapter on a
@@ -306,7 +306,14 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
         let run: Vec<usize> = (at..limit)
             .take_while(|&pos| photos[order[pos]].same_stretch(opener))
             .collect();
-        if let Some(pos) = best_sharp_at(&order, &run, PageKind::Divider) {
+        // The earliest that is sharp, so the title page does not jump ahead
+        // of the photos taken before it (a castle view from the end of
+        // the visit opening the day).
+        if let Some(pos) = run
+            .iter()
+            .copied()
+            .find(|&pos| sharp(order[pos], PageKind::Divider, 1))
+        {
             order[at..=pos].rotate_right(1);
         }
     }
