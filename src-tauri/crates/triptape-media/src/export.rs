@@ -176,8 +176,9 @@ fn photo_attraction(a: &triptape_core::types::Asset) -> Option<String> {
     triptape_core::geo::attraction_within(a.gps?, PHOTO_PLACE_RADIUS_M)
 }
 
-/// What a photo's own place says, before its chapter's: the attraction it
-/// was taken at when that day's photos show a real visit. Shots the
+/// What a photo's own place says, before its chapter's: a place the owner
+/// named in the itinerary, else the attraction it was taken at when that
+/// day's photos show a real visit. Shots the
 /// itinerary puts on board (at sea, or at a dock such as Tokyo's Aomi
 /// terminal beside Miraikan) name no attraction.
 fn photo_place(
@@ -186,6 +187,10 @@ fn photo_place(
     day: Option<u32>,
     a: &triptape_core::types::Asset,
 ) -> Option<String> {
+    // A place the owner named wins: they were there.
+    if let Some(named) = itin.and_then(|i| i.place_at(a.gps)) {
+        return Some(named.to_string());
+    }
     let aboard = itin
         .zip(asset_day(a))
         .and_then(|(i, d)| i.label_for(d, a.gps))
@@ -199,9 +204,9 @@ fn photo_place(
     })
 }
 
-/// `ch` titled for boarding when it is on the ship on a cruise's first or
-/// last day: `Carnival Luminosa Embarkation` instead of the ship alone.
-/// Only the title changes; its photos keep the ship as their place.
+/// `ch` retitled when it is on the ship on a cruise's first or last day
+/// (`Carnival Luminosa Embarkation`) or on a port day (the port). Only the
+/// title changes; its photos keep the ship as their place.
 fn boarding_chapter(
     itin: Option<&triptape_core::itinerary::Itinerary>,
     assets: &[triptape_core::types::Asset],
@@ -216,30 +221,33 @@ fn boarding_chapter(
         .filter(|a| ch.asset_ids.contains(&a.id))
         .filter_map(asset_day)
         .min();
-    let label = first_day.and_then(|d| itin.boarding(d));
+    // Boarding on a cruise's first or last day; else, on a port day, the
+    // port (Hong Kong, not the ship its morning was spent on).
+    let label = first_day.and_then(|d| itin.boarding(d).or_else(|| itin.port_on(d)));
     if let (Some(label), Some(place)) = (label, &ch.place) {
-        if label.starts_with(place.as_str()) {
+        if itin.ships().contains(place) {
             out.place = Some(label);
         }
     }
     out
 }
 
-/// A book photo's caption: the user's, else its own place ([`photo_place`]:
-/// Tokyo DisneySea says more than the itinerary's "Tokyo"), else its
-/// chapter's place.
+/// A book photo's place: its own ([`photo_place`]: Tokyo DisneySea says
+/// more than the itinerary's "Tokyo"), else its chapter's.
+fn book_place(plan: &Plan, chapter: Option<usize>, own_place: Option<String>) -> Option<String> {
+    let place = chapter.and_then(|i| plan.chapters[i].place.clone());
+    own_place
+        .filter(|p| place.as_deref() != Some(p.as_str()))
+        .or(place)
+}
+
+/// A book photo's caption: the user's, else its place.
 fn book_caption(
     plan: &Plan,
-    chapter: Option<usize>,
-    own_place: Option<String>,
+    place: Option<String>,
     a: &triptape_core::types::Asset,
 ) -> Option<String> {
-    plan.captions.get(&a.id).cloned().or_else(|| {
-        let place = chapter.and_then(|i| plan.chapters[i].place.clone());
-        own_place
-            .filter(|p| place.as_deref() != Some(p.as_str()))
-            .or(place)
-    })
+    plan.captions.get(&a.id).cloned().or(place)
 }
 
 /// Whether the book may use this asset. The plan's chapters hold near-dupe
@@ -761,17 +769,18 @@ fn export_inner(
             };
             let chapter = chapter_of.get(a.id.as_str()).copied();
             let day = asset_day(a).zip(trip_start).map(|(d, s)| trip_day(d, s));
+            let place = book_place(
+                plan,
+                chapter,
+                photo_place(opts.itinerary.as_ref(), &visits, day, a),
+            );
             book_photos.push(BookPhoto {
                 asset_id: a.id.clone(),
                 path: a.path.clone(),
                 width: w,
                 height: h,
-                caption: book_caption(
-                    plan,
-                    chapter,
-                    photo_place(opts.itinerary.as_ref(), &visits, day, a),
-                    a,
-                ),
+                caption: book_caption(plan, place.clone(), a),
+                place,
                 day,
                 chapter,
                 // Unclamped, so a strong bonus still ranks above a weak one
@@ -1012,7 +1021,8 @@ mod tests {
         let passed: Visits = [((4, disneysea.clone()), 1)].into();
         let mut a = Asset::new("a", "a.jpg".into(), AssetKind::Photo);
         let caption = |plan: &Plan, visits: &Visits, a: &Asset| {
-            book_caption(plan, Some(0), photo_place(None, visits, Some(4), a), a)
+            let place = book_place(plan, Some(0), photo_place(None, visits, Some(4), a));
+            book_caption(plan, place, a)
         };
         // No GPS: the chapter place.
         assert_eq!(caption(&plan, &visited, &a).as_deref(), Some("Tokyo"));
@@ -1051,11 +1061,13 @@ mod tests {
               "stops": [
                 { "id": "tokyo", "label": "Tokyo", "lat": 35.71, "lon": 139.80, "arrive": "2026-10-04", "depart": "2026-10-09" },
                 { "id": "port", "label": "Tokyo", "lat": 35.6177, "lon": 139.771, "arrive": "2026-10-09", "depart": "2026-10-09", "kind": "port" },
-                { "id": "osaka", "label": "Osaka", "lat": 34.656, "lon": 135.4306, "arrive": "2026-10-11", "depart": "2026-10-11", "kind": "port" }
+                { "id": "osaka", "label": "Osaka", "lat": 34.656, "lon": 135.4306, "arrive": "2026-10-11", "depart": "2026-10-11", "kind": "port" },
+                { "id": "fukuoka", "label": "Fukuoka", "lat": 33.6036, "lon": 130.4038, "arrive": "2026-10-13", "depart": "2026-10-13", "kind": "port" }
               ],
               "legs": [
                 { "from": "tokyo", "to": "port", "mode": "ground" },
-                { "from": "port", "to": "osaka", "mode": "ship", "ship": "Carnival Luminosa" }
+                { "from": "port", "to": "osaka", "mode": "ship", "ship": "Carnival Luminosa" },
+                { "from": "osaka", "to": "fukuoka", "mode": "ship", "ship": "Carnival Luminosa" }
               ]
             }"#,
         )
@@ -1088,6 +1100,10 @@ mod tests {
             Some("Carnival Luminosa Embarkation")
         );
         assert_eq!(titled("s").as_deref(), Some("Carnival Luminosa"));
+        // A port day's ship chapter is titled for the port.
+        let osaka_day = vec![at("o", (34.6, 135.3), 1_791_720_000)];
+        let port_day = boarding_chapter(Some(&itin), &osaka_day, &ship_day("o")).place;
+        assert_eq!(port_day.as_deref(), Some("Osaka"));
         assert_eq!(photo_place(Some(&itin), &visits, Some(8), &assets[1]), None);
     }
 

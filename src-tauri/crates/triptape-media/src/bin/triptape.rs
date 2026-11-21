@@ -5,7 +5,7 @@
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m] [--models DIR]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
-//!                [--solo REF...] [--unsolo REF...] [--join REF REF]... [--unjoin REF...] [--list]
+//!                [--solo REF...] [--unsolo REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--itinerary itinerary.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
@@ -915,6 +915,8 @@ struct EditArgs {
     unsolo: Vec<String>,
     join: Vec<(String, String)>,
     unjoin: Vec<String>,
+    /// (asset, caption); an empty caption clears the override.
+    caption: Vec<(String, String)>,
 }
 
 fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
@@ -942,6 +944,15 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
             "join" => match <[String; 2]>::try_from(values) {
                 Ok([a, b]) => out.join.push((a, b)),
                 Err(_) => return Err("--join wants exactly two assets".to_string()),
+            },
+            "caption" => match <[String; 2]>::try_from(values) {
+                Ok([a, text]) => out.caption.push((a, text)),
+                Err(_) => {
+                    return Err(
+                        "--caption wants an asset and the caption text (\"\" clears it)"
+                            .to_string(),
+                    )
+                }
             },
             "include" | "exclude" | "uninclude" | "unexclude" | "solo" | "unsolo" | "unjoin" => {
                 if values.is_empty() {
@@ -1095,13 +1106,19 @@ fn edit_cmd(args: &[String]) {
         .iter()
         .map(|(x, y)| (resolve_one(x), resolve_one(y)))
         .collect();
+    let captions: Vec<(&Asset, &String)> = a
+        .caption
+        .iter()
+        .map(|(q, text)| (resolve_one(q), text))
+        .collect();
     let changed = ops.iter().any(|(assets, ..)| !assets.is_empty())
         || !unjoins.is_empty()
-        || !joins.is_empty();
+        || !joins.is_empty()
+        || !captions.is_empty();
     if !changed && !a.list {
         die(
             "edit",
-            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin or --list",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin/--caption or --list",
         );
     }
     let mut edits = ep.edits.clone();
@@ -1114,6 +1131,14 @@ fn edit_cmd(args: &[String]) {
     for asset in &unjoins {
         edits.collage.unjoin(&asset.id);
         println!("unjoin: {}", asset_label(asset));
+    }
+    for (asset, text) in &captions {
+        let text = text.trim();
+        edits.set_caption(
+            asset.id.clone(),
+            (!text.is_empty()).then(|| text.to_string()),
+        );
+        println!("caption: {} = {text:?}", asset_label(asset));
     }
     // Each solo photo must be in the film; each join must leave the two in
     // one collage of the film (neighbouring collage photos of one day).
@@ -1521,6 +1546,26 @@ mod tests {
         assert_eq!(a.include, ["IMG_1060.JPG", "a2", "b"]);
         assert_eq!(a.exclude, ["x"]);
         assert!(a.list);
+    }
+
+    #[test]
+    fn edit_args_set_captions() {
+        let mut v = args("--db t.db --caption IMG_1209.HEIC");
+        v.push("Canal City Ramen Stadium: rich broth".into());
+        v.extend(args("--caption a2"));
+        v.push(String::new());
+        let a = parse_edit_args(&v).unwrap();
+        assert_eq!(
+            a.caption,
+            [
+                (
+                    "IMG_1209.HEIC".to_string(),
+                    "Canal City Ramen Stadium: rich broth".to_string()
+                ),
+                ("a2".to_string(), String::new()),
+            ]
+        );
+        assert!(parse_edit_args(&args("--caption a")).is_err());
     }
 
     #[test]

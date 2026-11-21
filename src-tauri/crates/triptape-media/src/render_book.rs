@@ -110,6 +110,10 @@ pub struct BookPhoto {
     /// 1-based trip day (local date), numbered as the plan's chapters are.
     /// Pages never mix two days, and each day's first page names it.
     pub day: Option<u32>,
+    /// Where the photo was taken, as the book names it (a named place, a
+    /// visited attraction, else the chapter's place). The page's location
+    /// strip lists it even when the user's caption is shown instead.
+    pub place: Option<String>,
     /// People (or detected faces) in the photo: cropping a group shot's
     /// edges cuts faces, so grid layouts give such photos room.
     pub people: u32,
@@ -1400,14 +1404,19 @@ struct PageTexts {
 /// the page line as [`page_caption`] does.
 fn grid_captions(slot: &[&BookPhoto]) -> (Vec<String>, Vec<CellCaption>) {
     let mut cells = vec![];
-    let mut auto: Vec<&BookPhoto> = vec![];
+    let mut lines: Vec<String> = vec![];
     for (k, p) in slot.iter().enumerate() {
         match caption_of(p).into_iter().next().filter(|_| p.keep) {
-            Some(c) => cells.push((k, c)),
-            None => auto.push(p),
+            // The user's words go on the photo; its place still joins the
+            // page's location strip (the lounge, the ramen hall).
+            Some(c) => {
+                cells.push((k, c));
+                lines.extend(p.place.clone());
+            }
+            None => lines.extend(caption_of(p)),
         }
     }
-    (page_caption(&auto, PageKind::Grid), cells)
+    (collapse_lines(lines, PageKind::Grid), cells)
 }
 
 /// Caption lines for one photo page. Single-photo pages keep the photo's
@@ -1415,12 +1424,22 @@ fn grid_captions(slot: &[&BookPhoto]) -> (Vec<String>, Vec<CellCaption>) {
 /// page never repeats near-identical per-photo template text; distinct
 /// user prose on a grid keeps at most the first two lines.
 fn page_caption(slot: &[&BookPhoto], kind: PageKind) -> Vec<String> {
-    let mut caps: Vec<String> = vec![];
+    let mut lines: Vec<String> = vec![];
     for p in slot {
-        for c in caption_of(p) {
-            if !caps.contains(&c) {
-                caps.push(c);
-            }
+        // A captioned photo's place follows the user's words.
+        let place = p.place.clone().filter(|_| p.keep);
+        lines.extend(caption_of(p).into_iter().chain(place));
+    }
+    collapse_lines(lines, kind)
+}
+
+/// [`page_caption`]'s rules over raw lines: duplicates drop, and on grids
+/// a less specific place, then datelines, collapse.
+fn collapse_lines(lines: Vec<String>, kind: PageKind) -> Vec<String> {
+    let mut caps: Vec<String> = vec![];
+    for c in lines {
+        if !caps.contains(&c) {
+            caps.push(c);
         }
     }
     if kind != PageKind::Grid || caps.len() <= 1 {
@@ -1956,6 +1975,9 @@ fn write_typst_and_compile(
             "#rect(width: 100%, height: 100%, fill: rgb(18, 20, 26))\n#place(center + horizon)[#image(\"{}\", width: 100%, height: 100%, fit: \"cover\")]\n",
             jpg.file_name().unwrap().to_string_lossy()
         ));
+        // Height (pt) of the page's bottom strip, which photo captions in
+        // the bottom row must clear.
+        let mut strip_pt = 0.0;
         if let Some(lines) = texts.lines.get(&page_no).filter(|l| !l.is_empty()) {
             // Chapter title pages carry a bigger strip, so they read as a
             // chapter opening without dimming the photo.
@@ -1964,13 +1986,27 @@ fn write_typst_and_compile(
             } else {
                 (14, 8)
             };
+            let text = lines.join(" · ");
+            strip_pt = strip_height_pt(&text, size, inset, pw);
             typ.push_str(&format!(
                 "#place(bottom + center)[#rect(fill: rgb(18, 20, 26).transparentize(20%), inset: {inset}pt)[#text(size: {size}pt)[{}]]]\n",
-                typ_escape(&lines.join(" · "))
+                typ_escape(&text)
             ));
         }
         for (rect, text) in texts.cells.get(&page_no).into_iter().flatten() {
-            typ.push_str(&cell_caption_typ((pw, ph), (tw_in, th_in), *rect, text));
+            // A bottom-row photo's caption sits above the page strip.
+            let lift = if rect.1 + rect.3 > 0.95 {
+                strip_pt
+            } else {
+                0.0
+            };
+            typ.push_str(&cell_caption_typ(
+                (pw, ph),
+                (tw_in, th_in),
+                *rect,
+                lift,
+                text,
+            ));
         }
         if i + 1 < jpegs.len() {
             typ.push_str("#pagebreak()\n");
@@ -2056,7 +2092,24 @@ fn burn_captions(
 /// cell's width. `page` is the PDF page and `trim` the page JPEG's size
 /// (inches); with bleed the JPEG is cover-scaled onto the larger page, so
 /// the cell is mapped the same way.
-fn cell_caption_typ(page: (f64, f64), trim: (f64, f64), (x, y, w, h): Rect, text: &str) -> String {
+/// Height in points of a bottom strip of `text` at `size` pt with `inset`
+/// padding on a `page_w`-inch page: a generous estimate (half an em per
+/// character, wrapping at the page width) so a caption lifted above it
+/// clears it.
+fn strip_height_pt(text: &str, size: u32, inset: u32, page_w: f64) -> f64 {
+    let (size, inset) = (f64::from(size), f64::from(inset));
+    let width_pt = text.chars().count() as f64 * size * 0.55;
+    let lines = (width_pt / (page_w * 72.0 - 2.0 * inset)).ceil().max(1.0);
+    lines * size * 1.3 + 2.0 * inset
+}
+
+fn cell_caption_typ(
+    page: (f64, f64),
+    trim: (f64, f64),
+    (x, y, w, h): Rect,
+    lift_pt: f64,
+    text: &str,
+) -> String {
     let scale = (page.0 / trim.0).max(page.1 / trim.1);
     let (ox, oy) = (
         (page.0 - trim.0 * scale) / 2.0,
@@ -2064,11 +2117,12 @@ fn cell_caption_typ(page: (f64, f64), trim: (f64, f64), (x, y, w, h): Rect, text
     );
     let (sw, sh) = (trim.0 * scale, trim.1 * scale);
     format!(
-        "#place(top + left, dx: {:.4}in, dy: {:.4}in)[#box(width: {:.4}in, height: {:.4}in)[#place(bottom + center, dy: -6pt)[#block(fill: rgb(18, 20, 26).transparentize(20%), inset: 6pt, radius: 2pt)[#text(size: 11pt)[{}]]]]]\n",
+        "#place(top + left, dx: {:.4}in, dy: {:.4}in)[#box(width: {:.4}in, height: {:.4}in)[#place(bottom + center, dy: {:.1}pt)[#block(fill: rgb(18, 20, 26).transparentize(20%), inset: 6pt, radius: 2pt)[#text(size: 11pt)[{}]]]]]\n",
         ox + x * sw,
         oy + y * sh,
         w * sw,
         h * sh,
+        -6.0 - lift_pt,
         typ_escape(text)
     )
 }
@@ -2129,6 +2183,26 @@ mod tests {
         );
         assert_eq!(*img.get_pixel(0, 0), Rgb([100, 100, 100]));
         assert_eq!(*img.get_pixel(0, 1), Rgb([25, 25, 25]));
+    }
+
+    #[test]
+    fn captioned_photos_still_name_their_place() {
+        let shot = |cap: &str, place: &str, keep: bool| BookPhoto {
+            caption: Some(cap.to_string()),
+            place: Some(place.to_string()),
+            keep,
+            ..blank_photo()
+        };
+        let ramen = shot("Best ramen of the trip.", "Canal City Ramen Stadium", true);
+        let other = shot("Fukuoka", "Fukuoka", false);
+        let (line, cells) = grid_captions(&[&ramen, &other]);
+        assert_eq!(cells, [(0, "Best ramen of the trip.".to_string())]);
+        assert_eq!(line, ["Canal City Ramen Stadium", "Fukuoka"]);
+        // A single captioned photo shows its words, then its place.
+        assert_eq!(
+            page_caption(&[&ramen], PageKind::PhotoCaption),
+            ["Best ramen of the trip.", "Canal City Ramen Stadium"]
+        );
     }
 
     #[test]
@@ -2196,6 +2270,7 @@ mod tests {
             embedding: None,
             day: None,
             people: 0,
+            place: None,
         }
     }
 
@@ -2589,6 +2664,34 @@ mod tests {
             .iter()
             .all(|(k, t)| *k != PageKind::Grid || t.len() <= 2));
         assert_eq!(soft_placements(&photos, 24), 1);
+    }
+
+    #[test]
+    fn bottom_row_captions_clear_the_page_strip() {
+        // One line of 14 pt with 8 pt inset on a 12 in page.
+        let strip = strip_height_pt("Taipei · Carnival Luminosa", 14, 8, 12.0);
+        assert!((strip - (14.0 * 1.3 + 16.0)).abs() < 1e-9);
+        // Long text wraps to more lines.
+        assert!(strip_height_pt(&"word ".repeat(80), 14, 8, 12.0) > 2.0 * strip);
+        let lifted = cell_caption_typ(
+            (12.0, 12.0),
+            (12.0, 12.0),
+            (0.0, 0.5, 0.5, 0.49),
+            strip,
+            "Tea",
+        );
+        assert!(
+            lifted.contains(&format!("dy: {:.1}pt", -6.0 - strip)),
+            "{lifted}"
+        );
+        let level = cell_caption_typ(
+            (12.0, 12.0),
+            (12.0, 12.0),
+            (0.0, 0.0, 0.5, 0.49),
+            0.0,
+            "Tea",
+        );
+        assert!(level.contains("dy: -6.0pt"), "{level}");
     }
 
     #[test]

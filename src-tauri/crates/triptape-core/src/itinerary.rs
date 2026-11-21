@@ -80,6 +80,26 @@ pub struct ItinLeg {
 pub struct Itinerary {
     pub stops: Vec<ItinStop>,
     pub legs: Vec<ItinLeg>,
+    /// Places the owner names themselves (Taipei 101, a night market, a
+    /// ramen hall): photos taken inside one are labelled with it, ahead of
+    /// the built-in attraction list, which misses many of them.
+    #[serde(default)]
+    pub places: Vec<NamedPlace>,
+}
+
+/// A place the owner named, as a point and the reach that counts as there.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NamedPlace {
+    pub name: String,
+    pub lat: f64,
+    pub lon: f64,
+    /// Metres from the point that count as at the place (default 300).
+    #[serde(default = "default_place_radius")]
+    pub radius_m: f64,
+}
+
+fn default_place_radius() -> f64 {
+    300.0
 }
 
 /// One cruise: a ship and the days the owner is on board.
@@ -145,6 +165,18 @@ impl Itinerary {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("read itinerary {}: {e}", path.display()))?;
         Self::from_json(&text)
+    }
+
+    /// The owner-named place a shot at `gps` was taken in: the nearest one
+    /// whose radius reaches it.
+    pub fn place_at(&self, gps: Option<(f64, f64)>) -> Option<&str> {
+        let p = gps?;
+        self.places
+            .iter()
+            .map(|pl| (pl, haversine_m(p, (pl.lat, pl.lon))))
+            .filter(|(pl, d)| *d <= pl.radius_m)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(pl, _)| pl.name.as_str())
     }
 
     /// Stop by id.
@@ -371,6 +403,15 @@ impl Itinerary {
                 None
             }
         })
+    }
+
+    /// The port the ship calls at on `day`, when it does: a port day spent
+    /// ashore is about the port even if its first shots were on deck.
+    pub fn port_on(&self, day: NaiveDate) -> Option<String> {
+        self.stops
+            .iter()
+            .find(|s| s.kind == StopKind::Port && s.active_on(day) && !s.hide_label)
+            .map(|s| s.label.clone())
     }
 
     /// First and last day of the trip: the earliest and latest dates of
@@ -676,6 +717,35 @@ mod tests {
         assert_eq!(places, ["Tokyo", "Carnival Luminosa", "Osaka"]);
         assert_eq!(out.chapters[1].title, "Carnival Luminosa");
         assert_eq!(out.map_polyline.len(), 7);
+    }
+
+    #[test]
+    fn named_places_label_shots_inside_their_radius() {
+        let mut it = itin();
+        assert!(it.places.is_empty());
+        it.places = serde_json::from_str(
+            r#"[
+              { "name": "Taipei 101", "lat": 25.0340, "lon": 121.5645, "radius_m": 250 },
+              { "name": "Raohe Night Market", "lat": 25.0509, "lon": 121.5775 }
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(it.place_at(Some((25.0343, 121.5648))), Some("Taipei 101"));
+        assert_eq!(
+            it.place_at(Some((25.0510, 121.5770))),
+            Some("Raohe Night Market")
+        );
+        // Between the two, outside both radii.
+        assert_eq!(it.place_at(Some((25.0420, 121.5700))), None);
+        assert_eq!(it.place_at(None), None);
+    }
+
+    #[test]
+    fn port_on_names_port_days_only() {
+        assert_eq!(itin().port_on(day("2026-10-11")).as_deref(), Some("Osaka"));
+        assert_eq!(itin().port_on(day("2026-10-10")), None);
+        // The embarkation port is hidden on the map and has no port day.
+        assert_eq!(itin().port_on(day("2026-10-09")), None);
     }
 
     #[test]
