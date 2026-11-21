@@ -60,7 +60,21 @@ pub fn day_of(a: &Asset) -> String {
 /// Whether two assets share a capture-local day ([`day_key`]); an unknown
 /// date matches nothing.
 pub fn same_day(a: &Asset, b: &Asset) -> bool {
-    a.taken_at.is_some() && day_of(a) == day_of(b)
+    let date = |x: &Asset| {
+        x.taken_at
+            .and_then(|t| crate::metadata::local_date(t, x.tz_offset_secs))
+    };
+    date(a).is_some_and(|d| date(b) == Some(d))
+}
+
+/// Root of `x` in a union-find forest (`parent[r] == r` at a root),
+/// halving the path on the way.
+pub(crate) fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
 }
 
 /// Capture-time sort key: capture time (unknown last), then id. This is
@@ -128,11 +142,6 @@ pub fn gps_outliers_in(ordered: &[(&Asset, Track)]) -> HashSet<String> {
         prev = Some((a.taken_at, g));
     }
     bad
-}
-
-/// See [`gps_outliers_in`]; sorts `assets` into story order first.
-pub fn gps_outliers(assets: &[Asset]) -> HashSet<String> {
-    gps_outliers_in(&story_tracks(assets))
 }
 
 /// Running state for the cluster being built; O(1) per pushed asset.
@@ -283,7 +292,7 @@ fn finish(accs: Vec<Acc>) -> Vec<Cluster> {
 /// clusters into a same-day neighbour ([`MERGE_MAX_ASSETS`]). On a split
 /// day each party's stretch gets clusters of its own.
 pub fn cluster_assets(assets: &[Asset]) -> Vec<Cluster> {
-    cluster_tracks(story_tracks(assets))
+    finish(merge_small(split_clusters(story_tracks(assets))))
 }
 
 /// Clusters as if no day were split (capture order, one shared timeline),
@@ -296,10 +305,6 @@ pub fn cluster_by_capture<'a>(assets: impl IntoIterator<Item = &'a Asset>) -> Ve
     finish(split_clusters(
         ordered.into_iter().map(|a| (a, Track::Shared)).collect(),
     ))
-}
-
-fn cluster_tracks(ordered: Vec<(&Asset, Track)>) -> Vec<Cluster> {
-    finish(merge_small(split_clusters(ordered)))
 }
 
 /// Start a new cluster on day change, time gap, place drift or party
@@ -387,13 +392,6 @@ fn looks_alike(a: &Asset, b: &Asset) -> bool {
 pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) -> Vec<DupeGroup> {
     let n = assets.len();
     let mut parent: Vec<usize> = (0..n).collect();
-    fn find(p: &mut [usize], mut x: usize) -> usize {
-        while p[x] != x {
-            p[x] = p[p[x]];
-            x = p[x];
-        }
-        x
-    }
     /// Join root `from` into root `into`, moving its member list along.
     fn union(p: &mut [usize], members: &mut [Vec<usize>], into: usize, from: usize) {
         p[from] = into;
@@ -419,9 +417,9 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
         for &e in &edits {
             is_edit[e] = true;
         }
-        let root = find(&mut parent, edits[0]);
+        let root = uf_find(&mut parent, edits[0]);
         for &m in edits[1..].iter().chain(&originals) {
-            let r = find(&mut parent, m);
+            let r = uf_find(&mut parent, m);
             if r != root {
                 union(&mut parent, &mut members, root, r);
             }
@@ -434,7 +432,7 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
             if !same_moment(&assets[i], &assets[j]) || !alike(i, j) {
                 continue;
             }
-            let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+            let (ri, rj) = (uf_find(&mut parent, i), uf_find(&mut parent, j));
             // Complete linkage: merge only if every cross pair is the
             // same moment, so chains (0, 9, 18 min) can't span the
             // window or radius as a whole.
@@ -451,7 +449,7 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
     }
     let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
     for i in 0..n {
-        let r = find(&mut parent, i);
+        let r = uf_find(&mut parent, i);
         groups.entry(r).or_default().push(i);
     }
     let score_of = |i: usize| scores.get(&assets[i].id).map(|s| s.total).unwrap_or(0.5);
@@ -702,7 +700,10 @@ mod tests {
             asset("a", Some(1_714_557_600), Some((37.77, -122.41)), None),
             asset("b", Some(1_714_557_660), Some((35.68, 139.69)), None),
         ];
-        assert_eq!(gps_outliers(&a), HashSet::from(["b".to_string()]));
+        assert_eq!(
+            gps_outliers_in(&story_tracks(&a)),
+            HashSet::from(["b".to_string()])
+        );
         let c = cluster_assets(&a);
         assert_eq!(c.len(), 1, "same day+hour stays one cluster: {c:?}");
         assert!(c[0].centroid_gps.is_some(), "outlier excluded, anchor kept");

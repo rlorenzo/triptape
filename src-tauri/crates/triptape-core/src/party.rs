@@ -35,7 +35,7 @@
 //!    The primary stream is the one holding the most user captions (ties:
 //!    most files): the owner's phone.
 
-use crate::cluster::{day_of, same_day, speed_jump, story_key};
+use crate::cluster::{day_of, same_day, speed_jump, story_key, uf_find};
 use crate::geo::haversine_m;
 use crate::plan::has_caption;
 use crate::types::Asset;
@@ -107,8 +107,6 @@ pub struct Apart {
     pub end: i64,
     /// Distinct fixes of each stream in the stretch.
     pub fixes: (usize, usize),
-    /// Median distance between the two at matching times (m).
-    pub median_m: f64,
 }
 
 /// One split stretch: parties told in turn between `start` and `end`.
@@ -214,16 +212,11 @@ pub fn camera_streams(assets: &[Asset]) -> Vec<Option<u32>> {
     for (i, it) in items.iter().enumerate() {
         let list = &by_scheme[it.scheme];
         let lo = i64::from(it.n) - i64::from(STREAM_MAX_STEP);
-        let ranges = if lo >= 0 {
-            [(lo as u32, it.n), (1, 0)]
-        } else {
-            [
-                (0, it.n),
-                ((i64::from(COUNTER_SPAN) + lo) as u32, COUNTER_SPAN - 1),
-            ]
-        };
+        // Counters up to STREAM_MAX_STEP below this one, wrapping past 0000.
+        let wrapped = (lo < 0).then(|| ((i64::from(COUNTER_SPAN) + lo) as u32, COUNTER_SPAN - 1));
+        let ranges = std::iter::once((lo.max(0) as u32, it.n)).chain(wrapped);
         let mut cands: Vec<(i64, usize)> = vec![];
-        for (from, to) in ranges.into_iter().filter(|(a, b)| a <= b) {
+        for (from, to) in ranges {
             let start = list.partition_point(|&(n, _)| n < from);
             for &(n, j) in list[start..].iter().take_while(|&&(n, _)| n <= to) {
                 if j == i {
@@ -257,18 +250,11 @@ pub fn camera_streams(assets: &[Asset]) -> Vec<Option<u32>> {
     let mut pred: Vec<Option<usize>> = vec![None; n];
     let mut succ: Vec<Option<usize>> = vec![None; n];
     let mut root: Vec<usize> = (0..n).collect();
-    fn find(root: &mut [usize], mut x: usize) -> usize {
-        while root[x] != x {
-            root[x] = root[root[x]];
-            x = root[x];
-        }
-        x
-    }
     for (_, i, j) in links {
         if pred[i].is_some() || succ[j].is_some() {
             continue;
         }
-        let (ri, rj) = (find(&mut root, i), find(&mut root, j));
+        let (ri, rj) = (uf_find(&mut root, i), uf_find(&mut root, j));
         if ri == rj {
             continue;
         }
@@ -381,14 +367,11 @@ fn apart_runs(streams: (u32, u32), obs: &[Obs]) -> Vec<Apart> {
                 && fixes.0 >= MIN_APART_SAMPLES
                 && fixes.1 >= MIN_APART_SAMPLES
             {
-                let mut d: Vec<f64> = run.iter().map(|o| o.d).collect();
-                d.sort_by(f64::total_cmp);
                 out.push(Apart {
                     streams,
                     start: first.t,
                     end: last.t,
                     fixes,
-                    median_m: d[d.len() / 2],
                 });
             }
         }
@@ -509,9 +492,10 @@ fn lay_out_day(assets: &[Asset], run: &[usize], day: String, layout: &mut StoryL
         }
     }
     let time_of = |i: usize| assets[i].taken_at.unwrap_or(i64::MAX);
-    // Per run position: (anchor position, turn, track).
-    let mut keyed: Vec<(usize, u32, usize, Track)> = Vec::with_capacity(run.len());
-    let mut placed = vec![false; run.len()];
+    // Per run position: (anchor position, turn, track). Shots outside
+    // every split stretch keep their own place on the shared timeline.
+    let mut keyed: Vec<(usize, u32, Track)> =
+        (0..run.len()).map(|p| (p, 0, Track::Shared)).collect();
     for &(start, end) in &segments {
         let segment = layout.splits.len() as u32;
         let evidence: Vec<Apart> = apart
@@ -580,8 +564,7 @@ fn lay_out_day(assets: &[Asset], run: &[usize], day: String, layout: &mut StoryL
                 .or_else(|| stray_rank(i));
             let track = rank.map_or(Track::Shared, |rank| Track::Party { segment, rank });
             // A shot no party claims plays after every party's turn.
-            keyed.push((anchor, rank.unwrap_or(turns), p, track));
-            placed[p] = true;
+            keyed[p] = (anchor, rank.unwrap_or(turns), track);
         }
         layout.splits.push(SplitStretch {
             day: day.clone(),
@@ -591,13 +574,11 @@ fn lay_out_day(assets: &[Asset], run: &[usize], day: String, layout: &mut StoryL
             apart: evidence,
         });
     }
-    for (p, _) in placed.iter().enumerate().filter(|(_, done)| !**done) {
-        keyed.push((p, 0, p, Track::Shared));
-    }
-    keyed.sort_unstable_by_key(|&(anchor, turn, p, _)| (anchor, turn, p));
-    for (_, _, p, track) in keyed {
+    let mut told: Vec<usize> = (0..run.len()).collect();
+    told.sort_unstable_by_key(|&p| (keyed[p].0, keyed[p].1, p));
+    for p in told {
         layout.order.push(run[p]);
-        layout.tracks.push(track);
+        layout.tracks.push(keyed[p].2);
     }
 }
 

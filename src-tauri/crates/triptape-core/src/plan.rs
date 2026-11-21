@@ -7,8 +7,9 @@
 //! Sec 5.4 degradation eligibility lives here too.
 
 use crate::clip_window::MAX_WINDOW_SECS;
-use crate::cluster::{gps_outliers_in, story_positions, story_tracks};
+use crate::cluster::{day_of, gps_outliers_in, same_day, story_positions, story_tracks};
 use crate::embedding::{same_scene, Embedding};
+use crate::party::Track;
 use crate::types::{
     distinct_assets, Asset, AssetKind, Chapter, CollageEdits, MusicPick, Plan, PlanEntry,
     Rendition, Score,
@@ -880,18 +881,29 @@ fn select_hero_by_budget<'a>(
                 .then(x.cmp(&y))
         });
     }
-    // Share weight per chapter: size^exponent, summed over its units.
-    let weight: Vec<f64> = chapters
+    // Each chapter's members grouped by unit, units in order of their best
+    // member, members best first.
+    let units: Vec<Vec<Vec<usize>>> = chapters
         .iter()
         .map(|(_, m)| {
-            let mut units: std::collections::BTreeMap<Option<usize>, usize> =
-                std::collections::BTreeMap::new();
+            let mut slot: HashMap<Option<usize>, usize> = HashMap::new();
+            let mut groups: Vec<Vec<usize>> = vec![];
             for &i in m {
-                *units.entry(unit_of(&cands[i].asset_id)).or_default() += 1;
+                let k = *slot.entry(unit_of(&cands[i].asset_id)).or_insert_with(|| {
+                    groups.push(vec![]);
+                    groups.len() - 1
+                });
+                groups[k].push(i);
             }
-            units
-                .values()
-                .map(|&n| (n as f64).powf(CHAPTER_TIME_EXPONENT))
+            groups
+        })
+        .collect();
+    // Share weight per chapter: size^exponent, summed over its units.
+    let weight: Vec<f64> = units
+        .iter()
+        .map(|u| {
+            u.iter()
+                .map(|g| (g.len() as f64).powf(CHAPTER_TIME_EXPONENT))
                 .sum()
         })
         .collect();
@@ -913,16 +925,7 @@ fn select_hero_by_budget<'a>(
     // Every chapter's best entry (each unit's, on a split day), weakest
     // dropped first if over budget (the strongest always stays, so the film
     // is never empty).
-    let mut reps: Vec<usize> = chapters
-        .iter()
-        .flat_map(|(_, m)| {
-            let mut seen = HashSet::new();
-            m.iter()
-                .copied()
-                .filter(|&i| seen.insert(unit_of(&cands[i].asset_id)))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    let mut reps: Vec<usize> = units.iter().flatten().map(|g| g[0]).collect();
     for &r in &reps {
         picked[r] = true;
     }
@@ -1207,7 +1210,7 @@ pub fn move_rejection(hero: &[PlanEntry], asset: &Asset, anchor: &Asset) -> Opti
         Some(MoveRejection::NotInFilm { anchor: true })
     } else if asset.id == anchor.id {
         Some(MoveRejection::SameShot)
-    } else if !crate::cluster::same_day(asset, anchor) {
+    } else if !same_day(asset, anchor) {
         Some(MoveRejection::OtherDay)
     } else {
         None
@@ -1694,14 +1697,14 @@ pub fn build_plan_with_length(
     // chapter, exactly as before.
     let split_days: HashSet<String> = tracked
         .iter()
-        .filter(|(_, t)| *t != crate::party::Track::Shared)
-        .map(|(a, _)| crate::cluster::day_of(a))
+        .filter(|(_, t)| *t != Track::Shared)
+        .map(|(a, _)| day_of(a))
         .collect();
     let capture_unit: HashMap<String, usize> = crate::cluster::cluster_by_capture(
         ordered
             .iter()
             .copied()
-            .filter(|a| split_days.contains(&crate::cluster::day_of(a))),
+            .filter(|a| split_days.contains(&day_of(a))),
     )
     .into_iter()
     .enumerate()
@@ -1803,13 +1806,12 @@ pub fn build_plan_with_length(
 /// the order of their median member, each chapter's shots in story order.
 /// Every other day is untouched.
 fn chapters_together<'a, 'c>(
-    tracked: &[(&'a Asset, crate::party::Track)],
+    tracked: &[(&'a Asset, Track)],
     chapter_of: impl Fn(&str) -> &'c str,
 ) -> Vec<&'a Asset> {
-    let day = crate::cluster::day_of;
     let mut out = Vec::with_capacity(tracked.len());
-    for run in tracked.chunk_by(|(a, _), (b, _)| day(a) == day(b)) {
-        if run.iter().all(|(_, t)| *t == crate::party::Track::Shared) {
+    for run in tracked.chunk_by(|(a, _), (b, _)| same_day(a, b)) {
+        if run.iter().all(|(_, t)| *t == Track::Shared) {
             out.extend(run.iter().map(|(a, _)| *a));
             continue;
         }
