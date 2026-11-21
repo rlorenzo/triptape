@@ -592,8 +592,15 @@ pub fn name_film_chapters(
 ) {
     let by_id: std::collections::HashMap<&str, &Asset> =
         assets.iter().map(|a| (a.id.as_str(), a)).collect();
-    let shown: std::collections::HashSet<&str> =
-        plan.hero.iter().map(|e| e.asset_id.as_str()).collect();
+    // Film order, each asset once (a multi-window clip has several
+    // entries): the user's moves reorder the hero, not the chapter.
+    let mut seen = std::collections::HashSet::new();
+    let film_order: Vec<String> = plan
+        .hero
+        .iter()
+        .map(|e| e.asset_id.clone())
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
     let home = crate::places::home_bases(assets);
     for ch in &mut plan.chapters {
         ch.film_place = None;
@@ -605,10 +612,12 @@ pub fn name_film_chapters(
             .iter()
             .filter_map(|id| by_id.get(id.as_str()).copied())
             .collect();
-        let on_screen: Vec<&Asset> = members
+        let in_chapter: std::collections::HashSet<&str> =
+            ch.asset_ids.iter().map(String::as_str).collect();
+        let on_screen: Vec<&Asset> = film_order
             .iter()
-            .copied()
-            .filter(|a| shown.contains(a.id.as_str()))
+            .filter(|id| in_chapter.contains(id.as_str()))
+            .filter_map(|id| by_id.get(id.as_str()).copied())
             .collect();
         if on_screen.is_empty() {
             continue;
