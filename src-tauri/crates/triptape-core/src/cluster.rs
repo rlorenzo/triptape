@@ -457,10 +457,19 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
         .into_values()
         .map(|idx| {
             // "I want to keep my edits": an edit of an original beats any
-            // score; among edits (or with none), the best score wins.
+            // score; among edits (or with none), the best score wins, and
+            // a tie goes to the first in story order. Byte-identical
+            // copies always tie (they share their score), so the earliest
+            // dated copy is kept: a later re-import carries a later date.
+            let rank = |i: usize| (is_edit[i], score_of(i));
             let mut best = idx[0];
             for &m in &idx[1..] {
-                let better = (is_edit[m], score_of(m)) > (is_edit[best], score_of(best));
+                let better = match rank(m).partial_cmp(&rank(best)) {
+                    Some(std::cmp::Ordering::Equal) | None => {
+                        story_key(&assets[m]) < story_key(&assets[best])
+                    }
+                    Some(o) => o.is_gt(),
+                };
                 if better {
                     best = m;
                 }
@@ -662,6 +671,19 @@ mod tests {
         a.gps = gps;
         a.phash = phash;
         a
+    }
+
+    #[test]
+    fn identical_copies_keep_the_earliest_dated_one() {
+        // The same file imported twice; the re-import is dated a day later
+        // and sorts first by id.
+        let mut later = asset("a-copy", Some(1_791_450_000 + 86_400), None, None);
+        let mut first = asset("b-orig", Some(1_791_450_000), None, None);
+        later.content_hash = Some("h".into());
+        first.content_hash = Some("h".into());
+        let groups = collapse_near_dupes(&[later, first], &HashMap::new());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].best_id, "b-orig");
     }
 
     #[test]
