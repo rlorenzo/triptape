@@ -16,10 +16,10 @@ use triptape_ai_local::local::{LocalModels, ModelPaths};
 use triptape_app::{
     apply_live_photo_pairing, book_notes, book_presets, check_sources as check_plan_sources,
     export_dir_in, export_eligibility, export_sources, fill_assets_parallel, find_relinks,
-    finished_film, keepsake_scope, paginate, parse_book_preset, plain_skip, relink_plan,
-    relinked_asset, resolve_export_parent, tool_status, tools, valid_job_kind, AppState, AssetView,
-    BookPresetView, EligibilityView, ExportSummary, JobView, RelinkView, ScanSummary,
-    SourceCheckView, StoryData, StoryEntryView, StoryView, ToolStatusView,
+    finished_film, keep_known_asset_ids, keepsake_scope, paginate, parse_book_preset, plain_skip,
+    relink_plan, relinked_asset, resolve_export_parent, tool_status, tools, valid_job_kind,
+    AppState, AssetView, BookPresetView, EligibilityView, ExportSummary, JobView, RelinkView,
+    ScanSummary, SourceCheckView, StoryData, StoryEntryView, StoryView, ToolStatusView,
 };
 use triptape_core::{
     cluster,
@@ -554,9 +554,9 @@ type IngestWalk = (usize, Vec<(String, PathBuf, u64, i64)>);
 ///
 /// A fresh scan numbers assets in walk order (`{pid}_a{i:06}`); a refresh
 /// keeps each known file's id by path and gives new files never-reused
-/// ids ([`scan::AssetIds`]), so Story edits (`plan_edits`, keyed by asset
-/// ids) keep applying to the right photos even after files are deleted. `files_seen` is the
-/// enumerated file count, as in the picker flow.
+/// ids ([`keep_known_asset_ids`]), so Story edits (`plan_edits`, keyed by asset
+/// ids) keep applying to the right photos even after files are deleted.
+/// `files_seen` is the enumerated file count, as in the picker flow.
 ///
 /// `refresh` selects the persist semantics: a fresh scan only adds rows,
 /// while a refresh first clears this project's cluster graph and prunes
@@ -682,18 +682,8 @@ async fn run_ingest(
             // own asset (the Live Photo row hashes its still).
             assets = apply_live_photo_pairing(assets);
             if refresh {
-                // A file the project already holds keeps its id; a new one
-                // takes a never-reused id. Walk-order ids would shift every
-                // later file when one is deleted, moving Story edits onto
-                // the wrong photos.
-                let known = lock()?
-                    .list_assets(&pid)?
-                    .into_iter()
-                    .map(|a| (a.path, a.id));
-                let mut ids = scan::AssetIds::new(&pid, true, known);
-                for a in &mut assets {
-                    a.id = ids.id_for(&a.path);
-                }
+                let known = lock()?.list_assets(&pid)?;
+                keep_known_asset_ids(&pid, &mut assets, known.into_iter().map(|a| (a.path, a.id)));
             }
             // Short foreground phases; the background task continues from
             // `FOREGROUND_DONE_PROGRESS` once the command returns.

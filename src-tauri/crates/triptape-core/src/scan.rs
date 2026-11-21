@@ -264,8 +264,9 @@ impl AssetIds {
         let id = if self.rescan {
             format!("{}_{}", self.project, crate::db::new_id("a"))
         } else {
+            let n = self.next;
             self.next += 1;
-            format!("{}_a{:05}", self.project, self.next - 1)
+            format!("{}_a{n:05}", self.project)
         };
         self.by_path.insert(path.to_path_buf(), id.clone());
         id
@@ -275,6 +276,12 @@ impl AssetIds {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn write(p: &Path, bytes: &[u8]) {
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, bytes).unwrap();
+    }
 
     #[test]
     fn a_rescan_keeps_each_files_id_and_never_reuses_one() {
@@ -294,12 +301,6 @@ mod tests {
         let mut fresh = AssetIds::new("prj_y", false, []);
         assert_eq!(fresh.id_for(Path::new("/t/a.jpg")), "prj_y_a00000");
         assert_eq!(fresh.id_for(Path::new("/t/b.jpg")), "prj_y_a00001");
-    }
-    use std::fs;
-
-    fn write(p: &Path, bytes: &[u8]) {
-        fs::create_dir_all(p.parent().unwrap()).unwrap();
-        fs::write(p, bytes).unwrap();
     }
 
     #[test]

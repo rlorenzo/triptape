@@ -1017,14 +1017,30 @@ pub fn fill_foreground_metadata(a: &mut Asset, library: Option<&OsxPhotosIndex>,
 /// the scoring worker count without fork-storming hundreds of probes.
 pub const FOREGROUND_FILL_WORKERS_MAX: usize = 8;
 
+/// Rescan ids: a file the project already holds (`known` path → id) keeps
+/// its id; a new one takes a never-reused id ([`triptape_core::scan::AssetIds`]). Walk-order
+/// ids would shift every later file when one is deleted, moving Story edits
+/// onto the wrong photos.
+pub fn keep_known_asset_ids(
+    pid: &str,
+    assets: &mut [Asset],
+    known: impl IntoIterator<Item = (PathBuf, String)>,
+) {
+    let mut ids = triptape_core::scan::AssetIds::new(pid, true, known);
+    for a in assets {
+        a.id = ids.id_for(&a.path);
+    }
+}
+
 /// Fill foreground metadata for every walked file on a bounded worker pool.
 /// Pure per-file work: EXIF/ffprobe reads plus struct fill, no Db access,
 /// so workers never contend on the store lock. `on_done(done, total)` runs
 /// on the calling thread once per completed file for progress.
 ///
 /// Walk order is restored before returning, so index-based asset ids
-/// (`{pid}_a{i:06}`) are identical to the sequential fill and Story edits
-/// keyed by those ids keep applying across rescans. `library` is the
+/// (`{pid}_a{i:06}`) are identical to the sequential fill. A rescan then
+/// swaps them for the project's stable ids ([`keep_known_asset_ids`]).
+/// `library` is the
 /// folder's osxphotos export index (see [`fill_foreground_metadata`]).
 pub fn fill_assets_parallel(
     pid: &str,
@@ -1272,6 +1288,31 @@ pub fn valid_job_kind(kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rescan_ids_follow_the_file_not_its_walk_position() {
+        // IMG_2 was deleted: IMG_3 is now second in walk order but keeps
+        // its stored id, and a new file never takes the freed number.
+        // Walk-order ids from the fill; the rescan must replace them.
+        let mut assets: Vec<Asset> = ["IMG_1", "IMG_3", "IMG_9"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let path = PathBuf::from(format!("/t/{n}.HEIC"));
+                Asset::new(format!("p_a{i:06}"), path, AssetKind::Photo)
+            })
+            .collect();
+        let known = [
+            (PathBuf::from("/t/IMG_1.HEIC"), "p_a000000".to_string()),
+            (PathBuf::from("/t/IMG_2.HEIC"), "p_a000001".to_string()),
+            (PathBuf::from("/t/IMG_3.HEIC"), "p_a000002".to_string()),
+        ];
+        keep_known_asset_ids("p", &mut assets, known);
+        assert_eq!(assets[0].id, "p_a000000");
+        assert_eq!(assets[1].id, "p_a000002");
+        assert!(assets[2].id.starts_with("p_a_"), "{}", assets[2].id);
+    }
+
     use triptape_core::plan::{build_plan, PlanEdits};
 
     /// One file per asset id, shared by the story tests (empty: only its
