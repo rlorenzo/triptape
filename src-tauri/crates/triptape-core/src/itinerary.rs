@@ -247,6 +247,9 @@ impl Itinerary {
             if timed && pl.window().is_none() {
                 return Err(format!("place {:?} needs both from and until", pl.name));
             }
+            if pl.window().is_some_and(|(from, until)| until < from) {
+                return Err(format!("place {:?} has until before from", pl.name));
+            }
             if !timed && (pl.lat.is_none() || pl.lon.is_none()) {
                 return Err(format!(
                     "place {:?} needs lat and lon, or from/until",
@@ -827,6 +830,13 @@ mod tests {
             1,
         );
         assert!(Itinerary::from_json(&bad).is_err());
+        // So is a window that ends before it starts.
+        let reversed = JSON.replacen(
+            "\"legs\"",
+            r#""places": [{ "name": "X", "from": "2026-10-23 12:30", "until": "2026-10-23 11:30" }], "legs""#,
+            1,
+        );
+        assert!(Itinerary::from_json(&reversed).is_err());
         // So is a window with only one end.
         let half = JSON.replacen(
             "\"legs\"",

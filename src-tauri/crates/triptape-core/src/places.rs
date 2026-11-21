@@ -6,7 +6,7 @@
 
 use crate::geo::attraction_within;
 use crate::itinerary::{asset_day, Itinerary};
-use crate::types::{Asset, AssetKind, Plan};
+use crate::types::{Asset, Plan};
 use std::collections::{HashMap, HashSet};
 
 /// How close a photo must be to an attraction to be named for it.
@@ -112,9 +112,9 @@ pub fn photo_places(
         .iter()
         .flat_map(|c| c.asset_ids.iter().map(String::as_str))
         .collect();
+    // Videos too: a reel can be a clip, and it names its place like a photo.
     let planned: Vec<&Asset> = assets
         .iter()
-        .filter(|a| a.kind != AssetKind::Video)
         .filter(|a| in_plan.is_empty() || in_plan.contains(a.id.as_str()))
         .collect();
     let hidden = |n: &str| itin.is_some_and(|i| i.hides_attraction(n));
@@ -150,6 +150,7 @@ pub fn photo_places(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::AssetKind;
     use crate::types::Chapter;
 
     fn photo(id: &str, noon_utc: i64, gps: Option<(f64, f64)>) -> Asset {
@@ -263,6 +264,14 @@ mod tests {
         )]);
         let places = photo_places(&plan, &assets, Some(&itin));
         assert_eq!(places["m0"], "Carnival Luminosa");
+        // A reel clip at the dock names its place like a photo.
+        let mut clip = photo("v", oct9, Some((35.6190, 139.7766)));
+        clip.kind = AssetKind::Video;
+        let plan = plan_of(vec![("Carnival Luminosa Embarkation", vec!["v"])]);
+        assert_eq!(
+            photo_places(&plan, &[clip], Some(&itin))["v"],
+            "Carnival Luminosa"
+        );
         assert_eq!(
             spot(Some(&itin), &assets[0]),
             Spot::Aboard("Carnival Luminosa".into())
