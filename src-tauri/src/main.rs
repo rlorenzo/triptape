@@ -552,10 +552,10 @@ type IngestWalk = (usize, Vec<(String, PathBuf, u64, i64)>);
 /// Shared ingest pipeline behind `scan_folder` (new project row) and
 /// `rescan_project` (in-place refresh of the stored project).
 ///
-/// Asset ids are enumeration-index based (`{pid}_a{i:06}` in walk order),
-/// so an unchanged folder yields identical ids across rescans: Story edits
-/// (`plan_edits`, keyed by asset/chapter ids) are never touched here and
-/// keep applying to the refreshed assets and plans. `files_seen` is the
+/// A fresh scan numbers assets in walk order (`{pid}_a{i:06}`); a refresh
+/// keeps each known file's id by path and gives new files never-reused
+/// ids ([`scan::AssetIds`]), so Story edits (`plan_edits`, keyed by asset
+/// ids) keep applying to the right photos even after files are deleted. `files_seen` is the
 /// enumerated file count, as in the picker flow.
 ///
 /// `refresh` selects the persist semantics: a fresh scan only adds rows,
@@ -681,6 +681,20 @@ async fn run_ingest(
             // all see the paired set. The motion file is not hashed as its
             // own asset (the Live Photo row hashes its still).
             assets = apply_live_photo_pairing(assets);
+            if refresh {
+                // A file the project already holds keeps its id; a new one
+                // takes a never-reused id. Walk-order ids would shift every
+                // later file when one is deleted, moving Story edits onto
+                // the wrong photos.
+                let known = lock()?
+                    .list_assets(&pid)?
+                    .into_iter()
+                    .map(|a| (a.path, a.id));
+                let mut ids = scan::AssetIds::new(&pid, true, known);
+                for a in &mut assets {
+                    a.id = ids.id_for(&a.path);
+                }
+            }
             // Short foreground phases; the background task continues from
             // `FOREGROUND_DONE_PROGRESS` once the command returns.
             if let Ok(db) = lock() {
@@ -723,10 +737,11 @@ async fn run_ingest(
                         db.upsert_asset(&pid, a)?;
                     }
                 }
-                if refresh {
-                    // Prune rows whose files left the folder. Kept ids
-                    // upsert in place above (identical ids for unchanged
-                    // folders), so `plan_edits` keep applying.
+                // Prune rows whose files left the folder, but only after a
+                // complete walk: an unreadable subfolder is not a deleted
+                // one. Kept ids upsert in place above, so `plan_edits` keep
+                // applying.
+                if refresh && result.errors.is_empty() {
                     let keep: Vec<String> = assets.iter().map(|a| a.id.clone()).collect();
                     db.delete_stale_assets(&pid, &keep)?;
                 }

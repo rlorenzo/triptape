@@ -231,7 +231,7 @@ fn scan_cmd(flags: &HashMap<String, String>) {
             false,
         ),
     };
-    let mut ids = AssetIds::new(
+    let mut ids = scan::AssetIds::new(
         &project.id,
         rescan,
         db.list_assets(&project.id)
@@ -570,47 +570,6 @@ fn scan_cmd(flags: &HashMap<String, String>) {
             eprintln!("scan incomplete; pass --allow-partial true to accept");
             std::process::exit(3);
         }
-    }
-}
-
-/// Asset ids for one scan: a file the project already holds keeps its id.
-/// A new file in a fresh project takes `{project}_a{n:05}` in walk order;
-/// one added on a rescan takes a never-reused unique id, so a deleted
-/// file's id (and any edit still naming it) can never land on another.
-/// (`assets.id` is database-wide, hence the project prefix.)
-struct AssetIds {
-    project: String,
-    rescan: bool,
-    by_path: HashMap<PathBuf, String>,
-    next: usize,
-}
-
-impl AssetIds {
-    fn new(
-        project_id: &str,
-        rescan: bool,
-        known: impl IntoIterator<Item = (PathBuf, String)>,
-    ) -> Self {
-        Self {
-            project: project_id.to_string(),
-            rescan,
-            by_path: known.into_iter().collect(),
-            next: 0,
-        }
-    }
-
-    fn id_for(&mut self, path: &Path) -> String {
-        if let Some(id) = self.by_path.get(path) {
-            return id.clone();
-        }
-        let id = if self.rescan {
-            format!("{}_{}", self.project, triptape_core::db::new_id("a"))
-        } else {
-            self.next += 1;
-            format!("{}_a{:05}", self.project, self.next - 1)
-        };
-        self.by_path.insert(path.to_path_buf(), id.clone());
-        id
     }
 }
 
@@ -1714,26 +1673,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_rescan_keeps_each_files_id_and_never_reuses_one() {
-        let known = [
-            (PathBuf::from("/t/IMG_1.HEIC"), "prj_x_a00000".to_string()),
-            (PathBuf::from("/t/IMG_3.HEIC"), "prj_x_a00002".to_string()),
-        ];
-        let mut ids = AssetIds::new("prj_x", true, known);
-        // IMG_2 left the folder: IMG_3 keeps its id, nothing shifts.
-        assert_eq!(ids.id_for(Path::new("/t/IMG_3.HEIC")), "prj_x_a00002");
-        assert_eq!(ids.id_for(Path::new("/t/IMG_1.HEIC")), "prj_x_a00000");
-        // A new file never takes a number a deleted file once had.
-        let new = ids.id_for(Path::new("/t/IMG_9.HEIC"));
-        assert!(new.starts_with("prj_x_a_") && new.len() > 20, "{new}");
-        assert_eq!(ids.id_for(Path::new("/t/IMG_9.HEIC")), new);
-        // A fresh project numbers in walk order.
-        let mut fresh = AssetIds::new("prj_y", false, []);
-        assert_eq!(fresh.id_for(Path::new("/t/a.jpg")), "prj_y_a00000");
-        assert_eq!(fresh.id_for(Path::new("/t/b.jpg")), "prj_y_a00001");
-    }
 
     #[test]
     fn music_flag_repeats_and_semicolons() {
