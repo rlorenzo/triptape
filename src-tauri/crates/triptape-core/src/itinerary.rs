@@ -85,17 +85,55 @@ pub struct Itinerary {
     /// the built-in attraction list, which misses many of them.
     #[serde(default)]
     pub places: Vec<NamedPlace>,
+    /// Built-in attraction names never to use: places the owner was near
+    /// but did not visit (the ArtScience Museum beside their hotel).
+    #[serde(default)]
+    pub hide_attractions: Vec<String>,
 }
 
-/// A place the owner named, as a point and the reach that counts as there.
+/// A place the owner named: a point and the reach that counts as there,
+/// or a local time window (`from`/`until`, `YYYY-MM-DD HH:MM`) for places
+/// GPS cannot tell apart, such as two glasshouses 130 m apart where indoor
+/// fixes drift. A window, when given, decides on its own.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NamedPlace {
     pub name: String,
-    pub lat: f64,
-    pub lon: f64,
+    #[serde(default)]
+    pub lat: Option<f64>,
+    #[serde(default)]
+    pub lon: Option<f64>,
     /// Metres from the point that count as at the place (default 300).
     #[serde(default = "default_place_radius")]
     pub radius_m: f64,
+    #[serde(default, deserialize_with = "local_minute")]
+    pub from: Option<jiff::civil::DateTime>,
+    #[serde(default, deserialize_with = "local_minute")]
+    pub until: Option<jiff::civil::DateTime>,
+}
+
+/// A `YYYY-MM-DD HH:MM` local time, parsed once when the itinerary loads.
+fn local_minute<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<jiff::civil::DateTime>, D::Error> {
+    let Some(s) = Option::<String>::deserialize(d)? else {
+        return Ok(None);
+    };
+    jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M", s.trim())
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom(format!("{s:?} is not \"YYYY-MM-DD HH:MM\"")))
+}
+
+impl NamedPlace {
+    /// The local time window, when both ends are given.
+    fn window(&self) -> Option<(jiff::civil::DateTime, jiff::civil::DateTime)> {
+        self.from.zip(self.until)
+    }
+
+    /// Metres from `gps` when the place has a point and `gps` is inside it.
+    fn reach(&self, gps: Option<(f64, f64)>) -> Option<f64> {
+        let d = haversine_m(gps?, (self.lat?, self.lon?));
+        (d <= self.radius_m).then_some(d)
+    }
 }
 
 fn default_place_radius() -> f64 {
@@ -167,16 +205,32 @@ impl Itinerary {
         Self::from_json(&text)
     }
 
-    /// The owner-named place a shot at `gps` was taken in: the nearest one
-    /// whose radius reaches it.
-    pub fn place_at(&self, gps: Option<(f64, f64)>) -> Option<&str> {
-        let p = gps?;
-        self.places
-            .iter()
-            .map(|pl| (pl, haversine_m(p, (pl.lat, pl.lon))))
-            .filter(|(pl, d)| *d <= pl.radius_m)
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(pl, _)| pl.name.as_str())
+    /// The owner-named place a shot was taken in: one whose time window
+    /// holds its local time, else the nearest whose radius reaches its GPS.
+    pub fn place_of(&self, a: &Asset) -> Option<&str> {
+        let when = a
+            .taken_at
+            .and_then(|t| crate::metadata::local_datetime(t, a.tz_offset_secs));
+        let timed = self.places.iter().find(|pl| {
+            pl.window()
+                .zip(when)
+                .is_some_and(|((from, until), w)| from <= w && w <= until)
+        });
+        timed
+            .or_else(|| {
+                self.places
+                    .iter()
+                    .filter(|pl| pl.window().is_none())
+                    .filter_map(|pl| pl.reach(a.gps).map(|d| (pl, d)))
+                    .min_by(|x, y| x.1.total_cmp(&y.1))
+                    .map(|(pl, _)| pl)
+            })
+            .map(|pl| pl.name.as_str())
+    }
+
+    /// Whether the owner asked never to name this attraction.
+    pub fn hides_attraction(&self, name: &str) -> bool {
+        self.hide_attractions.iter().any(|h| h.trim() == name)
     }
 
     /// Stop by id.
@@ -187,6 +241,32 @@ impl Itinerary {
     fn validate(&self) -> Result<(), String> {
         if self.stops.len() < 2 || self.legs.is_empty() {
             return Err("itinerary needs at least two stops and one leg".into());
+        }
+        for pl in &self.places {
+            if pl.name.trim().is_empty() {
+                return Err("a place needs a name".into());
+            }
+            if pl.lat.is_some_and(|v| !(-90.0..=90.0).contains(&v))
+                || pl.lon.is_some_and(|v| !(-180.0..=180.0).contains(&v))
+            {
+                return Err(format!("place {:?} has lat/lon out of range", pl.name));
+            }
+            if !(pl.radius_m.is_finite() && pl.radius_m > 0.0) {
+                return Err(format!("place {:?} needs a radius_m above 0", pl.name));
+            }
+            let timed = pl.from.is_some() || pl.until.is_some();
+            if timed && pl.window().is_none() {
+                return Err(format!("place {:?} needs both from and until", pl.name));
+            }
+            if pl.window().is_some_and(|(from, until)| until < from) {
+                return Err(format!("place {:?} has until before from", pl.name));
+            }
+            if !timed && (pl.lat.is_none() || pl.lon.is_none()) {
+                return Err(format!(
+                    "place {:?} needs lat and lon, or from/until",
+                    pl.name
+                ));
+            }
         }
         for (i, s) in self.stops.iter().enumerate() {
             if self.stops[..i].iter().any(|o| o.id == s.id) {
@@ -349,11 +429,11 @@ impl Itinerary {
                 on_ship: false,
             });
         };
-        // Today's port call, if the ship is docked somewhere today.
-        let port = self
-            .stops
-            .iter()
-            .find(|s| s.kind == StopKind::Port && s.active_on(day));
+        // Today's dock, if the ship ties up somewhere today: a port call,
+        // or the city a cruise starts or ends in (Singapore's Marina Bay is
+        // reclaimed land the coarse grid reads as water).
+        let docks = self.docks();
+        let port = docks.iter().find(|s| s.active_on(day));
         let on_board = match gps {
             None => true,
             Some(p) => {
@@ -430,19 +510,6 @@ impl Itinerary {
             })
         })
     }
-
-    /// Ship names on this itinerary (never shown as map points).
-    pub fn ships(&self) -> Vec<String> {
-        let mut out: Vec<String> = vec![];
-        for leg in &self.legs {
-            if let (LegMode::Ship, Some(s)) = (leg.mode, &leg.ship) {
-                if !out.contains(s) {
-                    out.push(s.clone());
-                }
-            }
-        }
-        out
-    }
 }
 
 fn parse_range(s: &str) -> Result<(NaiveDate, NaiveDate), String> {
@@ -484,25 +551,15 @@ pub fn apply_itinerary(plan: &Plan, assets: &[Asset], itin: &Itinerary) -> Plan 
 /// and title a whole day ashore in Jeju with the ship's name. Shots
 /// without GPS cast no vote; a chapter with none takes the no-fix label.
 fn chapter_label(itin: &Itinerary, day: NaiveDate, members: &[&Asset]) -> Option<DayLabel> {
-    let mut votes: Vec<(DayLabel, usize)> = vec![];
-    for gps in members.iter().filter_map(|a| a.gps) {
-        let Some(label) = itin.label_for(day, Some(gps)) else {
-            continue;
-        };
-        match votes.iter_mut().find(|(l, _)| *l == label) {
-            Some((_, n)) => *n += 1,
-            None => votes.push((label, 1)),
-        }
-    }
+    let votes = crate::places::tally(
+        members
+            .iter()
+            .filter_map(|a| itin.label_for(day, Some(a.gps?))),
+    );
     if votes.is_empty() {
         return itin.label_for(day, None);
     }
-    // `max_by_key` keeps the last maximum; reversing keeps the first.
-    votes
-        .into_iter()
-        .rev()
-        .max_by_key(|(_, n)| *n)
-        .map(|(l, _)| l)
+    crate::places::most_counted(votes).map(|(l, _)| l)
 }
 
 fn relabel_chapter(
@@ -518,13 +575,45 @@ fn relabel_chapter(
     let Some(day) = members.iter().filter_map(|a| asset_day(a)).min() else {
         return;
     };
-    match chapter_label(itin, day, &members) {
-        Some(l) => {
-            ch.title.clone_from(&l.place);
-            ch.place = Some(l.place);
-        }
-        None => ch.place = None,
+    let Some(label) = chapter_label(itin, day, &members) else {
+        ch.place = None;
+        return;
+    };
+    let place = chapter_name(itin, day, &members, label);
+    ch.title.clone_from(&place);
+    ch.place = Some(place);
+}
+
+/// A relabelled chapter's name, shared by every keepsake: a place the
+/// owner named when most of its photos are there; on board, the boarding
+/// (`Carnival Luminosa Embarkation`) on a cruise's first or last day, else
+/// the port on a port day, else the ship; ashore, the attraction its
+/// photos visited (see [`crate::places`]), else the stop's city.
+fn chapter_name(itin: &Itinerary, day: NaiveDate, members: &[&Asset], label: DayLabel) -> String {
+    let named = crate::places::tally(members.iter().filter_map(|a| itin.place_of(a)));
+    // A chapter spanning several named places (the Flower Dome, then the
+    // Cloud Forest) is named for what holds them, not its biggest part.
+    let several = named
+        .iter()
+        .filter(|(_, c)| *c >= crate::places::PLACE_MIN_SHOTS)
+        .count()
+        > 1;
+    if let Some((name, _)) =
+        crate::places::most_counted(named).filter(|(_, c)| !several && 2 * c >= members.len())
+    {
+        return name.to_string();
     }
+    if label.on_ship {
+        return itin
+            .boarding(day)
+            .or_else(|| itin.port_on(day))
+            .unwrap_or(label.place);
+    }
+    let fixes: Vec<(f64, f64)> = members.iter().filter_map(|a| a.gps).collect();
+    crate::places::visited_attraction(&fixes, crate::places::PLACE_MIN_SHOTS, |n| {
+        itin.hides_attraction(n)
+    })
+    .unwrap_or(label.place)
 }
 
 #[cfg(test)]
@@ -577,7 +666,6 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(itin().ships(), ["Carnival Luminosa", "Disney Adventure"]);
         // Chain polyline: every stop in order, loops and repeats included.
         assert_eq!(itin().polyline().len(), 7);
     }
@@ -720,24 +808,126 @@ mod tests {
     }
 
     #[test]
-    fn named_places_label_shots_inside_their_radius() {
+    fn named_places_label_shots_inside_their_radius_or_window() {
         let mut it = itin();
         assert!(it.places.is_empty());
         it.places = serde_json::from_str(
             r#"[
               { "name": "Taipei 101", "lat": 25.0340, "lon": 121.5645, "radius_m": 250 },
-              { "name": "Raohe Night Market", "lat": 25.0509, "lon": 121.5775 }
+              { "name": "Raohe Night Market", "lat": 25.0509, "lon": 121.5775 },
+              { "name": "Flower Dome", "from": "2026-10-23 11:30", "until": "2026-10-23 12:30" }
             ]"#,
         )
         .unwrap();
-        assert_eq!(it.place_at(Some((25.0343, 121.5648))), Some("Taipei 101"));
+        let at = |gps| photo("p", "2026-10-16", gps);
         assert_eq!(
-            it.place_at(Some((25.0510, 121.5770))),
+            it.place_of(&at(Some((25.0343, 121.5648)))),
+            Some("Taipei 101")
+        );
+        assert_eq!(
+            it.place_of(&at(Some((25.0510, 121.5770)))),
             Some("Raohe Night Market")
         );
-        // Between the two, outside both radii.
-        assert_eq!(it.place_at(Some((25.0420, 121.5700))), None);
-        assert_eq!(it.place_at(None), None);
+        // Between the two, outside both radii; or no GPS.
+        assert_eq!(it.place_of(&at(Some((25.0420, 121.5700)))), None);
+        assert_eq!(it.place_of(&at(None)), None);
+        // In the window (noon on Oct 23), whatever the GPS says.
+        let dome = photo("d", "2026-10-23", Some((25.0343, 121.5648)));
+        assert_eq!(it.place_of(&dome), Some("Flower Dome"));
+        // A malformed window is refused when loading.
+        let bad = JSON.replacen(
+            "\"legs\"",
+            r#""places": [{ "name": "X", "from": "Oct 23", "until": "2026-10-23 12:30" }], "legs""#,
+            1,
+        );
+        assert!(Itinerary::from_json(&bad).is_err());
+        // So is a window that ends before it starts.
+        let reversed = JSON.replacen(
+            "\"legs\"",
+            r#""places": [{ "name": "X", "from": "2026-10-23 12:30", "until": "2026-10-23 11:30" }], "legs""#,
+            1,
+        );
+        assert!(Itinerary::from_json(&reversed).is_err());
+        // Typos are refused too: a blank name, a latitude of 400, a
+        // non-positive radius.
+        for bad_place in [
+            r#"{ "name": " ", "lat": 1.0, "lon": 1.0 }"#,
+            r#"{ "name": "X", "lat": 400.0, "lon": 1.0 }"#,
+            r#"{ "name": "X", "lat": 1.0, "lon": 1.0, "radius_m": -5 }"#,
+        ] {
+            let json = JSON.replacen(
+                "\"legs\"",
+                &format!(r#""places": [{bad_place}], "legs""#),
+                1,
+            );
+            assert!(Itinerary::from_json(&json).is_err(), "{bad_place}");
+        }
+        // So is a window with only one end.
+        let half = JSON.replacen(
+            "\"legs\"",
+            r#""places": [{ "name": "X", "from": "2026-10-23 11:30" }], "legs""#,
+            1,
+        );
+        assert!(Itinerary::from_json(&half)
+            .unwrap_err()
+            .contains("needs both from and until"));
+    }
+
+    #[test]
+    fn chapter_names_are_shared_place_names() {
+        let mut it = itin();
+        it.places = serde_json::from_str(
+            r#"[{ "name": "Dotonbori", "lat": 34.6687, "lon": 135.5013, "radius_m": 200 }]"#,
+        )
+        .unwrap();
+        let name = |it: &Itinerary, date: &str, gps: (f64, f64), n: usize| {
+            let members: Vec<Asset> = (0..n)
+                .map(|i| photo(&format!("p{i}"), date, Some(gps)))
+                .collect();
+            let refs: Vec<&Asset> = members.iter().collect();
+            let label = chapter_label(it, day(date), &refs).unwrap();
+            chapter_name(it, day(date), &refs, label)
+        };
+        // On board on the cruise's first day, and on a port day.
+        assert_eq!(
+            name(&it, "2026-10-09", (35.6190, 139.7766), 3),
+            "Carnival Luminosa Embarkation"
+        );
+        assert_eq!(name(&it, "2026-10-11", (34.656, 135.4306), 3), "Osaka");
+        // At sea: the ship.
+        assert_eq!(
+            name(&it, "2026-10-10", (30.0, 140.0), 3),
+            "Carnival Luminosa"
+        );
+        // Ashore: a named place, then a visited attraction, then the city.
+        assert_eq!(name(&it, "2026-10-11", (34.6687, 135.5013), 3), "Dotonbori");
+        // Two named places in one chapter: neither names it.
+        it.places.push(
+            serde_json::from_str(
+                r#"{ "name": "Kuromon Market", "lat": 34.6655, "lon": 135.5065, "radius_m": 200 }"#,
+            )
+            .unwrap(),
+        );
+        let mixed: Vec<Asset> = (0..6)
+            .map(|i| {
+                let gps = if i < 3 {
+                    (34.6687, 135.5013)
+                } else {
+                    (34.6655, 135.5065)
+                };
+                photo(&format!("q{i}"), "2026-10-11", Some(gps))
+            })
+            .collect();
+        let refs: Vec<&Asset> = mixed.iter().collect();
+        let label = chapter_label(&it, day("2026-10-11"), &refs).unwrap();
+        assert_eq!(chapter_name(&it, day("2026-10-11"), &refs, label), "Osaka");
+        assert_eq!(
+            name(&it, "2026-10-06", (35.6267, 139.8881), 3),
+            "Tokyo DisneySea"
+        );
+        assert_eq!(name(&it, "2026-10-06", (35.6267, 139.8881), 2), "Tokyo");
+        it.hide_attractions = vec!["Tokyo DisneySea".into()];
+        assert_eq!(name(&it, "2026-10-06", (35.6267, 139.8881), 3), "Tokyo");
     }
 
     #[test]

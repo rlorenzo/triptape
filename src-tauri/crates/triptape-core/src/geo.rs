@@ -191,7 +191,7 @@ pub fn place_name(gps: (f64, f64)) -> Option<String> {
 
 /// Nearest populated place to `gps` within 100 km, as `City, Country`.
 /// `None` when the point is on open water or no city is that close.
-fn city_name(gps: (f64, f64)) -> Option<String> {
+pub fn city_name(gps: (f64, f64)) -> Option<String> {
     if !is_land(gps) {
         return None;
     }
