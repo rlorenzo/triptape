@@ -176,22 +176,18 @@ fn photo_attraction(a: &triptape_core::types::Asset) -> Option<String> {
     triptape_core::geo::attraction_within(a.gps?, PHOTO_PLACE_RADIUS_M)
 }
 
-/// What a photo's own place says, before its chapter's: boarding the ship
-/// at the dock on a cruise's first or last day, else the attraction it was
-/// taken at when that day's photos show a real visit. Shots the itinerary
-/// puts on board name no attraction: the ship passes them.
+/// What a photo's own place says, before its chapter's: the attraction it
+/// was taken at when that day's photos show a real visit. Shots the
+/// itinerary puts on board (at sea, or at a dock such as Tokyo's Aomi
+/// terminal beside Miraikan) name no attraction.
 fn photo_place(
     itin: Option<&triptape_core::itinerary::Itinerary>,
     visits: &Visits,
     day: Option<u32>,
     a: &triptape_core::types::Asset,
 ) -> Option<String> {
-    let date = asset_day(a);
-    if let Some(label) = itin.zip(date).and_then(|(i, d)| i.boarding_label(d, a.gps)) {
-        return Some(label);
-    }
     let aboard = itin
-        .zip(date)
+        .zip(asset_day(a))
         .and_then(|(i, d)| i.label_for(d, a.gps))
         .is_some_and(|l| l.on_ship);
     if aboard {
@@ -201,6 +197,32 @@ fn photo_place(
         day.and_then(|d| visits.get(&(d, poi.clone())))
             .is_some_and(|&n| n >= PHOTO_PLACE_MIN_SHOTS)
     })
+}
+
+/// `ch` titled for boarding when it is on the ship on a cruise's first or
+/// last day: `Carnival Luminosa Embarkation` instead of the ship alone.
+/// Only the title changes; its photos keep the ship as their place.
+fn boarding_chapter(
+    itin: Option<&triptape_core::itinerary::Itinerary>,
+    assets: &[triptape_core::types::Asset],
+    ch: &triptape_core::types::Chapter,
+) -> triptape_core::types::Chapter {
+    let mut out = ch.clone();
+    let Some(itin) = itin else {
+        return out;
+    };
+    let first_day = assets
+        .iter()
+        .filter(|a| ch.asset_ids.contains(&a.id))
+        .filter_map(asset_day)
+        .min();
+    let label = first_day.and_then(|d| itin.boarding(d));
+    if let (Some(label), Some(place)) = (label, &ch.place) {
+        if label.starts_with(place.as_str()) {
+            out.place = Some(label);
+        }
+    }
+    out
 }
 
 /// A book photo's caption: the user's, else its own place ([`photo_place`]:
@@ -781,7 +803,13 @@ fn export_inner(
         let chapter_titles: Vec<String> = plan
             .chapters
             .iter()
-            .map(crate::titlecard::chapter_book_title)
+            .map(|c| {
+                crate::titlecard::chapter_book_title(&boarding_chapter(
+                    opts.itinerary.as_ref(),
+                    assets,
+                    c,
+                ))
+            })
             .collect();
         match render_book::render_book(
             &book_photos,
@@ -1016,8 +1044,8 @@ mod tests {
     }
 
     #[test]
-    fn embarkation_day_terminal_shots_name_the_boarding() {
-        use triptape_core::types::Asset;
+    fn embarkation_day_reads_as_boarding_and_names_no_terminal_sights() {
+        use triptape_core::types::{Asset, Chapter};
         let itin = triptape_core::itinerary::Itinerary::from_json(
             r#"{
               "stops": [
@@ -1033,24 +1061,34 @@ mod tests {
         )
         .unwrap();
         // Noon UTC (no offset stored, so UTC is the local day).
-        let at = |gps: (f64, f64), noon_utc: i64| {
-            let mut a = Asset::new("m", "m.jpg".into(), AssetKind::Photo);
+        let at = |id: &str, gps: (f64, f64), noon_utc: i64| {
+            let mut a = Asset::new(id, format!("{id}.jpg").into(), AssetKind::Photo);
             a.taken_at = Some(noon_utc);
             a.gps = Some(gps);
             a
         };
         let (oct9, oct10) = (1_791_547_200, 1_791_633_600);
-        // Miraikan faces the Aomi terminal: on embarkation day the shot is
-        // boarding, even with Miraikan "visited" that day.
-        let miraikan = at((35.6190, 139.7766), oct9);
+        // Miraikan faces the Aomi terminal: on board by the dock rule, so
+        // no Miraikan caption even with Miraikan "visited" that day.
+        let miraikan = at("m", (35.6190, 139.7766), oct9);
         let visits: Visits = [((7, "Miraikan".to_string()), 9)].into();
+        assert_eq!(photo_place(Some(&itin), &visits, Some(7), &miraikan), None);
+        // The day's title reads as boarding; a sea day stays the ship.
+        let ship_day = |id: &str| Chapter {
+            title: "Carnival Luminosa".into(),
+            asset_ids: vec![id.into()],
+            place: Some("Carnival Luminosa".into()),
+            day_index: None,
+            date_label: None,
+        };
+        let assets = vec![miraikan, at("s", (33.0, 137.0), oct10)];
+        let titled = |id: &str| boarding_chapter(Some(&itin), &assets, &ship_day(id)).place;
         assert_eq!(
-            photo_place(Some(&itin), &visits, Some(7), &miraikan).as_deref(),
+            titled("m").as_deref(),
             Some("Carnival Luminosa Embarkation")
         );
-        // A sea day: on board, so no attraction from a passing coast.
-        let at_sea = at((33.0, 137.0), oct10);
-        assert_eq!(photo_place(Some(&itin), &visits, Some(8), &at_sea), None);
+        assert_eq!(titled("s").as_deref(), Some("Carnival Luminosa"));
+        assert_eq!(photo_place(Some(&itin), &visits, Some(8), &assets[1]), None);
     }
 
     #[test]

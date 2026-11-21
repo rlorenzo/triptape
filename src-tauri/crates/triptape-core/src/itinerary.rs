@@ -357,20 +357,11 @@ impl Itinerary {
         })
     }
 
-    /// `Carnival Luminosa Embarkation` for a shot taken at a dock on the
-    /// first day of a cruise, `… Disembarkation` on its last day. Terminal
-    /// shots sit beside whatever the port neighbourhood holds (Miraikan and
-    /// Shiokaze Park face Tokyo's Aomi terminal), and boarding is what
-    /// happened there.
-    pub fn boarding_label(&self, day: NaiveDate, gps: Option<(f64, f64)>) -> Option<String> {
-        let p = gps?;
-        let at_dock = self
-            .docks()
-            .iter()
-            .any(|d| haversine_m(p, d.pos()) <= DOCK_RADIUS_M);
-        if !at_dock {
-            return None;
-        }
+    /// `Carnival Luminosa Embarkation` on the first day of a cruise,
+    /// `… Disembarkation` on its last: what a day spent boarding the ship
+    /// was about, rather than whatever stands near the terminal (Miraikan
+    /// and Shiokaze Park face Tokyo's Aomi terminal).
+    pub fn boarding(&self, day: NaiveDate) -> Option<String> {
         self.cruises().into_iter().find_map(|c| {
             if c.start == day {
                 Some(format!("{} Embarkation", c.ship))
@@ -688,31 +679,16 @@ mod tests {
     }
 
     #[test]
-    fn boarding_days_name_the_terminal_shots() {
-        let terminal = (35.6190, 139.7766); // Miraikan, ~530 m from the dock
+    fn boarding_names_a_cruise_first_and_last_day() {
         assert_eq!(
-            itin()
-                .boarding_label(day("2026-10-09"), Some(terminal))
-                .as_deref(),
+            itin().boarding(day("2026-10-09")).as_deref(),
             Some("Carnival Luminosa Embarkation")
         );
-        // Disembarking in Singapore at the end of the cruise.
         assert_eq!(
-            itin()
-                .boarding_label(day("2026-10-23"), Some((1.2655, 103.864)))
-                .as_deref(),
+            itin().boarding(day("2026-10-23")).as_deref(),
             Some("Carnival Luminosa Disembarkation")
         );
-        // Mid-cruise, away from a dock, or without GPS: nothing.
-        assert_eq!(
-            itin().boarding_label(day("2026-10-11"), Some((34.656, 135.4306))),
-            None
-        );
-        assert_eq!(
-            itin().boarding_label(day("2026-10-09"), Some((35.7148, 139.7967))),
-            None
-        );
-        assert_eq!(itin().boarding_label(day("2026-10-09"), None), None);
+        assert_eq!(itin().boarding(day("2026-10-11")), None);
     }
 
     #[test]
