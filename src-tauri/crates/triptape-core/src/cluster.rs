@@ -1,14 +1,17 @@
 //! Stage 6 — Cluster: time-gap + GPS day/place clustering.
 //!
-//! Pipeline: sort by capture time, drop GPS outliers whose implied speed
-//! from the previous fix exceeds 1,000 km/h, then group into clusters — a
-//! new cluster starts on calendar-day change, on a time gap over
-//! [`TIME_GAP_SECS`], or when both fixes have GPS and drift more than
-//! [`PLACE_SPLIT_METERS`] from the running centroid. Near-dupes collapse to
-//! a best-shot pick via pHash Hamming distance.
+//! Pipeline: sort into story order (capture time; a day the group split up
+//! is told party by party, see [`crate::party`]), drop GPS outliers whose
+//! implied speed from the previous fix exceeds 1,000 km/h, then group into
+//! clusters — a new cluster starts on calendar-day change, on a time gap
+//! over [`TIME_GAP_SECS`], when both fixes have GPS and drift more than
+//! [`PLACE_SPLIT_METERS`] from the running centroid, or where one party's
+//! stretch of a split day hands over to the next party's. Near-dupes
+//! collapse to a best-shot pick via pHash Hamming distance.
 
 use crate::geo::haversine_m;
 use crate::hash::is_near_dupe;
+use crate::party::Track;
 use crate::types::{Asset, AssetKind, Cluster, Score};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -19,6 +22,12 @@ pub const TIME_GAP_SECS: i64 = 4 * 3600;
 pub const PLACE_SPLIT_METERS: f64 = 5_000.0;
 /// Implied speed that marks a GPS fix an outlier (1,000 km/h in m/s).
 pub const OUTLIER_SPEED_MPS: f64 = 1_000_000.0 / 3600.0;
+
+/// Whether moving `from` -> `to` in `dt_secs` implies more than
+/// [`OUTLIER_SPEED_MPS`]. A zero or negative delta judges nothing.
+pub fn speed_jump(dt_secs: i64, from: (f64, f64), to: (f64, f64)) -> bool {
+    dt_secs > 0 && haversine_m(from, to) / dt_secs as f64 > OUTLIER_SPEED_MPS
+}
 /// Max capture-time gap between two shots for them to count as near-dupes
 /// (a burst / retake window, 10 min).
 pub const DUPE_WINDOW_SECS: i64 = 10 * 60;
@@ -43,34 +52,89 @@ pub fn day_key(taken_at: Option<i64>, tz_offset_secs: Option<i32>) -> String {
         .unwrap_or_else(|| "unknown-date".to_string())
 }
 
-/// Story-order sort key: capture time (unknown last), then id.
+/// An asset's capture-local day ([`day_key`]).
+pub fn day_of(a: &Asset) -> String {
+    day_key(a.taken_at, a.tz_offset_secs)
+}
+
+/// Whether two assets share a capture-local day ([`day_key`]); an unknown
+/// date matches nothing.
+pub fn same_day(a: &Asset, b: &Asset) -> bool {
+    let date = |x: &Asset| {
+        x.taken_at
+            .and_then(|t| crate::metadata::local_date(t, x.tz_offset_secs))
+    };
+    date(a).is_some_and(|d| date(b) == Some(d))
+}
+
+/// Root of `x` in a union-find forest (`parent[r] == r` at a root),
+/// halving the path on the way.
+pub(crate) fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+/// Capture-time sort key: capture time (unknown last), then id. This is
+/// story order on every day the group stayed together, and the order
+/// within each party's stretch of a split day; [`story_order`] is the
+/// whole story order.
 pub fn story_key(a: &Asset) -> (i64, &str) {
     (a.taken_at.unwrap_or(i64::MAX), &a.id)
 }
 
-/// Assets in story order: capture time (unknown last), then id.
+/// Assets in story order: capture time (unknown last), then id, except
+/// that a day the group split up tells each party's stretch in turn
+/// ([`crate::party::story_layout`]). Deterministic.
 pub fn story_order(assets: &[Asset]) -> Vec<&Asset> {
-    let mut ordered: Vec<&Asset> = assets.iter().collect();
-    ordered.sort_by(|a, b| story_key(a).cmp(&story_key(b)));
-    ordered
+    story_tracks(assets).into_iter().map(|(a, _)| a).collect()
+}
+
+/// [`story_order`] with each asset's [`Track`]: the shared timeline, or
+/// one party's stretch of a split day.
+pub fn story_tracks(assets: &[Asset]) -> Vec<(&Asset, Track)> {
+    let layout = crate::party::story_layout(assets);
+    layout
+        .order
+        .iter()
+        .zip(&layout.tracks)
+        .map(|(&i, &t)| (&assets[i], t))
+        .collect()
+}
+
+/// Asset id -> position in [`story_order`].
+pub fn story_positions(assets: &[Asset]) -> HashMap<&str, usize> {
+    story_order(assets)
+        .into_iter()
+        .enumerate()
+        .map(|(i, a)| (a.id.as_str(), i))
+        .collect()
 }
 
 /// Ids of assets whose GPS fix implies travel faster than 1,000 km/h from
 /// the previous accepted fix. The later fix is dropped (kept for time
 /// clustering, ignored for place/route math). `ordered` must be in story
-/// order; fixes without a usable time delta are accepted unjudged.
-fn gps_outliers_ordered(ordered: &[&Asset]) -> HashSet<String> {
+/// order ([`story_tracks`]); fixes without a usable time delta are
+/// accepted unjudged, and so is the first fix of each party's stretch: one
+/// party's last fix is not where the next party set off from.
+pub fn gps_outliers_in(ordered: &[(&Asset, Track)]) -> HashSet<String> {
     let mut bad = HashSet::new();
     let mut prev: Option<(Option<i64>, (f64, f64))> = None;
-    for a in ordered {
+    let mut track = Track::Shared;
+    for &(a, t) in ordered {
+        if t != track {
+            track = t;
+            prev = None;
+        }
         let Some(g) = a.gps else { continue };
         let Some((pt, pg)) = prev else {
             prev = Some((a.taken_at, g));
             continue;
         };
         if let (Some(t), Some(pt)) = (a.taken_at, pt) {
-            let dt = (t - pt).abs() as f64;
-            if dt > 0.0 && haversine_m(pg, g) / dt > OUTLIER_SPEED_MPS {
+            if speed_jump((t - pt).abs(), pg, g) {
                 bad.insert(a.id.clone());
                 continue;
             }
@@ -78,11 +142,6 @@ fn gps_outliers_ordered(ordered: &[&Asset]) -> HashSet<String> {
         prev = Some((a.taken_at, g));
     }
     bad
-}
-
-/// See [`gps_outliers_ordered`]; sorts `assets` into story order first.
-pub fn gps_outliers(assets: &[Asset]) -> HashSet<String> {
-    gps_outliers_ordered(&story_order(assets))
 }
 
 /// Running state for the cluster being built; O(1) per pushed asset.
@@ -94,6 +153,9 @@ struct Acc {
     end: Option<i64>,
     gps_n: usize,
     gps_sum: (f64, f64),
+    /// The split-day party whose stretch this cluster holds, if any: a
+    /// cluster never holds two parties.
+    party: Option<Track>,
 }
 
 impl Acc {
@@ -102,8 +164,11 @@ impl Acc {
         (self.gps_n > 0).then(|| (self.gps_sum.0 / n, self.gps_sum.1 / n))
     }
 
-    fn push(&mut self, id: &str, t: Option<i64>, gps: Option<(f64, f64)>) {
+    fn push(&mut self, id: &str, t: Option<i64>, gps: Option<(f64, f64)>, track: Track) {
         self.ids.push(id.to_string());
+        if track != Track::Shared {
+            self.party = Some(track);
+        }
         if let Some(t) = t {
             self.start = Some(self.start.map_or(t, |s| s.min(t)));
             self.end = Some(self.end.map_or(t, |e| e.max(t)));
@@ -129,6 +194,14 @@ impl Acc {
         self.gps_n += next.gps_n;
         self.gps_sum.0 += next.gps_sum.0;
         self.gps_sum.1 += next.gps_sum.1;
+        self.party = self.party.or(next.party);
+    }
+
+    /// Whether `other` may join this cluster: same day, and the same
+    /// party of a split day (or neither holds one), so a party's small
+    /// cluster never lands in another party's or the shared timeline's.
+    fn can_merge(&self, other: &Acc) -> bool {
+        self.day == other.day && self.party == other.party
     }
 
     /// How far apart two clusters are: time gap plus GPS distance at
@@ -164,14 +237,15 @@ impl Acc {
 /// adjacent cluster on the same local day that is closer in time and place.
 /// Smallest clusters go first (earliest on ties), and a merge that is still
 /// small keeps merging, so a run of tiny clusters collapses into a
-/// neighbour. Clusters never merge across days. The merged cluster keeps the
+/// neighbour. Clusters never merge across days, nor out of one party's
+/// stretch of a split day. The merged cluster keeps the
 /// larger side's centroid, since the GPS sums are dominated by it.
 fn merge_small(mut v: Vec<Acc>) -> Vec<Acc> {
     let neighbour = |v: &[Acc], i: usize| -> Option<usize> {
         [i.checked_sub(1), Some(i + 1)]
             .into_iter()
             .flatten()
-            .filter(|&j| j < v.len() && v[j].day == v[i].day)
+            .filter(|&j| j < v.len() && v[i].can_merge(&v[j]))
             .min_by(|&a, &b| {
                 v[i].distance_secs(&v[a])
                     .total_cmp(&v[i].distance_secs(&v[b]))
@@ -215,15 +289,33 @@ fn finish(accs: Vec<Acc>) -> Vec<Cluster> {
 }
 
 /// Group assets into day/place clusters in story order, then merge tiny
-/// clusters into a same-day neighbour ([`MERGE_MAX_ASSETS`]).
+/// clusters into a same-day neighbour ([`MERGE_MAX_ASSETS`]). On a split
+/// day each party's stretch gets clusters of its own.
 pub fn cluster_assets(assets: &[Asset]) -> Vec<Cluster> {
-    let ordered = story_order(assets);
-    let outliers = gps_outliers_ordered(&ordered);
+    finish(merge_small(split_clusters(story_tracks(assets))))
+}
+
+/// Clusters as if no day were split (capture order, one shared timeline),
+/// with tiny clusters left unmerged. A split day's chapters are fewer and
+/// larger than these: the planner weighs a split day by them so it keeps
+/// the share of the film it had before it was told party by party.
+pub fn cluster_by_capture<'a>(assets: impl IntoIterator<Item = &'a Asset>) -> Vec<Cluster> {
+    let mut ordered: Vec<&Asset> = assets.into_iter().collect();
+    ordered.sort_by(|a, b| story_key(a).cmp(&story_key(b)));
+    finish(split_clusters(
+        ordered.into_iter().map(|a| (a, Track::Shared)).collect(),
+    ))
+}
+
+/// Start a new cluster on day change, time gap, place drift or party
+/// handover, before any merging.
+fn split_clusters(ordered: Vec<(&Asset, Track)>) -> Vec<Acc> {
+    let outliers = gps_outliers_in(&ordered);
 
     let mut clusters: Vec<Acc> = vec![];
     let mut acc = Acc::default();
-    for a in ordered {
-        let day = day_key(a.taken_at, a.tz_offset_secs);
+    for (a, track) in ordered {
+        let day = day_of(a);
         let gps = a.gps.filter(|_| !outliers.contains(&a.id));
         if acc.ids.is_empty() {
             acc.day = day;
@@ -234,14 +326,15 @@ pub fn cluster_assets(assets: &[Asset]) -> Vec<Cluster> {
                 (gps, acc.centroid()),
                 (Some(g), Some(c)) if haversine_m(c, g) > PLACE_SPLIT_METERS
             );
-            if day_changed || gap || moved {
+            let other_party = matches!(acc.party, Some(p) if track != Track::Shared && track != p);
+            if day_changed || gap || moved || other_party {
                 acc.flush(&mut clusters, day);
             }
         }
-        acc.push(&a.id, a.taken_at, gps);
+        acc.push(&a.id, a.taken_at, gps, track);
     }
     acc.flush(&mut clusters, String::new());
-    finish(merge_small(clusters))
+    clusters
 }
 
 /// One near-dupe stack: members plus the best-shot pick.
@@ -299,13 +392,6 @@ fn looks_alike(a: &Asset, b: &Asset) -> bool {
 pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) -> Vec<DupeGroup> {
     let n = assets.len();
     let mut parent: Vec<usize> = (0..n).collect();
-    fn find(p: &mut [usize], mut x: usize) -> usize {
-        while p[x] != x {
-            p[x] = p[p[x]];
-            x = p[x];
-        }
-        x
-    }
     /// Join root `from` into root `into`, moving its member list along.
     fn union(p: &mut [usize], members: &mut [Vec<usize>], into: usize, from: usize) {
         p[from] = into;
@@ -331,9 +417,9 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
         for &e in &edits {
             is_edit[e] = true;
         }
-        let root = find(&mut parent, edits[0]);
+        let root = uf_find(&mut parent, edits[0]);
         for &m in edits[1..].iter().chain(&originals) {
-            let r = find(&mut parent, m);
+            let r = uf_find(&mut parent, m);
             if r != root {
                 union(&mut parent, &mut members, root, r);
             }
@@ -346,7 +432,7 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
             if !same_moment(&assets[i], &assets[j]) || !alike(i, j) {
                 continue;
             }
-            let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+            let (ri, rj) = (uf_find(&mut parent, i), uf_find(&mut parent, j));
             // Complete linkage: merge only if every cross pair is the
             // same moment, so chains (0, 9, 18 min) can't span the
             // window or radius as a whole.
@@ -363,7 +449,7 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
     }
     let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
     for i in 0..n {
-        let r = find(&mut parent, i);
+        let r = uf_find(&mut parent, i);
         groups.entry(r).or_default().push(i);
     }
     let score_of = |i: usize| scores.get(&assets[i].id).map(|s| s.total).unwrap_or(0.5);
@@ -614,7 +700,10 @@ mod tests {
             asset("a", Some(1_714_557_600), Some((37.77, -122.41)), None),
             asset("b", Some(1_714_557_660), Some((35.68, 139.69)), None),
         ];
-        assert_eq!(gps_outliers(&a), HashSet::from(["b".to_string()]));
+        assert_eq!(
+            gps_outliers_in(&story_tracks(&a)),
+            HashSet::from(["b".to_string()])
+        );
         let c = cluster_assets(&a);
         assert_eq!(c.len(), 1, "same day+hour stays one cluster: {c:?}");
         assert!(c[0].centroid_gps.is_some(), "outlier excluded, anchor kept");
@@ -1142,5 +1231,76 @@ mod tests {
         let (lat, lon) = c[0].centroid_gps.unwrap();
         assert!((lat - 10.0001).abs() < 1e-9 && (lon - 20.0001).abs() < 1e-9);
         assert!(c[0].label.ends_with(" · place 1"));
+    }
+
+    /// A day the group split: phone 1xxx in the city, phone 5xxx at the
+    /// park 12 km away, shooting in turn every 25 minutes.
+    fn split_day(park_shots: usize) -> Vec<Asset> {
+        let (city, park) = ((22.282, 114.154), (22.313, 114.043));
+        let t0 = 1_792_285_200;
+        let mut a = vec![];
+        for k in 0..8 {
+            let t = t0 + k * 50 * 60;
+            a.push(asset(
+                &format!("IMG_{}", 1502 + k),
+                Some(t),
+                Some(city),
+                None,
+            ));
+            if (k as usize) < park_shots {
+                let t = t0 + k * 50 * 60 + 25 * 60;
+                a.push(asset(
+                    &format!("IMG_{}", 5801 + k),
+                    Some(t),
+                    Some(park),
+                    None,
+                ));
+            }
+        }
+        a
+    }
+
+    #[test]
+    fn a_split_day_gets_chapters_per_party_in_party_order() {
+        let a = split_day(8);
+        let c = cluster_assets(&a);
+        assert_eq!(c.len(), 2, "{c:?}");
+        assert!(c[0].asset_ids.iter().all(|id| id.starts_with("IMG_15")));
+        assert!(c[1].asset_ids.iter().all(|id| id.starts_with("IMG_58")));
+        let tracks: Vec<Track> = story_tracks(&a).into_iter().map(|(_, t)| t).collect();
+        // The first city shot comes before anyone is seen apart.
+        assert_eq!(tracks[0], Track::Shared);
+        let party = |rank| Track::Party { segment: 0, rank };
+        assert!(tracks[1..8].iter().all(|&t| t == party(0)));
+        assert!(tracks[8..].iter().all(|&t| t == party(1)));
+    }
+
+    #[test]
+    fn same_day_needs_a_known_shared_day() {
+        let a = split_day(1);
+        assert!(same_day(&a[0], &a[1]));
+        let mut later = a[0].clone();
+        later.taken_at = later.taken_at.map(|t| t + 86_400);
+        assert!(!same_day(&a[0], &later));
+        let mut undated = a[0].clone();
+        undated.taken_at = None;
+        assert!(!same_day(&undated, &undated));
+    }
+
+    #[test]
+    fn a_small_party_cluster_never_merges_into_another_party() {
+        // Two park shots an hour apart: a cluster small enough to merge,
+        // but its only neighbour is the other party's.
+        let mut a = split_day(0);
+        let (park, t0) = ((22.313, 114.043), 1_792_285_200);
+        a.push(asset("IMG_5801", Some(t0 + 600), Some(park), None));
+        a.push(asset("IMG_5802", Some(t0 + 600 + 3600), Some(park), None));
+        let c = cluster_assets(&a);
+        let park: Vec<&Cluster> = c
+            .iter()
+            .filter(|c| c.asset_ids[0].starts_with("IMG_58"))
+            .collect();
+        assert_eq!(park.len(), 1, "{c:?}");
+        assert_eq!(park[0].asset_ids, ["IMG_5801", "IMG_5802"]);
     }
 }

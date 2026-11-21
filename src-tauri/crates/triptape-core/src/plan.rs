@@ -7,8 +7,9 @@
 //! Sec 5.4 degradation eligibility lives here too.
 
 use crate::clip_window::MAX_WINDOW_SECS;
-use crate::cluster::{gps_outliers, story_key, story_order};
+use crate::cluster::{day_of, gps_outliers_in, same_day, story_positions, story_tracks};
 use crate::embedding::{same_scene, Embedding};
+use crate::party::Track;
 use crate::types::{
     distinct_assets, Asset, AssetKind, Chapter, CollageEdits, MusicPick, Plan, PlanEntry,
     Rendition, Score,
@@ -833,12 +834,15 @@ struct HeroBudget {
 
 /// Pick hero entries (given in story order) to fill `budget`.
 ///
-/// Every chapter first gets its best entry (dropping the weakest chapters'
-/// picks only if even those overrun the ceiling). Remaining time is dealt
+/// Every chapter first gets its best entry, one per unit (dropping the
+/// weakest chapters' picks only if even those overrun the ceiling). Remaining time is dealt
 /// out one entry at a time to the chapter with the least estimated screen
 /// time relative to `size^CHAPTER_TIME_EXPONENT`, taking that chapter's
 /// best remaining entry, so big days get more screen time without crowding
-/// out small ones.
+/// out small ones. Where `unit_of` puts a chapter's entries in several
+/// units (a split day's capture-order clusters), the chapter's weight is the
+/// sum over its units instead, so telling a day party by party, in fewer
+/// and larger chapters, does not shrink its share of the film.
 ///
 /// An entry that would overrun the ceiling is skipped and the chapter's
 /// next-best, cheaper entry tried, so the film fills the budget instead of
@@ -853,6 +857,7 @@ struct HeroBudget {
 fn select_hero_by_budget<'a>(
     cands: Vec<PlanEntry>,
     chapter_of: impl Fn(&str) -> &'a str + Copy,
+    unit_of: impl Fn(&str) -> Option<usize>,
     score_of: impl Fn(&PlanEntry) -> f32,
     similar: impl Fn(&str, &str) -> bool,
     pano_secs_of: impl Fn(&str) -> Option<f64> + Copy,
@@ -876,6 +881,32 @@ fn select_hero_by_budget<'a>(
                 .then(x.cmp(&y))
         });
     }
+    // Each chapter's members grouped by unit, units in order of their best
+    // member, members best first.
+    let units: Vec<Vec<Vec<usize>>> = chapters
+        .iter()
+        .map(|(_, m)| {
+            let mut slot: HashMap<Option<usize>, usize> = HashMap::new();
+            let mut groups: Vec<Vec<usize>> = vec![];
+            for &i in m {
+                let k = *slot.entry(unit_of(&cands[i].asset_id)).or_insert_with(|| {
+                    groups.push(vec![]);
+                    groups.len() - 1
+                });
+                groups[k].push(i);
+            }
+            groups
+        })
+        .collect();
+    // Share weight per chapter: size^exponent, summed over its units.
+    let weight: Vec<f64> = units
+        .iter()
+        .map(|u| {
+            u.iter()
+                .map(|g| (g.len() as f64).powf(CHAPTER_TIME_EXPONENT))
+                .sum()
+        })
+        .collect();
     let mut picked = vec![false; cands.len()];
     let estimate = |picked: &[bool]| {
         estimate_hero_secs(
@@ -891,9 +922,10 @@ fn select_hero_by_budget<'a>(
             budget.cards,
         )
     };
-    // Every chapter's best entry, weakest dropped first if over budget
-    // (the strongest always stays, so the film is never empty).
-    let mut reps: Vec<usize> = chapters.iter().map(|(_, m)| m[0]).collect();
+    // Every chapter's best entry (each unit's, on a split day), weakest
+    // dropped first if over budget (the strongest always stays, so the film
+    // is never empty).
+    let mut reps: Vec<usize> = units.iter().flatten().map(|g| g[0]).collect();
     for &r in &reps {
         picked[r] = true;
     }
@@ -928,12 +960,9 @@ fn select_hero_by_budget<'a>(
                 .iter()
                 .enumerate()
                 .filter(|(ci, _)| !closed[*ci])
-                .min_by(|(a, (_, ma)), (b, (_, mb))| {
-                    let share =
-                        |ci: usize, n: usize| secs[ci] / (n as f64).powf(CHAPTER_TIME_EXPONENT);
-                    share(*a, ma.len())
-                        .total_cmp(&share(*b, mb.len()))
-                        .then(a.cmp(b))
+                .min_by(|(a, _), (b, _)| {
+                    let share = |ci: usize| secs[ci] / weight[ci];
+                    share(*a).total_cmp(&share(*b)).then(a.cmp(b))
                 })
                 .map(|(ci, _)| ci);
             let Some(ci) = next else { break };
@@ -1051,6 +1080,12 @@ pub struct PlanEdits {
     /// Asset id -> user caption (beats the caption embedded in the file).
     #[serde(default)]
     pub caption_overrides: BTreeMap<String, String>,
+    /// Film picks the user placed right before or after another film pick
+    /// of the same day, oldest first, at most one per moved asset. Film
+    /// order only: chapters, reels and the book are untouched. Ignored
+    /// while either asset is out of the film. See [`apply_moves`].
+    #[serde(default)]
+    pub moves: Vec<FilmMove>,
     /// Film photos the user set to play on their own ("Show on its own")
     /// or joined into one collage ("Join with next"), oldest first. Stored
     /// flat (`solo`, `joins`) beside the other edits. See [`collage_slots`].
@@ -1065,7 +1100,26 @@ impl PlanEdits {
             && self.swaps.is_empty()
             && self.place_overrides.is_empty()
             && self.caption_overrides.is_empty()
+            && self.moves.is_empty()
             && self.collage.is_empty()
+    }
+
+    /// Play `asset` right after (or before) `anchor` in the film,
+    /// replacing any earlier move of `asset`.
+    pub fn set_move(&mut self, asset: String, anchor: String, after: bool) {
+        self.unmove(&asset);
+        self.moves.push(FilmMove {
+            asset,
+            anchor,
+            after,
+        });
+    }
+
+    /// Undo the move of `asset`; false when it had none.
+    pub fn unmove(&mut self, asset: &str) -> bool {
+        let before = self.moves.len();
+        self.moves.retain(|m| m.asset != asset);
+        self.moves.len() != before
     }
 
     /// Set or (when blank) clear the place label for a chapter.
@@ -1125,6 +1179,113 @@ impl PlanEdits {
     }
 }
 
+/// "Play this one right before/after that one" in the film.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FilmMove {
+    /// The film pick that moves.
+    pub asset: String,
+    /// The film pick it plays next to (same day).
+    pub anchor: String,
+    /// Right after the anchor (`true`) or right before it.
+    pub after: bool,
+}
+
+/// Why a film move of `asset` next to `anchor` can't apply to `hero`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveRejection {
+    /// The moving shot (`anchor: false`) or its anchor isn't a film pick.
+    NotInFilm { anchor: bool },
+    /// A shot can't move next to itself.
+    SameShot,
+    /// The two aren't on one capture-local day.
+    OtherDay,
+}
+
+/// Check a film move against `hero` ([`FilmMove`]); `None` when it applies.
+pub fn move_rejection(hero: &[PlanEntry], asset: &Asset, anchor: &Asset) -> Option<MoveRejection> {
+    let in_film = |a: &Asset| hero.iter().any(|e| e.asset_id == a.id);
+    if !in_film(asset) {
+        Some(MoveRejection::NotInFilm { anchor: false })
+    } else if !in_film(anchor) {
+        Some(MoveRejection::NotInFilm { anchor: true })
+    } else if asset.id == anchor.id {
+        Some(MoveRejection::SameShot)
+    } else if !same_day(asset, anchor) {
+        Some(MoveRejection::OtherDay)
+    } else {
+        None
+    }
+}
+
+/// Apply the user's film moves to `hero` ([`PlanEdits::moves`]).
+///
+/// A move applies only while both assets are film picks of one capture-
+/// local day and neither is removed (`dead`); otherwise it is skipped and
+/// kept for when it fits again. All of a clip's windows move together, in
+/// their order, landing after the anchor's last window or before its first.
+/// Deterministic when moves chain: a move whose anchor was moved itself is
+/// applied after the anchor's own move (so "B after A, C after B" plays A,
+/// B, C whatever order they were made in); in a loop, the oldest move is
+/// applied last and wins.
+fn apply_moves(
+    hero: &mut Vec<PlanEntry>,
+    by_id: &HashMap<&str, &Asset>,
+    moves: &[FilmMove],
+    dead: &HashSet<&str>,
+) {
+    let move_of: HashMap<&str, usize> = moves
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.asset.as_str(), i))
+        .collect();
+    // Dependency order: each move after the move of its anchor.
+    let mut order: Vec<usize> = Vec::with_capacity(moves.len());
+    let mut state = vec![0u8; moves.len()]; // 0 new, 1 visiting, 2 done
+    for root in 0..moves.len() {
+        let mut stack = vec![(root, false)];
+        while let Some((i, expanded)) = stack.pop() {
+            if expanded {
+                state[i] = 2;
+                order.push(i);
+                continue;
+            }
+            if state[i] != 0 {
+                continue;
+            }
+            state[i] = 1;
+            stack.push((i, true));
+            if let Some(&j) = move_of.get(moves[i].anchor.as_str()) {
+                if state[j] == 0 {
+                    stack.push((j, false));
+                }
+            }
+        }
+    }
+    for i in order {
+        let m = &moves[i];
+        let (x, y) = (m.asset.as_str(), m.anchor.as_str());
+        if dead.contains(x) || dead.contains(y) {
+            continue;
+        }
+        let (Some(a), Some(b)) = (by_id.get(x), by_id.get(y)) else {
+            continue;
+        };
+        if move_rejection(hero, a, b).is_some() {
+            continue;
+        }
+        let moved: Vec<PlanEntry> = hero.iter().filter(|e| e.asset_id == x).cloned().collect();
+        hero.retain(|e| e.asset_id != x);
+        let at = if m.after {
+            hero.iter()
+                .rposition(|e| e.asset_id == y)
+                .map_or(0, |p| p + 1)
+        } else {
+            hero.iter().position(|e| e.asset_id == y).unwrap_or(0)
+        };
+        hero.splice(at..at, moved);
+    }
+}
+
 fn set_override(map: &mut BTreeMap<String, String>, key: String, value: Option<String>) {
     match value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
         Some(v) => map.insert(key, v.to_string()),
@@ -1164,10 +1325,11 @@ fn with_user_captions_only(plan: &Plan, by_id: &HashMap<&str, &Asset>) -> Plan {
 ///
 /// Apply user edits to a stored plan. Pure and deterministic:
 /// place overrides first (they rename whole chapters), then swaps,
-/// then pinned inclusions, then exclusions, then caption overrides on top.
+/// then pinned inclusions, then film moves ([`apply_moves`]), then
+/// exclusions, then caption overrides on top.
 ///
 /// Inclusions (hero only) put each pinned asset into `hero` at its
-/// story-order position (capture time, then id: [`story_order`]) with the
+/// story-order position ([`crate::cluster::story_order`]) with the
 /// same rendition rules as a swap-in (clips keep their window, Live
 /// Photos are stills). Pins must belong to this plan's chapters and are
 /// skipped when already picked. To keep the film at the length the user
@@ -1237,7 +1399,8 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
         }
     }
 
-    include_pins(&mut out, &by_id, edits, &dead);
+    include_pins(&mut out, assets, &by_id, edits, &dead);
+    apply_moves(&mut out.hero, &by_id, &edits.moves, &dead);
 
     // Exclusions: out of every pick and out of the book flow.
     out.hero.retain(|e| !dead.contains(e.asset_id.as_str()));
@@ -1278,6 +1441,7 @@ fn user_hero_entry(asset: &Asset) -> PlanEntry {
 /// Insert the user's pinned assets into the hero (see [`apply_edits`]).
 fn include_pins(
     out: &mut Plan,
+    assets: &[Asset],
     by_id: &HashMap<&str, &Asset>,
     edits: &PlanEdits,
     dead: &HashSet<&str>,
@@ -1295,8 +1459,12 @@ fn include_pins(
             .and_then(|a| a.score.as_ref())
             .map_or(DEFAULT_SCORE, |s| s.total)
     };
-    // Unknown assets sort last.
-    let key_of = |id: &str| by_id.get(id).map_or((i64::MAX, ""), |a| story_key(a));
+    if edits.included.is_empty() {
+        return;
+    }
+    // Story positions over the project's assets; unknown assets sort last.
+    let pos = story_positions(assets);
+    let key_of = |id: &str| pos.get(id).copied().unwrap_or(usize::MAX);
     for id in &edits.included {
         let Some(asset) = by_id.get(id.as_str()) else {
             continue;
@@ -1322,9 +1490,9 @@ fn include_pins(
             out.hero.remove(i);
         }
         // Swaps keep their slot, so the hero may be out of story order:
-        // land right after the last earlier capture, so nothing captured
-        // before the pin plays after it.
-        let key = story_key(asset);
+        // land right after the last entry earlier in story order, so
+        // nothing told before the pin plays after it.
+        let key = key_of(&asset.id);
         let at = out
             .hero
             .iter()
@@ -1368,8 +1536,10 @@ pub fn build_plan_with_length(
     overrides: &[PlaceOverride],
     length: FilmLength,
 ) -> Plan {
-    let ordered = story_order(assets);
+    // Story order: capture time, a split day told party by party.
+    let tracked = story_tracks(assets);
     let chapter_label = |id: &str| cluster_of.get(id).map_or(UNGROUPED, String::as_str);
+    let ordered = chapters_together(&tracked, chapter_label);
     // Story score per asset: technical quality relative to its chapter plus
     // the story bonuses (people, caption, clip). Assets without a score keep
     // the neutral default.
@@ -1423,7 +1593,10 @@ pub fn build_plan_with_length(
 
     // Map polyline: GPS fixes in story order, minus fixes that imply
     // impossible speed. Capture times separate those from real flights.
-    let outliers = gps_outliers(assets);
+    // On a split day the line follows one party's stretch, then the next
+    // party's (one hop between them), as the film tells it, instead of
+    // zig-zagging between parties in capture order.
+    let outliers = gps_outliers_in(&tracked);
     let map_polyline: Vec<(f64, f64)> = ordered
         .iter()
         .filter(|a| !outliers.contains(&a.id))
@@ -1519,9 +1692,28 @@ pub fn build_plan_with_length(
     // collages by playback order, and selection keeps candidate order, so
     // every budget check sees the order that will be rendered.
     place_sibling_windows(&mut hero, &by_id, chapter_label);
+    // A split day's capture-order clusters, which keep its share of the
+    // film (see `select_hero_by_budget`); every other day is one unit per
+    // chapter, exactly as before.
+    let split_days: HashSet<String> = tracked
+        .iter()
+        .filter(|(_, t)| *t != Track::Shared)
+        .map(|(a, _)| day_of(a))
+        .collect();
+    let capture_unit: HashMap<String, usize> = crate::cluster::cluster_by_capture(
+        ordered
+            .iter()
+            .copied()
+            .filter(|a| split_days.contains(&day_of(a))),
+    )
+    .into_iter()
+    .enumerate()
+    .flat_map(|(k, c)| c.asset_ids.into_iter().map(move |id| (id, k)))
+    .collect();
     let hero = select_hero_by_budget(
         hero,
         chapter_label,
+        |id| capture_unit.get(id).copied(),
         entry_score,
         similar,
         pano_secs_of,
@@ -1602,6 +1794,40 @@ pub fn build_plan_with_length(
                 .to_string(),
         },
     }
+}
+
+/// Story order with each chapter of a split day kept in one piece.
+///
+/// Chapters come from clustering every asset, while the plan sees only the
+/// kept ones (near-dupes suppressed), so a shot told with one party here
+/// can belong to another party's chapter: a captioned copy of a photo
+/// whose original was the only nearby shot of its phone. On a day with a
+/// split stretch, the day's shots are regrouped by chapter, chapters in
+/// the order of their median member, each chapter's shots in story order.
+/// Every other day is untouched.
+fn chapters_together<'a, 'c>(
+    tracked: &[(&'a Asset, Track)],
+    chapter_of: impl Fn(&str) -> &'c str,
+) -> Vec<&'a Asset> {
+    let mut out = Vec::with_capacity(tracked.len());
+    for run in tracked.chunk_by(|(a, _), (b, _)| same_day(a, b)) {
+        if run.iter().all(|(_, t)| *t == Track::Shared) {
+            out.extend(run.iter().map(|(a, _)| *a));
+            continue;
+        }
+        let mut members: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (p, (a, _)) in run.iter().enumerate() {
+            members.entry(chapter_of(&a.id)).or_default().push(p);
+        }
+        let median: HashMap<&str, usize> = members
+            .iter()
+            .map(|(c, ps)| (*c, ps[(ps.len() - 1) / 2]))
+            .collect();
+        let mut idx: Vec<usize> = (0..run.len()).collect();
+        idx.sort_by_key(|&p| (median[chapter_of(&run[p].0.id)], p));
+        out.extend(idx.into_iter().map(|p| run[p].0));
+    }
+    out
 }
 
 /// Move each further window of a clip to where it was captured: the clip's
@@ -3422,6 +3648,7 @@ mod tests {
         select_hero_by_budget(
             cands,
             letter,
+            |_| None,
             score_of,
             similar,
             |_| None,
@@ -3435,6 +3662,54 @@ mod tests {
         .into_iter()
         .map(|e| e.asset_id)
         .collect()
+    }
+
+    /// A split day's chapter keeps the share its capture-order clusters
+    /// had: each unit gets a pick, and the chapter weighs as its units.
+    #[test]
+    fn a_chapter_split_into_units_keeps_their_share() {
+        let ids: Vec<String> = ["a", "b"]
+            .iter()
+            .flat_map(|l| (1..=8).map(move |k| format!("{l}{k}")))
+            .collect();
+        let cands: Vec<PlanEntry> = ids.iter().map(|id| clip_entry(id, 5.0)).collect();
+        // Within each chapter the lower numbers score higher.
+        let score_of = |e: &PlanEntry| 1.0 - e.asset_id[1..].parse::<f32>().unwrap() / 10.0;
+        let run = |unit_of: &dyn Fn(&str) -> Option<usize>| -> Vec<String> {
+            select_hero_by_budget(
+                cands.clone(),
+                letter,
+                unit_of,
+                score_of,
+                |_, _| false,
+                |_| None,
+                |_| false,
+                |_| Some(0),
+                HeroBudget {
+                    ceiling_secs: 60.0,
+                    cards: NO_CARDS,
+                },
+            )
+            .into_iter()
+            .map(|e| e.asset_id)
+            .collect()
+        };
+        let count = |v: &[String], l: &str| v.iter().filter(|id| id.starts_with(l)).count();
+        let plain = run(&|_| None);
+        assert!(!plain.contains(&"a7".to_string()), "{plain:?}");
+        // Chapter a was four capture-order clusters of two.
+        let split = run(&|id: &str| {
+            id.starts_with('a')
+                .then(|| (id[1..].parse::<usize>().unwrap() - 1) / 2)
+        });
+        assert!(
+            count(&split, "a") > count(&plain, "a"),
+            "{plain:?} {split:?}"
+        );
+        assert!(count(&split, "a") > count(&split, "b"), "{split:?}");
+        for unit_rep in ["a1", "a3", "a5", "a7"] {
+            assert!(split.contains(&unit_rep.to_string()), "{split:?}");
+        }
     }
 
     #[test]
@@ -4071,6 +4346,7 @@ mod tests {
             select_hero_by_budget(
                 cands.clone(),
                 letter,
+                |_| None,
                 score_of,
                 |_, _| false,
                 |_| None,
@@ -4780,5 +5056,199 @@ mod tests {
         // 0.54 + 0.7 = 2.48 s.
         let est = estimate_hero_secs(&entries, ch, |_| None, |id| id == "x3", |_| Some(0), bare);
         assert!((est - 18.02).abs() < 1e-9, "{est}");
+    }
+
+    fn split_fixture() -> Vec<Asset> {
+        let (city, park) = ((22.282, 114.154), (22.313, 114.043));
+        let t0 = 1_792_285_200;
+        let mut assets = vec![];
+        for k in 0..8 {
+            let mut c = asset(
+                &format!("IMG_{}", 1502 + k),
+                t0 + k * 3000,
+                AssetKind::Photo,
+            );
+            c.gps = Some(city);
+            let mut p = asset(
+                &format!("IMG_{}", 5801 + k),
+                t0 + k * 3000 + 1500,
+                AssetKind::Photo,
+            );
+            p.gps = Some(park);
+            assets.extend([c, p]);
+        }
+        assets[0].user_caption = Some("I toured the city".into());
+        assets
+    }
+
+    fn split_plan(assets: &[Asset]) -> Plan {
+        let cluster_of = crate::cluster::chapter_labels(&crate::cluster::cluster_assets(assets));
+        build_plan_with_length(
+            assets,
+            &cluster_of,
+            &HashMap::new(),
+            &[],
+            FilmLength::Secs(3600.0),
+        )
+    }
+
+    fn owned(ids: Vec<&str>) -> Vec<String> {
+        ids.into_iter().map(String::from).collect()
+    }
+
+    #[test]
+    fn a_split_day_plays_the_owners_party_then_the_others() {
+        let assets = split_fixture();
+        let plan = split_plan(&assets);
+        let hero = hero_ids(&plan);
+        let first_park = hero.iter().position(|id| id.starts_with("IMG_58")).unwrap();
+        assert!(
+            hero[..first_park].iter().all(|id| id.starts_with("IMG_15")),
+            "{hero:?}"
+        );
+        assert!(
+            hero[first_park..].iter().all(|id| id.starts_with("IMG_58")),
+            "{hero:?}"
+        );
+        assert_eq!(plan.chapters.len(), 2);
+        assert_eq!(
+            plan.chapters[1].place.as_deref(),
+            Some("Hong Kong Disneyland")
+        );
+        assert_ne!(plan.chapters[0].place, plan.chapters[1].place);
+        // The route follows one party, then hops once to the other.
+        let hops = plan
+            .map_polyline
+            .windows(2)
+            .filter(|w| crate::geo::haversine_m(w[0], w[1]) > 3000.0)
+            .count();
+        assert_eq!(hops, 1, "{:?}", plan.map_polyline);
+    }
+
+    fn moved(plan: &Plan, assets: &[Asset], moves: &[(&str, &str, bool)]) -> Vec<String> {
+        let mut edits = PlanEdits::default();
+        for (x, y, after) in moves {
+            edits.set_move(x.to_string(), y.to_string(), *after);
+        }
+        owned(hero_ids(&apply_edits(plan, assets, &edits)))
+    }
+
+    #[test]
+    fn a_move_places_a_shot_next_to_another_of_its_day() {
+        let assets = split_fixture();
+        let plan = split_plan(&assets);
+        let base = owned(hero_ids(&plan));
+        let at = |v: &[String], id: &str| v.iter().position(|x| x == id).unwrap();
+        // Within a chapter: the fourth city shot opens the day.
+        let v = moved(&plan, &assets, &[("IMG_1505", "IMG_1502", false)]);
+        assert_eq!(at(&v, "IMG_1505") + 1, at(&v, "IMG_1502"));
+        assert_eq!(v.len(), base.len());
+        // Across the day's chapters: a park shot right after a city shot.
+        let v = moved(&plan, &assets, &[("IMG_5803", "IMG_1504", true)]);
+        assert_eq!(at(&v, "IMG_1504") + 1, at(&v, "IMG_5803"));
+        // Chapters are untouched.
+        let mut edits = PlanEdits::default();
+        edits.set_move("IMG_5803".into(), "IMG_1504".into(), true);
+        let members = |p: &Plan| -> Vec<Vec<String>> {
+            p.chapters.iter().map(|c| c.asset_ids.clone()).collect()
+        };
+        assert_eq!(
+            members(&apply_edits(&plan, &assets, &edits)),
+            members(&plan)
+        );
+        // Chained, in either order of making: 1502, then 1507, then 1506.
+        for moves in [
+            [
+                ("IMG_1507", "IMG_1502", true),
+                ("IMG_1506", "IMG_1507", true),
+            ],
+            [
+                ("IMG_1506", "IMG_1507", true),
+                ("IMG_1507", "IMG_1502", true),
+            ],
+        ] {
+            let v = moved(&plan, &assets, &moves);
+            let (a, b, c) = (at(&v, "IMG_1502"), at(&v, "IMG_1507"), at(&v, "IMG_1506"));
+            assert_eq!((b, c), (a + 1, a + 2), "{v:?}");
+        }
+        // Undone cleanly.
+        let mut edits = PlanEdits::default();
+        edits.set_move("IMG_1505".into(), "IMG_1502".into(), false);
+        assert!(edits.unmove("IMG_1505"));
+        assert!(!edits.unmove("IMG_1505"));
+        assert!(edits.is_empty());
+        assert_eq!(
+            hero_ids(&apply_edits(&plan, &assets, &edits)),
+            hero_ids(&plan)
+        );
+    }
+
+    #[test]
+    fn moves_across_days_or_out_of_the_film_are_ignored() {
+        let mut assets = split_fixture();
+        let mut next_day = asset("IMG_1600", 1_792_285_200 + 86_400, AssetKind::Photo);
+        next_day.gps = Some((22.282, 114.154));
+        assets.push(next_day);
+        let plan = split_plan(&assets);
+        assert!(hero_ids(&plan).contains(&"IMG_1600"));
+        let base = owned(hero_ids(&plan));
+        assert_eq!(
+            moved(&plan, &assets, &[("IMG_1600", "IMG_1502", false)]),
+            base
+        );
+        assert_eq!(moved(&plan, &assets, &[("IMG_1502", "gone", true)]), base);
+        // A removed anchor leaves the shot where it was.
+        let mut edits = PlanEdits::default();
+        edits.set_move("IMG_1505".into(), "IMG_1502".into(), false);
+        edits.set_excluded("IMG_1502".into(), true);
+        let mut want = base.clone();
+        want.retain(|id| id != "IMG_1502");
+        assert_eq!(owned(hero_ids(&apply_edits(&plan, &assets, &edits))), want);
+    }
+
+    #[test]
+    fn move_rejection_names_why_a_move_cant_apply() {
+        let mut assets = split_fixture();
+        let mut next_day = asset("IMG_1600", 1_792_285_200 + 86_400, AssetKind::Photo);
+        next_day.gps = Some((22.282, 114.154));
+        assets.push(next_day);
+        let plan = split_plan(&assets);
+        let get = |id: &str| assets.iter().find(|a| a.id == id).unwrap();
+        let outside = asset("IMG_9999", 1_792_285_200, AssetKind::Photo);
+        let check = |x: &Asset, y: &Asset| move_rejection(&plan.hero, x, y);
+        assert_eq!(check(get("IMG_1505"), get("IMG_1502")), None);
+        assert_eq!(
+            check(&outside, get("IMG_1502")),
+            Some(MoveRejection::NotInFilm { anchor: false })
+        );
+        assert_eq!(
+            check(get("IMG_1502"), &outside),
+            Some(MoveRejection::NotInFilm { anchor: true })
+        );
+        assert_eq!(
+            check(get("IMG_1502"), get("IMG_1502")),
+            Some(MoveRejection::SameShot)
+        );
+        assert_eq!(
+            check(get("IMG_1600"), get("IMG_1502")),
+            Some(MoveRejection::OtherDay)
+        );
+    }
+
+    #[test]
+    fn moves_survive_a_replan_and_old_edits_still_load() {
+        let assets = split_fixture();
+        let mut edits = PlanEdits::default();
+        edits.set_move("IMG_1505".into(), "IMG_1502".into(), false);
+        let json = serde_json::to_string(&edits).unwrap();
+        let loaded: PlanEdits = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, edits);
+        // A rebuilt plan of the same assets takes the stored move.
+        let replanned = split_plan(&assets);
+        let v = owned(hero_ids(&apply_edits(&replanned, &assets, &loaded)));
+        let at = |id: &str| v.iter().position(|x| x == id).unwrap();
+        assert_eq!(at("IMG_1505") + 1, at("IMG_1502"));
+        let old: PlanEdits = serde_json::from_str(r#"{"excluded":["a"]}"#).unwrap();
+        assert!(old.moves.is_empty());
     }
 }

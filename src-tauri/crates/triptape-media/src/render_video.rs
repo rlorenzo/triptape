@@ -609,9 +609,10 @@ pub fn render_hero_video(
     }
 
     let mut places: Vec<String> = vec![];
+    let ships = opts.journey.as_ref().map(|j| j.ships()).unwrap_or_default();
+    // A ship is where we slept, not a place we went.
+    let is_ship = |p: &String| triptape_core::itinerary::is_ship_place(&ships, p);
     for c in &plan.chapters {
-        // A ship is where we slept, not a place we went.
-        let is_ship = |p: &String| opts.journey.as_ref().is_some_and(|j| j.ships().contains(p));
         if let Some(p) = c.place.as_ref().filter(|p| !is_ship(p)) {
             if !places.contains(p) {
                 places.push(p.clone());
