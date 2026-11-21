@@ -1781,8 +1781,17 @@ fn face_window(
     // Along each axis: centre on the kept faces, slid to hold them all.
     let place = |lo: f64, hi: f64, win: f64, full: f64| {
         let want = (lo + hi) / 2.0 - win / 2.0;
-        want.clamp((hi - win).max(0.0), lo.min(full - win))
-            .clamp(0.0, full - win)
+        let max_origin = (full - win).max(0.0);
+        // The 0.5 px slack above (and rounding) can leave the faces a
+        // touch wider than the window: then centre rather than panic in
+        // `clamp` on an inverted range.
+        let (from, to) = ((hi - win).max(0.0), lo.min(max_origin));
+        let held = if from <= to {
+            want.clamp(from, to)
+        } else {
+            want
+        };
+        held.clamp(0.0, max_origin)
     };
     let (x, y) = match keep {
         Some(k) => (place(k.0, k.2, cw, sw), place(k.1, k.3, ch, sh)),
@@ -1801,10 +1810,11 @@ fn cover_fit_faces(src: &RgbImage, tw: u32, th: u32, faces: &[FaceBox]) -> (RgbI
         f64::from(src.height().max(1)),
     );
     let ((x, y, w, h), cut) = face_window(sw, sh, f64::from(tw), f64::from(th), faces);
-    let (x, y) = (x.round() as u32, y.round() as u32);
+    let x = (x.round() as u32).min(src.width().saturating_sub(1));
+    let y = (y.round() as u32).min(src.height().saturating_sub(1));
     let (w, h) = (
-        (w.round() as u32).clamp(1, src.width() - x.min(src.width() - 1)),
-        (h.round() as u32).clamp(1, src.height() - y.min(src.height() - 1)),
+        (w.round() as u32).clamp(1, src.width().saturating_sub(x).max(1)),
+        (h.round() as u32).clamp(1, src.height().saturating_sub(y).max(1)),
     );
     let window = image::imageops::crop_imm(src, x, y, w, h).to_image();
     let out = image::imageops::resize(&window, tw, th, image::imageops::FilterType::Triangle);
@@ -2965,6 +2975,13 @@ mod tests {
         );
         assert!(x + w >= 0.95 * 6000.0, "the big face's side: x={x}");
         assert!(cut);
+        // Faces padded a fraction of a pixel wider than the window still
+        // count as kept, and place them without panicking.
+        let ((x, _, w, _), cut) =
+            face_window(4000.0, 3000.0, 1.0, 1.0, &[face(0.15, 0.33, 0.5358)]);
+        assert_eq!(w, 3000.0);
+        assert!((0.0..=1000.0).contains(&x), "in the photo: x={x}");
+        assert!(!cut);
         // No faces: centred, as before.
         let ((x, y, _, _), cut) = face_window(4000.0, 3000.0, 1.0, 1.0, &[]);
         assert_eq!((x, y, cut), (500.0, 0.0, false));

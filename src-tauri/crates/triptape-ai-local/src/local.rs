@@ -376,14 +376,22 @@ impl FaceModels {
     fn boxes(&self, img: &RgbImage) -> Result<Vec<crate::FaceBox>, String> {
         let found = self.detect(img)?;
         let (iw, ih) = (img.width().max(1) as f32, img.height().max(1) as f32);
+        // MIN_FACE_PX is in thumbnail pixels; scale it to `img`.
+        let min_px = faces::MIN_FACE_PX * (iw.max(ih) / proxies::THUMB_LONG_EDGE as f32).max(1.0);
         Ok(found
             .iter()
-            .filter(|f| f.side() >= faces::MIN_FACE_PX)
-            .map(|f| crate::FaceBox {
-                x: (f.x1 / iw).clamp(0.0, 1.0),
-                y: (f.y1 / ih).clamp(0.0, 1.0),
-                w: ((f.x2 - f.x1) / iw).clamp(0.0, 1.0),
-                h: ((f.y2 - f.y1) / ih).clamp(0.0, 1.0),
+            .filter(|f| f.side() >= min_px)
+            .map(|f| {
+                let x1 = (f.x1 / iw).clamp(0.0, 1.0);
+                let y1 = (f.y1 / ih).clamp(0.0, 1.0);
+                let x2 = (f.x2 / iw).clamp(x1, 1.0);
+                let y2 = (f.y2 / ih).clamp(y1, 1.0);
+                crate::FaceBox {
+                    x: x1,
+                    y: y1,
+                    w: x2 - x1,
+                    h: y2 - y1,
+                }
             })
             .collect())
     }

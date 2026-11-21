@@ -770,6 +770,10 @@ fn export_cmd(flags: &HashMap<String, String>) {
         Progress::new(console.clone())
     };
     let segment_cache = segment_cache_config(flags);
+    // Only the book crops around faces; skip loading the models otherwise.
+    let faces = matches!(only.as_str(), "all" | "book")
+        .then(|| book_faces(flags))
+        .flatten();
     let exported = export_all(
         &caps,
         &plan,
@@ -789,7 +793,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             progress,
             segment_cache,
             itinerary,
-            faces: book_faces(flags),
+            faces,
         },
     );
     console.finish();
