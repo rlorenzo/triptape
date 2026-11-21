@@ -1835,7 +1835,7 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
 fn divider_lines(bg: &BookPhoto, chapters: &[String], announced: &mut Announced) -> Vec<String> {
     // A captioned background keeps its place too, as on photo pages.
     titled(
-        opening_title(bg, chapters, announced),
+        opening_title(bg, chapters, announced).map(|t| places_in_time_order(&t, &[bg])),
         page_caption(&[bg], PageKind::PhotoCaption),
     )
 }

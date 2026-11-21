@@ -1353,6 +1353,17 @@ fn edit_cmd(args: &[String]) {
         .collect();
     let uncrops = resolve(&a.uncrop);
     let books = resolve(&a.book);
+    // A pin only places a photo the plan holds (a near-duplicate the scan
+    // set aside has no page to go to): refuse it rather than save a no-op.
+    if let Some(asset) = books.iter().find(|x| ep.base.chapter_of(&x.id).is_none()) {
+        die(
+            "edit",
+            format!(
+                "{} is not in any chapter of the plan, so the book can't place it",
+                asset_label(asset)
+            ),
+        );
+    }
     let unbooks = resolve(&a.unbook);
     let changed = ops.iter().any(|(assets, ..)| !assets.is_empty())
         || !unjoins.is_empty()

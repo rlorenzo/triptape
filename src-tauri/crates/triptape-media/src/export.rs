@@ -804,7 +804,10 @@ fn export_inner(
                     s.tech_quality() + s.bonus + panorama_bonus(a, s.tech_quality())
                 }),
                 // Captioned or pinned by the owner: always placed.
+                // Captioned, pinned into the book, or pinned to the cover by
+                // the owner: always placed (the page cap never drops it).
                 keep: plan.book.contains(&a.id)
+                    || plan.cover.contains_key(&a.id)
                     || plan
                         .captions
                         .get(&a.id)
