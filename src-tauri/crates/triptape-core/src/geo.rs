@@ -233,8 +233,15 @@ fn attractions() -> &'static [Attraction] {
 /// known attraction is that close. The nearest wins: on the 2026 Japan to
 /// Singapore trip, a notability weight or a 1 km radius for the tail of the
 /// list changed none of the 72 chapter names.
-pub fn attraction_name(gps: (f64, f64)) -> Option<String> {
-    nearest_within(attractions(), |a| (a.lat, a.lon), gps, 2_000.0).map(|a| a.name.to_string())
+fn attraction_name(gps: (f64, f64)) -> Option<String> {
+    attraction_within(gps, 2_000.0)
+}
+
+/// The nearest known attraction within `max_m` of `gps`. Chapter names use
+/// 2 km (a day centred near a place); captioning one photo needs to be much
+/// closer, since a 2 km reach names whatever a walk passed by.
+pub fn attraction_within(gps: (f64, f64), max_m: f64) -> Option<String> {
+    nearest_within(attractions(), |a| (a.lat, a.lon), gps, max_m).map(|a| a.name.to_string())
 }
 
 /// The item nearest `gps` within `max_m`, by `coords` (`(lat, lon)`).

@@ -157,18 +157,42 @@ fn book_chapter_of(plan: &Plan) -> HashMap<&str, usize> {
         .collect()
 }
 
+/// How close a photo must be to an attraction to be captioned with it.
+/// Measured on the Japan to Singapore trip: shots at places visited sat a
+/// median 35-440 m from the attraction's point (Kōtoku-in, DisneySea,
+/// Universal Studios), while places merely walked past or near sat 650-
+/// 1000 m away (Hamarikyu beside Tsukiji, Hibiya, Sensō-ji from the hotel).
+const PHOTO_PLACE_RADIUS_M: f64 = 600.0;
+
+/// Photos a day needs at an attraction before it names any of them: one
+/// shot on the walk to the station is not a visit.
+const PHOTO_PLACE_MIN_SHOTS: usize = 3;
+
+/// Attractions visited per trip day: (day, name) -> photos within
+/// [`PHOTO_PLACE_RADIUS_M`].
+type Visits = HashMap<(u32, String), usize>;
+
+fn photo_attraction(a: &triptape_core::types::Asset) -> Option<String> {
+    triptape_core::geo::attraction_within(a.gps?, PHOTO_PLACE_RADIUS_M)
+}
+
 /// A book photo's caption: the user's, else the attraction it was taken at
-/// (Tokyo DisneySea says more than the itinerary's "Tokyo"), else its
-/// chapter's place.
+/// when that day's photos show a real visit (Tokyo DisneySea says more than
+/// the itinerary's "Tokyo"), else its chapter's place.
 fn book_caption(
     plan: &Plan,
     chapter: Option<usize>,
+    visits: &Visits,
+    day: Option<u32>,
     a: &triptape_core::types::Asset,
 ) -> Option<String> {
     plan.captions.get(&a.id).cloned().or_else(|| {
         let place = chapter.and_then(|i| plan.chapters[i].place.clone());
-        a.gps
-            .and_then(triptape_core::geo::attraction_name)
+        photo_attraction(a)
+            .filter(|poi| {
+                day.and_then(|d| visits.get(&(d, poi.clone())))
+                    .is_some_and(|&n| n >= PHOTO_PLACE_MIN_SHOTS)
+            })
             .filter(|poi| place.as_deref() != Some(poi.as_str()))
             .or(place)
     })
@@ -653,6 +677,16 @@ fn export_inner(
             days.clone().min().zip(days.max())
         };
         let trip_start = photo_span.map(|(s, _)| s);
+        let mut visits: Visits = HashMap::new();
+        for a in assets
+            .iter()
+            .filter(|a| a.kind != AssetKind::Video && in_book_flow(&chapter_of, &a.id))
+        {
+            let day = asset_day(a).zip(trip_start).map(|(d, s)| trip_day(d, s));
+            if let (Some(d), Some(poi)) = (day, photo_attraction(a)) {
+                *visits.entry((d, poi)).or_default() += 1;
+            }
+        }
         let mut book_photos: Vec<BookPhoto> = vec![];
         for a in assets
             .iter()
@@ -682,13 +716,14 @@ fn export_inner(
                 (w, h)
             };
             let chapter = chapter_of.get(a.id.as_str()).copied();
+            let day = asset_day(a).zip(trip_start).map(|(d, s)| trip_day(d, s));
             book_photos.push(BookPhoto {
                 asset_id: a.id.clone(),
                 path: a.path.clone(),
                 width: w,
                 height: h,
-                caption: book_caption(plan, chapter, a),
-                day: asset_day(a).zip(trip_start).map(|(d, s)| trip_day(d, s)),
+                caption: book_caption(plan, chapter, &visits, day, a),
+                day,
                 chapter,
                 // Unclamped, so a strong bonus still ranks above a weak one
                 // once `total` saturates.
@@ -907,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn book_captions_prefer_user_text_then_attraction_then_place() {
+    fn book_captions_prefer_user_text_then_visited_attraction_then_place() {
         use triptape_core::types::{Asset, Chapter};
         let mut plan = empty_plan();
         plan.chapters = vec![Chapter {
@@ -917,25 +952,41 @@ mod tests {
             day_index: None,
             date_label: None,
         }];
+        let disneysea = "Tokyo DisneySea".to_string();
+        let visited: Visits = [((4, disneysea.clone()), 3)].into();
+        let passed: Visits = [((4, disneysea.clone()), 1)].into();
         let mut a = Asset::new("a", "a.jpg".into(), AssetKind::Photo);
         // No GPS: the chapter place.
-        assert_eq!(book_caption(&plan, Some(0), &a).as_deref(), Some("Tokyo"));
-        // Inside Tokyo DisneySea: the attraction beats the city.
+        assert_eq!(
+            book_caption(&plan, Some(0), &visited, Some(4), &a).as_deref(),
+            Some("Tokyo")
+        );
+        // Inside Tokyo DisneySea on a day spent there: the attraction.
         a.gps = Some((35.6267, 139.8881));
         assert_eq!(
-            book_caption(&plan, Some(0), &a).as_deref(),
+            book_caption(&plan, Some(0), &visited, Some(4), &a).as_deref(),
             Some("Tokyo DisneySea")
         );
-        // An attraction that is the chapter place already is not repeated.
-        plan.chapters[0].place = Some("Tokyo DisneySea".into());
+        // One shot there that day is passing by, not a visit.
         assert_eq!(
-            book_caption(&plan, Some(0), &a).as_deref(),
+            book_caption(&plan, Some(0), &passed, Some(4), &a).as_deref(),
+            Some("Tokyo")
+        );
+        // A Day 5 shot on the way to the station, 749 m from the National
+        // Museum of Western Art: too far to caption a walk past it.
+        let mut ueno = Asset::new("u", "u.jpg".into(), AssetKind::Photo);
+        ueno.gps = Some((35.71139, 139.78256));
+        assert_eq!(photo_attraction(&ueno), None);
+        // An attraction that is the chapter place already is not repeated.
+        plan.chapters[0].place = Some(disneysea.clone());
+        assert_eq!(
+            book_caption(&plan, Some(0), &visited, Some(4), &a).as_deref(),
             Some("Tokyo DisneySea")
         );
         // The user's caption always wins.
         plan.captions.insert("a".into(), "Rain all day".into());
         assert_eq!(
-            book_caption(&plan, Some(0), &a).as_deref(),
+            book_caption(&plan, Some(0), &visited, Some(4), &a).as_deref(),
             Some("Rain all day")
         );
     }
