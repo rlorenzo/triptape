@@ -118,7 +118,7 @@ pub type Features = BTreeMap<String, f64>;
 /// Which edit produced a preference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EventKind {
-    /// A pinned photo was chosen over the shot it displaced.
+    /// A pinned photo was chosen over its chapter's weakest pick.
     Include,
     /// A replacement was chosen over the original pick.
     Swap,
@@ -482,7 +482,7 @@ fn hero_ids(plan: &Plan) -> Vec<&str> {
 /// Preference events implied by changing `before` into `after`. Pure: the
 /// caller supplies the stored plan and assets. Additions are replayed one
 /// at a time from `before` (swaps, then removals, then pins) so each pin's
-/// displaced shot is known; undone edits come back as `removed`.
+/// chapter is judged as it stood; undone edits come back as `removed`.
 pub fn events_for_edit(
     base: &Plan,
     assets: &[Asset],
@@ -597,17 +597,24 @@ pub fn events_for_edit(
         .iter()
         .filter(|i| !before.included.contains(i) && !new_swaps.iter().any(|(_, t)| t == *i));
     for id in pins {
+        // Pinning a shot the film already holds changes nothing to learn.
+        let already_picked = plan.hero.iter().any(|e| e.asset_id == *id);
         cur.set_included(id.clone(), true);
-        let was = std::mem::replace(&mut plan, apply_edits(base, assets, &cur));
-        let kept = hero_ids(&plan);
-        let Some(chosen) = feats(id) else { continue };
-        for gone in hero_ids(&was)
-            .into_iter()
-            .filter(|g| *g != id && !kept.contains(g))
-        {
-            if let Some(rejected) = feats(gone) {
-                push(EventKind::Include, id, gone, chosen.clone(), rejected);
-            }
+        plan = apply_edits(base, assets, &cur);
+        if already_picked {
+            continue;
+        }
+        // A pin adds to the film; the user still chose it over the shot
+        // the planner rated lowest in its chapter. Asked of the rebuilt
+        // plan, so a pin that restores an excluded shot finds its chapter.
+        let (Some(chosen), Some(gone)) = (
+            feats(id),
+            crate::plan::weakest_unchosen_pick(&plan, assets, &cur, id),
+        ) else {
+            continue;
+        };
+        if let Some(r) = feats(gone) {
+            push(EventKind::Include, id, gone, chosen, r);
         }
     }
     delta
@@ -847,12 +854,35 @@ mod tests {
     }
 
     #[test]
-    fn pin_records_a_win_over_the_shot_it_displaced() {
+    fn pinning_a_shot_already_in_the_film_records_nothing() {
+        let (db, pid, _) = db_with_chapter();
+        let mut edits = PlanEdits::default();
+        edits.set_included("b".into(), true);
+        db.save_plan_edits(&pid, &edits).unwrap();
+        assert!(events(&db, &pid).is_empty());
+    }
+
+    #[test]
+    fn pinning_an_excluded_shot_still_records_a_win() {
+        let (db, pid, _) = db_with_chapter();
+        let mut edits = PlanEdits::default();
+        edits.set_excluded("e".into(), true);
+        db.save_plan_edits(&pid, &edits).unwrap();
+        edits.set_included("e".into(), true);
+        db.save_plan_edits(&pid, &edits).unwrap();
+        assert_eq!(
+            events(&db, &pid),
+            [(EventKind::Include, "e".into(), "a".into())]
+        );
+    }
+
+    #[test]
+    fn pin_records_a_win_over_its_chapters_weakest_pick() {
         let (db, pid, _) = db_with_chapter();
         let mut edits = PlanEdits::default();
         edits.set_included("e".into(), true);
         db.save_plan_edits(&pid, &edits).unwrap();
-        // The weakest unpinned hero pick (a: no people, ties break by order).
+        // The weakest unchosen hero pick (a: no people, ties break by order).
         assert_eq!(
             events(&db, &pid),
             [(EventKind::Include, "e".into(), "a".into())]

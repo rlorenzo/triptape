@@ -1399,8 +1399,8 @@ async fn set_asset_excluded(
 }
 
 /// Pin a photo into the film ("Add to film"), or un-pin it. Film only; the
-/// plan puts it at its capture-time position and trades it for the weakest
-/// unpinned shot of its day to keep the length.
+/// plan puts it at its capture-time position and the film grows by that
+/// shot; nothing is taken out.
 #[tauri::command]
 async fn set_asset_included(
     state: State<'_, AppState>,
