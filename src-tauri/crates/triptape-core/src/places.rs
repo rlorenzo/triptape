@@ -283,6 +283,7 @@ mod tests {
                 place: Some(place.into()),
                 day_index: None,
                 date_label: None,
+                film_place: None,
             })
             .collect();
         plan

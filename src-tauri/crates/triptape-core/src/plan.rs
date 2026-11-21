@@ -1663,6 +1663,7 @@ pub fn build_plan_with_length(
                 place,
                 day_index: first_date.zip(trip_start).map(|(d, s)| trip_day(d, s)),
                 date_label: first_date.map(|d| d.strftime(DAY_FORMAT).to_string()),
+                film_place: None,
             }
         })
         .collect();

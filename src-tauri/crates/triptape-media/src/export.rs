@@ -51,6 +51,12 @@ pub struct ExportOptions {
     pub itinerary: Option<triptape_core::itinerary::Itinerary>,
     /// Face detection for book crops; `None` crops around the centre.
     pub faces: Option<render_book::FaceFinder>,
+    /// How the itinerary's travel is shown in the film.
+    pub map_style: crate::render_video::MapStyle,
+    /// The owner's own hop clips, one per hop of the itinerary, in order.
+    pub hop_clips: Vec<PathBuf>,
+    /// The owner's own picture for the book's back cover.
+    pub back_cover: Option<PathBuf>,
 }
 
 /// How the segment cache served one export.
@@ -482,6 +488,16 @@ fn export_inner(
     // Every keepsake reads its places from here (chapter names are already
     // in the plan): none names a place on its own.
     let places = triptape_core::places::photo_places(plan, assets, opts.itinerary.as_ref());
+    // The film and the book share one journey; building it routes every
+    // sailing, so it is built once, and only if one of them asks.
+    let journey_cell = std::cell::OnceCell::new();
+    let journey = || {
+        opts.itinerary.as_ref().map(|i| {
+            journey_cell
+                .get_or_init(|| triptape_core::journey::Journey::build(i, assets))
+                .clone()
+        })
+    };
 
     // Validated here too, so a bad cap fails before the free-space check.
     let book_cap = opts
@@ -571,10 +587,9 @@ fn export_inner(
                 typst_bin: opts.typst_bin.clone(),
                 resolution: opts.resolution,
                 jobs: opts.jobs,
-                journey: opts
-                    .itinerary
-                    .as_ref()
-                    .map(|i| triptape_core::journey::Journey::build(i, assets)),
+                map_style: opts.map_style,
+                hop_clips: opts.hop_clips.clone(),
+                journey: journey(),
                 route_stops: if opts.itinerary.is_some() {
                     vec![]
                 } else {
@@ -871,6 +886,8 @@ fn export_inner(
                     .or(photo_span)
                     .map(|(a, b)| triptape_core::plan::date_range_label(a, b)),
                 faces: opts.faces.clone(),
+                journey: journey(),
+                back_cover_image: opts.back_cover.clone(),
             },
         ) {
             Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
@@ -1023,6 +1040,7 @@ mod tests {
             place: None,
             day_index: None,
             date_label: None,
+            film_place: None,
         };
         let mut plan = empty_plan();
         // No chapters: nothing was curated, so every still may flow.
@@ -1078,6 +1096,7 @@ mod tests {
             place: None,
             day_index: None,
             date_label: None,
+            film_place: None,
         };
         let shot = |id: &str, t: i64| {
             let mut a = Asset::new(id, PathBuf::from(format!("/t/{id}.jpg")), AssetKind::Photo);
@@ -1196,6 +1215,9 @@ mod tests {
                 segment_cache: None,
                 itinerary: None,
                 faces: None,
+                map_style: Default::default(),
+                hop_clips: vec![],
+                back_cover: None,
             },
         );
         assert!(matches!(err, Err(crate::MediaError::Cancelled)), "{err:?}");
@@ -1249,6 +1271,9 @@ mod tests {
             segment_cache: Some(SegmentCacheConfig::roomy(t.path().join("cache"))),
             itinerary: None,
             faces: None,
+            map_style: Default::default(),
+            hop_clips: vec![],
+            back_cover: None,
         };
         let report = export_all(&Default::default(), &empty_plan(), &[], &out, &opts).unwrap();
         assert!(!out.join(".work").exists(), "{:?}", report.fallbacks);
@@ -1363,6 +1388,7 @@ mod tests {
             place: Some("Sensō-ji".into()),
             day_index: None,
             date_label: None,
+            film_place: None,
         });
         plan.captions.insert("a0".into(), "Overlook".into());
         let a0 =

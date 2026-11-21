@@ -6,7 +6,7 @@
 //! schedule exactly, and the plan's film-length budget reads
 //! [`Journey::duration_secs`], so the two cannot drift apart.
 
-use crate::itinerary::{asset_day, Itinerary, LegMode};
+use crate::itinerary::{asset_day, ItinStop, Itinerary, LegMode, StopKind};
 use crate::searoute::{is_water, route, shape_ship_leg};
 use crate::types::Asset;
 
@@ -35,6 +35,12 @@ pub struct JourneyNode {
     /// terminal, a loop's return).
     pub label: Option<String>,
     pub pin: bool,
+    /// The day the owner arrives here, when the itinerary says.
+    pub arrive: Option<jiff::civil::Date>,
+    /// The stop is home (where the trip starts or ends).
+    pub home: bool,
+    /// Artwork for the stop on the parchment travel maps.
+    pub sticker: Option<std::path::PathBuf>,
 }
 
 /// One leg between consecutive nodes.
@@ -49,6 +55,9 @@ pub struct JourneyLeg {
     pub path: Vec<(f64, f64)>,
     /// "Boarded Carnival Luminosa · Oct 9", on the leg where boarding happens.
     pub boarding_tag: Option<String>,
+    /// First and last day of the leg, when the itinerary dates it (a
+    /// round-trip cruise).
+    pub dates: Option<(jiff::civil::Date, jiff::civil::Date)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +77,89 @@ pub struct Schedule {
     /// When the pull-back to the whole route begins.
     pub pull_back_at: f64,
     pub total_secs: f64,
+}
+
+/// Length of one travel-map hop in the film, by what it shows. Each
+/// includes [`HOP_LEAD_SECS`] before the line starts (the cut into the map
+/// is a crossfade) and [`HOP_HOLD_SECS`] on the arrival.
+pub const HOP_FLIGHT_SECS: f64 = 5.4;
+pub const HOP_LOOP_SECS: f64 = 5.0;
+pub const HOP_SECS: f64 = 4.2;
+pub const HOP_LEAD_SECS: f64 = 0.4;
+pub const HOP_HOLD_SECS: f64 = 1.7;
+/// Hold on the whole-route map that closes a film told in hops.
+pub const HOP_OVERVIEW_SECS: f64 = 5.0;
+
+/// One travel-map interlude: the legs from the last named stop to the next
+/// (a flight, a sailing between two ports, a round-trip cruise).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hop {
+    /// The journey legs it travels, in order.
+    pub legs: std::ops::Range<usize>,
+    /// The node it arrives at.
+    pub node: usize,
+    pub secs: f64,
+    /// The day the film reaches it: the arrival, or a round trip's first day.
+    pub day: Option<jiff::civil::Date>,
+    /// It arrives home.
+    pub home: bool,
+}
+
+/// Where each hop plays in a film whose shots were taken at `shots` (unix
+/// seconds and UTC offset, in film order; `None` for an undated shot): the
+/// index of the shot it goes in front of, which is the first one taken on
+/// or after the hop's day, or `shots.len()` to follow them all. Hops keep
+/// their order, and the last hop home closes the trip, after every shot.
+pub fn hop_cuts(hops: &[Hop], shots: &[Option<(i64, Option<i32>)>]) -> Vec<usize> {
+    let mut at = 0;
+    let mut out = vec![];
+    for (i, hop) in hops.iter().enumerate() {
+        if hop.home && i + 1 == hops.len() {
+            at = shots.len();
+        } else if let Some(day) = hop.day {
+            at = (at..shots.len())
+                .find(|&s| {
+                    shots[s]
+                        .and_then(|(t, tz)| crate::metadata::local_date(t, tz))
+                        .is_some_and(|d| d >= day)
+                })
+                .unwrap_or(shots.len());
+        }
+        out.push(at);
+    }
+    out
+}
+
+/// How many hops the trip has made by the time a shot was taken (unix
+/// seconds and UTC offset): the hops whose day is on or before the shot's.
+/// Shots either side of a hop get different counts, so a film can keep
+/// them in separate segments and play the hop between them. An undated
+/// shot counts none, and the last hop home is never counted (it follows
+/// every shot; see [`hop_cuts`]).
+pub fn hops_reached(hops: &[Hop], shot: Option<(i64, Option<i32>)>) -> usize {
+    let Some(day) = shot.and_then(|(t, tz)| crate::metadata::local_date(t, tz)) else {
+        return 0;
+    };
+    hops.iter()
+        .enumerate()
+        .filter(|(i, h)| !(h.home && i + 1 == hops.len()))
+        .filter(|(_, h)| h.day.is_some_and(|d| d <= day))
+        .count()
+}
+
+fn short_date(d: jiff::civil::Date) -> String {
+    d.strftime("%b %-d").to_string()
+}
+
+/// `Oct 26–29`, or `Oct 30 – Nov 2` across a month end.
+fn date_span(a: jiff::civil::Date, b: jiff::civil::Date) -> String {
+    if a == b {
+        short_date(a)
+    } else if (a.year(), a.month()) == (b.year(), b.month()) {
+        format!("{}\u{2013}{}", short_date(a), b.day())
+    } else {
+        format!("{} \u{2013} {}", short_date(a), short_date(b))
+    }
 }
 
 fn leg_secs(leg: &JourneyLeg) -> f64 {
@@ -121,6 +213,71 @@ impl Journey {
         self.schedule().total_secs
     }
 
+    /// The journey as hops between named stops, for a film that shows each
+    /// one where the trip reaches it. A waypoint (an embarkation terminal)
+    /// joins the hop that leaves it.
+    pub fn hops(&self) -> Vec<Hop> {
+        let mut out = vec![];
+        let mut start = 0;
+        for (i, leg) in self.legs.iter().enumerate() {
+            let node = &self.nodes[i + 1];
+            let last = i + 1 == self.legs.len();
+            if !(leg.is_loop || node.label.is_some() || last) {
+                continue;
+            }
+            let legs = &self.legs[start..=i];
+            let secs = if legs.iter().any(|l| l.mode == LegMode::Flight) {
+                HOP_FLIGHT_SECS
+            } else if leg.is_loop {
+                HOP_LOOP_SECS
+            } else {
+                HOP_SECS
+            };
+            out.push(Hop {
+                legs: start..i + 1,
+                node: i + 1,
+                secs,
+                day: leg
+                    .dates
+                    .filter(|_| leg.is_loop)
+                    .map(|d| d.0)
+                    .or(node.arrive),
+                home: node.home,
+            });
+            start = i + 1;
+        }
+        out
+    }
+
+    /// What a stop's plaque says on a travel map: `Tokyo · Oct 4`. `None`
+    /// for a waypoint; the unnamed arrival home reads `Home`.
+    pub fn node_text(&self, node: usize) -> Option<String> {
+        let n = &self.nodes[node];
+        let name = match &n.label {
+            Some(l) => l.clone(),
+            None if n.home => "Home".to_string(),
+            None => return None,
+        };
+        Some(match n.arrive {
+            Some(d) => format!("{name} \u{b7} {}", short_date(d)),
+            None => name,
+        })
+    }
+
+    /// What a hop's plaque says on arrival; a round trip names its ship
+    /// and days (`Disney Adventure · Oct 26–29`).
+    pub fn hop_text(&self, hop: &Hop) -> Option<String> {
+        let leg = &self.legs[hop.legs.end - 1];
+        if !leg.is_loop {
+            return self.node_text(hop.node);
+        }
+        let name = leg.ship.clone().unwrap_or_else(|| "Round trip".into());
+        Some(match leg.dates {
+            Some((a, b)) => format!("{name} \u{b7} {}", date_span(a, b)),
+            None => name,
+        })
+    }
+
     /// Ships that appear on a leg.
     pub fn ships(&self) -> Vec<String> {
         let mut out: Vec<String> = vec![];
@@ -139,11 +296,18 @@ impl Journey {
         let mut nodes: Vec<JourneyNode> = vec![];
         let mut legs: Vec<JourneyLeg> = vec![];
         let first = itin.stop(&itin.legs[0].from).expect("validated chain");
-        nodes.push(JourneyNode {
-            pos: first.pos(),
-            label: Some(first.label.clone()),
-            pin: true,
-        });
+        // `pin` is settled once every node is in.
+        let node = |stop: &ItinStop, label: Option<String>| JourneyNode {
+            pos: stop.pos(),
+            label,
+            pin: false,
+            // A stop with only a departure is there that day (the same
+            // reading as the itinerary's own stop window).
+            arrive: stop.arrive_date().or(stop.depart_date()),
+            home: stop.kind == StopKind::Home,
+            sticker: stop.sticker.as_ref().map(Into::into),
+        };
+        nodes.push(node(first, Some(first.label.clone())));
         let mut prev_ship: Option<&str> = None;
         // Traced paths by leg, so a smoothed leg can borrow the neighbouring
         // leg's adjacent point and leave a stop with the tangent it arrived on.
@@ -203,14 +367,12 @@ impl Journey {
             let ship = leg.ship.as_deref().filter(|_| leg.mode == LegMode::Ship);
             let boarding_tag = ship.filter(|s| prev_ship != Some(*s)).map(|s| {
                 let day = leg
-                    .dates
-                    .as_deref()
-                    .and_then(|d| d.split_once(".."))
-                    .and_then(|(a, _)| jiff::civil::Date::strptime("%Y-%m-%d", a).ok())
+                    .date_range()
+                    .map(|(a, _)| a)
                     .or(from.depart_date())
                     .or(from.arrive_date());
                 match day {
-                    Some(d) => format!("Boarded {s} \u{b7} {}", d.strftime("%b %-d")),
+                    Some(d) => format!("Boarded {s} \u{b7} {}", short_date(d)),
                     None => format!("Boarded {s}"),
                 }
             });
@@ -221,12 +383,12 @@ impl Journey {
                 is_loop: leg.is_loop,
                 path,
                 boarding_tag,
+                dates: leg.date_range(),
             });
-            nodes.push(JourneyNode {
-                pos: to.pos(),
-                label: (!to.hide_label && !leg.is_loop).then(|| to.label.clone()),
-                pin: false,
-            });
+            nodes.push(node(
+                to,
+                (!to.hide_label && !leg.is_loop).then(|| to.label.clone()),
+            ));
         }
         let last = nodes.len() - 1;
         for (i, n) in nodes.iter_mut().enumerate() {
@@ -549,6 +711,102 @@ mod tests {
         assert!(lp[1..lp.len() - 1]
             .iter()
             .all(|&p| is_water((p.0, (p.1 + 180.0).rem_euclid(360.0) - 180.0))));
+    }
+
+    #[test]
+    fn hops_run_from_one_named_stop_to_the_next() {
+        let j = journey();
+        let hops = j.hops();
+        let texts: Vec<String> = hops.iter().filter_map(|h| j.hop_text(h)).collect();
+        assert_eq!(
+            texts,
+            [
+                "Tokyo \u{b7} Oct 4",
+                "Osaka \u{b7} Oct 11",
+                "Fukuoka \u{b7} Oct 13",
+                "Jeju \u{b7} Oct 14",
+                "Taipei \u{b7} Oct 16",
+                "Hong Kong \u{b7} Oct 18",
+                "Ho Chi Minh City \u{b7} Oct 21",
+                "Singapore \u{b7} Oct 23",
+                "Disney Adventure \u{b7} Oct 26\u{2013}29",
+                "Home \u{b7} Oct 30",
+            ]
+        );
+        // Every leg is in exactly one hop, in order; the ride to the
+        // terminal joins the sailing that leaves it.
+        assert_eq!(hops[1].legs, 1..3);
+        let covered: Vec<usize> = hops.iter().flat_map(|h| h.legs.clone()).collect();
+        assert_eq!(covered, (0..j.legs.len()).collect::<Vec<_>>());
+        assert_eq!(hops[0].secs, HOP_FLIGHT_SECS);
+        assert_eq!(hops[1].secs, HOP_SECS);
+        assert_eq!(hops[8].secs, HOP_LOOP_SECS);
+        // The round trip plays on its first day, not the day it returns.
+        assert_eq!(hops[8].day, Some(jiff::civil::date(2026, 10, 26)));
+        assert!(hops[9].home && !hops[0].home);
+        assert_eq!(
+            date_span(
+                jiff::civil::date(2026, 10, 30),
+                jiff::civil::date(2026, 11, 2)
+            ),
+            "Oct 30 \u{2013} Nov 2"
+        );
+    }
+
+    #[test]
+    fn hops_play_where_the_film_reaches_their_day() {
+        let j = journey();
+        let hops = j.hops();
+        // Noon local time (UTC+9) on a day of October 2026.
+        let shot = |day: i8| {
+            let noon = jiff::civil::date(2026, 10, day).at(12, 0, 0, 0);
+            let ts = jiff::tz::TimeZone::UTC.to_timestamp(noon).unwrap();
+            Some((ts.as_second() - 9 * 3600, Some(9 * 3600)))
+        };
+        // Airport, Tokyo x2, sea day, Osaka, undated, Jeju, Singapore
+        // (through the cruise), the morning of the flight home.
+        let shots = [
+            shot(3),
+            shot(4),
+            shot(5),
+            shot(10),
+            shot(11),
+            None,
+            shot(14),
+            shot(24),
+            shot(27),
+            shot(30),
+        ];
+        let cuts = hop_cuts(&hops, &shots);
+        assert_eq!(cuts[0], 1, "Tokyo after the airport shot");
+        assert_eq!(cuts[1], 4, "Osaka after the sea day");
+        // No Fukuoka shots: its hop plays back to back with Jeju's.
+        assert_eq!((cuts[2], cuts[3]), (6, 6));
+        // Ports with no shots at all queue up before the next dated shot.
+        assert_eq!(&cuts[4..8], [7, 7, 7, 7]);
+        assert_eq!(cuts[8], 8, "the cruise before its first day's shots");
+        // Home closes the trip even though shots share its date.
+        assert_eq!(cuts[9], shots.len());
+        assert!(cuts.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(hop_cuts(&hops, &[]), vec![0; hops.len()]);
+        // Shots either side of a hop's day count a different number of
+        // hops made, so they are never shown in one collage.
+        assert_eq!(hops_reached(&hops, shot(3)), 0);
+        assert_eq!(hops_reached(&hops, shot(10)), 1);
+        assert_eq!(hops_reached(&hops, shot(11)), 2);
+        assert_eq!(hops_reached(&hops, None), 0);
+        // The hop home follows every shot, so it splits nothing.
+        assert_eq!(hops_reached(&hops, shot(30)), 9);
+        // A stop with only a departure date still dates its hop.
+        let itin = Itinerary::from_json(
+            r#"{"stops": [
+                {"id": "a", "label": "Osaka", "lat": 34.6, "lon": 135.4, "depart": "2026-10-11"},
+                {"id": "b", "label": "Kyoto", "lat": 35.0, "lon": 135.8, "depart": "2026-10-12"}],
+              "legs": [{"from": "a", "to": "b", "mode": "ground"}]}"#,
+        )
+        .unwrap();
+        let j = Journey::build(&itin, &[]);
+        assert_eq!(j.hops()[0].day, Some(jiff::civil::date(2026, 10, 12)));
     }
 
     #[test]

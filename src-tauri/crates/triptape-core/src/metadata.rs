@@ -944,6 +944,13 @@ pub fn local_date(taken_at: i64, tz_offset_secs: Option<i32>) -> Option<jiff::ci
 /// offset, so its nearest neighbor is found per candidate offset: the time
 /// is normalized with that offset, then compared to the assets carrying it.
 pub fn fill_tz_offsets(assets: &mut [crate::types::Asset]) {
+    // Correct stray zones first so no neighbor inherits one; again after,
+    // once GPS shots that lacked an offset can serve as anchors. The
+    // second pass leaves alone the offsets inferred here: a naive wall
+    // clock was just turned into an instant with that offset, and changing
+    // it now would move the photo's local time.
+    align_stray_offsets(assets, &[]);
+    let mut inferred = vec![false; assets.len()];
     let mut known: Vec<(i64, i32)> = assets
         .iter()
         .filter_map(|a| Some((a.taken_at?, a.tz_offset_secs?)))
@@ -956,8 +963,12 @@ pub fn fill_tz_offsets(assets: &mut [crate::types::Asset]) {
     for &(kt, o) in &known {
         by_offset.entry(o).or_default().push(kt);
     }
-    for a in assets.iter_mut().filter(|a| a.tz_offset_secs.is_none()) {
+    for (idx, a) in assets.iter_mut().enumerate() {
+        if a.tz_offset_secs.is_some() {
+            continue;
+        }
         let Some(t) = a.taken_at else { continue };
+        inferred[idx] = true;
         let wall_clock = a.kind != crate::types::AssetKind::Video && !a.time_guessed;
         a.tz_offset_secs = if wall_clock {
             nearest_wall_clock_offset(t, &by_offset)
@@ -974,6 +985,46 @@ pub fn fill_tz_offsets(assets: &mut [crate::types::Asset]) {
         };
         if let Some(o) = a.tz_offset_secs.filter(|_| wall_clock) {
             a.taken_at = t.checked_sub(i64::from(o));
+        }
+    }
+    align_stray_offsets(assets, &inferred);
+}
+
+/// How close in time the shots around a stray zone must be to overrule it.
+const STRAY_OFFSET_WINDOW_SECS: i64 = 3600;
+
+/// A shot without GPS whose zone disagrees with the GPS-tagged shots
+/// either side of it (each within [`STRAY_OFFSET_WINDOW_SECS`], agreeing
+/// with each other) takes theirs: it was taken where they were. A file
+/// that lost its EXIF gets its zone from the photo library, which may
+/// record where it was imported (California) rather than where it was
+/// shot (Japan), and lands it on the wrong day. Only `tz_offset_secs`
+/// changes: `taken_at` is already an instant once an offset is known.
+/// Assets flagged in `skip` (by index; missing means not skipped) keep
+/// their offset.
+fn align_stray_offsets(assets: &mut [crate::types::Asset], skip: &[bool]) {
+    let mut anchors: Vec<(i64, i32)> = assets
+        .iter()
+        .filter(|a| a.gps.is_some())
+        .filter_map(|a| Some((a.taken_at?, a.tz_offset_secs?)))
+        .collect();
+    anchors.sort_unstable();
+    for (idx, a) in assets.iter_mut().enumerate() {
+        if a.gps.is_some() || skip.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let (Some(t), Some(own)) = (a.taken_at, a.tz_offset_secs) else {
+            continue;
+        };
+        let i = anchors.partition_point(|&(at, _)| at <= t);
+        let before = i.checked_sub(1).map(|j| anchors[j]);
+        let after = anchors.get(i).copied();
+        if let (Some((bt, bo)), Some((nt, no))) = (before, after) {
+            let window = STRAY_OFFSET_WINDOW_SECS.unsigned_abs();
+            let close = t.abs_diff(bt) <= window && nt.abs_diff(t) <= window;
+            if close && bo == no && bo != own {
+                a.tz_offset_secs = Some(bo);
+            }
         }
     }
 }
@@ -1172,6 +1223,70 @@ mod tests {
             "2026-10-04 22:50"
         );
         assert_eq!(local_datetime(i64::MAX, Some(3600)), None);
+    }
+
+    #[test]
+    fn an_inferred_wall_clock_offset_is_not_realigned() {
+        use crate::types::{Asset, AssetKind};
+        let shot = |id: &str, t: i64, tz: Option<i32>, gps: Option<(f64, f64)>, kind| {
+            let mut a = Asset::new(id, format!("/t/{id}").into(), kind);
+            a.taken_at = Some(t);
+            a.tz_offset_secs = tz;
+            a.gps = gps;
+            a
+        };
+        let (jst, cst) = (9 * 3600, 8 * 3600);
+        let gps = Some((33.6, 130.5));
+        let base = 1_800_000_000;
+        // GPS anchors at +9 either side of the photo; a GPS-less +8 shot
+        // just after the last anchor (so nothing realigns it) is nearest,
+        // and the fill infers +8 for the naive photo.
+        let naive_wall = base + 2_400 + i64::from(cst);
+        let mut v = vec![
+            shot("a", base, Some(jst), gps, AssetKind::Video),
+            shot("p", naive_wall, None, None, AssetKind::Photo),
+            shot("b", base + 3_000, Some(jst), gps, AssetKind::Video),
+            shot("k", base + 3_060, Some(cst), None, AssetKind::Video),
+        ];
+        fill_tz_offsets(&mut v);
+        let p = &v[1];
+        let local = p.taken_at.unwrap() + i64::from(p.tz_offset_secs.unwrap());
+        assert_eq!(local, naive_wall, "the photo's wall clock is kept");
+    }
+
+    #[test]
+    fn a_stray_zone_without_gps_follows_the_shots_around_it() {
+        use crate::types::{Asset, AssetKind};
+        let shot = |id: &str, t: i64, tz: i32, gps: Option<(f64, f64)>| {
+            let mut a = Asset::new(id, format!("/t/{id}.heic").into(), AssetKind::Video);
+            a.taken_at = Some(t);
+            a.tz_offset_secs = Some(tz);
+            a.gps = gps;
+            a
+        };
+        let jst = 9 * 3600;
+        let pdt = -7 * 3600;
+        let fukuoka = Some((33.6, 130.5));
+        let mut v = vec![
+            shot("before", 1_000, jst, fukuoka),
+            shot("stray", 1_600, pdt, None),
+            shot("twin", 1_600, pdt, None),
+            shot("after", 2_000, jst, fukuoka),
+            // Far from any GPS shot: nothing to go by, so it keeps its zone.
+            shot("alone", 50_000, pdt, None),
+        ];
+        fill_tz_offsets(&mut v);
+        let tz: Vec<i32> = v.iter().map(|a| a.tz_offset_secs.unwrap()).collect();
+        assert_eq!(tz, [jst, jst, jst, jst, pdt]);
+        assert_eq!(v[1].taken_at, Some(1_600), "the instant is unchanged");
+        // A shot with its own GPS keeps its zone whatever its neighbours say.
+        let mut w = vec![
+            shot("a", 1_000, jst, fukuoka),
+            shot("b", 1_600, pdt, Some((34.0, -118.0))),
+            shot("c", 2_000, jst, fukuoka),
+        ];
+        fill_tz_offsets(&mut w);
+        assert_eq!(w[1].tz_offset_secs, Some(pdt));
     }
 
     #[test]
