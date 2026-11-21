@@ -1065,8 +1065,8 @@ pub struct PlanEdits {
     pub excluded: Vec<String>,
     /// Assets the user pinned into the hero film ("Add to film"), oldest
     /// first. Mutually exclusive with `excluded`. Hero only: reels and the
-    /// book flow are untouched. See [`apply_edits`] for placement and the
-    /// displacement rule.
+    /// book flow are untouched. See [`apply_edits`] for placement; a pin
+    /// lengthens the film rather than replacing a shot.
     #[serde(default)]
     pub included: Vec<String>,
     /// Hero/reel entry asset id -> replacement asset id (same chapter), in
@@ -1332,10 +1332,8 @@ fn with_user_captions_only(plan: &Plan, by_id: &HashMap<&str, &Asset>) -> Plan {
 /// story-order position ([`crate::cluster::story_order`]) with the
 /// same rendition rules as a swap-in (clips keep their window, Live
 /// Photos are stills). Pins must belong to this plan's chapters and are
-/// skipped when already picked. To keep the film at the length the user
-/// asked for, a pin displaces the lowest-scored unpinned hero entry of its
-/// own chapter (pins and swap replacements are never displaced); a chapter
-/// with nothing displaceable just grows the film.
+/// skipped when already picked. A pin adds to the film: nothing is taken
+/// out to make room, so each pin lengthens the film by its own duration.
 pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
     let by_id: HashMap<&str, &Asset> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
     let legacy;
@@ -1446,19 +1444,6 @@ fn include_pins(
     edits: &PlanEdits,
     dead: &HashSet<&str>,
 ) {
-    // Pins and swap replacements are the user's picks: never displaced.
-    let pinned: HashSet<&str> = edits
-        .included
-        .iter()
-        .chain(edits.swaps.iter().map(|(_, to)| to))
-        .map(String::as_str)
-        .collect();
-    let score_of = |id: &str| {
-        by_id
-            .get(id)
-            .and_then(|a| a.score.as_ref())
-            .map_or(DEFAULT_SCORE, |s| s.total)
-    };
     if edits.included.is_empty() {
         return;
     }
@@ -1469,25 +1454,11 @@ fn include_pins(
         let Some(asset) = by_id.get(id.as_str()) else {
             continue;
         };
-        let Some(chapter) = out.chapter_of(id) else {
+        if out.chapter_of(id).is_none()
+            || dead.contains(id.as_str())
+            || out.hero.iter().any(|e| e.asset_id == *id)
+        {
             continue;
-        };
-        if dead.contains(id.as_str()) || out.hero.iter().any(|e| e.asset_id == *id) {
-            continue;
-        }
-        let same_chapter: HashSet<&str> = chapter.asset_ids.iter().map(String::as_str).collect();
-        let weakest = out
-            .hero
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| {
-                let id = e.asset_id.as_str();
-                !pinned.contains(id) && same_chapter.contains(id)
-            })
-            .min_by(|(_, a), (_, b)| score_of(&a.asset_id).total_cmp(&score_of(&b.asset_id)))
-            .map(|(i, _)| i);
-        if let Some(i) = weakest {
-            out.hero.remove(i);
         }
         // Swaps keep their slot, so the hero may be out of story order:
         // land right after the last entry earlier in story order, so
@@ -1500,6 +1471,42 @@ fn include_pins(
             .map_or(0, |i| i + 1);
         out.hero.insert(at, user_hero_entry(asset));
     }
+}
+
+/// The lowest-scored hero pick in `id`'s chapter that the user did not
+/// choose (pins and swap replacements are theirs): the shot a pin of `id`
+/// was preferred over, for learning ([`crate::learn`]). `None` when the
+/// chapter has no such pick.
+pub fn weakest_unchosen_pick<'p>(
+    plan: &'p Plan,
+    assets: &[Asset],
+    edits: &PlanEdits,
+    id: &str,
+) -> Option<&'p str> {
+    let chosen: HashSet<&str> = edits
+        .included
+        .iter()
+        .chain(edits.swaps.iter().map(|(_, to)| to))
+        .map(String::as_str)
+        .collect();
+    let chapter: HashSet<&str> = plan
+        .chapter_of(id)?
+        .asset_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let score_of = |id: &str| {
+        assets
+            .iter()
+            .find(|a| a.id == id)
+            .and_then(|a| a.score.as_ref())
+            .map_or(DEFAULT_SCORE, |s| s.total)
+    };
+    plan.hero
+        .iter()
+        .map(|e| e.asset_id.as_str())
+        .filter(|h| *h != id && !chosen.contains(h) && chapter.contains(h))
+        .min_by(|a, b| score_of(a).total_cmp(&score_of(b)))
 }
 
 /// Build the plan from scored, clustered assets.
@@ -2694,14 +2701,14 @@ mod tests {
     }
 
     #[test]
-    fn included_asset_lands_in_story_order_and_displaces_the_weakest() {
+    fn included_asset_lands_in_story_order_and_lengthens_the_film() {
         // Hero holds a, c, e (scores 0.2, 0.4, 0.6); pin d.
         let (assets, base) = pin_fixture(&[0, 2, 4]);
         let mut edits = PlanEdits::default();
         edits.set_included("d".into(), true);
         let out = apply_edits(&base, &assets, &edits);
-        // Weakest unpinned (a) makes room; d sits between c and e.
-        assert_eq!(hero_ids(&out), ["c", "d", "e"]);
+        // Nothing makes room; d sits between c and e.
+        assert_eq!(hero_ids(&out), ["a", "c", "d", "e"]);
         // Pinning an already-picked asset changes nothing.
         let mut edits = PlanEdits::default();
         edits.set_included("c".into(), true);
@@ -2712,7 +2719,7 @@ mod tests {
     }
 
     #[test]
-    fn pins_are_never_displaced_and_fall_back_to_growing_the_film() {
+    fn pins_never_take_a_shot_out() {
         let (assets, base) = pin_fixture(&[0]);
         let mut edits = PlanEdits::default();
         edits.set_included("a".into(), true);
@@ -2720,13 +2727,13 @@ mod tests {
         edits.set_included("c".into(), true);
         let out = apply_edits(&base, &assets, &edits);
         assert_eq!(hero_ids(&out), ["a", "b", "c"]);
-        // A swap replacement counts as pinned too.
+        // A swap replacement stays alongside the pin.
         let (assets, base) = pin_fixture(&[0, 1]);
         let mut edits = PlanEdits::default();
         edits.swap("a".into(), "e".into()); // hero: e, b
         edits.set_included("c".into(), true);
         let out = apply_edits(&base, &assets, &edits);
-        assert_eq!(hero_ids(&out), ["c", "e"]);
+        assert_eq!(hero_ids(&out), ["e", "b", "c"]);
     }
 
     #[test]
@@ -2743,7 +2750,7 @@ mod tests {
             e.set_included("b".into(), true);
             e.swap("b".into(), "c".into());
         });
-        assert_eq!((ids.as_str(), pins), ("c", vec!["c".to_string()]));
+        assert_eq!((ids.as_str(), pins), ("a,c", vec!["c".to_string()]));
         // Pin the base hero already holds, then swapped: the original stays out.
         let (ids, _) = hero(&[0, 1], &|e| {
             e.set_included("a".into(), true);
@@ -2756,13 +2763,13 @@ mod tests {
             e.swap("b".into(), "c".into());
             e.swap("c".into(), "d".into());
         });
-        assert_eq!(ids, "d");
+        assert_eq!(ids, "a,d");
         let (ids, pins) = hero(&[0], &|e| {
             e.set_included("b".into(), true);
             e.swap("b".into(), "c".into());
             e.swap("c".into(), "b".into());
         });
-        assert_eq!((ids.as_str(), pins), ("b", vec!["b".to_string()]));
+        assert_eq!((ids.as_str(), pins), ("a,b", vec!["b".to_string()]));
         // A swapped-out pick pinned back, then swapped: both replacements stay.
         let (ids, pins) = hero(&[0], &|e| {
             e.swap("a".into(), "b".into());
@@ -2775,13 +2782,13 @@ mod tests {
     #[test]
     fn pin_never_plays_before_an_earlier_capture() {
         // Hero a, b, c; swap a -> e keeps a's slot: e, b, c. Pinning d
-        // displaces b (weakest) and must land after c, not before e.
+        // must land after c, not before e.
         let (assets, base) = pin_fixture(&[0, 1, 2]);
         let mut edits = PlanEdits::default();
         edits.swap("a".into(), "e".into());
         edits.set_included("d".into(), true);
         let out = apply_edits(&base, &assets, &edits);
-        assert_eq!(hero_ids(&out), ["e", "c", "d"]);
+        assert_eq!(hero_ids(&out), ["e", "b", "c", "d"]);
     }
 
     #[test]
@@ -2820,7 +2827,7 @@ mod tests {
     #[test]
     fn pins_outside_the_plan_or_removed_are_skipped() {
         let (assets, mut base) = pin_fixture(&[0, 2]);
-        // "e" drops out of every chapter: nothing to trade it against.
+        // "e" drops out of every chapter, so it is not in this plan.
         for ch in &mut base.chapters {
             ch.asset_ids.retain(|id| id != "e");
         }

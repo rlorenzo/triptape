@@ -118,7 +118,7 @@ pub type Features = BTreeMap<String, f64>;
 /// Which edit produced a preference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EventKind {
-    /// A pinned photo was chosen over the shot it displaced.
+    /// A pinned photo was chosen over its chapter's weakest pick.
     Include,
     /// A replacement was chosen over the original pick.
     Swap,
@@ -482,7 +482,7 @@ fn hero_ids(plan: &Plan) -> Vec<&str> {
 /// Preference events implied by changing `before` into `after`. Pure: the
 /// caller supplies the stored plan and assets. Additions are replayed one
 /// at a time from `before` (swaps, then removals, then pins) so each pin's
-/// displaced shot is known; undone edits come back as `removed`.
+/// chapter is judged as it stood; undone edits come back as `removed`.
 pub fn events_for_edit(
     base: &Plan,
     assets: &[Asset],
@@ -597,17 +597,17 @@ pub fn events_for_edit(
         .iter()
         .filter(|i| !before.included.contains(i) && !new_swaps.iter().any(|(_, t)| t == *i));
     for id in pins {
+        // A pin adds to the film; the user still chose it over the shot
+        // the planner rated lowest in its chapter.
+        let rejected =
+            crate::plan::weakest_unchosen_pick(&plan, assets, &cur, id).map(str::to_owned);
         cur.set_included(id.clone(), true);
-        let was = std::mem::replace(&mut plan, apply_edits(base, assets, &cur));
-        let kept = hero_ids(&plan);
-        let Some(chosen) = feats(id) else { continue };
-        for gone in hero_ids(&was)
-            .into_iter()
-            .filter(|g| *g != id && !kept.contains(g))
-        {
-            if let Some(rejected) = feats(gone) {
-                push(EventKind::Include, id, gone, chosen.clone(), rejected);
-            }
+        plan = apply_edits(base, assets, &cur);
+        let (Some(chosen), Some(gone)) = (feats(id), rejected.as_deref()) else {
+            continue;
+        };
+        if let Some(r) = feats(gone) {
+            push(EventKind::Include, id, gone, chosen, r);
         }
     }
     delta
