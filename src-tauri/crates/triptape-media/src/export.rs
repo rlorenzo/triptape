@@ -268,18 +268,18 @@ fn port_day_order(at: &[Whereabouts]) -> Vec<usize> {
             out.extend(day);
             continue;
         }
-        let area_of: HashMap<usize, usize> =
-            ashore.iter().zip(&roots).map(|(&i, &r)| (i, r)).collect();
-        let mut emitted: HashSet<usize> = HashSet::new();
+        let mut members: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut area_of: HashMap<usize, usize> = HashMap::new();
+        for (&i, &r) in ashore.iter().zip(&roots) {
+            members.entry(r).or_default().push(i);
+            area_of.insert(i, r);
+        }
         for &i in &day {
             match area_of.get(&i) {
                 None => out.push(i),
-                Some(&r) if emitted.insert(r) => out.extend(
-                    (0..ashore.len())
-                        .filter(|&a| roots[a] == r)
-                        .map(|a| ashore[a]),
-                ),
-                Some(_) => {}
+                // An area's first shot brings the whole area; `remove`
+                // leaves nothing for its later shots to emit again.
+                Some(r) => out.extend(members.remove(r).unwrap_or_default()),
             }
         }
     }

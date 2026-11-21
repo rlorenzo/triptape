@@ -124,9 +124,17 @@ pub struct BookPhoto {
 }
 
 impl BookPhoto {
+    /// The photo's file name for render notes, else its asset id.
+    fn display_name(&self) -> String {
+        self.path.file_name().map_or_else(
+            || self.asset_id.clone(),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    }
+
     /// Whether two photos may trade places in the page order: the same
-    /// chapter and the same owner-named place, so no swap carries a photo
-    /// across a page break between two visits.
+    /// chapter, day and owner-named place, so no swap carries a photo
+    /// across a page break between two visits or two days.
     fn same_stretch(&self, other: &BookPhoto) -> bool {
         (self.chapter, self.day) == (other.chapter, other.day) && self.area == other.area
     }
@@ -243,8 +251,9 @@ fn story_order(n_photos: usize, spread: Option<usize>) -> Vec<usize> {
 /// [`flow_pages`] planned for it:
 /// - the hero is the best-scored of the opening chapter's first
 ///   [`HERO_WINDOW`] photos that reaches 300 dpi full-page (else the first);
-/// - a divider is backed by its chapter's earliest photo that reaches
-///   300 dpi full-page (else its first), pulled to the chapter's front;
+/// - a divider is backed by its chapter's earliest photo that is not
+///   blocked full-page (soft is allowed; else its first), pulled to the
+///   chapter's front;
 /// - a photo that would print soft on a 1- or 2-up page but sharp in a
 ///   3/4-up cell trades places with the nearest photo of its chapter on a
 ///   3/4-up page of the same run that is sharp in the bigger slot.
@@ -311,8 +320,8 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
         // blocked is not), so the title page does not jump ahead of the
         // photos taken before it (a castle view from the end of the visit
         // opening the day).
+        let (w, h) = slot_inches(preset, PageKind::Divider, 1);
         if let Some(pos) = run.iter().copied().find(|&pos| {
-            let (w, h) = slot_inches(preset, PageKind::Divider, 1);
             let p = &photos[order[pos]];
             dpi_verdict(p.width, p.height, w, h) != DpiVerdict::Block
         }) {
@@ -354,11 +363,10 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
                 .filter(|&&(c, small)| {
                     // Only a shot from the same moment: a swap must not
                     // break the book's time order.
-                    let close = match (photos[order[c]].taken_at, photos[soft].taken_at) {
-                        (Some(a), Some(b)) => (a - b).abs() <= TIME_ORDER_SLACK_SECS,
-                        _ => true,
-                    };
-                    close
+                    photos[order[c]]
+                        .taken_at
+                        .zip(photos[soft].taken_at)
+                        .is_none_or(|(a, b)| (a - b).abs() <= SAME_MOMENT_SECS)
                         && photos[order[c]].same_stretch(&photos[soft])
                         && sharp_in(order[c], size)
                         && sharp_in(soft, small)
@@ -1191,14 +1199,19 @@ pub fn render_book(
                     PageKind::Grid => grid_cells(&slot, f64::from(tw), f64::from(th)),
                     _ => vec![(0.0, 0.0, 1.0, 1.0); slot.len()],
                 };
-                fallbacks.extend(time_order_notes(page_no, &slot, &cells, &mut last_time));
+                // The hero is the opening's best shot pulled to the front,
+                // not its earliest, so it neither checks nor sets the time
+                // the next page must follow (as with the spread).
+                if fp.kind != PageKind::Hero {
+                    fallbacks.extend(time_order_notes(page_no, &slot, &cells, &mut last_time));
+                }
                 match fp.kind {
                     // Caption pages are full-bleed too: the caption burn lays
                     // its strip over the photo's lower edge.
                     PageKind::Hero | PageKind::PhotoCaption => {
                         draw_fullbleed(slot[0], tw, th, &out, &fit, &mut fallbacks)?
                     }
-                    _ => draw_grid(&slot, tw, th, &out, &fit, &mut fallbacks)?,
+                    _ => draw_grid(&slot, &cells, tw, th, &out, &fit, &mut fallbacks)?,
                 }
             }
             PageKind::SpreadLeft | PageKind::SpreadRight => {
@@ -1460,10 +1473,6 @@ fn day_banner(p: &BookPhoto, chapters: &[String], announced: &mut Announced) -> 
     opening_title(p, chapters, announced)
 }
 
-/// Photos taken this close together count as the same moment for the
-/// chronology check (bursts, a panorama finished after a snapshot).
-const TIME_ORDER_SLACK_SECS: i64 = 120;
-
 /// Chronology check for one photo page: its photos in reading order (top
 /// to bottom, then left to right) and its first photo after the previous
 /// page's last must run forward in time. Returns one note per break, for
@@ -1485,28 +1494,23 @@ fn time_order_notes(
             a.1.total_cmp(&b.1)
         }
     });
-    let name = |p: &BookPhoto| {
-        p.path
-            .file_name()
-            .map_or_else(|| p.asset_id.clone(), |n| n.to_string_lossy().into_owned())
-    };
     let mut notes = vec![];
     let mut prev: Option<(i64, &BookPhoto)> = None;
     for (_, p) in &reading {
         let Some(t) = p.taken_at else { continue };
         if let Some((pt, q)) = prev {
-            if t + TIME_ORDER_SLACK_SECS < pt {
+            if t + SAME_MOMENT_SECS < pt {
                 notes.push(format!(
                     "page {page_no}: out of time order: {} comes after the later {}",
-                    name(p),
-                    name(q)
+                    p.display_name(),
+                    q.display_name()
                 ));
             }
         } else if let Some(l) = *last {
-            if t + TIME_ORDER_SLACK_SECS < l {
+            if t + SAME_MOMENT_SECS < l {
                 notes.push(format!(
                     "page {page_no}: out of time order: {} is earlier than the page before",
-                    name(p)
+                    p.display_name()
                 ));
             }
         }
@@ -1731,12 +1735,9 @@ fn fit_photo(p: &BookPhoto, tw: u32, th: u32, fit: &Fit, fb: &mut Vec<String>) -
     };
     let (img, cut) = cover_fit_faces(&src, tw, th, &faces);
     if cut {
-        let name = p
-            .path
-            .file_name()
-            .map_or_else(|| p.asset_id.clone(), |n| n.to_string_lossy().into_owned());
         fb.push(format!(
-            "crop: {name} cannot keep every face in its cell; the biggest stay"
+            "crop: {} cannot keep every face in its cell; the biggest stay",
+            p.display_name()
         ));
     }
     img
@@ -1784,6 +1785,12 @@ fn face_window(
             keep = Some(u);
         } else {
             cut = true;
+            if keep.is_none() {
+                // The biggest face alone overflows the cell: centre on it
+                // rather than on a small background face or the photo.
+                keep = Some(b);
+                break;
+            }
         }
     }
     // Along each axis: centre on the kept faces, slid to hold them all.
@@ -1889,7 +1896,7 @@ const PANORAMA_ASPECT: f64 = 2.0;
 /// cells, one per photo in slot order. Rows of 1–3 photos fill the page;
 /// within a row each photo's width follows its shape, and rows share the
 /// height in proportion, so a photo is cropped only as much as the page
-/// shape forces. Of every row split and photo order, the layout with the
+/// shape forces. Of every row split, the layout with the
 /// least weighted cropping wins: crops cost more the more people a photo
 /// holds (a group shot gets a full-width row instead of losing the faces
 /// at its edges), trimming sky or table off a landscape costs less than
@@ -1911,91 +1918,88 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
     let mut best: Option<(f64, Vec<Rect>)> = None;
     for rows in row_splits(n) {
         // Photos keep their order (time order): only the rows vary.
-        {
-            let order: Vec<usize> = (0..n).collect();
-            let avail_h = h - gap * (rows.len() + 1) as f64;
-            let mut at = 0;
-            // (photo, row, share of the row width); `natural` holds each
-            // row's height before stretching to fill the page.
-            let mut placed: Vec<(usize, usize, f64)> = vec![];
-            let mut natural: Vec<f64> = vec![];
-            // A panorama alone on its row keeps its own height (the full
-            // page width, uncropped); the other rows share the rest.
-            let mut fixed: Vec<bool> = vec![];
-            for (r, &k) in rows.iter().enumerate() {
-                let members = &order[at..at + k];
-                at += k;
-                let sum: f64 = members.iter().map(|&i| aspect(slot[i])).sum();
-                let row_w = w - gap * (k + 1) as f64;
-                natural.push(row_w / sum);
-                fixed.push(k == 1 && sum >= PANORAMA_ASPECT);
-                placed.extend(members.iter().map(|&i| (i, r, aspect(slot[i]) / sum)));
+        let avail_h = h - gap * (rows.len() + 1) as f64;
+        let mut at = 0;
+        // (photo, row, share of the row width); `natural` holds each
+        // row's height before stretching to fill the page.
+        let mut placed: Vec<(usize, usize, f64)> = vec![];
+        let mut natural: Vec<f64> = vec![];
+        // A panorama alone on its row keeps its own height (the full
+        // page width, uncropped); the other rows share the rest.
+        let mut fixed: Vec<bool> = vec![];
+        for (r, &k) in rows.iter().enumerate() {
+            let members = at..at + k;
+            at += k;
+            let sum: f64 = members.clone().map(|i| aspect(slot[i])).sum();
+            let row_w = w - gap * (k + 1) as f64;
+            natural.push(row_w / sum);
+            fixed.push(k == 1 && sum >= PANORAMA_ASPECT);
+            placed.extend(members.map(|i| (i, r, aspect(slot[i]) / sum)));
+        }
+        let total: f64 = natural.iter().sum();
+        let held: f64 = natural
+            .iter()
+            .zip(&fixed)
+            .filter(|(_, &f)| f)
+            .map(|(n, _)| n)
+            .sum();
+        let free = total - held;
+        // Panoramas keep their height only when the other rows can
+        // take up the rest; else every row stretches alike.
+        let hold = free > 0.0 && held < avail_h;
+        let stretch = if hold {
+            (avail_h - held) / free
+        } else {
+            avail_h / total
+        };
+        let row_h: Vec<f64> = natural
+            .iter()
+            .zip(&fixed)
+            .map(|(&nh, &f)| if hold && f { nh } else { nh * stretch })
+            .collect();
+        let mut cells = vec![(0.0, 0.0, 0.0, 0.0); n];
+        let mut cost = 0.0;
+        let mut y = gap;
+        let mut x = gap;
+        let mut row = 0;
+        for &(i, r, share) in &placed {
+            if r != row {
+                y += row_h[row] + gap;
+                x = gap;
+                row = r;
             }
-            let total: f64 = natural.iter().sum();
-            let held: f64 = natural
+            let row_w = w - gap * (rows[r] + 1) as f64;
+            let cw = row_w * share;
+            cells[i] = (x, y, cw, row_h[r]);
+            x += cw + gap;
+            let (a, c) = (aspect(slot[i]), cw / row_h[r]);
+            let weight = people_weight(slot[i]);
+            cost += weight
+                * if c < a {
+                    1.0 - c / a // sides cut
+                } else {
+                    (1.0 - a / c) * if a > 1.0 { 0.6 } else { 1.0 } // top/bottom cut
+                };
+        }
+        // Unequal sizes: shrinking a photo costs as much more as
+        // cropping it does, so people photos get the big cells.
+        let areas: Vec<f64> = cells.iter().map(|c| c.2 * c.3).collect();
+        let mean = areas.iter().sum::<f64>() / n as f64;
+        cost += BALANCE
+            * areas
                 .iter()
-                .zip(&fixed)
-                .filter(|(_, &f)| f)
-                .map(|(n, _)| n)
-                .sum();
-            let free = total - held;
-            // Panoramas keep their height only when the other rows can
-            // take up the rest; else every row stretches alike.
-            let hold = free > 0.0 && held < avail_h;
-            let stretch = if hold {
-                (avail_h - held) / free
-            } else {
-                avail_h / total
-            };
-            let row_h: Vec<f64> = natural
-                .iter()
-                .zip(&fixed)
-                .map(|(&nh, &f)| if hold && f { nh } else { nh * stretch })
-                .collect();
-            let mut cells = vec![(0.0, 0.0, 0.0, 0.0); n];
-            let mut cost = 0.0;
-            let mut y = gap;
-            let mut x = gap;
-            let mut row = 0;
-            for &(i, r, share) in &placed {
-                if r != row {
-                    y += row_h[row] + gap;
-                    x = gap;
-                    row = r;
-                }
-                let row_w = w - gap * (rows[r] + 1) as f64;
-                let cw = row_w * share;
-                cells[i] = (x, y, cw, row_h[r]);
-                x += cw + gap;
-                let (a, c) = (aspect(slot[i]), cw / row_h[r]);
-                let weight = people_weight(slot[i]);
-                cost += weight
-                    * if c < a {
-                        1.0 - c / a // sides cut
+                .zip(slot)
+                .map(|(a, p)| {
+                    let r = (a / mean).ln();
+                    if r < 0.0 {
+                        -r * people_weight(p)
                     } else {
-                        (1.0 - a / c) * if a > 1.0 { 0.6 } else { 1.0 } // top/bottom cut
-                    };
-            }
-            // Unequal sizes: shrinking a photo costs as much more as
-            // cropping it does, so people photos get the big cells.
-            let areas: Vec<f64> = cells.iter().map(|c| c.2 * c.3).collect();
-            let mean = areas.iter().sum::<f64>() / n as f64;
-            cost += BALANCE
-                * areas
-                    .iter()
-                    .zip(slot)
-                    .map(|(a, p)| {
-                        let r = (a / mean).ln();
-                        if r < 0.0 {
-                            -r * people_weight(p)
-                        } else {
-                            r
-                        }
-                    })
-                    .sum::<f64>();
-            if best.as_ref().is_none_or(|(c, _)| cost < *c - 1e-9) {
-                best = Some((cost, cells));
-            }
+                        r
+                    }
+                })
+                .sum::<f64>();
+        if best.as_ref().is_none_or(|(c, _)| cost < *c - 1e-9) {
+            best = Some((cost, cells));
         }
     }
     best.map(|(_, cells)| cells).unwrap_or_default()
@@ -2007,8 +2011,10 @@ fn grid_cells(slot: &[&BookPhoto], w: f64, h: f64) -> Vec<Rect> {
     grid_layout(slot, w, h, w / 100.0)
 }
 
+/// Paint `slot` into `cells` (from [`grid_cells`] at `tw`x`th`).
 fn draw_grid(
     slot: &[&BookPhoto],
+    cells: &[Rect],
     tw: u32,
     th: u32,
     out: &Path,
@@ -2016,10 +2022,7 @@ fn draw_grid(
     fb: &mut Vec<String>,
 ) -> Result<(), crate::MediaError> {
     let mut page = solid(tw, th, Rgb([18, 20, 26]));
-    for (p, (x, y, w, h)) in slot
-        .iter()
-        .zip(grid_cells(slot, f64::from(tw), f64::from(th)))
-    {
+    for (p, &(x, y, w, h)) in slot.iter().zip(cells) {
         let (x, y) = (x.round() as u32, y.round() as u32);
         let (w, h) = (
             (w.round() as u32).min(tw - x),
@@ -2969,6 +2972,18 @@ mod tests {
         assert_eq!(w, 3000.0);
         assert!((0.0..=1000.0).contains(&x), "in the photo: x={x}");
         assert!(!cut);
+        // A close-up whose padded face is taller than a wide cell's band
+        // stays the centre even with a small face elsewhere.
+        let ((_, y, _, h), cut) = face_window(
+            3000.0,
+            4000.0,
+            2.0,
+            1.0,
+            &[face(0.3, 0.4, 0.4), face(0.05, 0.02, 0.04)],
+        );
+        let mid = (0.4 - 0.4 * HEAD_ABOVE + 0.4 + 0.4 + 0.4 * FACE_BELOW) as f64 / 2.0 * 4000.0;
+        assert!((y + h / 2.0 - mid).abs() < 1.0, "on the close-up: y={y}");
+        assert!(cut);
         // No faces: centred, as before.
         let ((x, y, _, _), cut) = face_window(4000.0, 3000.0, 1.0, 1.0, &[]);
         assert_eq!((x, y, cut), (500.0, 0.0, false));
@@ -3098,6 +3113,17 @@ mod tests {
         assert_eq!((*last_kind, last.len()), (PageKind::Grid, 2));
         assert!(last.contains(&130), "no other day's page takes it");
         assert_eq!(soft_placements(&photos, 40), 1);
+        // One day: a shot from the same moment on a 4-up page takes it...
+        let at = |gap: i64| {
+            let mut photos = book(131, 130);
+            for (i, p) in photos.iter_mut().enumerate() {
+                p.taken_at = Some(i as i64 * gap);
+            }
+            photos
+        };
+        assert_eq!(soft_placements(&at(10), 40), 0, "a burst swaps");
+        // ...but not one from an hour earlier: that would break time order.
+        assert_eq!(soft_placements(&at(3_600), 40), 1, "hours apart stay");
         // All pages 2-up: no small cell to move to, so it stays (and warns).
         let photos = book(21, 20);
         let pages = pages_of(&photos, 24);
