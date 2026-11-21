@@ -143,7 +143,8 @@ pub fn chapter_attraction(fixes: &[(f64, f64)], home: &HashSet<String>) -> Optio
 /// the itinerary; the ship for shots the itinerary puts on board (even at
 /// a dock beside Miraikan or the Osaka Aquarium); else the attraction it
 /// was taken at on a day with [`PLACE_MIN_SHOTS`] there; else its
-/// chapter's place, unless that is a name the trip hides (a home base or
+/// chapter's place (its city when that place is a sight elsewhere),
+/// unless that is a name the trip hides (a home base or
 /// an itinerary `hide_attractions` entry). Photos with none are absent.
 pub fn photo_places(
     plan: &Plan,
@@ -173,6 +174,13 @@ pub fn photo_places(
         .filter(|(a, _)| in_plan.is_empty() || in_plan.contains(a.id.as_str()))
         .collect();
     let visits = day_visits(planned.iter().copied());
+    let sights: HashSet<&str> = poi.iter().flatten().map(String::as_str).collect();
+    let city_of = |a: &Asset| {
+        let stop = itin.and_then(|i| i.label_for(asset_day(a)?, a.gps));
+        stop.filter(|l| !l.on_ship)
+            .map(|l| l.place)
+            .or_else(|| crate::geo::city_name(a.gps?))
+    };
     let mut out = HashMap::new();
     for (a, poi) in planned {
         let own = match spot(itin, a) {
@@ -188,11 +196,15 @@ pub fn photo_places(
                 })
                 .map(String::from),
         };
+        // The chapter's place, unless that is a sight this photo was not
+        // taken at (the day's first visit, Osaka Castle Park, must not
+        // caption the evening in Dōtonbori): then the photo's own city.
         let fallback = || {
-            chapter_place
-                .get(a.id.as_str())
-                .filter(|&&p| !hidden(p))
-                .map(|p| p.to_string())
+            let p = *chapter_place.get(a.id.as_str()).filter(|&&p| !hidden(p))?;
+            if !sights.contains(p) || poi.as_deref() == Some(p) {
+                return Some(p.to_string());
+            }
+            Some(city_of(a).unwrap_or_else(|| p.to_string()))
         };
         if let Some(p) = own.or_else(fallback) {
             out.insert(a.id.clone(), p);
@@ -300,6 +312,23 @@ mod tests {
             chapter_attraction(&[disneysea], &HashSet::new()).as_deref(),
             Some("Tokyo DisneySea")
         );
+    }
+
+    #[test]
+    fn a_day_named_for_a_sight_lends_it_only_to_shots_taken_there() {
+        let oct11 = 1_791_720_000;
+        let castle = (34.6873, 135.5262); // Osaka Castle
+        let dotonbori = (34.6687, 135.5013);
+        let assets: Vec<Asset> = (0..3)
+            .map(|i| photo(&format!("c{i}"), oct11 + i, Some(castle)))
+            .chain([photo("d", oct11 + 9, Some(dotonbori))])
+            .collect();
+        let sight = attraction_within(castle, PLACE_RADIUS_M).expect("a castle sight");
+        let plan = plan_of(vec![(sight.as_str(), vec!["c0", "c1", "c2", "d"])]);
+        let places = photo_places(&plan, &assets, None);
+        assert_eq!(places["c0"], sight);
+        assert_ne!(places["d"], sight, "the evening elsewhere takes its city");
+        assert!(places["d"].contains("Osaka"), "{}", places["d"]);
     }
 
     #[test]

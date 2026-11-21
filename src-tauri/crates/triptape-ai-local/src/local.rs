@@ -344,12 +344,17 @@ struct FaceModels {
 }
 
 impl FaceModels {
-    fn analyze(&self, img: &RgbImage) -> Result<FaceSignals, String> {
+    /// Every face YuNet finds in `img`, in its pixels.
+    fn detect(&self, img: &RgbImage) -> Result<Vec<faces::Face>, String> {
         let (input, shape, scale) = faces::yunet_input(img);
         let out = self.detector.with(|s| run_f32(s, shape, input))?;
         let data: Vec<Vec<f32>> = out.into_iter().map(|(_, d)| d).collect();
         let (h, w) = (shape[2] as u32, shape[3] as u32);
-        let found = faces::yunet_decode(&data, w, h, scale).ok_or("unexpected YuNet outputs")?;
+        faces::yunet_decode(&data, w, h, scale).ok_or_else(|| "unexpected YuNet outputs".into())
+    }
+
+    fn analyze(&self, img: &RgbImage) -> Result<FaceSignals, String> {
+        let found = self.detect(img)?;
         let happy: Vec<Option<f32>> = faces::smile_gated(&found)
             .map(|f| {
                 let input = faces::ferplus_input(img, f);
@@ -365,6 +370,30 @@ impl FaceModels {
             img.width(),
             img.height(),
         ))
+    }
+
+    /// Plausible faces in `img`, as boxes normalised to its size.
+    fn boxes(&self, img: &RgbImage) -> Result<Vec<crate::FaceBox>, String> {
+        let found = self.detect(img)?;
+        let (iw, ih) = (img.width().max(1) as f32, img.height().max(1) as f32);
+        // MIN_FACE_PX is in thumbnail pixels; scale it to `img`.
+        let min_px = faces::MIN_FACE_PX * (iw.max(ih) / proxies::THUMB_LONG_EDGE as f32).max(1.0);
+        Ok(found
+            .iter()
+            .filter(|f| f.side() >= min_px)
+            .map(|f| {
+                let x1 = (f.x1 / iw).clamp(0.0, 1.0);
+                let y1 = (f.y1 / ih).clamp(0.0, 1.0);
+                let x2 = (f.x2 / iw).clamp(x1, 1.0);
+                let y2 = (f.y2 / ih).clamp(y1, 1.0);
+                crate::FaceBox {
+                    x: x1,
+                    y: y1,
+                    w: x2 - x1,
+                    h: y2 - y1,
+                }
+            })
+            .collect())
     }
 }
 
@@ -489,6 +518,13 @@ impl LocalModels {
     /// ([`Capabilities::owe`]).
     pub fn wants(&self, a: &Asset) -> bool {
         self.capabilities().owe(a)
+    }
+
+    /// Faces in a decoded, upright photo (any size; the detector shrinks
+    /// it), as normalised boxes. `None` when the face models are not
+    /// loaded or the detector failed.
+    pub fn face_boxes(&self, img: &RgbImage) -> Option<Vec<crate::FaceBox>> {
+        self.faces.as_ref()?.boxes(img).ok()
     }
 
     /// Run the loaded models on a decoded, upright thumbnail.

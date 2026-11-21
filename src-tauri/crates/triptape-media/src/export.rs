@@ -49,6 +49,8 @@ pub struct ExportOptions {
     /// relabelled with it before the plan got here (see
     /// `Db::edited_plan_with`).
     pub itinerary: Option<triptape_core::itinerary::Itinerary>,
+    /// Face detection for book crops; `None` crops around the centre.
+    pub faces: Option<render_book::FaceFinder>,
 }
 
 /// How the segment cache served one export.
@@ -782,6 +784,7 @@ fn export_inner(
                     .and_then(|i| i.span())
                     .or(photo_span)
                     .map(|(a, b)| triptape_core::plan::date_range_label(a, b)),
+                faces: opts.faces.clone(),
             },
         ) {
             Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
@@ -1058,6 +1061,7 @@ mod tests {
                 progress,
                 segment_cache: None,
                 itinerary: None,
+                faces: None,
             },
         );
         assert!(matches!(err, Err(crate::MediaError::Cancelled)), "{err:?}");
@@ -1107,6 +1111,7 @@ mod tests {
             progress: Default::default(),
             segment_cache: Some(SegmentCacheConfig::roomy(t.path().join("cache"))),
             itinerary: None,
+            faces: None,
         };
         let report = export_all(&Default::default(), &empty_plan(), &[], &out, &opts).unwrap();
         assert!(!out.join(".work").exists(), "{:?}", report.fallbacks);
