@@ -46,6 +46,8 @@ pub struct ExportOptions {
     /// relabelled with it before the plan got here (see
     /// `Db::edited_plan_with`).
     pub itinerary: Option<triptape_core::itinerary::Itinerary>,
+    /// Face detection for book crops; `None` crops around the centre.
+    pub faces: Option<render_book::FaceFinder>,
 }
 
 /// How the segment cache served one export.
@@ -193,8 +195,9 @@ const PORT_AREA_LINK_M: f64 = 6_000.0;
 /// up (half to Hong Kong Disneyland, half around the city) and the shots
 /// interleave by time, so the day's places alternate page to page. There,
 /// ashore shots group by area (single-linked within [`PORT_AREA_LINK_M`]),
-/// areas in the order first reached, and the shots on board follow
-/// together. Other days keep story order.
+/// areas in the order first reached. Shots on board before the first
+/// one ashore open the day; the rest follow together. Other days keep
+/// story order.
 fn port_day_order(at: &[Whereabouts]) -> Vec<usize> {
     let mut out = Vec::with_capacity(at.len());
     let mut start = 0;
@@ -244,8 +247,14 @@ fn port_day_order(at: &[Whereabouts]) -> Vec<usize> {
         let roots: Vec<usize> = (0..ashore.len()).map(|a| root(&mut area, a)).collect();
         let mut order: Vec<usize> = (0..ashore.len()).collect();
         order.sort_by_key(|&a| (roots[a], a));
+        // Shots on board before the first one ashore (breakfast, the
+        // terminal on the way out) open the day; the rest follow it.
+        let first_ashore = ashore.first().copied().unwrap_or(usize::MAX);
+        let (before, after): (Vec<usize>, Vec<usize>) =
+            aboard.iter().partition(|&&i| i < first_ashore);
+        out.extend(before);
         out.extend(order.into_iter().map(|a| ashore[a]));
-        out.extend(aboard);
+        out.extend(after);
     }
     out
 }
@@ -842,6 +851,7 @@ fn export_inner(
                     .and_then(|i| i.span())
                     .or(photo_span)
                     .map(|(a, b)| triptape_core::plan::date_range_label(a, b)),
+                faces: opts.faces.clone(),
             },
         ) {
             Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
@@ -1041,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn port_day_groups_areas_then_the_ship() {
+    fn port_day_groups_areas_between_the_ship_before_and_after() {
         let w = |day: u32, port_day: bool, aboard: bool, gps: Option<(f64, f64)>| Whereabouts {
             day: Some(day),
             port_day,
@@ -1064,7 +1074,8 @@ mod tests {
             w(16, true, true, Some(central)),  // 7 back on board
             w(17, false, true, None),          // 8 sea day
         ];
-        assert_eq!(port_day_order(&at), [0, 2, 4, 5, 3, 6, 1, 7, 8]);
+        // The dawn deck shot opens the day; the return aboard closes it.
+        assert_eq!(port_day_order(&at), [0, 1, 2, 4, 5, 3, 6, 7, 8]);
         // Days that are not port days keep story order.
         let plain: Vec<Whereabouts> = at
             .iter()
@@ -1118,6 +1129,7 @@ mod tests {
                 progress,
                 segment_cache: None,
                 itinerary: None,
+                faces: None,
             },
         );
         assert!(matches!(err, Err(crate::MediaError::Cancelled)), "{err:?}");
@@ -1166,6 +1178,7 @@ mod tests {
             progress: Default::default(),
             segment_cache: Some(SegmentCacheConfig::roomy(t.path().join("cache"))),
             itinerary: None,
+            faces: None,
         };
         let report = export_all(&Default::default(), &empty_plan(), &[], &out, &opts).unwrap();
         assert!(!out.join(".work").exists(), "{:?}", report.fallbacks);

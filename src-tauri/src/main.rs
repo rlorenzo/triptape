@@ -1256,6 +1256,7 @@ fn export_blocking(
         resolution: triptape_media::resolution::Resolution::default(),
         jobs: None,
         itinerary: None,
+        faces: None,
         // The same dir the CLI uses, so `triptape cache` sees the app's
         // segments: macOS ~/Library/Caches/app.triptape.desktop/segments.
         segment_cache: triptape_media::segment_cache::default_dir().map(|dir| {

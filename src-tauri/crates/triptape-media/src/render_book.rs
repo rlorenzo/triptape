@@ -12,6 +12,7 @@ use image::{Rgb, RgbImage};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use triptape_ai_local::FaceBox;
 use triptape_core::plan::SAME_MOMENT_SECS;
 
 /// Book preset (PLAN.md Sec 11: only two in v1).
@@ -620,6 +621,28 @@ pub struct BookOptions {
     /// The trip's dates for the cover (`October 3–30, 2026`); `None` puts
     /// a generic line there.
     pub dates: Option<String>,
+    /// Face detection for crops that keep heads in frame; `None` (no
+    /// models installed) crops every photo around its centre.
+    pub faces: Option<FaceFinder>,
+}
+
+/// Finds the faces in a decoded photo, as boxes normalised to 0..1.
+#[derive(Clone)]
+pub struct FaceFinder(pub std::sync::Arc<FindFaces>);
+
+/// A face detector over a decoded photo.
+pub type FindFaces = dyn Fn(&RgbImage) -> Vec<FaceBox> + Send + Sync;
+
+impl std::fmt::Debug for FaceFinder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FaceFinder")
+    }
+}
+
+/// How page painters decode and crop a photo.
+struct Fit<'a> {
+    ffmpeg: &'a str,
+    faces: Option<&'a FaceFinder>,
 }
 
 #[derive(Debug)]
@@ -1062,10 +1085,16 @@ pub fn render_book(
     let mut captions: HashMap<usize, Vec<String>> = HashMap::new();
     // Grid pages: the user's captions, each on its own photo's cell.
     let mut cell_captions: CellCaptions = HashMap::new();
+    // Photo pages that open a day: their banner reads as a heading.
+    let mut bannered: HashSet<usize> = HashSet::new();
     // Consumption order: hero, then the spread wide photo, then the rest
     // in story order, each page's photos picked for sharpness — every photo
     // placed exactly once, exactly as `planned_blocked` simulated.
     let order = consumption_order(photos, &flow, opts.preset);
+    let fit = Fit {
+        ffmpeg: &opts.ffmpeg_bin,
+        faces: opts.faces.as_ref(),
+    };
     let cover = draw_cover_collage(
         photos,
         tw,
@@ -1135,6 +1164,9 @@ pub fn render_book(
                 } else {
                     day_banner(slot[0], chapters, &mut announced)
                 };
+                if title.is_some() {
+                    bannered.insert(page_no);
+                }
                 page_caps = titled(title, page_caps);
                 if !page_caps.is_empty() {
                     captions.entry(page_no).or_default().extend(page_caps);
@@ -1143,9 +1175,9 @@ pub fn render_book(
                     // Caption pages are full-bleed too: the caption burn lays
                     // its strip over the photo's lower edge.
                     PageKind::Hero | PageKind::PhotoCaption => {
-                        draw_fullbleed(slot[0], tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?
+                        draw_fullbleed(slot[0], tw, th, &out, &fit, &mut fallbacks)?
                     }
-                    _ => draw_grid(&slot, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?,
+                    _ => draw_grid(&slot, tw, th, &out, &fit, &mut fallbacks)?,
                 }
             }
             PageKind::SpreadLeft | PageKind::SpreadRight => {
@@ -1179,7 +1211,7 @@ pub fn render_book(
                     tw,
                     th,
                     &out,
-                    &opts.ffmpeg_bin,
+                    &fit,
                     &mut fallbacks,
                 )?;
             }
@@ -1200,7 +1232,7 @@ pub fn render_book(
                 placements.push((page_no, dpi_verdict(bg.width, bg.height, sw, sh)));
                 // Full brightness: the title sits in the caption strip, which
                 // carries its own dark backing.
-                draw_fullbleed(bg, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?;
+                draw_fullbleed(bg, tw, th, &out, &fit, &mut fallbacks)?;
                 let lines = divider_lines(bg, chapters, &mut announced);
                 if !lines.is_empty() {
                     captions.entry(page_no).or_default().extend(lines);
@@ -1212,7 +1244,7 @@ pub fn render_book(
                 } else {
                     let last = &photos[photos.len() - 1];
                     shown.push(last);
-                    draw_fullbleed(last, tw, th, &out, &opts.ffmpeg_bin, &mut fallbacks)?;
+                    draw_fullbleed(last, tw, th, &out, &fit, &mut fallbacks)?;
                     captions
                         .entry(page_no)
                         .or_default()
@@ -1268,7 +1300,7 @@ pub fn render_book(
         cells: cell_captions,
         // kinds[0] is the uncounted cover-proxy, so kinds[n] is page n.
         titles: (1..kinds.len())
-            .filter(|&n| kinds[n] == PageKind::Divider)
+            .filter(|&n| kinds[n] == PageKind::Divider || bannered.contains(&n))
             .collect(),
     };
     opts.progress.check_cancelled()?;
@@ -1376,13 +1408,20 @@ struct Announced {
 }
 
 /// The title of the chapter `p` opens, once per chapter. Showing it also
-/// names `p`'s day, so that day gets no second banner.
+/// names `p`'s day, so that day gets no second banner. A second chapter
+/// the same day (a title page midway through Jeju) names only its place:
+/// the day and date were already shown.
 fn opening_title(p: &BookPhoto, chapters: &[String], announced: &mut Announced) -> Option<String> {
     let title = p
         .chapter
         .filter(|&c| announced.chapters.insert(c))
         .and_then(|c| chapters.get(c).cloned())?;
-    announced.days.extend(p.day);
+    let seen = p.day.is_some_and(|d| !announced.days.insert(d));
+    if seen {
+        if let Some((_, place)) = title.split_once(" — ") {
+            return Some(place.to_string());
+        }
+    }
     Some(title)
 }
 
@@ -1594,15 +1633,115 @@ pub(crate) fn cover_fit(src: &RgbImage, tw: u32, th: u32) -> RgbImage {
     image::imageops::crop_imm(&big, x.min(nw - 1), y.min(nh - 1), tw.min(nw), th.min(nh)).to_image()
 }
 
+/// `p` decoded and cover-fitted into `tw`x`th`, cropped to keep its
+/// faces (with room above for the head) in frame. When they cannot all
+/// fit, the biggest stay and the render notes the photo.
+fn fit_photo(p: &BookPhoto, tw: u32, th: u32, fit: &Fit, fb: &mut Vec<String>) -> RgbImage {
+    let src = load(p, fit.ffmpeg, fb);
+    let faces = fit.faces.map(|f| (f.0)(&src)).unwrap_or_default();
+    let (img, cut) = cover_fit_faces(&src, tw, th, &faces);
+    if cut {
+        let name = p
+            .path
+            .file_name()
+            .map_or_else(|| p.asset_id.clone(), |n| n.to_string_lossy().into_owned());
+        fb.push(format!(
+            "crop: {name} cannot keep every face in its cell; the biggest stay"
+        ));
+    }
+    img
+}
+
+/// Room kept around a face, as fractions of its box: the detector boxes
+/// the face, so the top of the head and hair sit well above it.
+const HEAD_ABOVE: f32 = 0.6;
+const FACE_SIDE: f32 = 0.2;
+const FACE_BELOW: f32 = 0.15;
+
+/// The source window (x, y, w, h in pixels) a cover-fit of an `sw`x`sh`
+/// photo into a `tw`x`th` cell keeps: as many faces as fit, biggest
+/// first, each with its head room, centred between them; centred on the
+/// photo when it has none. Also whether a face was left out or cut.
+fn face_window(
+    sw: f64,
+    sh: f64,
+    tw: f64,
+    th: f64,
+    faces: &[FaceBox],
+) -> ((f64, f64, f64, f64), bool) {
+    let scale = (tw / sw).max(th / sh);
+    let (cw, ch) = ((tw / scale).min(sw), (th / scale).min(sh));
+    let mut by_size: Vec<(f64, f64, f64, f64)> = faces
+        .iter()
+        .map(|f| {
+            let (x, y, w, h) = (f.x, f.y, f.w, f.h);
+            (
+                f64::from(x - FACE_SIDE * w).max(0.0) * sw,
+                f64::from(y - HEAD_ABOVE * h).max(0.0) * sh,
+                f64::from(x + w + FACE_SIDE * w).min(1.0) * sw,
+                f64::from(y + h + FACE_BELOW * h).min(1.0) * sh,
+            )
+        })
+        .collect();
+    by_size.sort_by(|a, b| ((b.2 - b.0) * (b.3 - b.1)).total_cmp(&((a.2 - a.0) * (a.3 - a.1))));
+    let mut keep: Option<(f64, f64, f64, f64)> = None;
+    let mut cut = false;
+    for b in by_size {
+        let u = keep.map_or(b, |k| {
+            (k.0.min(b.0), k.1.min(b.1), k.2.max(b.2), k.3.max(b.3))
+        });
+        if u.2 - u.0 <= cw + 0.5 && u.3 - u.1 <= ch + 0.5 {
+            keep = Some(u);
+        } else {
+            cut = true;
+        }
+    }
+    // Along each axis: centre on the kept faces, slid to hold them all.
+    let place = |lo: f64, hi: f64, win: f64, full: f64| {
+        let want = (lo + hi) / 2.0 - win / 2.0;
+        want.clamp((hi - win).max(0.0), lo.min(full - win))
+            .clamp(0.0, full - win)
+    };
+    let (x, y) = match keep {
+        Some(k) => (place(k.0, k.2, cw, sw), place(k.1, k.3, ch, sh)),
+        None => ((sw - cw) / 2.0, (sh - ch) / 2.0),
+    };
+    // A face too big for the window even alone is cut as well.
+    if keep.is_none() && !faces.is_empty() {
+        cut = true;
+    }
+    ((x, y, cw, ch), cut)
+}
+
+/// [`cover_fit`] that keeps faces in frame (see [`face_window`]).
+fn cover_fit_faces(src: &RgbImage, tw: u32, th: u32, faces: &[FaceBox]) -> (RgbImage, bool) {
+    if faces.is_empty() {
+        return (cover_fit(src, tw, th), false);
+    }
+    let (sw, sh) = (
+        f64::from(src.width().max(1)),
+        f64::from(src.height().max(1)),
+    );
+    let ((x, y, w, h), cut) = face_window(sw, sh, f64::from(tw), f64::from(th), faces);
+    let (x, y) = (x.round() as u32, y.round() as u32);
+    let (w, h) = (
+        (w.round() as u32).clamp(1, src.width() - x.min(src.width() - 1)),
+        (h.round() as u32).clamp(1, src.height() - y.min(src.height() - 1)),
+    );
+    let window = image::imageops::crop_imm(src, x, y, w, h).to_image();
+    let out = image::imageops::resize(&window, tw, th, image::imageops::FilterType::Triangle);
+    (out, cut)
+}
+
 fn draw_fullbleed(
     p: &BookPhoto,
     tw: u32,
     th: u32,
     out: &Path,
-    ff: &str,
+    ff: &Fit,
     fb: &mut Vec<String>,
 ) -> Result<(), crate::MediaError> {
-    save_jpg(&cover_fit(&load(p, ff, fb), tw, th), out)
+    save_jpg(&fit_photo(p, tw, th, ff, fb), out)
 }
 
 fn draw_half(
@@ -1611,10 +1750,10 @@ fn draw_half(
     tw: u32,
     th: u32,
     out: &Path,
-    ff: &str,
+    ff: &Fit,
     fb: &mut Vec<String>,
 ) -> Result<(), crate::MediaError> {
-    let full = cover_fit(&load(p, ff, fb), tw * 2, th);
+    let full = fit_photo(p, tw * 2, th, ff, fb);
     let x = if left { 0 } else { tw };
     save_jpg(
         &image::imageops::crop_imm(&full, x, 0, tw, th).to_image(),
@@ -1672,6 +1811,10 @@ fn orderings(n: usize) -> Vec<Vec<usize>> {
 /// at its edges), trimming sky or table off a landscape costs less than
 /// trimming its sides, and very unequal photo sizes and leaving story
 /// order cost a little.
+/// Width / height from which a photo is a panorama: alone on a grid row
+/// it spans the page at its own height.
+const PANORAMA_ASPECT: f64 = 2.0;
+
 fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
     const BALANCE: f64 = 0.3;
     const REORDER: f64 = 0.02;
@@ -1694,16 +1837,41 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
             // row's height before stretching to fill the page.
             let mut placed: Vec<(usize, usize, f64)> = vec![];
             let mut natural: Vec<f64> = vec![];
+            // A panorama alone on its row keeps its own height (the full
+            // page width, uncropped); the other rows share the rest.
+            let mut fixed: Vec<bool> = vec![];
             for (r, &k) in rows.iter().enumerate() {
                 let members = &order[at..at + k];
                 at += k;
                 let sum: f64 = members.iter().map(|&i| aspect(slot[i])).sum();
                 let row_w = w - gap * (k + 1) as f64;
                 natural.push(row_w / sum);
+                fixed.push(k == 1 && sum >= PANORAMA_ASPECT);
                 placed.extend(members.iter().map(|&i| (i, r, aspect(slot[i]) / sum)));
             }
-            let stretch = avail_h / natural.iter().sum::<f64>();
-            let row_h: Vec<f64> = natural.iter().map(|nh| nh * stretch).collect();
+            let held: f64 = natural
+                .iter()
+                .zip(&fixed)
+                .filter(|(_, &f)| f)
+                .map(|(n, _)| n)
+                .sum();
+            let free: f64 = natural
+                .iter()
+                .zip(&fixed)
+                .filter(|(_, &f)| !f)
+                .map(|(n, _)| n)
+                .sum();
+            let row_h: Vec<f64> = if free > 0.0 && held < avail_h {
+                let stretch = (avail_h - held) / free;
+                natural
+                    .iter()
+                    .zip(&fixed)
+                    .map(|(&nh, &f)| if f { nh } else { nh * stretch })
+                    .collect()
+            } else {
+                let stretch = avail_h / natural.iter().sum::<f64>();
+                natural.iter().map(|nh| nh * stretch).collect()
+            };
             let mut cells = vec![(0.0, 0.0, 0.0, 0.0); n];
             let mut cost = 0.0;
             let mut y = gap;
@@ -1769,7 +1937,7 @@ fn draw_grid(
     tw: u32,
     th: u32,
     out: &Path,
-    ff: &str,
+    ff: &Fit,
     fb: &mut Vec<String>,
 ) -> Result<(), crate::MediaError> {
     let mut page = solid(tw, th, Rgb([18, 20, 26]));
@@ -1782,7 +1950,7 @@ fn draw_grid(
             (w.round() as u32).min(tw - x),
             (h.round() as u32).min(th - y),
         );
-        let fit = cover_fit(&load(p, ff, fb), w.max(1), h.max(1));
+        let fit = fit_photo(p, w.max(1), h.max(1), ff, fb);
         image::imageops::replace(&mut page, &fit, i64::from(x), i64::from(y));
     }
     save_jpg(&page, out)
@@ -1910,11 +2078,11 @@ fn draw_cover_collage(
     let mut canvas = solid(tw, th, Rgb([18, 20, 26]));
     for (k, pi) in picks.iter().enumerate() {
         let (cx, cy) = ((k as u32) % cols, (k as u32) / cols);
-        let tile = cover_fit(
-            &load(&photos[*pi], &opts.ffmpeg_bin, fallbacks),
-            tile_w,
-            tile_h,
-        );
+        let fit = Fit {
+            ffmpeg: &opts.ffmpeg_bin,
+            faces: opts.faces.as_ref(),
+        };
+        let tile = fit_photo(&photos[*pi], tile_w, tile_h, &fit, fallbacks);
         image::imageops::replace(
             &mut canvas,
             &tile,
@@ -2032,8 +2200,8 @@ fn write_typst_and_compile(
         // the bottom row must clear.
         let mut strip_pt = 0.0;
         if let Some(lines) = texts.lines.get(&page_no).filter(|l| !l.is_empty()) {
-            // Chapter title pages carry a bigger strip, so they read as a
-            // chapter opening without dimming the photo.
+            // Chapter title pages and day banners carry a bigger strip, so
+            // they read as an opening without dimming the photo.
             let (size, inset) = if texts.titles.contains(&page_no) {
                 (24, 14)
             } else {
@@ -2647,6 +2815,59 @@ mod tests {
     }
 
     #[test]
+    fn a_panorama_spans_its_row() {
+        let photos: Vec<BookPhoto> = [(5712, 4284), (4284, 5712), (16242, 3854), (5712, 4284)]
+            .iter()
+            .enumerate()
+            .map(|(i, &(w, h))| sized(i, w, h, None, NEUTRAL_SCORE))
+            .collect();
+        let slot: Vec<&BookPhoto> = photos.iter().collect();
+        let cells = grid_layout(&slot, 100.0, 100.0, 1.0);
+        let (_, _, w, h) = cells[2];
+        assert!(w > 97.0, "full width: {cells:?}");
+        assert!(
+            (w / h - 16242.0 / 3854.0).abs() < 0.05,
+            "uncropped: {cells:?}"
+        );
+    }
+
+    #[test]
+    fn crops_keep_faces_and_their_heads() {
+        let face = |x: f32, y: f32, side: f32| FaceBox {
+            x,
+            y,
+            w: side,
+            h: side,
+        };
+        // A portrait 3000x4000 into a 2:1 cell keeps a 3000x1500 band; a
+        // face near the top keeps its head instead of the centred band.
+        let ((x, y, w, h), cut) = face_window(3000.0, 4000.0, 2.0, 1.0, &[face(0.4, 0.1, 0.15)]);
+        assert_eq!((x, w, h), (0.0, 3000.0, 1500.0));
+        assert!(
+            y <= (0.1 - 0.15 * HEAD_ABOVE) as f64 * 4000.0,
+            "head room: y={y}"
+        );
+        assert!(!cut);
+        // A selfie face at the right edge of a wide photo in a square cell.
+        let ((x, _, w, _), cut) = face_window(4000.0, 3000.0, 1.0, 1.0, &[face(0.85, 0.3, 0.12)]);
+        assert!(x + w >= 0.97 * 4000.0, "right side kept: x={x} w={w}");
+        assert!(!cut);
+        // Two faces too far apart for the cell: the bigger stays, noted.
+        let ((x, _, w, _), cut) = face_window(
+            6000.0,
+            3000.0,
+            1.0,
+            1.0,
+            &[face(0.02, 0.4, 0.05), face(0.8, 0.4, 0.15)],
+        );
+        assert!(x + w >= 0.95 * 6000.0, "the big face's side: x={x}");
+        assert!(cut);
+        // No faces: centred, as before.
+        let ((x, y, _, _), cut) = face_window(4000.0, 3000.0, 1.0, 1.0, &[]);
+        assert_eq!((x, y, cut), (500.0, 0.0, false));
+    }
+
+    #[test]
     fn no_photo_is_left_alone_on_a_page() {
         assert_eq!(even_split(9, 4), vec![3, 3, 3], "not 4 + 4 + 1");
         assert_eq!(even_split(5, 4), vec![3, 2]);
@@ -3158,6 +3379,9 @@ mod tests {
         // A divider already named day 4: its pages get no banner.
         assert!(divider_lines(&photo(2, 4), &titles, &mut seen)[0].contains("Day 4"));
         assert_eq!(day_banner(&photo(2, 4), &titles, &mut seen), None);
+        // A second title page on day 4 names only its place.
+        let more = [titles.to_vec(), vec!["Day 4 — Ginza".to_string()]].concat();
+        assert_eq!(divider_lines(&photo(3, 4), &more, &mut seen)[0], "Ginza");
         // Unknown day: no banner.
         assert_eq!(day_banner(&blank_photo(), &titles, &mut seen), None);
     }
@@ -3291,6 +3515,7 @@ mod tests {
             max_pages: None,
             progress: Default::default(),
             dates: None,
+            faces: None,
         };
         let res = render_book(&photos, None, &[], &out, &opts).unwrap();
         assert!(
@@ -3368,6 +3593,7 @@ mod tests {
             max_pages: None,
             progress: Default::default(),
             dates: None,
+            faces: None,
         };
         render_book(&photos, None, &titles, &out, &opts).unwrap();
         let typ = std::fs::read_to_string(out.join("proof.typ")).unwrap();

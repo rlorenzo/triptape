@@ -368,6 +368,28 @@ impl FaceModels {
     }
 }
 
+impl FaceModels {
+    /// Plausible faces in `img`, as boxes normalised to its size.
+    fn boxes(&self, img: &RgbImage) -> Result<Vec<crate::FaceBox>, String> {
+        let (input, shape, scale) = faces::yunet_input(img);
+        let out = self.detector.with(|s| run_f32(s, shape, input))?;
+        let data: Vec<Vec<f32>> = out.into_iter().map(|(_, d)| d).collect();
+        let (h, w) = (shape[2] as u32, shape[3] as u32);
+        let found = faces::yunet_decode(&data, w, h, scale).ok_or("unexpected YuNet outputs")?;
+        let (iw, ih) = (img.width().max(1) as f32, img.height().max(1) as f32);
+        Ok(found
+            .iter()
+            .filter(|f| f.side() >= faces::MIN_FACE_PX)
+            .map(|f| crate::FaceBox {
+                x: (f.x1 / iw).clamp(0.0, 1.0),
+                y: (f.y1 / ih).clamp(0.0, 1.0),
+                w: ((f.x2 - f.x1) / iw).clamp(0.0, 1.0),
+                h: ((f.y2 - f.y1) / ih).clamp(0.0, 1.0),
+            })
+            .collect())
+    }
+}
+
 /// The optional local models that loaded. Every capability is `None` when
 /// its files are missing, in which case callers keep their old behaviour.
 #[derive(Default)]
@@ -489,6 +511,13 @@ impl LocalModels {
     /// ([`Capabilities::owe`]).
     pub fn wants(&self, a: &Asset) -> bool {
         self.capabilities().owe(a)
+    }
+
+    /// Faces in a decoded, upright photo (any size; the detector shrinks
+    /// it), as normalised boxes. `None` when the face models are not
+    /// loaded or the detector failed.
+    pub fn face_boxes(&self, img: &RgbImage) -> Option<Vec<crate::FaceBox>> {
+        self.faces.as_ref()?.boxes(img).ok()
     }
 
     /// Run the loaded models on a decoded, upright thumbnail.

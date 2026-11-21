@@ -645,6 +645,24 @@ fn parse_lat_lon(s: &str) -> Option<(f64, f64)> {
     ((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)).then_some((lat, lon))
 }
 
+/// Face detection for the book's crops when the local face models are
+/// installed (`scripts/fetch-models`); `None` crops around the centre.
+fn book_faces(flags: &HashMap<String, String>) -> Option<triptape_media::render_book::FaceFinder> {
+    let paths = ModelPaths::from_env(
+        flags.get("models").map(Path::new),
+        dirs::data_dir().map(|d| d.join("app.triptape.desktop").join("models")),
+    )?;
+    if !paths.installed().faces {
+        return None;
+    }
+    let models = std::sync::Arc::new(LocalModels::load(Some(&paths), 1));
+    models.capabilities().faces.then(|| {
+        triptape_media::render_book::FaceFinder(std::sync::Arc::new(move |img| {
+            models.face_boxes(img).unwrap_or_default()
+        }))
+    })
+}
+
 fn export_cmd(flags: &HashMap<String, String>) {
     let db_path = need(flags, "db");
     let out = need(flags, "out");
@@ -765,6 +783,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             progress,
             segment_cache,
             itinerary,
+            faces: book_faces(flags),
         },
     );
     console.finish();
