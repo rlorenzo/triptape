@@ -2032,6 +2032,23 @@ mod tests {
         assert_eq!(lp.taken_at, Some(1_714_557_600), "still capture time kept");
     }
 
+    /// The motion half is probed like any video, so it carries its own
+    /// capture time and offset (Apple's creation date); folding it into the
+    /// pair must leave the still's EXIF date and offset in place.
+    #[test]
+    fn pairing_keeps_the_stills_date_over_the_motions() {
+        let mut still = pairing_asset("s", "/t/IMG_106.HEIC", AssetKind::Photo, None);
+        still.tz_offset_secs = Some(9 * 3600);
+        let mut mov = pairing_asset("m", "/t/IMG_106.MOV", AssetKind::Video, Some(2.0));
+        mov.taken_at = Some(1_800_000_000);
+        mov.tz_offset_secs = Some(-7 * 3600);
+        let out = apply_live_photo_pairing(vec![still, mov]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, AssetKind::LivePhoto);
+        assert_eq!(out[0].taken_at, Some(1_714_557_600));
+        assert_eq!(out[0].tz_offset_secs, Some(9 * 3600));
+    }
+
     #[test]
     fn pairing_keeps_long_mov_as_separate_video() {
         let still = pairing_asset("s", "/t/IMG_102.HEIC", AssetKind::Photo, None);

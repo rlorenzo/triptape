@@ -110,12 +110,31 @@ impl FfprobeOutput {
         parse_iso6709(loc)
     }
 
-    /// Capture time: `creation_time` tag as unix seconds, if present.
+    /// Container `creation_time` tag as unix seconds, if present. Apple
+    /// Photos rewrites it when an edit (a trim) is saved, so it is the
+    /// fallback behind [`Self::apple_creation_date`].
     pub fn creation_time(&self) -> Option<i64> {
         let tags = self.format.tags.as_ref()?;
         tags.get("creation_time")
             .and_then(|v| v.parse::<jiff::Timestamp>().ok())
             .map(unix_floor)
+    }
+
+    /// `com.apple.quicktime.creationdate` as unix seconds and its UTC offset
+    /// (seconds east). iPhones write the real capture moment here, and it
+    /// survives a trim in Photos while `creation_time` becomes the save time.
+    pub fn apple_creation_date(&self) -> Option<(i64, i32)> {
+        let tags = self.format.tags.as_ref()?;
+        parse_apple_creation_date(tags.get("com.apple.quicktime.creationdate")?)
+    }
+
+    /// Capture instant and, when known, its UTC offset:
+    /// [`Self::apple_creation_date`] first, else [`Self::creation_time`]
+    /// (an instant with no offset).
+    pub fn capture_time(&self) -> Option<(i64, Option<i32>)> {
+        self.apple_creation_date()
+            .map(|(t, o)| (t, Some(o)))
+            .or_else(|| self.creation_time().map(|t| (t, None)))
     }
 
     /// Live Photo / content-identifier UUIDs, when the container carries one.
@@ -252,8 +271,11 @@ pub fn fill_photo(
 }
 
 /// Fill a video's metadata from its ffprobe output plus its story fields
-/// (see [`fill_photo`] for `library` and `salt`). Unprobeable videos fall
-/// back to file mtime with `time_guessed`.
+/// (see [`fill_photo`] for `library` and `salt`). Capture time comes from
+/// the probe ([`FfprobeOutput::capture_time`]: Apple's creation date, which
+/// an edit keeps, before the container's `creation_time`, which an edit
+/// resets), then the photo library's date, then file mtime with
+/// `time_guessed` (also for unprobeable videos).
 pub fn fill_video(
     a: &mut crate::types::Asset,
     probe: Option<&FfprobeOutput>,
@@ -262,21 +284,46 @@ pub fn fill_video(
 ) {
     let lib = library.and_then(|l| l.get(&a.path));
     story_fields(&a.path, None, lib).apply(a, salt);
-    let Some(p) = probe else {
-        a.taken_at = Some(a.mtime);
-        a.time_guessed = true;
-        return;
-    };
-    a.duration_secs = p.duration_secs();
-    if let Some((w, h)) = p.video_dims() {
-        a.width = Some(w);
-        a.height = Some(h);
+    if let Some(p) = probe {
+        a.duration_secs = p.duration_secs();
+        if let Some((w, h)) = p.video_dims() {
+            a.width = Some(w);
+            a.height = Some(h);
+        }
+        a.rotation_deg = p.rotation_deg();
+        a.gps = p.gps();
     }
-    a.rotation_deg = p.rotation_deg();
-    a.gps = p.gps();
-    let ct = resolve_capture_time(p.creation_time(), a.mtime);
+    let library_time = || {
+        let l = lib?;
+        Some((l.taken_at?, l.tz_offset_secs))
+    };
+    let (taken_at, tz_offset_secs) = probe
+        .and_then(FfprobeOutput::capture_time)
+        .or_else(library_time)
+        .map_or((None, None), |(t, o)| (Some(t), o));
+    let ct = resolve_capture_time(taken_at, a.mtime);
     a.taken_at = Some(ct.unix_secs);
     a.time_guessed = ct.time_guessed;
+    a.tz_offset_secs = tz_offset_secs;
+}
+
+/// Parse `com.apple.quicktime.creationdate` (`2026-10-14T13:30:00+0900`;
+/// the offset may also be `+09:00` or `Z`) to unix seconds and the offset in
+/// seconds east of UTC. `None` without an offset.
+pub fn parse_apple_creation_date(s: &str) -> Option<(i64, i32)> {
+    let s = s.trim();
+    // Apple writes the offset without a colon, which RFC 3339 needs.
+    let b = s.as_bytes();
+    let n = b.len();
+    let colonless = n > 5
+        && matches!(b[n - 5], b'+' | b'-')
+        && b[n - 4..].iter().all(u8::is_ascii_digit)
+        && b[..n - 5].contains(&b'T');
+    if colonless {
+        parse_iso_instant(&format!("{}:{}", &s[..n - 2], &s[n - 2..]))
+    } else {
+        parse_iso_instant(s)
+    }
 }
 
 /// Parse an ISO 8601 / RFC 3339 instant with a UTC offset (as osxphotos
@@ -1714,6 +1761,70 @@ mod tests {
         );
         assert_eq!(parse_iso_instant("2026-10-27T10:05:38"), None);
         assert_eq!(parse_iso_instant(""), None);
+    }
+
+    #[test]
+    fn apple_creation_date_forms() {
+        // 2026-10-14T04:30:00Z in each form Apple and ffprobe produce.
+        let utc = 1_791_952_200;
+        assert_eq!(
+            parse_apple_creation_date("2026-10-14T13:30:00+0900"),
+            Some((utc, 9 * 3600))
+        );
+        assert_eq!(
+            parse_apple_creation_date("2026-10-13T21:30:00-0700"),
+            Some((utc, -7 * 3600))
+        );
+        assert_eq!(
+            parse_apple_creation_date("2026-10-14T04:30:00Z"),
+            Some((utc, 0))
+        );
+        assert_eq!(
+            parse_apple_creation_date("2026-10-14T13:30:00+09:00"),
+            Some((utc, 9 * 3600))
+        );
+        assert_eq!(parse_apple_creation_date("2026-10-14T13:30:00"), None);
+        assert_eq!(parse_apple_creation_date("+0900"), None);
+        assert_eq!(parse_apple_creation_date(""), None);
+    }
+
+    /// A trim saved in Apple Photos resets `creation_time` to the save
+    /// moment; Apple's creation date still holds the capture.
+    #[test]
+    fn video_capture_prefers_apple_creation_date() {
+        use crate::types::{Asset, AssetKind};
+        let probe = |tags: &str| {
+            FfprobeOutput::parse(&format!(r#"{{"format":{{"tags":{{{tags}}}}}}}"#)).unwrap()
+        };
+        let edited = probe(
+            r#""creation_time":"2026-10-15T19:19:09.000000Z","com.apple.quicktime.creationdate":"2026-10-14T13:30:00+0900""#,
+        );
+        assert_eq!(edited.capture_time(), Some((1_791_952_200, Some(9 * 3600))));
+        let plain = probe(r#""creation_time":"2026-10-15T19:19:09.000000Z""#);
+        assert_eq!(plain.capture_time(), Some((1_792_091_949, None)));
+        // An unreadable Apple date does not hide creation_time.
+        let bad = probe(
+            r#""creation_time":"2026-10-15T19:19:09.000000Z","com.apple.quicktime.creationdate":"soon""#,
+        );
+        assert_eq!(bad.capture_time(), Some((1_792_091_949, None)));
+        assert_eq!(probe("").capture_time(), None);
+
+        let mut a = Asset::new("v", "/t/IMG_6674_edited.mov".into(), AssetKind::Video);
+        a.mtime = 2_000_000_000;
+        fill_video(&mut a, Some(&edited), None, "prj");
+        assert_eq!(a.taken_at, Some(1_791_952_200));
+        assert_eq!(a.tz_offset_secs, Some(9 * 3600));
+        assert!(!a.time_guessed);
+        // The capture lands on its own local day, Oct 14 in Jeju.
+        assert_eq!(
+            local_date(a.taken_at.unwrap(), a.tz_offset_secs).unwrap(),
+            jiff::civil::date(2026, 10, 14)
+        );
+        // No date anywhere: mtime, guessed, no offset.
+        fill_video(&mut a, Some(&probe("")), None, "prj");
+        assert_eq!(a.taken_at, Some(2_000_000_000));
+        assert!(a.time_guessed);
+        assert_eq!(a.tz_offset_secs, None);
     }
 
     #[test]
