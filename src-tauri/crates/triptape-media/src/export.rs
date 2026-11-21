@@ -871,7 +871,12 @@ fn export_inner(
             });
         match render_book::render_book(
             &book_photos,
-            book_map.as_deref().or(map_card.as_deref()),
+            // The owner's back cover is the trip's map: no second, plainer
+            // route map before it.
+            book_map
+                .as_deref()
+                .or(map_card.as_deref())
+                .filter(|_| opts.back_cover.is_none()),
             &chapter_titles,
             &staged_book,
             &BookOptions {

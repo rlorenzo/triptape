@@ -1345,21 +1345,10 @@ pub fn render_book(
                 // Captions on grid cells, placed once the page is drawn
                 // and its faces are known.
                 let mut pending_cells: Vec<(usize, Rect, String)> = vec![];
+                let mut cell_texts: Vec<CellCaption> = vec![];
                 let mut page_caps = if fp.kind == PageKind::Grid {
                     let (page, cells) = grid_captions(&slot);
-                    if !cells.is_empty() {
-                        // Cell rects as fractions of the page, from the
-                        // same layout the page is drawn with.
-                        let (w, h) = opts.preset.trim_inches();
-                        let rects: Vec<Rect> = grid_cells(&slot, w, h)
-                            .into_iter()
-                            .map(|(x, y, cw, ch)| (x / w, y / h, cw / w, ch / h))
-                            .collect();
-                        pending_cells = cells
-                            .into_iter()
-                            .map(|(k, text)| (k, rects[k], text))
-                            .collect();
-                    }
+                    cell_texts = cells;
                     page
                 } else {
                     page_caption(&slot, fp.kind)
@@ -1380,22 +1369,38 @@ pub fn render_book(
                 if !page_caps.is_empty() {
                     captions.entry(page_no).or_default().extend(page_caps);
                 }
-                let cells = match fp.kind {
-                    PageKind::Grid => grid_cells(&slot, f64::from(tw), f64::from(th)),
-                    _ => vec![FULL_PAGE; slot.len()],
-                };
-                // The hero is the opening's best shot pulled to the front,
-                // not its earliest, so it neither checks nor sets the time
-                // the next page must follow (as with the spread).
-                if fp.kind != PageKind::Hero {
-                    fallbacks.extend(time_order_notes(page_no, &slot, &cells, &mut last_time));
-                }
                 let strip = strip_px(
                     captions.get(&page_no).map_or(&[][..], Vec::as_slice),
                     bannered.contains(&page_no),
                     opts.preset,
                     th,
                 );
+                // Grid photos stop above the page's caption strip: a day
+                // banner never lies over a face in the bottom row.
+                let cells = match fp.kind {
+                    PageKind::Grid => {
+                        grid_cells(&slot, f64::from(tw), f64::from(th.saturating_sub(strip)))
+                    }
+                    _ => vec![FULL_PAGE; slot.len()],
+                };
+                if fp.kind == PageKind::Grid {
+                    // Cell rects as fractions of the page, from the layout
+                    // the page is drawn with.
+                    let (pw, ph) = (f64::from(tw), f64::from(th));
+                    pending_cells = cell_texts
+                        .drain(..)
+                        .map(|(k, text)| {
+                            let (x, y, w, h) = cells[k];
+                            (k, (x / pw, y / ph, w / pw, h / ph), text)
+                        })
+                        .collect();
+                }
+                // The hero is the opening's best shot pulled to the front,
+                // not its earliest, so it neither checks nor sets the time
+                // the next page must follow (as with the spread).
+                if fp.kind != PageKind::Hero {
+                    fallbacks.extend(time_order_notes(page_no, &slot, &cells, &mut last_time));
+                }
                 match fp.kind {
                     // Caption pages are full-bleed too: the caption burn lays
                     // its strip over the photo's lower edge.
@@ -1403,12 +1408,13 @@ pub fn render_book(
                         draw_fullbleed(slot[0], (tw, th), strip, &out, &fit, &mut fallbacks)?
                     }
                     _ => {
-                        let bars = caption_bars(&pending_cells, slot.len(), strip, opts.preset, th);
+                        // The strip is below the grid now: nothing to clear.
+                        let bars = caption_bars(&pending_cells, slot.len(), 0, opts.preset, th);
                         draw_grid(
                             &slot,
                             &cells,
                             (tw, th),
-                            (strip, &bars),
+                            (0, &bars),
                             &out,
                             &fit,
                             &mut fallbacks,
@@ -1520,7 +1526,9 @@ pub fn render_book(
                     let last = photos
                         .iter()
                         .filter(|p| {
-                            p.is_of_people()
+                            // A people photo that fills a page well: no
+                            // panorama, no group a square would cut.
+                            cover_rank(p) == 2
                                 && !recent.contains(&p.asset_id.as_str())
                                 && p.day.zip(last_day).is_some_and(|(d, l)| d + 2 >= l)
                         })
@@ -2576,7 +2584,7 @@ fn typst_text_png(
 
 /// Photos at the start of the book (hero, spread, the first pages) the
 /// cover never repeats.
-const COVER_SKIPS_FIRST: usize = 12;
+const COVER_SKIPS_FIRST: usize = 30;
 
 /// Detected face size (of the photo's shorter side) from which a face is
 /// someone the photo is of, not a stranger in the crowd or a far statue.
@@ -2598,9 +2606,9 @@ fn cover_rank(p: &BookPhoto) -> u8 {
         && p.width > 0
         && p.height > 0
         && face_window(f64::from(p.width), f64::from(p.height), 1.0, 1.0, &p.faces).1;
-    if png || panorama {
+    if png || panorama || tile_cuts {
         0
-    } else if p.is_of_people() && !tile_cuts {
+    } else if p.is_of_people() {
         2
     } else {
         1
@@ -2860,9 +2868,11 @@ fn write_typst_and_compile(
         }
         for (rect, text, top) in texts.cells.get(&page_no).into_iter().flatten() {
             // A bottom-row photo's caption sits above the page strip.
+            // Grid cells end above the strip, so a cell caption needs no lift
+            // unless its cell still reaches into the strip's band.
             let lift = if *top {
                 0.0
-            } else if rect.1 + rect.3 > 0.95 {
+            } else if rect.1 + rect.3 > 1.0 - strip_pt / (ph * 72.0) {
                 strip_pt
             } else {
                 0.0
