@@ -909,7 +909,8 @@ fn cache_cmd(sub: &str, flags: &HashMap<String, String>) {
 /// Parsed `edit` arguments. `--include`, `--exclude`, `--uninclude`,
 /// `--unexclude`, `--solo`, `--unsolo` and `--unjoin` each take one or more
 /// asset references (id, file name or path) and may repeat; `--join` takes
-/// exactly two and may repeat.
+/// exactly two and may repeat. `--move REF` is followed by `--after REF` or
+/// `--before REF`; `--unmove` takes one or more references.
 #[derive(Debug, Default, PartialEq)]
 struct EditArgs {
     db: Option<PathBuf>,
@@ -925,10 +926,14 @@ struct EditArgs {
     unjoin: Vec<String>,
     /// (asset, caption); an empty caption clears the override.
     caption: Vec<(String, String)>,
+    /// (asset, anchor, after): play the asset right after/before the anchor.
+    moves: Vec<(String, String, bool)>,
+    unmove: Vec<String>,
 }
 
 fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
     let mut out = EditArgs::default();
+    let mut pending_move: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let flag = args[i]
@@ -962,7 +967,20 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     )
                 }
             },
-            "include" | "exclude" | "uninclude" | "unexclude" | "solo" | "unsolo" | "unjoin" => {
+            "move" => {
+                if pending_move.is_some() {
+                    return Err("--move wants --after REF or --before REF".to_string());
+                }
+                pending_move = Some(single(values)?);
+            }
+            "after" | "before" => {
+                let asset = pending_move
+                    .take()
+                    .ok_or_else(|| format!("--{flag} follows --move REF"))?;
+                out.moves.push((asset, single(values)?, flag == "after"));
+            }
+            "include" | "exclude" | "uninclude" | "unexclude" | "solo" | "unsolo" | "unjoin"
+            | "unmove" => {
                 if values.is_empty() {
                     return Err(format!("--{flag} wants at least one asset"));
                 }
@@ -973,11 +991,15 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     "unexclude" => out.unexclude.extend(values),
                     "solo" => out.solo.extend(values),
                     "unsolo" => out.unsolo.extend(values),
+                    "unmove" => out.unmove.extend(values),
                     _ => out.unjoin.extend(values),
                 }
             }
             other => return Err(format!("unknown flag --{other}")),
         }
+    }
+    if pending_move.is_some() {
+        return Err("--move wants --after REF or --before REF".to_string());
     }
     Ok(out)
 }
@@ -1013,6 +1035,11 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
         edits.place_overrides.len(),
         edits.caption_overrides.len()
     );
+    println!("moves: {}", edits.moves.len());
+    for m in &edits.moves {
+        let side = if m.after { "after" } else { "before" };
+        println!("  {} {side} {}", show(&m.asset), show(&m.anchor));
+    }
     let collage = &edits.collage;
     println!("on their own: {}", collage.solo.len());
     for id in &collage.solo {
@@ -1053,6 +1080,11 @@ fn print_film(plan: &Plan, assets: &[Asset], by_id: &HashMap<&str, &Asset>, was_
             .collect();
         println!("  collage of {}: {}", g.len(), names.join(", "));
     }
+}
+
+/// Whether two capture-local days differ (unknown days never match).
+fn a_day_differs(a: String, b: String) -> bool {
+    a != b || a == "unknown-date"
 }
 
 fn edit_cmd(args: &[String]) {
@@ -1131,14 +1163,22 @@ fn edit_cmd(args: &[String]) {
         .iter()
         .map(|(q, text)| (resolve_one(q), text))
         .collect();
+    let moves: Vec<(&Asset, &Asset, bool)> = a
+        .moves
+        .iter()
+        .map(|(x, y, after)| (resolve_one(x), resolve_one(y), *after))
+        .collect();
+    let unmoves = resolve(&a.unmove);
     let changed = ops.iter().any(|(assets, ..)| !assets.is_empty())
         || !unjoins.is_empty()
         || !joins.is_empty()
-        || !captions.is_empty();
+        || !captions.is_empty()
+        || !moves.is_empty()
+        || !unmoves.is_empty();
     if !changed && !a.list {
         die(
             "edit",
-            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin/--caption or --list",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin/--caption/--move/--unmove or --list",
         );
     }
     let mut edits = ep.edits.clone();
@@ -1160,11 +1200,48 @@ fn edit_cmd(args: &[String]) {
         );
         println!("caption: {} = {text:?}", asset_label(asset));
     }
+    for asset in &unmoves {
+        if edits.unmove(&asset.id) {
+            println!("unmove: {}", asset_label(asset));
+        } else {
+            println!("unmove: {} had no move", asset_label(asset));
+        }
+    }
     // Each solo photo must be in the film; each join must leave the two in
     // one collage of the film (neighbouring collage photos of one day).
     // Collage edits never change which photos are in the film.
     let edited = |edits: &PlanEdits| planmod::apply_edits(&ep.base, &ep.assets, edits);
     let mut plan = edited(&edits);
+    // A move places one film pick next to another of the same day, in the
+    // film only (pins above count, so --include X --move X works).
+    for (x, y, after) in &moves {
+        let in_film = |a: &Asset| plan.hero.iter().any(|e| e.asset_id == a.id);
+        for asset in [x, y] {
+            if !in_film(asset) {
+                die("edit", format!("{} is not in the film", asset_label(asset)));
+            }
+        }
+        let day = |a: &Asset| cluster::day_key(a.taken_at, a.tz_offset_secs);
+        if x.id == y.id {
+            die("edit", "a shot can't move next to itself");
+        }
+        if a_day_differs(day(x), day(y)) {
+            die(
+                "edit",
+                format!(
+                    "{} and {} are on different days: a shot moves only within its day",
+                    asset_label(x),
+                    asset_label(y)
+                ),
+            );
+        }
+        edits.set_move(x.id.clone(), y.id.clone(), *after);
+        let side = if *after { "after" } else { "before" };
+        println!("move: {} {side} {}", asset_label(x), asset_label(y));
+    }
+    if !moves.is_empty() {
+        plan = edited(&edits);
+    }
     for asset in &solos {
         if !plan.hero.iter().any(|e| e.asset_id == asset.id) {
             die("edit", format!("{} is not in the film", asset_label(asset)));
@@ -1215,6 +1292,35 @@ fn edit_cmd(args: &[String]) {
             .and_then(|e| by_id.get(e.asset_id.as_str()))
             .map_or_else(|| "(start/end)".to_string(), |x| asset_label(x))
     };
+    let chapter_of = |id: &str| {
+        plan.chapters
+            .iter()
+            .position(|c| c.asset_ids.iter().any(|a| a == id))
+    };
+    for (asset, ..) in &moves {
+        let Some(i) = hero.iter().position(|e| e.asset_id == asset.id) else {
+            continue;
+        };
+        let last = hero
+            .iter()
+            .rposition(|e| e.asset_id == asset.id)
+            .unwrap_or(i);
+        let (prev, next) = (i.checked_sub(1).map(|j| &hero[j]), hero.get(last + 1));
+        println!(
+            "film: {} after {} before {}",
+            asset_label(asset),
+            label_at(i.checked_sub(1)),
+            label_at(Some(last + 1))
+        );
+        if let (Some(p), Some(n)) = (prev, next) {
+            let (cp, cn) = (chapter_of(&p.asset_id), chapter_of(&n.asset_id));
+            if cp == cn && cp != chapter_of(&asset.id) {
+                println!(
+                    "note: it plays inside another chapter, whose place is shown again after it"
+                );
+            }
+        }
+    }
     for asset in &ops[3].0 {
         match hero.iter().position(|e| e.asset_id == asset.id) {
             Some(i) => println!(
@@ -1598,6 +1704,35 @@ mod tests {
         assert!(parse_edit_args(&args("--join a")).is_err());
         assert!(parse_edit_args(&args("--join a b c")).is_err());
         assert!(parse_edit_args(&args("--solo")).is_err());
+    }
+
+    #[test]
+    fn edit_args_take_moves() {
+        let a = parse_edit_args(&args(
+            "--db x.db --move IMG_1620.HEIC --before IMG_1613.HEIC --move b --after c --unmove d e",
+        ))
+        .unwrap();
+        assert_eq!(
+            a.moves,
+            vec![
+                (
+                    "IMG_1620.HEIC".to_string(),
+                    "IMG_1613.HEIC".to_string(),
+                    false
+                ),
+                ("b".to_string(), "c".to_string(), true),
+            ]
+        );
+        assert_eq!(a.unmove, vec!["d".to_string(), "e".to_string()]);
+        for bad in [
+            "--move a",
+            "--after b",
+            "--move a --move b --after c",
+            "--move a b --after c",
+            "--unmove",
+        ] {
+            assert!(parse_edit_args(&args(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

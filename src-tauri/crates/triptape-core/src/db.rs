@@ -1068,6 +1068,11 @@ mod tests {
             swaps: vec![("a2".into(), "a3".into())],
             place_overrides: [("a1".to_string(), "Our Hotel".to_string())].into(),
             caption_overrides: [("a3".to_string(), "Sunset".to_string())].into(),
+            moves: vec![crate::plan::FilmMove {
+                asset: "a7".into(),
+                anchor: "a8".into(),
+                after: true,
+            }],
             collage: crate::types::CollageEdits {
                 solo: vec!["a4".into()],
                 joins: vec![("a5".into(), "a6".into())],
