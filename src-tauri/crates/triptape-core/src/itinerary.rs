@@ -357,6 +357,18 @@ impl Itinerary {
         })
     }
 
+    /// First and last day of the trip: the earliest and latest dates of
+    /// any stop. `None` when no stop carries a date.
+    pub fn span(&self) -> Option<(NaiveDate, NaiveDate)> {
+        let windows = self.stops.iter().filter_map(ItinStop::window);
+        windows.fold(None, |acc, (a, d)| {
+            Some(match acc {
+                None => (a, d),
+                Some((s, e)) => (s.min(a), e.max(d)),
+            })
+        })
+    }
+
     /// Ship names on this itinerary (never shown as map points).
     pub fn ships(&self) -> Vec<String> {
         let mut out: Vec<String> = vec![];
@@ -643,6 +655,11 @@ mod tests {
         assert_eq!(places, ["Tokyo", "Carnival Luminosa", "Osaka"]);
         assert_eq!(out.chapters[1].title, "Carnival Luminosa");
         assert_eq!(out.map_polyline.len(), 7);
+    }
+
+    #[test]
+    fn span_runs_from_departure_to_homecoming() {
+        assert_eq!(itin().span(), Some((day("2026-10-03"), day("2026-10-30"))));
     }
 
     #[test]

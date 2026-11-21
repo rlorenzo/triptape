@@ -729,6 +729,16 @@ fn export_inner(
                 ffmpeg_bin: caps.ffmpeg_bin.clone(),
                 max_pages: opts.book_max_pages,
                 progress: opts.progress.clone(),
+                // The itinerary's span, else the first to last photo day.
+                dates: opts
+                    .itinerary
+                    .as_ref()
+                    .and_then(|i| i.span())
+                    .or_else(|| {
+                        let days = assets.iter().filter_map(asset_day);
+                        days.clone().min().zip(days.max())
+                    })
+                    .map(|(a, b)| triptape_core::plan::date_range_label(a, b)),
             },
         ) {
             Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),

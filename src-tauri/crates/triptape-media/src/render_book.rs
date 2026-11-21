@@ -588,6 +588,9 @@ pub struct BookOptions {
     pub max_pages: Option<usize>,
     /// Progress and cancel handle (default: silent, never cancelled).
     pub progress: crate::progress::Progress,
+    /// The trip's dates for the cover (`October 3–30, 2026`); `None` puts
+    /// a generic line there.
+    pub dates: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1807,7 +1810,30 @@ fn draw_cover_collage(
     if photos.is_empty() {
         return None;
     }
-    let picks = evenly_spaced(photos.len(), photos.len().min(12));
+    // People make the cover: tiles come from photos with people in them,
+    // evenly through the trip, topped up from the rest only when too few.
+    let with_people: Vec<usize> = (0..photos.len())
+        .filter(|&i| photos[i].people > 0)
+        .collect();
+    let want = photos.len().min(12);
+    let picks: Vec<usize> = if with_people.len() >= want {
+        evenly_spaced(with_people.len(), want)
+            .into_iter()
+            .map(|j| with_people[j])
+            .collect()
+    } else {
+        let mut picks = with_people.clone();
+        let rest: Vec<usize> = (0..photos.len())
+            .filter(|i| !with_people.contains(i))
+            .collect();
+        picks.extend(
+            evenly_spaced(rest.len(), want - picks.len())
+                .into_iter()
+                .map(|j| rest[j]),
+        );
+        picks.sort_unstable();
+        picks
+    };
     let (cols, rows) = cover_grid(picks.len());
     let gap = 14u32;
     let tile_w = (tw - gap * (cols + 1)) / cols;
@@ -1839,7 +1865,7 @@ fn draw_cover_collage(
     match typst_text_png(
         &opts.typst_bin,
         &opts.trip_name,
-        "TripTape Photo Book",
+        opts.dates.as_deref().unwrap_or("TripTape Photo Book"),
         &out.with_file_name("cover-title.png"),
     ) {
         Some(text) => {
@@ -1883,6 +1909,10 @@ fn save_jpg(img: &RgbImage, out: &Path) -> Result<(), crate::MediaError> {
 
 // -- Typst -----------------------------------------------------------------
 
+/// Blank pages between the cover and page 1 in `proof.pdf` (see
+/// [`write_typst_and_compile`]).
+const PROOF_LEAD_BLANKS: usize = 2;
+
 /// Write the Typst source and compile it. `bleed` selects press geometry
 /// (trim + 0.125 in each side); otherwise screen proof geometry.
 fn write_typst_and_compile(
@@ -1913,6 +1943,15 @@ fn write_typst_and_compile(
             "#rect(width: 100%, height: 100%, fill: rgb(18, 20, 26))\n#place(center + horizon)[#text(size: 28pt)[{}]]\n#pagebreak()\n",
             typ_escape(&opts.trip_name)
         )),
+    }
+    // The proof is for two-page viewing: blanks after the cover stand in
+    // for the cover's back and the inside front cover, so page 1 opens on
+    // the right and every spread (2|3, 4|5, …) lands side by side. Press
+    // files keep interior pages only.
+    if !bleed {
+        for _ in 0..PROOF_LEAD_BLANKS {
+            typ.push_str("#box()\n#pagebreak()\n");
+        }
     }
     for (i, jpg) in jpegs.iter().enumerate() {
         let page_no = i + 1;
@@ -1959,7 +1998,8 @@ fn write_typst_and_compile(
 }
 
 /// Rasterize the captioned proof pages at 300 ppi and overwrite the
-/// matching page JPEGs. Proof page N+1 is interior page N (page 1 is the
+/// matching page JPEGs. Proof page N+1+[`PROOF_LEAD_BLANKS`] is interior
+/// page N (page 1 is the
 /// uncounted cover-proxy); proof geometry equals trim, so sizes match.
 fn burn_captions(
     jpegs: &[PathBuf],
@@ -1973,7 +2013,7 @@ fn burn_captions(
     std::fs::create_dir_all(&raster).map_err(|e| crate::MediaError::Io(e.to_string()))?;
     let pages = captioned
         .iter()
-        .map(|n| (n + 1).to_string())
+        .map(|n| (n + 1 + PROOF_LEAD_BLANKS).to_string())
         .collect::<Vec<_>>()
         .join(",");
     let result = (|| {
@@ -1994,7 +2034,7 @@ fn burn_captions(
             )));
         }
         for &n in captioned {
-            let png = raster.join(format!("p{}.png", n + 1));
+            let png = raster.join(format!("p{}.png", n + 1 + PROOF_LEAD_BLANKS));
             let img = image::open(&png)
                 .map_err(|e| crate::MediaError::Io(format!("read {}: {e}", png.display())))?
                 .to_rgb8();
@@ -3029,6 +3069,7 @@ mod tests {
             ffmpeg_bin: "ffmpeg".into(),
             max_pages: None,
             progress: Default::default(),
+            dates: None,
         };
         let res = render_book(&photos, None, &[], &out, &opts).unwrap();
         assert!(
@@ -3105,6 +3146,7 @@ mod tests {
             ffmpeg_bin: "ffmpeg".into(),
             max_pages: None,
             progress: Default::default(),
+            dates: None,
         };
         render_book(&photos, None, &titles, &out, &opts).unwrap();
         let typ = std::fs::read_to_string(out.join("proof.typ")).unwrap();
