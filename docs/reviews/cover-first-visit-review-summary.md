@@ -29,3 +29,5 @@ None. The final review reported no findings and the verdict "good to go".
 - Duration: 8m 20s
 - Final issue counts: High 0, Medium 0, Low 0
 - Final status: CLEAN
+
+> **Later change:** after Greptile's review of PR #30, `cover_worthy` and its `preferred` flags became `cover_rank` (2 = camera photo with people, 1 = camera photo, 0 = PNG). `cover_picks` now fills tiles rank by rank, so PNGs appear only when the camera photos run out.

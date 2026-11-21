@@ -73,22 +73,35 @@ pub const HOME_BASE_DAYS: usize = 3;
 /// photo. A sight visited once in depth (Sensō-ji: 22 photos on one day,
 /// a stray shot on two others) stays.
 pub fn home_bases(assets: &[Asset]) -> HashSet<String> {
-    let mut visits: HashMap<(jiff::civil::Date, String), usize> = HashMap::new();
-    for key in assets
-        .iter()
-        .filter_map(|a| Some((asset_day(a)?, photo_attraction(a)?)))
-    {
-        *visits.entry(key).or_default() += 1;
+    let poi: Vec<Option<String>> = assets.iter().map(photo_attraction).collect();
+    home_bases_of(&day_visits(assets.iter().zip(&poi)))
+}
+
+/// Photos per (day, attraction), from each asset paired with its
+/// [`photo_attraction`].
+fn day_visits<'a>(
+    shots: impl IntoIterator<Item = (&'a Asset, &'a Option<String>)>,
+) -> HashMap<(jiff::civil::Date, &'a str), usize> {
+    let mut visits = HashMap::new();
+    for (a, p) in shots {
+        if let (Some(d), Some(p)) = (asset_day(a), p) {
+            *visits.entry((d, p.as_str())).or_default() += 1;
+        }
     }
-    let mut days: HashMap<String, usize> = HashMap::new();
-    for ((_, poi), n) in visits {
+    visits
+}
+
+/// [`home_bases`] from a [`day_visits`] tally.
+fn home_bases_of(visits: &HashMap<(jiff::civil::Date, &str), usize>) -> HashSet<String> {
+    let mut days: HashMap<&str, usize> = HashMap::new();
+    for (&(_, poi), &n) in visits {
         if n >= PLACE_MIN_SHOTS {
             *days.entry(poi).or_default() += 1;
         }
     }
     days.into_iter()
-        .filter(|(_, d)| *d >= HOME_BASE_DAYS)
-        .map(|(poi, _)| poi)
+        .filter(|&(_, d)| d >= HOME_BASE_DAYS)
+        .map(|(poi, _)| poi.to_string())
         .collect()
 }
 
@@ -148,22 +161,20 @@ pub fn photo_places(
         .iter()
         .flat_map(|c| c.asset_ids.iter().map(String::as_str))
         .collect();
-    // Videos too: a reel can be a clip, and it names its place like a photo.
-    let planned: Vec<&Asset> = assets
-        .iter()
-        .filter(|a| in_plan.is_empty() || in_plan.contains(a.id.as_str()))
-        .collect();
-    let home = home_bases(assets);
+    // One gazetteer lookup per asset serves both the trip's home bases and
+    // the planned photos' visits.
+    let poi: Vec<Option<String>> = assets.iter().map(photo_attraction).collect();
+    let home = home_bases_of(&day_visits(assets.iter().zip(&poi)));
     let hidden = |n: &str| home.contains(n) || itin.is_some_and(|i| i.hides_attraction(n));
-    let poi: Vec<Option<String>> = planned.iter().map(|a| photo_attraction(a)).collect();
-    let mut visits: HashMap<(jiff::civil::Date, &str), usize> = HashMap::new();
-    for (a, p) in planned.iter().zip(&poi) {
-        if let (Some(d), Some(p)) = (asset_day(a), p) {
-            *visits.entry((d, p.as_str())).or_default() += 1;
-        }
-    }
+    // Videos too: a reel can be a clip, and it names its place like a photo.
+    let planned: Vec<(&Asset, &Option<String>)> = assets
+        .iter()
+        .zip(&poi)
+        .filter(|(a, _)| in_plan.is_empty() || in_plan.contains(a.id.as_str()))
+        .collect();
+    let visits = day_visits(planned.iter().copied());
     let mut out = HashMap::new();
-    for (a, poi) in planned.into_iter().zip(&poi) {
+    for (a, poi) in planned {
         let own = match spot(itin, a) {
             Spot::Named(name) => Some(name.to_string()),
             Spot::Aboard(ship) => Some(ship),
