@@ -105,19 +105,28 @@ pub struct NamedPlace {
     /// Metres from the point that count as at the place (default 300).
     #[serde(default = "default_place_radius")]
     pub radius_m: f64,
-    #[serde(default)]
-    pub from: Option<String>,
-    #[serde(default)]
-    pub until: Option<String>,
+    #[serde(default, deserialize_with = "local_minute")]
+    pub from: Option<jiff::civil::DateTime>,
+    #[serde(default, deserialize_with = "local_minute")]
+    pub until: Option<jiff::civil::DateTime>,
+}
+
+/// A `YYYY-MM-DD HH:MM` local time, parsed once when the itinerary loads.
+fn local_minute<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<jiff::civil::DateTime>, D::Error> {
+    let Some(s) = Option::<String>::deserialize(d)? else {
+        return Ok(None);
+    };
+    jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M", s.trim())
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom(format!("{s:?} is not \"YYYY-MM-DD HH:MM\"")))
 }
 
 impl NamedPlace {
-    /// The local time window, when both ends parse.
+    /// The local time window, when both ends are given.
     fn window(&self) -> Option<(jiff::civil::DateTime, jiff::civil::DateTime)> {
-        let parse = |s: &Option<String>| {
-            jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M", s.as_deref()?.trim()).ok()
-        };
-        Some((parse(&self.from)?, parse(&self.until)?))
+        self.from.zip(self.until)
     }
 
     /// Metres from `gps` when the place has a point and `gps` is inside it.
@@ -236,10 +245,7 @@ impl Itinerary {
         for pl in &self.places {
             let timed = pl.from.is_some() || pl.until.is_some();
             if timed && pl.window().is_none() {
-                return Err(format!(
-                    "place {:?}: from/until must both be \"YYYY-MM-DD HH:MM\"",
-                    pl.name
-                ));
+                return Err(format!("place {:?} needs both from and until", pl.name));
             }
             if !timed && (pl.lat.is_none() || pl.lon.is_none()) {
                 return Err(format!(
@@ -490,19 +496,6 @@ impl Itinerary {
             })
         })
     }
-
-    /// Ship names on this itinerary (never shown as map points).
-    pub fn ships(&self) -> Vec<String> {
-        let mut out: Vec<String> = vec![];
-        for leg in &self.legs {
-            if let (LegMode::Ship, Some(s)) = (leg.mode, &leg.ship) {
-                if !out.contains(s) {
-                    out.push(s.clone());
-                }
-            }
-        }
-        out
-    }
 }
 
 fn parse_range(s: &str) -> Result<(NaiveDate, NaiveDate), String> {
@@ -544,25 +537,15 @@ pub fn apply_itinerary(plan: &Plan, assets: &[Asset], itin: &Itinerary) -> Plan 
 /// and title a whole day ashore in Jeju with the ship's name. Shots
 /// without GPS cast no vote; a chapter with none takes the no-fix label.
 fn chapter_label(itin: &Itinerary, day: NaiveDate, members: &[&Asset]) -> Option<DayLabel> {
-    let mut votes: Vec<(DayLabel, usize)> = vec![];
-    for gps in members.iter().filter_map(|a| a.gps) {
-        let Some(label) = itin.label_for(day, Some(gps)) else {
-            continue;
-        };
-        match votes.iter_mut().find(|(l, _)| *l == label) {
-            Some((_, n)) => *n += 1,
-            None => votes.push((label, 1)),
-        }
-    }
+    let votes = crate::places::tally(
+        members
+            .iter()
+            .filter_map(|a| itin.label_for(day, Some(a.gps?))),
+    );
     if votes.is_empty() {
         return itin.label_for(day, None);
     }
-    // `max_by_key` keeps the last maximum; reversing keeps the first.
-    votes
-        .into_iter()
-        .rev()
-        .max_by_key(|(_, n)| *n)
-        .map(|(l, _)| l)
+    crate::places::most_counted(votes).map(|(l, _)| l)
 }
 
 fn relabel_chapter(
@@ -593,13 +576,7 @@ fn relabel_chapter(
 /// the port on a port day, else the ship; ashore, the attraction its
 /// photos visited (see [`crate::places`]), else the stop's city.
 fn chapter_name(itin: &Itinerary, day: NaiveDate, members: &[&Asset], label: DayLabel) -> String {
-    let mut named: Vec<(&str, usize)> = vec![];
-    for name in members.iter().filter_map(|a| itin.place_of(a)) {
-        match named.iter_mut().find(|(n, _)| *n == name) {
-            Some((_, c)) => *c += 1,
-            None => named.push((name, 1)),
-        }
-    }
+    let named = crate::places::tally(members.iter().filter_map(|a| itin.place_of(a)));
     // A chapter spanning several named places (the Flower Dome, then the
     // Cloud Forest) is named for what holds them, not its biggest part.
     let several = named
@@ -607,11 +584,8 @@ fn chapter_name(itin: &Itinerary, day: NaiveDate, members: &[&Asset], label: Day
         .filter(|(_, c)| *c >= crate::places::PLACE_MIN_SHOTS)
         .count()
         > 1;
-    if let Some((name, _)) = named
-        .into_iter()
-        .rev()
-        .max_by_key(|(_, c)| *c)
-        .filter(|(_, c)| !several && 2 * c >= members.len())
+    if let Some((name, _)) =
+        crate::places::most_counted(named).filter(|(_, c)| !several && 2 * c >= members.len())
     {
         return name.to_string();
     }
@@ -678,7 +652,6 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(itin().ships(), ["Carnival Luminosa", "Disney Adventure"]);
         // Chain polyline: every stop in order, loops and repeats included.
         assert_eq!(itin().polyline().len(), 7);
     }
@@ -854,6 +827,15 @@ mod tests {
             1,
         );
         assert!(Itinerary::from_json(&bad).is_err());
+        // So is a window with only one end.
+        let half = JSON.replacen(
+            "\"legs\"",
+            r#""places": [{ "name": "X", "from": "2026-10-23 11:30" }], "legs""#,
+            1,
+        );
+        assert!(Itinerary::from_json(&half)
+            .unwrap_err()
+            .contains("needs both from and until"));
     }
 
     #[test]

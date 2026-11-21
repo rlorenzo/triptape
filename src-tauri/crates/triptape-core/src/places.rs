@@ -25,6 +25,24 @@ pub fn photo_attraction(a: &Asset) -> Option<String> {
     attraction_within(a.gps?, PLACE_RADIUS_M)
 }
 
+/// Each distinct item with its count, in the order first seen.
+pub fn tally<K: PartialEq>(items: impl IntoIterator<Item = K>) -> Vec<(K, usize)> {
+    let mut counts: Vec<(K, usize)> = vec![];
+    for k in items {
+        match counts.iter_mut().find(|(n, _)| *n == k) {
+            Some((_, c)) => *c += 1,
+            None => counts.push((k, 1)),
+        }
+    }
+    counts
+}
+
+/// The most counted entry of a [`tally`]; ties go to the first seen
+/// (`max_by_key` keeps the last maximum, so it runs reversed).
+pub fn most_counted<K>(counts: Vec<(K, usize)>) -> Option<(K, usize)> {
+    counts.into_iter().rev().max_by_key(|(_, c)| *c)
+}
+
 /// The attraction most of `fixes` were taken at, when at least `min_shots`
 /// were (ties: the first reached). `hidden` names the owner never wants.
 pub fn visited_attraction(
@@ -32,22 +50,38 @@ pub fn visited_attraction(
     min_shots: usize,
     hidden: impl Fn(&str) -> bool,
 ) -> Option<String> {
-    let mut counts: Vec<(String, usize)> = vec![];
-    for &f in fixes {
-        let Some(name) = attraction_within(f, PLACE_RADIUS_M).filter(|n| !hidden(n)) else {
-            continue;
-        };
-        match counts.iter_mut().find(|(n, _)| *n == name) {
-            Some((_, c)) => *c += 1,
-            None => counts.push((name, 1)),
-        }
-    }
-    counts
-        .into_iter()
-        .rev()
-        .max_by_key(|(_, c)| *c)
+    let names = fixes
+        .iter()
+        .filter_map(|&f| attraction_within(f, PLACE_RADIUS_M))
+        .filter(|n| !hidden(n));
+    most_counted(tally(names))
         .filter(|(_, c)| *c >= min_shots.max(1))
         .map(|(n, _)| n)
+}
+
+/// Where the itinerary alone puts a photo, before any attraction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Spot<'a> {
+    /// A place the owner named.
+    Named(&'a str),
+    /// On board this ship (even at a dock beside Miraikan).
+    Aboard(String),
+    /// Ashore, or no itinerary.
+    Ashore,
+}
+
+/// A photo's [`Spot`]: a named place wins over the ship, as the owner was there.
+pub fn spot<'a>(itin: Option<&'a Itinerary>, a: &Asset) -> Spot<'a> {
+    let Some(itin) = itin else {
+        return Spot::Ashore;
+    };
+    if let Some(name) = itin.place_of(a) {
+        return Spot::Named(name);
+    }
+    asset_day(a)
+        .and_then(|d| itin.label_for(d, a.gps))
+        .filter(|l| l.on_ship)
+        .map_or(Spot::Ashore, |l| Spot::Aboard(l.place))
 }
 
 /// A chapter's attraction for its name when the plan has no itinerary:
@@ -84,32 +118,28 @@ pub fn photo_places(
         .filter(|a| in_plan.is_empty() || in_plan.contains(a.id.as_str()))
         .collect();
     let hidden = |n: &str| itin.is_some_and(|i| i.hides_attraction(n));
-    let mut visits: HashMap<(jiff::civil::Date, String), usize> = HashMap::new();
-    for a in &planned {
-        if let (Some(d), Some(poi)) = (asset_day(a), photo_attraction(a)) {
-            *visits.entry((d, poi)).or_default() += 1;
+    let poi: Vec<Option<String>> = planned.iter().map(|a| photo_attraction(a)).collect();
+    let mut visits: HashMap<(jiff::civil::Date, &str), usize> = HashMap::new();
+    for (a, p) in planned.iter().zip(&poi) {
+        if let (Some(d), Some(p)) = (asset_day(a), p) {
+            *visits.entry((d, p.as_str())).or_default() += 1;
         }
     }
     let mut out = HashMap::new();
-    for a in planned {
-        let own = itin
-            .and_then(|i| i.place_of(a))
-            .map(String::from)
-            .or_else(|| {
-                let aboard = itin
-                    .zip(asset_day(a))
-                    .and_then(|(i, d)| i.label_for(d, a.gps))
-                    .filter(|l| l.on_ship);
-                match aboard {
-                    Some(l) => Some(l.place),
-                    None => photo_attraction(a).filter(|poi| {
-                        !hidden(poi)
-                            && asset_day(a)
-                                .and_then(|d| visits.get(&(d, poi.clone())))
-                                .is_some_and(|&n| n >= PLACE_MIN_SHOTS)
-                    }),
-                }
-            });
+    for (a, poi) in planned.into_iter().zip(&poi) {
+        let own = match spot(itin, a) {
+            Spot::Named(name) => Some(name.to_string()),
+            Spot::Aboard(ship) => Some(ship),
+            Spot::Ashore => poi
+                .as_deref()
+                .filter(|&p| {
+                    !hidden(p)
+                        && asset_day(a)
+                            .and_then(|d| visits.get(&(d, p)))
+                            .is_some_and(|&n| n >= PLACE_MIN_SHOTS)
+                })
+                .map(String::from),
+        };
         if let Some(p) = own.or_else(|| chapter_place.get(a.id.as_str()).map(|p| p.to_string())) {
             out.insert(a.id.clone(), p);
         }
@@ -145,6 +175,14 @@ mod tests {
             })
             .collect();
         plan
+    }
+
+    #[test]
+    fn the_most_counted_ties_to_the_first_seen() {
+        let t = tally(["b", "a", "b", "a", "c"]);
+        assert_eq!(t, [("b", 2), ("a", 2), ("c", 1)]);
+        assert_eq!(most_counted(t), Some(("b", 2)));
+        assert_eq!(most_counted(tally(Vec::<&str>::new())), None);
     }
 
     #[test]
@@ -225,5 +263,10 @@ mod tests {
         )]);
         let places = photo_places(&plan, &assets, Some(&itin));
         assert_eq!(places["m0"], "Carnival Luminosa");
+        assert_eq!(
+            spot(Some(&itin), &assets[0]),
+            Spot::Aboard("Carnival Luminosa".into())
+        );
+        assert_eq!(spot(None, &assets[0]), Spot::Ashore);
     }
 }

@@ -645,7 +645,7 @@ fn book_flow(photos: &[BookPhoto], has_map: bool, cap: usize) -> Vec<FlowPage> {
     let chapter_of: Vec<Option<usize>> = photos.iter().map(|p| p.chapter).collect();
     // A page break wherever the day or the owner-named place changes.
     let mut stretch = 0u32;
-    let day_of: Vec<Option<u32>> = photos
+    let stretch_of: Vec<Option<u32>> = photos
         .iter()
         .enumerate()
         .map(|(i, p)| {
@@ -655,7 +655,7 @@ fn book_flow(photos: &[BookPhoto], has_map: bool, cap: usize) -> Vec<FlowPage> {
             Some(stretch)
         })
         .collect();
-    flow_pages(&chapter_of, &day_of, wide_index(photos), has_map, cap)
+    flow_pages(&chapter_of, &stretch_of, wide_index(photos), has_map, cap)
 }
 
 /// Largest selection size found whose flowed book fits `cap` counted pages.

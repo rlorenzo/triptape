@@ -14,6 +14,7 @@ use crate::segment_cache::{SegmentCache, SegmentCacheConfig};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use triptape_core::itinerary::asset_day;
+use triptape_core::places::Spot;
 use triptape_core::plan::{check_source_integrity, plan_eligibility, trip_day, Integrity};
 use triptape_core::types::{distinct_assets, AssetKind, Plan, PlanEntry, Rendition};
 
@@ -764,15 +765,14 @@ fn export_inner(
             let day = asset_day(a).zip(trip_start).map(|(d, s)| trip_day(d, s));
             let place = places.get(&a.id).cloned();
             let itin = opts.itinerary.as_ref();
-            let date = asset_day(a);
+            let spot = triptape_core::places::spot(itin, a);
             whereabouts.push(Whereabouts {
                 day,
-                port_day: itin.zip(date).and_then(|(i, d)| i.port_on(d)).is_some(),
-                aboard: itin.and_then(|i| i.place_of(a)).is_none()
-                    && itin
-                        .zip(date)
-                        .and_then(|(i, d)| i.label_for(d, a.gps))
-                        .is_some_and(|l| l.on_ship),
+                port_day: itin
+                    .zip(asset_day(a))
+                    .and_then(|(i, d)| i.port_on(d))
+                    .is_some(),
+                aboard: matches!(spot, Spot::Aboard(_)),
                 gps: a.gps,
             });
             book_photos.push(BookPhoto {
@@ -782,7 +782,10 @@ fn export_inner(
                 height: h,
                 caption: book_caption(plan, &places, &a.id),
                 place,
-                area: itin.and_then(|i| i.place_of(a)).map(String::from),
+                area: match spot {
+                    Spot::Named(name) => Some(name.to_string()),
+                    _ => None,
+                },
                 day,
                 chapter,
                 // Unclamped, so a strong bonus still ranks above a weak one
@@ -807,9 +810,11 @@ fn export_inner(
             });
         }
         // Story order: keep db order (taken_at, id).
-        let order = port_day_order(&whereabouts);
-        let book_photos: Vec<BookPhoto> =
-            order.into_iter().map(|i| book_photos[i].clone()).collect();
+        let mut slots: Vec<Option<BookPhoto>> = book_photos.into_iter().map(Some).collect();
+        let book_photos: Vec<BookPhoto> = port_day_order(&whereabouts)
+            .into_iter()
+            .filter_map(|i| slots[i].take())
+            .collect();
         let book_dir = out_dir.join("book");
         let staged_book = stage.join("book");
         // Day-marker titles: day once, with the location.
@@ -1018,6 +1023,21 @@ mod tests {
             book_caption(&plan, &places, "a").as_deref(),
             Some("Rain all day")
         );
+    }
+
+    #[test]
+    fn only_sharp_panoramas_earn_the_book_bonus() {
+        let mut a = triptape_core::types::Asset::new("p", "p.jpg".into(), AssetKind::Photo);
+        (a.width, a.height) = (Some(8000), Some(2000));
+        assert_eq!(
+            panorama_bonus(&a, PANORAMA_MIN_QUALITY),
+            PANORAMA_BOOK_BONUS
+        );
+        assert_eq!(panorama_bonus(&a, PANORAMA_MIN_QUALITY - 0.01), 0.0);
+        (a.width, a.height) = (Some(4032), Some(3024));
+        assert_eq!(panorama_bonus(&a, 0.9), 0.0);
+        a.width = None;
+        assert_eq!(panorama_bonus(&a, 0.9), 0.0);
     }
 
     #[test]
