@@ -188,6 +188,10 @@ struct Whereabouts {
     gps: Option<(f64, f64)>,
 }
 
+/// Returns to an area already left that mark a port day whose shots
+/// interleave between places.
+const INTERLEAVED_RETURNS: usize = 3;
+
 /// Shots this close (single-linked) are one area of a port day.
 const PORT_AREA_LINK_M: f64 = 6_000.0;
 
@@ -196,7 +200,8 @@ const PORT_AREA_LINK_M: f64 = 6_000.0;
 /// interleave by time, so the day's places alternate page to page. There,
 /// ashore shots group by area (single-linked within [`PORT_AREA_LINK_M`]),
 /// areas in the order first reached, and shots on board keep their
-/// moment between them. Other days keep story order.
+/// moment between them. Days whose areas do not interleave, and other
+/// days, keep story order.
 fn port_day_order(at: &[Whereabouts]) -> Vec<usize> {
     let mut out = Vec::with_capacity(at.len());
     let mut start = 0;
@@ -247,6 +252,22 @@ fn port_day_order(at: &[Whereabouts]) -> Vec<usize> {
         // 5 PM after the cliffs); the first shot of an area brings its
         // whole area along.
         let roots: Vec<usize> = (0..ashore.len()).map(|a| root(&mut area, a)).collect();
+        // Group only when the day keeps switching between areas (two
+        // parties' phones in two places at once). A day that moves on and
+        // comes back once (the waterfall, the temple, then Seogwipo again
+        // in the afternoon) stays in time order.
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut returns = 0;
+        for w in roots.windows(2) {
+            seen.insert(w[0]);
+            if w[1] != w[0] && seen.contains(&w[1]) {
+                returns += 1;
+            }
+        }
+        if returns < INTERLEAVED_RETURNS {
+            out.extend(day);
+            continue;
+        }
         let area_of: HashMap<usize, usize> =
             ashore.iter().zip(&roots).map(|(&i, &r)| (i, r)).collect();
         let mut emitted: HashSet<usize> = HashSet::new();
@@ -1077,11 +1098,21 @@ mod tests {
             w(16, true, false, Some(peak)),    // 4 city
             w(16, true, false, None),          // 5 no GPS, beside the Peak shot
             w(16, true, false, Some(disney)),  // 6 Disneyland
-            w(16, true, true, Some(central)),  // 7 back on board
-            w(17, false, true, None),          // 8 sea day
+            w(16, true, false, Some(central)), // 7 city
+            w(16, true, false, Some(disney)),  // 8 Disneyland
+            w(16, true, true, Some(central)),  // 9 back on board
+            w(17, false, true, None),          // 10 sea day
         ];
-        // The dawn deck shot opens the day; the return aboard closes it.
-        assert_eq!(port_day_order(&at), [0, 1, 2, 4, 5, 3, 6, 7, 8]);
+        // Two parties' shots interleave: areas group; the dawn deck shot
+        // opens the day and the return aboard closes it.
+        assert_eq!(port_day_order(&at), [0, 1, 2, 4, 5, 7, 3, 6, 8, 9, 10]);
+        // A day that moves on and comes back once keeps time order.
+        let jeju = vec![
+            w(14, true, false, Some(central)), // waterfall
+            w(14, true, false, Some(disney)),  // temple, far off
+            w(14, true, false, Some(central)), // back in town
+        ];
+        assert_eq!(port_day_order(&jeju), [0, 1, 2]);
         // Days that are not port days keep story order.
         let plain: Vec<Whereabouts> = at
             .iter()
@@ -1090,7 +1121,7 @@ mod tests {
                 ..*x
             })
             .collect();
-        assert_eq!(port_day_order(&plain), (0..9).collect::<Vec<_>>());
+        assert_eq!(port_day_order(&plain), (0..11).collect::<Vec<_>>());
     }
 
     #[test]

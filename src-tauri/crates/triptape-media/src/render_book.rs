@@ -307,14 +307,15 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
         let run: Vec<usize> = (at..limit)
             .take_while(|&pos| photos[order[pos]].same_stretch(opener))
             .collect();
-        // The earliest that is sharp, so the title page does not jump ahead
-        // of the photos taken before it (a castle view from the end of
-        // the visit opening the day).
-        if let Some(pos) = run
-            .iter()
-            .copied()
-            .find(|&pos| sharp(order[pos], PageKind::Divider, 1))
-        {
+        // The earliest that prints well enough full-page (soft is allowed,
+        // blocked is not), so the title page does not jump ahead of the
+        // photos taken before it (a castle view from the end of the visit
+        // opening the day).
+        if let Some(pos) = run.iter().copied().find(|&pos| {
+            let (w, h) = slot_inches(preset, PageKind::Divider, 1);
+            let p = &photos[order[pos]];
+            dpi_verdict(p.width, p.height, w, h) != DpiVerdict::Block
+        }) {
             order[at..=pos].rotate_right(1);
         }
     }
@@ -351,7 +352,14 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
             let partner = small_cells
                 .iter()
                 .filter(|&&(c, small)| {
-                    photos[order[c]].same_stretch(&photos[soft])
+                    // Only a shot from the same moment: a swap must not
+                    // break the book's time order.
+                    let close = match (photos[order[c]].taken_at, photos[soft].taken_at) {
+                        (Some(a), Some(b)) => (a - b).abs() <= TIME_ORDER_SLACK_SECS,
+                        _ => true,
+                    };
+                    close
+                        && photos[order[c]].same_stretch(&photos[soft])
                         && sharp_in(order[c], size)
                         && sharp_in(soft, small)
                 })
@@ -1873,22 +1881,6 @@ fn row_splits(n: usize) -> Vec<Vec<usize>> {
     out
 }
 
-/// Every ordering of `0..n` (n ≤ 4 on a grid page).
-fn orderings(n: usize) -> Vec<Vec<usize>> {
-    if n == 0 {
-        return vec![vec![]];
-    }
-    let mut out = vec![];
-    for rest in orderings(n - 1) {
-        for at in 0..=rest.len() {
-            let mut o = rest.clone();
-            o.insert(at, n - 1);
-            out.push(o);
-        }
-    }
-    out
-}
-
 /// Width / height from which a photo is a panorama: alone on a grid row
 /// it spans the page at its own height.
 const PANORAMA_ASPECT: f64 = 2.0;
@@ -1901,13 +1893,11 @@ const PANORAMA_ASPECT: f64 = 2.0;
 /// least weighted cropping wins: crops cost more the more people a photo
 /// holds (a group shot gets a full-width row instead of losing the faces
 /// at its edges), trimming sky or table off a landscape costs less than
-/// trimming its sides, and very unequal photo sizes and leaving story
-/// order cost a little.
+/// trimming its sides, and very unequal photo sizes cost a little. The
+/// photos keep their slot order, read top to bottom and left to right,
+/// so a page reads in time order.
 fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
     const BALANCE: f64 = 0.3;
-    // Pages read in time order: moving a photo ahead of an earlier one
-    // costs about as much as cutting a fifth of a photo away.
-    const REORDER: f64 = 0.1;
     // How much a photo's faces raise the cost of cropping or shrinking it.
     let people_weight = |p: &BookPhoto| 1.0 + 0.5 * f64::from(p.people.min(4));
     let n = slot.len();
@@ -1920,7 +1910,9 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
     };
     let mut best: Option<(f64, Vec<Rect>)> = None;
     for rows in row_splits(n) {
-        for order in orderings(n) {
+        // Photos keep their order (time order): only the rows vary.
+        {
+            let order: Vec<usize> = (0..n).collect();
             let avail_h = h - gap * (rows.len() + 1) as f64;
             let mut at = 0;
             // (photo, row, share of the row width); `natural` holds each
@@ -2001,11 +1993,6 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
                         }
                     })
                     .sum::<f64>();
-            let inversions = (0..n)
-                .flat_map(|a| (a + 1..n).map(move |b| (a, b)))
-                .filter(|&(a, b)| order[a] > order[b])
-                .count();
-            cost += REORDER * inversions as f64;
             if best.as_ref().is_none_or(|(c, _)| cost < *c - 1e-9) {
                 best = Some((cost, cells));
             }
@@ -3065,14 +3052,16 @@ mod tests {
         assert_eq!(pages[1], (PageKind::Hero, vec![5]), "best sharp opener");
         assert_eq!(pages[2].1, [0], "the first photo follows the hero");
         let divider = pages.iter().find(|(k, _)| *k == PageKind::Divider);
-        assert_eq!(divider.unwrap().1, [12], "sharp chapter photo backs it");
+        // Soft (252 dpi) still prints: the chapter's earliest photo backs
+        // it, so the title page keeps time order.
+        assert_eq!(divider.unwrap().1, [10], "the earliest printable photo");
         let after: Vec<usize> = pages
             .iter()
             .skip_while(|(k, _)| *k != PageKind::Divider)
             .skip(1)
             .flat_map(|(_, t)| t.iter().copied())
             .collect();
-        assert_eq!(after, [10, 11, 13, 14], "the rest keep story order");
+        assert_eq!(after, [11, 12, 13, 14], "the rest keep story order");
         assert!(soft_placements(&photos, 60) < soft_placements(&book(&[]), 60));
         // No sharp candidate: today's choice, the chapters' first photos.
         let pages = pages_of(&book(&[(9, 1.0)]), 60);
@@ -3196,12 +3185,12 @@ mod tests {
         let cells = grid_layout(&[&land, &land, &land, &land], 12.0, 12.0, 0.12);
         fills_page(&cells);
         assert!(cells.iter().all(|c| (c.2 - cells[0].2).abs() < 1e-6));
-        // A group shot among them gets a full-width row: no faces cut off
-        // its sides.
-        let cells = grid_layout(&[&land, &group, &land, &land], 12.0, 12.0, 0.12);
+        // A group shot opening the page gets a full-width row: no faces
+        // cut off its sides.
+        let cells = grid_layout(&[&group, &land, &land, &land], 12.0, 12.0, 0.12);
         fills_page(&cells);
-        assert!(cells[1].2 > 11.0, "group cell {:?}", cells[1]);
-        let (a, c) = (4.0 / 3.0, cells[1].2 / cells[1].3);
+        assert!(cells[0].2 > 11.0, "group cell {:?}", cells[0]);
+        let (a, c) = (4.0 / 3.0, cells[0].2 / cells[0].3);
         assert!(c >= a - 1e-6, "group photo keeps its full width");
         // Two portraits sit side by side, not stacked into wide strips.
         let cells = grid_layout(&[&tall, &tall], 12.0, 12.0, 0.12);
