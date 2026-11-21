@@ -1906,9 +1906,9 @@ fn save_jpg(img: &RgbImage, out: &Path) -> Result<(), crate::MediaError> {
 
 // -- Typst -----------------------------------------------------------------
 
-/// Blank pages between the cover and page 1 in `proof.pdf` (see
-/// [`write_typst_and_compile`]).
-const PROOF_LEAD_BLANKS: usize = 2;
+/// Blank pages between the cover and page 1 in `proof.pdf`: the back of
+/// the cover (see [`write_typst_and_compile`]).
+const PROOF_LEAD_BLANKS: usize = 1;
 
 /// Write the Typst source and compile it. `bleed` selects press geometry
 /// (trim + 0.125 in each side); otherwise screen proof geometry.
@@ -1941,10 +1941,10 @@ fn write_typst_and_compile(
             typ_escape(&opts.trip_name)
         )),
     }
-    // The proof is for two-page viewing: blanks after the cover stand in
-    // for the cover's back and the inside front cover, so page 1 opens on
-    // the right and every spread (2|3, 4|5, …) lands side by side. Press
-    // files keep interior pages only.
+    // The proof is for two-page viewing, which shows the cover alone like
+    // a book (Preview does). A blank for the cover's back then faces page
+    // 1, so page 1 opens on the right and every spread (2|3, 4|5, …) lands
+    // side by side. Press files keep interior pages only.
     if !bleed {
         for _ in 0..PROOF_LEAD_BLANKS {
             typ.push_str("#box()\n#pagebreak()\n");
