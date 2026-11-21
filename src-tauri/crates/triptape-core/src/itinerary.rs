@@ -243,6 +243,17 @@ impl Itinerary {
             return Err("itinerary needs at least two stops and one leg".into());
         }
         for pl in &self.places {
+            if pl.name.trim().is_empty() {
+                return Err("a place needs a name".into());
+            }
+            if pl.lat.is_some_and(|v| !(-90.0..=90.0).contains(&v))
+                || pl.lon.is_some_and(|v| !(-180.0..=180.0).contains(&v))
+            {
+                return Err(format!("place {:?} has lat/lon out of range", pl.name));
+            }
+            if !(pl.radius_m.is_finite() && pl.radius_m > 0.0) {
+                return Err(format!("place {:?} needs a radius_m above 0", pl.name));
+            }
             let timed = pl.from.is_some() || pl.until.is_some();
             if timed && pl.window().is_none() {
                 return Err(format!("place {:?} needs both from and until", pl.name));
@@ -837,6 +848,20 @@ mod tests {
             1,
         );
         assert!(Itinerary::from_json(&reversed).is_err());
+        // Typos are refused too: a blank name, a latitude of 400, a
+        // non-positive radius.
+        for bad_place in [
+            r#"{ "name": " ", "lat": 1.0, "lon": 1.0 }"#,
+            r#"{ "name": "X", "lat": 400.0, "lon": 1.0 }"#,
+            r#"{ "name": "X", "lat": 1.0, "lon": 1.0, "radius_m": -5 }"#,
+        ] {
+            let json = JSON.replacen(
+                "\"legs\"",
+                &format!(r#""places": [{bad_place}], "legs""#),
+                1,
+            );
+            assert!(Itinerary::from_json(&json).is_err(), "{bad_place}");
+        }
         // So is a window with only one end.
         let half = JSON.replacen(
             "\"legs\"",

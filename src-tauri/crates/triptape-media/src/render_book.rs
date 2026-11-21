@@ -1155,7 +1155,7 @@ pub fn render_book(
                     captions
                         .entry(page_no)
                         .or_default()
-                        .extend(titled(title, caption_of(p)));
+                        .extend(titled(title, page_caption(&[p], PageKind::PhotoCaption)));
                     cursor += 1;
                 }
                 draw_half(
@@ -1399,7 +1399,11 @@ fn titled(title: Option<String>, caps: Vec<String>) -> Vec<String> {
 /// Caption lines for a divider page: its background photo's chapter title
 /// plus that photo's own caption, since the photo is consumed here.
 fn divider_lines(bg: &BookPhoto, chapters: &[String], announced: &mut Announced) -> Vec<String> {
-    titled(opening_title(bg, chapters, announced), caption_of(bg))
+    // A captioned background keeps its place too, as on photo pages.
+    titled(
+        opening_title(bg, chapters, announced),
+        page_caption(&[bg], PageKind::PhotoCaption),
+    )
 }
 
 /// A caption set on one grid cell: the slot index of its photo and its text.
@@ -3021,6 +3025,26 @@ mod tests {
         assert!(counted <= 60);
         assert_eq!(kinds[0], PageKind::CoverProxy);
         assert_eq!(*kinds.last().unwrap(), PageKind::Closing);
+    }
+
+    #[test]
+    fn title_pages_keep_a_captioned_photo_place() {
+        let bg = BookPhoto {
+            chapter: Some(0),
+            caption: Some("Best ramen of the trip.".into()),
+            place: Some("Canal City Ramen Stadium".into()),
+            keep: true,
+            ..blank_photo()
+        };
+        let titles = ["Day 11 — Fukuoka".to_string()];
+        assert_eq!(
+            divider_lines(&bg, &titles, &mut Announced::default()),
+            [
+                "Day 11 — Fukuoka",
+                "Best ramen of the trip.",
+                "Canal City Ramen Stadium"
+            ]
+        );
     }
 
     #[test]
