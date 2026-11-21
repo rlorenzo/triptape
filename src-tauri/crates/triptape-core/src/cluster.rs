@@ -86,31 +86,6 @@ pub fn story_tracks(assets: &[Asset]) -> Vec<(&Asset, Track)> {
         .collect()
 }
 
-/// One asset's place in the story, for keepsakes that follow
-/// [`story_order`] (the book, once it is wired to it) and need to tell a
-/// split day's parties apart.
-#[derive(Debug, Clone)]
-pub struct StorySlot<'a> {
-    pub asset: &'a Asset,
-    /// Capture-local day ([`day_key`]).
-    pub day: String,
-    /// Shared timeline, or one party's stretch of a split day
-    /// (`segment` numbers the split stretches, `rank` the party's turn).
-    pub track: Track,
-}
-
-/// [`story_order`] as [`StorySlot`]s.
-pub fn story_slots(assets: &[Asset]) -> Vec<StorySlot<'_>> {
-    story_tracks(assets)
-        .into_iter()
-        .map(|(asset, track)| StorySlot {
-            asset,
-            day: day_key(asset.taken_at, asset.tz_offset_secs),
-            track,
-        })
-        .collect()
-}
-
 /// Asset id -> position in [`story_order`].
 pub fn story_positions(assets: &[Asset]) -> HashMap<&str, usize> {
     story_order(assets)
@@ -1287,9 +1262,7 @@ mod tests {
         assert_eq!(c.len(), 2, "{c:?}");
         assert!(c[0].asset_ids.iter().all(|id| id.starts_with("IMG_15")));
         assert!(c[1].asset_ids.iter().all(|id| id.starts_with("IMG_58")));
-        let slots = story_slots(&a);
-        assert!(slots.iter().all(|s| s.day == slots[0].day));
-        let tracks: Vec<Track> = slots.iter().map(|s| s.track).collect();
+        let tracks: Vec<Track> = story_tracks(&a).into_iter().map(|(_, t)| t).collect();
         // The first city shot comes before anyone is seen apart.
         assert_eq!(tracks[0], Track::Shared);
         let party = |rank| Track::Party { segment: 0, rank };

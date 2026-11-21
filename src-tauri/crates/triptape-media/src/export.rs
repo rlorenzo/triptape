@@ -178,79 +178,23 @@ fn panorama_bonus(a: &triptape_core::types::Asset, quality: f32) -> f32 {
     }
 }
 
-/// Where a book photo was taken, for [`port_day_order`].
-#[derive(Debug, Clone, Copy, Default)]
-struct Whereabouts {
-    day: Option<u32>,
-    /// The ship calls at a port that day.
-    port_day: bool,
-    /// The itinerary puts the shot on board (and no named place claims it).
-    aboard: bool,
-    gps: Option<(f64, f64)>,
-}
-
-/// Shots this close (single-linked) are one area of a port day.
-const PORT_AREA_LINK_M: f64 = 6_000.0;
-
-/// Book order for photos in story order: on a port day a group can split
-/// up (half to Hong Kong Disneyland, half around the city) and the shots
-/// interleave by time, so the day's places alternate page to page. There,
-/// ashore shots group by area (single-linked within [`PORT_AREA_LINK_M`]),
-/// areas in the order first reached, and the shots on board follow
-/// together. Other days keep story order.
-fn port_day_order(at: &[Whereabouts]) -> Vec<usize> {
-    let mut out = Vec::with_capacity(at.len());
-    let mut start = 0;
-    while start < at.len() {
-        let end = (start..at.len())
-            .find(|&i| at[i].day != at[start].day)
-            .unwrap_or(at.len());
-        let day: Vec<usize> = (start..end).collect();
-        start = end;
-        if !at[day[0]].port_day {
-            out.extend(day);
-            continue;
-        }
-        let (aboard, ashore): (Vec<usize>, Vec<usize>) = day.iter().partition(|&&i| at[i].aboard);
-        // Area per ashore shot: union-find over GPS links; a shot without
-        // GPS joins its nearest neighbour in time that has one.
-        let mut area: Vec<usize> = (0..ashore.len()).collect();
-        fn root(area: &mut [usize], mut i: usize) -> usize {
-            while area[i] != i {
-                area[i] = area[area[i]];
-                i = area[i];
-            }
-            i
-        }
-        for a in 0..ashore.len() {
-            for b in a + 1..ashore.len() {
-                if let (Some(p), Some(q)) = (at[ashore[a]].gps, at[ashore[b]].gps) {
-                    if triptape_core::geo::haversine_m(p, q) <= PORT_AREA_LINK_M {
-                        let (ra, rb) = (root(&mut area, a), root(&mut area, b));
-                        area[ra.max(rb)] = ra.min(rb);
-                    }
-                }
-            }
-        }
-        for a in 0..ashore.len() {
-            if at[ashore[a]].gps.is_none() {
-                if let Some(b) = (0..ashore.len())
-                    .filter(|&b| at[ashore[b]].gps.is_some())
-                    .min_by_key(|&b| b.abs_diff(a))
-                {
-                    area[a] = root(&mut area, b);
-                }
-            }
-        }
-        // Unions keep the lower index as root, so an area's root is its
-        // first shot: sorting by root puts areas in the order reached.
-        let roots: Vec<usize> = (0..ashore.len()).map(|a| root(&mut area, a)).collect();
-        let mut order: Vec<usize> = (0..ashore.len()).collect();
-        order.sort_by_key(|&a| (roots[a], a));
-        out.extend(order.into_iter().map(|a| ashore[a]));
-        out.extend(aboard);
+/// Book order: the plan's story order (chapters in turn, each chapter's
+/// shots as the plan tells them, so a split day reads party by party as
+/// in the film), else [`triptape_core::cluster::story_order`] for a plan
+/// without chapters. Asset id -> position.
+fn book_story_positions<'a>(
+    plan: &'a Plan,
+    assets: &'a [triptape_core::types::Asset],
+) -> HashMap<&'a str, usize> {
+    if plan.chapters.is_empty() {
+        return triptape_core::cluster::story_positions(assets);
     }
-    out
+    plan.chapters
+        .iter()
+        .flat_map(|c| c.asset_ids.iter().map(String::as_str))
+        .enumerate()
+        .map(|(i, id)| (id, i))
+        .collect()
 }
 
 /// Whether the book may use this asset. The plan's chapters hold near-dupe
@@ -737,7 +681,6 @@ fn export_inner(
         };
         let trip_start = photo_span.map(|(s, _)| s);
         let mut book_photos: Vec<BookPhoto> = vec![];
-        let mut whereabouts: Vec<Whereabouts> = vec![];
         for a in assets
             .iter()
             .filter(|a| a.kind != AssetKind::Video && in_book_flow(&chapter_of, &a.id))
@@ -770,15 +713,6 @@ fn export_inner(
             let place = places.get(&a.id).cloned();
             let itin = opts.itinerary.as_ref();
             let spot = triptape_core::places::spot(itin, a);
-            whereabouts.push(Whereabouts {
-                day,
-                port_day: itin
-                    .zip(asset_day(a))
-                    .and_then(|(i, d)| i.port_on(d))
-                    .is_some(),
-                aboard: matches!(spot, Spot::Aboard(_)),
-                gps: a.gps,
-            });
             book_photos.push(BookPhoto {
                 asset_id: a.id.clone(),
                 path: a.path.clone(),
@@ -813,12 +747,9 @@ fn export_inner(
                     .max(a.faces.as_ref().map_or(0, |f| f.count)),
             });
         }
-        // Story order: keep db order (taken_at, id).
-        let mut slots: Vec<Option<BookPhoto>> = book_photos.into_iter().map(Some).collect();
-        let book_photos: Vec<BookPhoto> = port_day_order(&whereabouts)
-            .into_iter()
-            .filter_map(|i| slots[i].take())
-            .collect();
+        // The film's story order (stable, so ties keep db order).
+        let story_pos = book_story_positions(plan, assets);
+        book_photos.sort_by_key(|p| story_pos.get(p.asset_id.as_str()).copied());
         let book_dir = out_dir.join("book");
         let staged_book = stage.join("book");
         // Day-marker titles: day once, with the location.
@@ -1045,39 +976,38 @@ mod tests {
     }
 
     #[test]
-    fn port_day_groups_areas_then_the_ship() {
-        let w = |day: u32, port_day: bool, aboard: bool, gps: Option<(f64, f64)>| Whereabouts {
-            day: Some(day),
-            port_day,
-            aboard,
-            gps,
+    fn the_book_follows_the_plans_story_order() {
+        use triptape_core::types::{Asset, Chapter};
+        let chapter = |ids: &[&str]| Chapter {
+            title: String::new(),
+            asset_ids: ids.iter().map(|s| s.to_string()).collect(),
+            place: None,
+            day_index: None,
+            date_label: None,
         };
-        let (central, peak, disney) = (
-            (22.2817, 114.1542),
-            (22.2709, 114.1504),
-            (22.3130, 114.0413),
-        );
-        let at = vec![
-            w(15, false, true, None),          // 0 sea day
-            w(16, true, true, Some(central)),  // 1 on deck at dawn
-            w(16, true, false, Some(central)), // 2 city
-            w(16, true, false, Some(disney)),  // 3 Disneyland
-            w(16, true, false, Some(peak)),    // 4 city
-            w(16, true, false, None),          // 5 no GPS, beside the Peak shot
-            w(16, true, false, Some(disney)),  // 6 Disneyland
-            w(16, true, true, Some(central)),  // 7 back on board
-            w(17, false, true, None),          // 8 sea day
+        let shot = |id: &str, t: i64| {
+            let mut a = Asset::new(id, PathBuf::from(format!("/t/{id}.jpg")), AssetKind::Photo);
+            a.taken_at = Some(t);
+            a
+        };
+        // Capture order interleaves two parties; the plan tells "c" first.
+        let assets = vec![
+            shot("p1", 10),
+            shot("c1", 20),
+            shot("p2", 30),
+            shot("c2", 40),
         ];
-        assert_eq!(port_day_order(&at), [0, 2, 4, 5, 3, 6, 1, 7, 8]);
-        // Days that are not port days keep story order.
-        let plain: Vec<Whereabouts> = at
-            .iter()
-            .map(|x| Whereabouts {
-                port_day: false,
-                ..*x
-            })
-            .collect();
-        assert_eq!(port_day_order(&plain), (0..9).collect::<Vec<_>>());
+        let mut plan = empty_plan();
+        let order = |plan: &Plan| {
+            let pos = book_story_positions(plan, &assets);
+            let mut ids: Vec<&str> = assets.iter().map(|a| a.id.as_str()).collect();
+            ids.sort_by_key(|id| pos[id]);
+            ids.into_iter().map(String::from).collect::<Vec<_>>()
+        };
+        // No chapters: capture order.
+        assert_eq!(order(&plan), ["p1", "c1", "p2", "c2"]);
+        plan.chapters = vec![chapter(&["c1", "c2"]), chapter(&["p1", "p2"])];
+        assert_eq!(order(&plan), ["c1", "c2", "p1", "p2"]);
     }
 
     #[test]
