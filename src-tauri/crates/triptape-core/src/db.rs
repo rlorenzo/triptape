@@ -987,8 +987,17 @@ impl Db {
         let edits = self.get_plan_edits(&project_id)?;
         let assets = self.list_assets(&project_id)?;
         let relabelled = itinerary.map(|i| crate::itinerary::apply_itinerary(&base, &assets, i));
-        let edited =
+        let mut edited =
             crate::plan::apply_edits(relabelled.as_ref().unwrap_or(&base), &assets, &edits);
+        if let Some(itin) = itinerary {
+            // A chapter the user renamed keeps their name in the film too.
+            let renamed = |ch: &crate::types::Chapter| {
+                ch.asset_ids
+                    .iter()
+                    .any(|id| edits.place_overrides.contains_key(id))
+            };
+            crate::itinerary::name_film_chapters(&mut edited, &assets, itin, renamed);
+        }
         Ok(Some(EditedPlan {
             project_id,
             base,

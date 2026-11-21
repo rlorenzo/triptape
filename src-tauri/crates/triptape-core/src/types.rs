@@ -212,6 +212,12 @@ pub struct Chapter {
     /// Local date label of the chapter's first asset, e.g. `Wed, Oct 8`.
     #[serde(default)]
     pub date_label: Option<String>,
+    /// Where the film's own shots of this chapter were taken, when that
+    /// differs from [`Self::place`] (which names the whole chapter, as the
+    /// book shows it): the film shows Dotonbori, not the castle it skipped.
+    /// Set by [`crate::itinerary::name_film_chapters`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub film_place: Option<String>,
 }
 
 /// Music pick with a human-readable rationale ("vibe fit", never fake emotion).

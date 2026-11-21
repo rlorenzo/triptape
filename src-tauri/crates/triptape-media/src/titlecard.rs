@@ -223,6 +223,13 @@ pub(crate) fn chapter_lines(ch: &Chapter) -> Option<(String, Option<String>)> {
     })
 }
 
+/// [`chapter_lines`] for the film: names where the film's own shots of the
+/// chapter were taken ([`Chapter::film_place`]) when that differs.
+pub(crate) fn chapter_film_lines(ch: &Chapter) -> Option<(String, Option<String>)> {
+    let place = ch.film_place.as_deref().or(ch.place.as_deref());
+    chapter_overlay(ch.day_index, ch.date_label.as_deref(), place).or_else(|| chapter_lines(ch))
+}
+
 /// Chapter heading on one line, for book day-marker pages.
 pub(crate) fn chapter_book_title(ch: &Chapter) -> String {
     match chapter_lines(ch) {

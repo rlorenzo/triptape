@@ -613,7 +613,8 @@ pub fn render_hero_video(
     // A ship is where we slept, not a place we went.
     let is_ship = |p: &String| triptape_core::itinerary::is_ship_place(&ships, p);
     for c in &plan.chapters {
-        if let Some(p) = c.place.as_ref().filter(|p| !is_ship(p)) {
+        let shown = c.film_place.as_ref().or(c.place.as_ref());
+        if let Some(p) = shown.filter(|p| !is_ship(p)) {
             if !places.contains(p) {
                 places.push(p.clone());
             }
@@ -895,6 +896,9 @@ pub fn render_hero_video(
         // Each overlay rewrites its own segment file, so they run alongside
         // one another; notes are folded back in segment order.
         let mut todo: Vec<(usize, String)> = vec![];
+        // A chapter heading identical to the last one shown (the same day
+        // and place, split by a few shots elsewhere) is not repeated.
+        let mut last_heading: Option<(String, Option<String>)> = None;
         for (i, (r, _, _, _)) in segs.iter().enumerate() {
             let id = r.entry.asset_id.as_str();
             if id == "title" || id == "credits" {
@@ -908,7 +912,12 @@ pub fn render_hero_video(
             } else if chapter_start[i] {
                 chapter_of_entry
                     .get(id)
-                    .and_then(|ch| crate::titlecard::chapter_lines(ch))
+                    .and_then(|ch| crate::titlecard::chapter_film_lines(ch))
+                    .filter(|lines| {
+                        let repeat = last_heading.as_ref() == Some(lines);
+                        last_heading = Some(lines.clone());
+                        !repeat
+                    })
             } else {
                 None
             };
@@ -4569,6 +4578,7 @@ mod tests {
             place: Some(place.into()),
             day_index: Some(day),
             date_label: Some("Wed, Oct 8".into()),
+            film_place: None,
         };
         let plan = Plan {
             plan_version: 1,
