@@ -43,8 +43,11 @@ pub fn most_counted<K>(counts: Vec<(K, usize)>) -> Option<(K, usize)> {
     counts.into_iter().rev().max_by_key(|(_, c)| *c)
 }
 
-/// The attraction most of `fixes` were taken at, when at least `min_shots`
-/// were (ties: the first reached). `hidden` names the owner never wants.
+/// The first attraction `fixes` (in story order) visited: the earliest
+/// reached with at least `min_shots` taken there. A chapter's name opens
+/// its day, so it follows the day: Tsurugaoka Hachimangū in the morning
+/// names Day 5 even though more shots came later at Kōtoku-in, whose name
+/// then captions its own pages. `hidden` names the owner never wants.
 pub fn visited_attraction(
     fixes: &[(f64, f64)],
     min_shots: usize,
@@ -54,9 +57,52 @@ pub fn visited_attraction(
         .iter()
         .filter_map(|&f| attraction_within(f, PLACE_RADIUS_M))
         .filter(|n| !hidden(n));
-    most_counted(tally(names))
-        .filter(|(_, c)| *c >= min_shots.max(1))
+    tally(names)
+        .into_iter()
+        .find(|(_, c)| *c >= min_shots.max(1))
         .map(|(n, _)| n)
+}
+
+/// Distinct days an attraction must be visited on to count as a home base.
+pub const HOME_BASE_DAYS: usize = 3;
+
+/// Attractions the trip keeps coming back to: [`PLACE_MIN_SHOTS`] or more
+/// photos within [`PLACE_RADIUS_M`] on [`HOME_BASE_DAYS`] or more days.
+/// That is the hotel's neighbourhood (Masjid Omar beside the Singapore
+/// hotel, every morning), not a sight, so it never names a chapter or a
+/// photo. A sight visited once in depth (Sensō-ji: 22 photos on one day,
+/// a stray shot on two others) stays.
+pub fn home_bases(assets: &[Asset]) -> HashSet<String> {
+    let poi: Vec<Option<String>> = assets.iter().map(photo_attraction).collect();
+    home_bases_of(&day_visits(assets.iter().zip(&poi)))
+}
+
+/// Photos per (day, attraction), from each asset paired with its
+/// [`photo_attraction`].
+fn day_visits<'a>(
+    shots: impl IntoIterator<Item = (&'a Asset, &'a Option<String>)>,
+) -> HashMap<(jiff::civil::Date, &'a str), usize> {
+    let mut visits = HashMap::new();
+    for (a, p) in shots {
+        if let (Some(d), Some(p)) = (asset_day(a), p) {
+            *visits.entry((d, p.as_str())).or_default() += 1;
+        }
+    }
+    visits
+}
+
+/// [`home_bases`] from a [`day_visits`] tally.
+fn home_bases_of(visits: &HashMap<(jiff::civil::Date, &str), usize>) -> HashSet<String> {
+    let mut days: HashMap<&str, usize> = HashMap::new();
+    for (&(_, poi), &n) in visits {
+        if n >= PLACE_MIN_SHOTS {
+            *days.entry(poi).or_default() += 1;
+        }
+    }
+    days.into_iter()
+        .filter(|&(_, d)| d >= HOME_BASE_DAYS)
+        .map(|(poi, _)| poi.to_string())
+        .collect()
 }
 
 /// Where the itinerary alone puts a photo, before any attraction.
@@ -86,16 +132,19 @@ pub fn spot<'a>(itin: Option<&'a Itinerary>, a: &Asset) -> Spot<'a> {
 
 /// A chapter's attraction for its name when the plan has no itinerary:
 /// the one its photos visited (a single-photo chapter needs only that
-/// shot there).
-pub fn chapter_attraction(fixes: &[(f64, f64)]) -> Option<String> {
-    visited_attraction(fixes, PLACE_MIN_SHOTS.min(fixes.len()), |_| false)
+/// shot there), never one of the trip's [`home_bases`].
+pub fn chapter_attraction(fixes: &[(f64, f64)], home: &HashSet<String>) -> Option<String> {
+    visited_attraction(fixes, PLACE_MIN_SHOTS.min(fixes.len()), |n| {
+        home.contains(n)
+    })
 }
 
 /// Each planned photo's place, by asset id: a place the owner named in
 /// the itinerary; the ship for shots the itinerary puts on board (even at
 /// a dock beside Miraikan or the Osaka Aquarium); else the attraction it
 /// was taken at on a day with [`PLACE_MIN_SHOTS`] there; else its
-/// chapter's place. Photos with none of these are absent.
+/// chapter's place, unless that is a name the trip hides (a home base or
+/// an itinerary `hide_attractions` entry). Photos with none are absent.
 pub fn photo_places(
     plan: &Plan,
     assets: &[Asset],
@@ -112,21 +161,20 @@ pub fn photo_places(
         .iter()
         .flat_map(|c| c.asset_ids.iter().map(String::as_str))
         .collect();
+    // One gazetteer lookup per asset serves both the trip's home bases and
+    // the planned photos' visits.
+    let poi: Vec<Option<String>> = assets.iter().map(photo_attraction).collect();
+    let home = home_bases_of(&day_visits(assets.iter().zip(&poi)));
+    let hidden = |n: &str| home.contains(n) || itin.is_some_and(|i| i.hides_attraction(n));
     // Videos too: a reel can be a clip, and it names its place like a photo.
-    let planned: Vec<&Asset> = assets
+    let planned: Vec<(&Asset, &Option<String>)> = assets
         .iter()
-        .filter(|a| in_plan.is_empty() || in_plan.contains(a.id.as_str()))
+        .zip(&poi)
+        .filter(|(a, _)| in_plan.is_empty() || in_plan.contains(a.id.as_str()))
         .collect();
-    let hidden = |n: &str| itin.is_some_and(|i| i.hides_attraction(n));
-    let poi: Vec<Option<String>> = planned.iter().map(|a| photo_attraction(a)).collect();
-    let mut visits: HashMap<(jiff::civil::Date, &str), usize> = HashMap::new();
-    for (a, p) in planned.iter().zip(&poi) {
-        if let (Some(d), Some(p)) = (asset_day(a), p) {
-            *visits.entry((d, p.as_str())).or_default() += 1;
-        }
-    }
+    let visits = day_visits(planned.iter().copied());
     let mut out = HashMap::new();
-    for (a, poi) in planned.into_iter().zip(&poi) {
+    for (a, poi) in planned {
         let own = match spot(itin, a) {
             Spot::Named(name) => Some(name.to_string()),
             Spot::Aboard(ship) => Some(ship),
@@ -140,7 +188,13 @@ pub fn photo_places(
                 })
                 .map(String::from),
         };
-        if let Some(p) = own.or_else(|| chapter_place.get(a.id.as_str()).map(|p| p.to_string())) {
+        let fallback = || {
+            chapter_place
+                .get(a.id.as_str())
+                .filter(|&&p| !hidden(p))
+                .map(|p| p.to_string())
+        };
+        if let Some(p) = own.or_else(fallback) {
             out.insert(a.id.clone(), p);
         }
     }
@@ -187,8 +241,45 @@ mod tests {
     }
 
     #[test]
+    fn the_hotel_neighbourhood_is_a_home_base_not_a_sight() {
+        let day = |n: i64| 1_791_288_000 + n * 86_400;
+        let masjid = (1.2856, 103.8475); // near the Singapore hotel
+        let shots = |d: i64, n: usize, gps| {
+            (0..n).map(move |i| photo(&format!("{d}-{i}"), day(d) + i as i64, Some(gps)))
+        };
+        let seen = |days: &[i64]| -> Vec<Asset> {
+            days.iter().flat_map(|&d| shots(d, 3, masjid)).collect()
+        };
+        let name = attraction_within(masjid, PLACE_RADIUS_M).expect("an attraction near the hotel");
+        assert!(home_bases(&seen(&[0, 1, 2])).contains(&name));
+        assert!(
+            !home_bases(&seen(&[0, 1])).contains(&name),
+            "two days is a visit"
+        );
+        let plan = plan_of(vec![]);
+        assert!(
+            photo_places(&plan, &seen(&[0, 1, 2]), None).is_empty(),
+            "a home base captions no photo"
+        );
+        assert_eq!(photo_places(&plan, &seen(&[0, 1]), None).len(), 6);
+        // Nor does a chapter named for it give it back as the fallback.
+        let assets = seen(&[0, 1, 2]);
+        let ids: Vec<&str> = assets.iter().map(|a| a.id.as_str()).collect();
+        let named = plan_of(vec![(name.as_str(), ids)]);
+        assert!(photo_places(&named, &assets, None).is_empty());
+    }
+
+    #[test]
     fn a_visit_needs_several_shots_within_reach() {
         let disneysea = (35.6267, 139.8881);
+        // Day 5: the shrine in the morning, then many more at the Buddha.
+        let (shrine, buddha) = ((35.3260, 139.5565), (35.3167, 139.5359));
+        let day: Vec<(f64, f64)> = [shrine; 3].into_iter().chain([buddha; 10]).collect();
+        assert_eq!(
+            visited_attraction(&day, 3, |_| false).as_deref(),
+            Some("Tsurugaoka Hachimangū"),
+            "the first visit names the chapter"
+        );
         assert_eq!(
             visited_attraction(&[disneysea; 3], 3, |_| false).as_deref(),
             Some("Tokyo DisneySea")
@@ -206,7 +297,7 @@ mod tests {
         );
         // Single-photo chapters name the place that photo was taken at.
         assert_eq!(
-            chapter_attraction(&[disneysea]).as_deref(),
+            chapter_attraction(&[disneysea], &HashSet::new()).as_deref(),
             Some("Tokyo DisneySea")
         );
     }

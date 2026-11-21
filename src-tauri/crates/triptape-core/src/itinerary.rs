@@ -537,9 +537,10 @@ pub fn asset_day(a: &Asset) -> Option<NaiveDate> {
 pub fn apply_itinerary(plan: &Plan, assets: &[Asset], itin: &Itinerary) -> Plan {
     let by_id: std::collections::HashMap<&str, &Asset> =
         assets.iter().map(|a| (a.id.as_str(), a)).collect();
+    let home = crate::places::home_bases(assets);
     let mut out = plan.clone();
     for ch in &mut out.chapters {
-        relabel_chapter(ch, &by_id, itin);
+        relabel_chapter(ch, &by_id, itin, &home);
     }
     out.map_polyline = itin.polyline();
     out
@@ -566,6 +567,7 @@ fn relabel_chapter(
     ch: &mut Chapter,
     by_id: &std::collections::HashMap<&str, &Asset>,
     itin: &Itinerary,
+    home: &std::collections::HashSet<String>,
 ) {
     let members: Vec<&Asset> = ch
         .asset_ids
@@ -579,7 +581,7 @@ fn relabel_chapter(
         ch.place = None;
         return;
     };
-    let place = chapter_name(itin, day, &members, label);
+    let place = chapter_name(itin, day, &members, label, home);
     ch.title.clone_from(&place);
     ch.place = Some(place);
 }
@@ -589,7 +591,13 @@ fn relabel_chapter(
 /// (`Carnival Luminosa Embarkation`) on a cruise's first or last day, else
 /// the port on a port day, else the ship; ashore, the attraction its
 /// photos visited (see [`crate::places`]), else the stop's city.
-fn chapter_name(itin: &Itinerary, day: NaiveDate, members: &[&Asset], label: DayLabel) -> String {
+fn chapter_name(
+    itin: &Itinerary,
+    day: NaiveDate,
+    members: &[&Asset],
+    label: DayLabel,
+    home: &std::collections::HashSet<String>,
+) -> String {
     let named = crate::places::tally(members.iter().filter_map(|a| itin.place_of(a)));
     // A chapter spanning several named places (the Flower Dome, then the
     // Cloud Forest) is named for what holds them, not its biggest part.
@@ -610,8 +618,9 @@ fn chapter_name(itin: &Itinerary, day: NaiveDate, members: &[&Asset], label: Day
             .unwrap_or(label.place);
     }
     let fixes: Vec<(f64, f64)> = members.iter().filter_map(|a| a.gps).collect();
+    // Neither a hidden name nor the hotel's neighbourhood (a home base).
     crate::places::visited_attraction(&fixes, crate::places::PLACE_MIN_SHOTS, |n| {
-        itin.hides_attraction(n)
+        itin.hides_attraction(n) || home.contains(n)
     })
     .unwrap_or(label.place)
 }
@@ -886,7 +895,7 @@ mod tests {
                 .collect();
             let refs: Vec<&Asset> = members.iter().collect();
             let label = chapter_label(it, day(date), &refs).unwrap();
-            chapter_name(it, day(date), &refs, label)
+            chapter_name(it, day(date), &refs, label, &Default::default())
         };
         // On board on the cruise's first day, and on a port day.
         assert_eq!(
@@ -920,7 +929,10 @@ mod tests {
             .collect();
         let refs: Vec<&Asset> = mixed.iter().collect();
         let label = chapter_label(&it, day("2026-10-11"), &refs).unwrap();
-        assert_eq!(chapter_name(&it, day("2026-10-11"), &refs, label), "Osaka");
+        assert_eq!(
+            chapter_name(&it, day("2026-10-11"), &refs, label, &Default::default()),
+            "Osaka"
+        );
         assert_eq!(
             name(&it, "2026-10-06", (35.6267, 139.8881), 3),
             "Tokyo DisneySea"
