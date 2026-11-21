@@ -130,6 +130,23 @@ pub fn hop_cuts(hops: &[Hop], shots: &[Option<(i64, Option<i32>)>]) -> Vec<usize
     out
 }
 
+/// How many hops the trip has made by the time a shot was taken (unix
+/// seconds and UTC offset): the hops whose day is on or before the shot's.
+/// Shots either side of a hop get different counts, so a film can keep
+/// them in separate segments and play the hop between them. An undated
+/// shot counts none, and the last hop home is never counted (it follows
+/// every shot; see [`hop_cuts`]).
+pub fn hops_reached(hops: &[Hop], shot: Option<(i64, Option<i32>)>) -> usize {
+    let Some(day) = shot.and_then(|(t, tz)| crate::metadata::local_date(t, tz)) else {
+        return 0;
+    };
+    hops.iter()
+        .enumerate()
+        .filter(|(i, h)| !(h.home && i + 1 == hops.len()))
+        .filter(|(_, h)| h.day.is_some_and(|d| d <= day))
+        .count()
+}
+
 fn short_date(d: jiff::civil::Date) -> String {
     d.strftime("%b %-d").to_string()
 }
@@ -284,7 +301,9 @@ impl Journey {
             pos: stop.pos(),
             label,
             pin: false,
-            arrive: stop.arrive_date(),
+            // A stop with only a departure is there that day (the same
+            // reading as the itinerary's own stop window).
+            arrive: stop.arrive_date().or(stop.depart_date()),
             home: stop.kind == StopKind::Home,
             sticker: stop.sticker.as_ref().map(Into::into),
         };
@@ -770,6 +789,24 @@ mod tests {
         assert_eq!(cuts[9], shots.len());
         assert!(cuts.windows(2).all(|w| w[0] <= w[1]));
         assert_eq!(hop_cuts(&hops, &[]), vec![0; hops.len()]);
+        // Shots either side of a hop's day count a different number of
+        // hops made, so they are never shown in one collage.
+        assert_eq!(hops_reached(&hops, shot(3)), 0);
+        assert_eq!(hops_reached(&hops, shot(10)), 1);
+        assert_eq!(hops_reached(&hops, shot(11)), 2);
+        assert_eq!(hops_reached(&hops, None), 0);
+        // The hop home follows every shot, so it splits nothing.
+        assert_eq!(hops_reached(&hops, shot(30)), 9);
+        // A stop with only a departure date still dates its hop.
+        let itin = Itinerary::from_json(
+            r#"{"stops": [
+                {"id": "a", "label": "Osaka", "lat": 34.6, "lon": 135.4, "depart": "2026-10-11"},
+                {"id": "b", "label": "Kyoto", "lat": 35.0, "lon": 135.8, "depart": "2026-10-12"}],
+              "legs": [{"from": "a", "to": "b", "mode": "ground"}]}"#,
+        )
+        .unwrap();
+        let j = Journey::build(&itin, &[]);
+        assert_eq!(j.hops()[0].day, Some(jiff::civil::date(2026, 10, 12)));
     }
 
     #[test]

@@ -712,7 +712,21 @@ pub fn render_hero_video(
     let groups: Vec<Vec<&ResolvedEntry>> = if opts.short_mode {
         selected.into_iter().map(|r| vec![r]).collect()
     } else {
-        hero_groups(&selected, chapter_of, &plan.collage)
+        // Shots either side of a travel-map hop stay in separate
+        // segments, so the hop can play between them.
+        let hops = opts
+            .journey
+            .as_ref()
+            .filter(|_| opts.map_style == MapStyle::Parchment)
+            .map_or_else(Vec::new, |j| j.hops());
+        let stage_of = |r: &ResolvedEntry| {
+            triptape_core::journey::hops_reached(&hops, r.taken_at.map(|t| (t, r.tz_offset_secs)))
+        };
+        hero_groups(
+            &selected,
+            |r| (chapter_of(&r.entry.asset_id), stage_of(r)),
+            &plan.collage,
+        )
     };
     // Segment renders are independent unless a short-mode budget couples
     // them (each one's cap and freeze-pad depend on what earlier ones left),
@@ -930,15 +944,19 @@ pub fn render_hero_video(
             let close_mp4 = work_dir.join("seg_closing.mp4");
             // Animated travel recap; the static pull-out card is the fallback.
             let animated = match &opts.journey {
-                Some(journey) => crate::routetravel::render_journey_recap(
+                // A parchment film whose route map could not be drawn gets
+                // the static card: it fits the time kept for the map, which
+                // the longer travelling recap would overrun in a short film.
+                Some(_) if opts.map_style == MapStyle::Parchment => None,
+                Some(journey) => Some(crate::routetravel::render_journey_recap(
                     caps,
                     journey,
                     opts.resolution,
                     &opts.typst_bin,
                     work_dir,
                     &close_mp4,
-                ),
-                None => crate::routeanim::render_route_recap(
+                )),
+                None => Some(crate::routeanim::render_route_recap(
                     caps,
                     &plan.map_polyline,
                     &opts.route_stops,
@@ -946,15 +964,18 @@ pub fn render_hero_video(
                     &opts.typst_bin,
                     work_dir,
                     &close_mp4,
-                ),
+                )),
             };
             let animated = match animated {
-                Ok(rep) => {
+                None => None,
+                Some(Ok(rep)) => {
                     fallbacks.extend(rep.notes);
                     Some(rep.secs)
                 }
-                Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
-                Err(e) => {
+                Some(Err(crate::MediaError::Cancelled)) => {
+                    return Err(crate::MediaError::Cancelled)
+                }
+                Some(Err(e)) => {
                     if opts.journey.is_some()
                         || triptape_core::route_stops::animated_stop_count(&opts.route_stops) >= 2
                     {
@@ -2047,17 +2068,18 @@ fn collage_eligible(e: &ResolvedEntry) -> bool {
 /// Hero segments in playback order: each is one entry or a collage of
 /// same-chapter stills, as [`plan::collage_groups`] decides under the
 /// user's `collage` overrides (the plan's length estimate and the Story
-/// editor group the same way).
+/// editor group the same way). `chapter_of` may tell more apart than the
+/// plan's chapters do: shots it separates never share a collage.
 fn hero_groups<'a, C: PartialEq>(
     entries: &[&'a ResolvedEntry],
-    chapter_of: impl Fn(&str) -> C,
+    chapter_of: impl Fn(&ResolvedEntry) -> C,
     collage: &CollageEdits,
 ) -> Vec<Vec<&'a ResolvedEntry>> {
     let slots = plan::collage_slots(
         entries.iter().map(|r| {
             (
                 r.entry.asset_id.as_str(),
-                chapter_of(&r.entry.asset_id),
+                chapter_of(r),
                 collage_eligible(r),
                 r.taken_at,
             )
@@ -3001,11 +3023,14 @@ mod tests {
                     })
                     .collect();
                 let refs: Vec<&ResolvedEntry> = resolved.iter().collect();
-                let groups: Vec<Vec<&PlanEntry>> =
-                    hero_groups(&refs, chapter_of, &CollageEdits::default())
-                        .into_iter()
-                        .map(|g| g.into_iter().map(|r| &r.entry).collect())
-                        .collect();
+                let groups: Vec<Vec<&PlanEntry>> = hero_groups(
+                    &refs,
+                    |r| chapter_of(&r.entry.asset_id),
+                    &CollageEdits::default(),
+                )
+                .into_iter()
+                .map(|g| g.into_iter().map(|r| &r.entry).collect())
+                .collect();
                 // (asset id, duration, kind) as in the renderer's `segs`.
                 let mut segs: Vec<(String, f64, &str)> =
                     vec![("title".into(), opts.title_secs, "title")];

@@ -1234,7 +1234,7 @@ fn clip_filter((w, h): (u32, u32)) -> String {
     format!(
         "scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,\
          pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={FPS},\
-         tpad=start_mode=clone:start_duration={HOP_LEAD_SECS}:stop_mode=clone:stop_duration={CLIP_HOLD_SECS},\
+         tpad=start_mode=clone:start_duration={HOP_LEAD_SECS}:stop_mode=clone:stop=-1,\
          format=yuv420p"
     )
 }
@@ -1255,6 +1255,9 @@ pub fn adopt_hop_clip(
             clip.display()
         )));
     }
+    // The last frame is held without end and `-t` cuts the segment to
+    // length, so it lasts exactly `secs` even when the clip's picture is
+    // shorter than the length its file reports (a longer sound track).
     let secs = info.duration_secs + HOP_LEAD_SECS + CLIP_HOLD_SECS;
     let args: Vec<String> = [
         vec![
@@ -1532,7 +1535,8 @@ mod tests {
         let f = clip_filter((1920, 1080));
         assert!(f.starts_with("scale=1920:1080:force_original_aspect_ratio=decrease"));
         assert!(f.contains("pad=1920:1080") && f.contains("setsar=1") && f.contains("fps=30"));
-        assert!(f.contains("start_duration=0.4") && f.contains("stop_duration=1.2"));
+        // The last frame is held for as long as the segment is cut to.
+        assert!(f.contains("start_duration=0.4") && f.contains("stop_mode=clone:stop=-1"));
         assert!(!f.contains(' '), "one filter chain, no stray spaces: {f}");
     }
 

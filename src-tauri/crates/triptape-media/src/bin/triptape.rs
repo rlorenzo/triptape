@@ -1726,6 +1726,17 @@ fn maps_cmd(flags: &HashMap<String, String>) {
             &tool_bin(flags, Tool::Ffmpeg),
             &tool_bin(flags, Tool::Ffprobe),
         );
+        // Hops from an earlier run (a longer itinerary) must not be left
+        // among the new ones: `--hop-clips` counts the videos in a folder.
+        for old in std::fs::read_dir(&out).into_iter().flatten().flatten() {
+            let name = old.file_name().to_string_lossy().into_owned();
+            let number = name
+                .strip_prefix("hop-")
+                .and_then(|n| n.strip_suffix(".mp4"));
+            if number.is_some_and(|n| n.len() == 2 && n.bytes().all(|b| b.is_ascii_digit())) {
+                std::fs::remove_file(old.path()).unwrap_or_else(|e| die("old hop clip", e));
+            }
+        }
         for (i, hop) in journey.hops().iter().enumerate() {
             let mp4 = out.join(format!("hop-{:02}.mp4", i + 1));
             let report = parchment::render_hop(
