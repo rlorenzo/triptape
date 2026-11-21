@@ -198,10 +198,12 @@ fn photo_place(
     if aboard {
         return None;
     }
-    photo_attraction(a).filter(|poi| {
-        day.and_then(|d| visits.get(&(d, poi.clone())))
-            .is_some_and(|&n| n >= PHOTO_PLACE_MIN_SHOTS)
-    })
+    photo_attraction(a)
+        .filter(|poi| !itin.is_some_and(|i| i.hides_attraction(poi)))
+        .filter(|poi| {
+            day.and_then(|d| visits.get(&(d, poi.clone())))
+                .is_some_and(|&n| n >= PHOTO_PLACE_MIN_SHOTS)
+        })
 }
 
 /// `ch` retitled when it is on the ship on a cruise's first or last day
@@ -248,6 +250,81 @@ fn book_caption(
     a: &triptape_core::types::Asset,
 ) -> Option<String> {
     plan.captions.get(&a.id).cloned().or(place)
+}
+
+/// Where a book photo was taken, for [`port_day_order`].
+#[derive(Debug, Clone, Copy, Default)]
+struct Whereabouts {
+    day: Option<u32>,
+    /// The ship calls at a port that day.
+    port_day: bool,
+    /// The itinerary puts the shot on board (and no named place claims it).
+    aboard: bool,
+    gps: Option<(f64, f64)>,
+}
+
+/// Shots this close (single-linked) are one area of a port day.
+const PORT_AREA_LINK_M: f64 = 6_000.0;
+
+/// Book order for photos in story order: on a port day a group can split
+/// up (half to Hong Kong Disneyland, half around the city) and the shots
+/// interleave by time, so the day's places alternate page to page. There,
+/// ashore shots group by area (single-linked within [`PORT_AREA_LINK_M`]),
+/// areas in the order first reached, and the shots on board follow
+/// together. Other days keep story order.
+fn port_day_order(at: &[Whereabouts]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(at.len());
+    let mut start = 0;
+    while start < at.len() {
+        let end = (start..at.len())
+            .find(|&i| at[i].day != at[start].day)
+            .unwrap_or(at.len());
+        let day: Vec<usize> = (start..end).collect();
+        start = end;
+        if !at[day[0]].port_day {
+            out.extend(day);
+            continue;
+        }
+        let (aboard, ashore): (Vec<usize>, Vec<usize>) = day.iter().partition(|&&i| at[i].aboard);
+        // Area per ashore shot: union-find over GPS links; a shot without
+        // GPS joins its nearest neighbour in time that has one.
+        let mut area: Vec<usize> = (0..ashore.len()).collect();
+        fn root(area: &mut [usize], mut i: usize) -> usize {
+            while area[i] != i {
+                area[i] = area[area[i]];
+                i = area[i];
+            }
+            i
+        }
+        for a in 0..ashore.len() {
+            for b in a + 1..ashore.len() {
+                if let (Some(p), Some(q)) = (at[ashore[a]].gps, at[ashore[b]].gps) {
+                    if triptape_core::geo::haversine_m(p, q) <= PORT_AREA_LINK_M {
+                        let (ra, rb) = (root(&mut area, a), root(&mut area, b));
+                        area[ra.max(rb)] = ra.min(rb);
+                    }
+                }
+            }
+        }
+        for a in 0..ashore.len() {
+            if at[ashore[a]].gps.is_none() {
+                if let Some(b) = (0..ashore.len())
+                    .filter(|&b| at[ashore[b]].gps.is_some())
+                    .min_by_key(|&b| b.abs_diff(a))
+                {
+                    area[a] = root(&mut area, b);
+                }
+            }
+        }
+        // Unions keep the lower index as root, so an area's root is its
+        // first shot: sorting by root puts areas in the order reached.
+        let roots: Vec<usize> = (0..ashore.len()).map(|a| root(&mut area, a)).collect();
+        let mut order: Vec<usize> = (0..ashore.len()).collect();
+        order.sort_by_key(|&a| (roots[a], a));
+        out.extend(order.into_iter().map(|a| ashore[a]));
+        out.extend(aboard);
+    }
+    out
 }
 
 /// Whether the book may use this asset. The plan's chapters hold near-dupe
@@ -740,6 +817,7 @@ fn export_inner(
             }
         }
         let mut book_photos: Vec<BookPhoto> = vec![];
+        let mut whereabouts: Vec<Whereabouts> = vec![];
         for a in assets
             .iter()
             .filter(|a| a.kind != AssetKind::Video && in_book_flow(&chapter_of, &a.id))
@@ -774,6 +852,18 @@ fn export_inner(
                 chapter,
                 photo_place(opts.itinerary.as_ref(), &visits, day, a),
             );
+            let itin = opts.itinerary.as_ref();
+            let date = asset_day(a);
+            whereabouts.push(Whereabouts {
+                day,
+                port_day: itin.zip(date).and_then(|(i, d)| i.port_on(d)).is_some(),
+                aboard: itin.and_then(|i| i.place_at(a.gps)).is_none()
+                    && itin
+                        .zip(date)
+                        .and_then(|(i, d)| i.label_for(d, a.gps))
+                        .is_some_and(|l| l.on_ship),
+                gps: a.gps,
+            });
             book_photos.push(BookPhoto {
                 asset_id: a.id.clone(),
                 path: a.path.clone(),
@@ -806,6 +896,9 @@ fn export_inner(
             });
         }
         // Story order: keep db order (taken_at, id).
+        let order = port_day_order(&whereabouts);
+        let book_photos: Vec<BookPhoto> =
+            order.into_iter().map(|i| book_photos[i].clone()).collect();
         let book_dir = out_dir.join("book");
         let staged_book = stage.join("book");
         // Day-marker titles: day once, with the location.
@@ -1051,6 +1144,42 @@ mod tests {
             caption(&plan, &visited, &a).as_deref(),
             Some("Rain all day")
         );
+    }
+
+    #[test]
+    fn port_day_groups_areas_then_the_ship() {
+        let w = |day: u32, port_day: bool, aboard: bool, gps: Option<(f64, f64)>| Whereabouts {
+            day: Some(day),
+            port_day,
+            aboard,
+            gps,
+        };
+        let (central, peak, disney) = (
+            (22.2817, 114.1542),
+            (22.2709, 114.1504),
+            (22.3130, 114.0413),
+        );
+        let at = vec![
+            w(15, false, true, None),          // 0 sea day
+            w(16, true, true, Some(central)),  // 1 on deck at dawn
+            w(16, true, false, Some(central)), // 2 city
+            w(16, true, false, Some(disney)),  // 3 Disneyland
+            w(16, true, false, Some(peak)),    // 4 city
+            w(16, true, false, None),          // 5 no GPS, beside the Peak shot
+            w(16, true, false, Some(disney)),  // 6 Disneyland
+            w(16, true, true, Some(central)),  // 7 back on board
+            w(17, false, true, None),          // 8 sea day
+        ];
+        assert_eq!(port_day_order(&at), [0, 2, 4, 5, 3, 6, 1, 7, 8]);
+        // Days that are not port days keep story order.
+        let plain: Vec<Whereabouts> = at
+            .iter()
+            .map(|x| Whereabouts {
+                port_day: false,
+                ..*x
+            })
+            .collect();
+        assert_eq!(port_day_order(&plain), (0..9).collect::<Vec<_>>());
     }
 
     #[test]

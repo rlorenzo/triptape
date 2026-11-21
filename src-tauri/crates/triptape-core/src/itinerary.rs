@@ -85,6 +85,10 @@ pub struct Itinerary {
     /// the built-in attraction list, which misses many of them.
     #[serde(default)]
     pub places: Vec<NamedPlace>,
+    /// Built-in attraction names never to use: places the owner was near
+    /// but did not visit (the ArtScience Museum beside their hotel).
+    #[serde(default)]
+    pub hide_attractions: Vec<String>,
 }
 
 /// A place the owner named, as a point and the reach that counts as there.
@@ -177,6 +181,11 @@ impl Itinerary {
             .filter(|(pl, d)| *d <= pl.radius_m)
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(pl, _)| pl.name.as_str())
+    }
+
+    /// Whether the owner asked never to name this attraction.
+    pub fn hides_attraction(&self, name: &str) -> bool {
+        self.hide_attractions.iter().any(|h| h.trim() == name)
     }
 
     /// Stop by id.
