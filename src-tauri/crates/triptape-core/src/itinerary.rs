@@ -576,6 +576,66 @@ pub fn apply_itinerary(plan: &Plan, assets: &[Asset], itin: &Itinerary) -> Plan 
     out
 }
 
+/// Name what the film shows: for each chapter, [`chapter_name`] over only
+/// its shots in `plan.hero`, kept in [`Chapter::film_place`] when it
+/// differs from the chapter's own place. A chapter often spans more than
+/// the film keeps (Osaka Castle in the morning, Dotonbori in the
+/// afternoon, with only Dotonbori in the film), and its lower third should
+/// name what is on screen. Run after the user's edits, on the final hero;
+/// chapters `renamed` by the user keep their name. A visit needs fewer
+/// shots here, as the film keeps only a few of each place.
+pub fn name_film_chapters(
+    plan: &mut Plan,
+    assets: &[Asset],
+    itin: &Itinerary,
+    renamed: impl Fn(&Chapter) -> bool,
+) {
+    let by_id: std::collections::HashMap<&str, &Asset> =
+        assets.iter().map(|a| (a.id.as_str(), a)).collect();
+    // Film order, each asset once (a multi-window clip has several
+    // entries): the user's moves reorder the hero, not the chapter.
+    let mut seen = std::collections::HashSet::new();
+    let film_order: Vec<String> = plan
+        .hero
+        .iter()
+        .map(|e| e.asset_id.clone())
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
+    let home = crate::places::home_bases(assets);
+    for ch in &mut plan.chapters {
+        ch.film_place = None;
+        if renamed(ch) {
+            continue;
+        }
+        let members: Vec<&Asset> = ch
+            .asset_ids
+            .iter()
+            .filter_map(|id| by_id.get(id.as_str()).copied())
+            .collect();
+        let in_chapter: std::collections::HashSet<&str> =
+            ch.asset_ids.iter().map(String::as_str).collect();
+        let on_screen: Vec<&Asset> = film_order
+            .iter()
+            .filter(|id| in_chapter.contains(id.as_str()))
+            .filter_map(|id| by_id.get(id.as_str()).copied())
+            .collect();
+        if on_screen.is_empty() {
+            continue;
+        }
+        let Some(day) = members.iter().filter_map(|a| asset_day(a)).min() else {
+            continue;
+        };
+        let Some(label) = chapter_label(itin, day, &on_screen) else {
+            continue;
+        };
+        let min_shots = crate::places::PLACE_MIN_SHOTS.min(on_screen.len().div_ceil(2));
+        let name = chapter_name(itin, day, &on_screen, label, &home, min_shots);
+        if ch.place.as_deref() != Some(name.as_str()) {
+            ch.film_place = Some(name);
+        }
+    }
+}
+
 /// The label most of a chapter's GPS fixes get on `day` (ties: the label
 /// reached first in story order). One medoid fix is not enough on a port
 /// day: a few deck or tender shots near the dock could pull it on board
@@ -611,7 +671,14 @@ fn relabel_chapter(
         ch.place = None;
         return;
     };
-    let place = chapter_name(itin, day, &members, label, home);
+    let place = chapter_name(
+        itin,
+        day,
+        &members,
+        label,
+        home,
+        crate::places::PLACE_MIN_SHOTS,
+    );
     ch.title.clone_from(&place);
     ch.place = Some(place);
 }
@@ -627,15 +694,12 @@ fn chapter_name(
     members: &[&Asset],
     label: DayLabel,
     home: &std::collections::HashSet<String>,
+    min_shots: usize,
 ) -> String {
     let named = crate::places::tally(members.iter().filter_map(|a| itin.place_of(a)));
     // A chapter spanning several named places (the Flower Dome, then the
     // Cloud Forest) is named for what holds them, not its biggest part.
-    let several = named
-        .iter()
-        .filter(|(_, c)| *c >= crate::places::PLACE_MIN_SHOTS)
-        .count()
-        > 1;
+    let several = named.iter().filter(|(_, c)| *c >= min_shots.max(1)).count() > 1;
     if let Some((name, _)) =
         crate::places::most_counted(named).filter(|(_, c)| !several && 2 * c >= members.len())
     {
@@ -649,7 +713,7 @@ fn chapter_name(
     }
     let fixes: Vec<(f64, f64)> = members.iter().filter_map(|a| a.gps).collect();
     // Neither a hidden name nor the hotel's neighbourhood (a home base).
-    crate::places::visited_attraction(&fixes, crate::places::PLACE_MIN_SHOTS, |n| {
+    crate::places::visited_attraction(&fixes, min_shots, |n| {
         itin.hides_attraction(n) || home.contains(n)
     })
     .unwrap_or(label.place)
@@ -861,6 +925,63 @@ mod tests {
     }
 
     #[test]
+    fn the_film_names_the_shots_it_shows() {
+        let mut it = itin();
+        it.places = serde_json::from_str(
+            r#"[
+              { "name": "Taipei 101", "lat": 25.0340, "lon": 121.5645, "radius_m": 250 },
+              { "name": "Raohe Night Market", "lat": 25.0509, "lon": 121.5775 }
+            ]"#,
+        )
+        .unwrap();
+        let tower = Some((25.0343, 121.5648));
+        let market = Some((25.0510, 121.5770));
+        let assets = vec![
+            photo("t1", "2026-10-16", tower),
+            photo("t2", "2026-10-16", tower),
+            photo("t3", "2026-10-16", tower),
+            photo("m1", "2026-10-16", market),
+            photo("m2", "2026-10-16", market),
+        ];
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let chapter = |members: &[&str]| Chapter {
+            title: "Taipei 101".into(),
+            asset_ids: ids(members),
+            place: Some("Taipei 101".into()),
+            day_index: Some(14),
+            date_label: None,
+            film_place: None,
+        };
+        let entry = |id: &str| {
+            serde_json::json!({
+                "asset_id": id, "content_hash": null, "size_bytes": 0, "mtime": 0,
+                "rendition": "still"
+            })
+        };
+        let mut plan: Plan = serde_json::from_value(serde_json::json!({
+            "plan_version": 1, "schema_version": 1, "reel_selects": [], "chapters": [],
+            "captions": {}, "map_polyline": [], "music": {"track": "", "rationale": ""},
+            "hero": [entry("m1"), entry("m2"), entry("t1")],
+        }))
+        .unwrap();
+        plan.chapters = vec![
+            chapter(&["t1", "t2", "t3", "m1", "m2"]),
+            chapter(&["t1", "t2", "t3"]),
+        ];
+        name_film_chapters(&mut plan, &assets, &it, |_| false);
+        // The film shows the night market first: that is the lower third.
+        assert_eq!(
+            plan.chapters[0].film_place.as_deref(),
+            Some("Raohe Night Market")
+        );
+        // Shown where the chapter is named: nothing to add.
+        assert_eq!(plan.chapters[1].film_place, None);
+        // A chapter the user renamed keeps their name.
+        name_film_chapters(&mut plan, &assets, &it, |c| c.asset_ids.len() == 5);
+        assert_eq!(plan.chapters[0].film_place, None);
+    }
+
+    #[test]
     fn named_places_label_shots_inside_their_radius_or_window() {
         let mut it = itin();
         assert!(it.places.is_empty());
@@ -944,7 +1065,7 @@ mod tests {
                 .collect();
             let refs: Vec<&Asset> = members.iter().collect();
             let label = chapter_label(it, day(date), &refs).unwrap();
-            chapter_name(it, day(date), &refs, label, &Default::default())
+            chapter_name(it, day(date), &refs, label, &Default::default(), 3)
         };
         // On board on the cruise's first day, and on a port day.
         assert_eq!(
@@ -979,7 +1100,7 @@ mod tests {
         let refs: Vec<&Asset> = mixed.iter().collect();
         let label = chapter_label(&it, day("2026-10-11"), &refs).unwrap();
         assert_eq!(
-            chapter_name(&it, day("2026-10-11"), &refs, label, &Default::default()),
+            chapter_name(&it, day("2026-10-11"), &refs, label, &Default::default(), 3),
             "Osaka"
         );
         assert_eq!(

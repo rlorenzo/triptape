@@ -217,7 +217,17 @@ pub fn chapter_overlay(
 /// day/date/place deserialize with those fields `None`; they fall back to
 /// the stored chapter title so re-exports keep their chapter context.
 pub(crate) fn chapter_lines(ch: &Chapter) -> Option<(String, Option<String>)> {
-    chapter_overlay(ch.day_index, ch.date_label.as_deref(), ch.place.as_deref()).or_else(|| {
+    chapter_lines_naming(ch, ch.place.as_deref())
+}
+
+/// [`chapter_lines`] for the film: names where the film's own shots of the
+/// chapter were taken ([`Chapter::film_heading_place`]).
+pub(crate) fn chapter_film_lines(ch: &Chapter) -> Option<(String, Option<String>)> {
+    chapter_lines_naming(ch, ch.film_heading_place())
+}
+
+fn chapter_lines_naming(ch: &Chapter, place: Option<&str>) -> Option<(String, Option<String>)> {
+    chapter_overlay(ch.day_index, ch.date_label.as_deref(), place).or_else(|| {
         let t = ch.title.trim();
         (!t.is_empty()).then(|| (t.to_string(), None))
     })

@@ -611,11 +611,11 @@ pub fn render_hero_video(
     let mut places: Vec<String> = vec![];
     let ships = opts.journey.as_ref().map(|j| j.ships()).unwrap_or_default();
     // A ship is where we slept, not a place we went.
-    let is_ship = |p: &String| triptape_core::itinerary::is_ship_place(&ships, p);
+    let is_ship = |p: &str| triptape_core::itinerary::is_ship_place(&ships, p);
     for c in &plan.chapters {
-        if let Some(p) = c.place.as_ref().filter(|p| !is_ship(p)) {
-            if !places.contains(p) {
-                places.push(p.clone());
+        if let Some(p) = c.film_heading_place().filter(|p| !is_ship(p)) {
+            if !places.iter().any(|q| q == p) {
+                places.push(p.to_string());
             }
         }
     }
@@ -895,6 +895,9 @@ pub fn render_hero_video(
         // Each overlay rewrites its own segment file, so they run alongside
         // one another; notes are folded back in segment order.
         let mut todo: Vec<(usize, String)> = vec![];
+        // A chapter heading identical to the last one shown (the same day
+        // and place, split by a few shots elsewhere) is not repeated.
+        let mut last_heading: Option<(String, Option<String>)> = None;
         for (i, (r, _, _, _)) in segs.iter().enumerate() {
             let id = r.entry.asset_id.as_str();
             if id == "title" || id == "credits" {
@@ -908,7 +911,12 @@ pub fn render_hero_video(
             } else if chapter_start[i] {
                 chapter_of_entry
                     .get(id)
-                    .and_then(|ch| crate::titlecard::chapter_lines(ch))
+                    .and_then(|ch| crate::titlecard::chapter_film_lines(ch))
+                    .filter(|lines| {
+                        let repeat = last_heading.as_ref() == Some(lines);
+                        last_heading = Some(lines.clone());
+                        !repeat
+                    })
             } else {
                 None
             };
@@ -3342,6 +3350,37 @@ mod tests {
     }
 
     #[test]
+    fn the_film_heading_names_the_film_place_and_the_book_keeps_the_chapter_place() {
+        use crate::titlecard::{chapter_book_title, chapter_film_lines};
+        let mut ch = triptape_core::types::Chapter {
+            title: "Osaka Castle".into(),
+            place: Some("Osaka Castle".into()),
+            day_index: Some(3),
+            ..Default::default()
+        };
+        // No film place: the film names the chapter's own place.
+        assert_eq!(
+            chapter_film_lines(&ch),
+            Some(("Day 3".to_string(), Some("Osaka Castle".to_string())))
+        );
+        ch.film_place = Some("Dotonbori".into());
+        assert_eq!(
+            chapter_film_lines(&ch),
+            Some(("Day 3".to_string(), Some("Dotonbori".to_string())))
+        );
+        assert_eq!(chapter_book_title(&ch), "Day 3 \u{2014} Osaka Castle");
+        // Legacy chapters with nothing but a title still fall back to it.
+        let legacy = triptape_core::types::Chapter {
+            title: "Coast".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            chapter_film_lines(&legacy),
+            Some(("Coast".to_string(), None))
+        );
+    }
+
+    #[test]
     fn chapter_overlay_and_date_range() {
         use crate::titlecard::{chapter_overlay, format_date_range};
         // 2026-10-06 12:00 UTC.
@@ -4569,6 +4608,7 @@ mod tests {
             place: Some(place.into()),
             day_index: Some(day),
             date_label: Some("Wed, Oct 8".into()),
+            film_place: None,
         };
         let plan = Plan {
             plan_version: 1,

@@ -937,6 +937,7 @@ mod tests {
             place: None,
             day_index: None,
             date_label: None,
+            film_place: None,
         };
         let mut plan = empty_plan();
         // No chapters: nothing was curated, so every still may flow.
@@ -992,6 +993,7 @@ mod tests {
             place: None,
             day_index: None,
             date_label: None,
+            film_place: None,
         };
         let shot = |id: &str, t: i64| {
             let mut a = Asset::new(id, PathBuf::from(format!("/t/{id}.jpg")), AssetKind::Photo);
@@ -1226,6 +1228,7 @@ mod tests {
             place: Some("Sensō-ji".into()),
             day_index: None,
             date_label: None,
+            film_place: None,
         });
         plan.captions.insert("a0".into(), "Overlook".into());
         let a0 =
