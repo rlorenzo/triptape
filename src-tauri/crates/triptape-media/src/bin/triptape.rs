@@ -7,7 +7,7 @@
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
 //!                [--solo REF...] [--unsolo REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
-//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--itinerary itinerary.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
 //! triptape cache stats|clear [--segment-cache DIR]
 //! triptape pick --db trip.db --out /path/to/new-folder [--count 800] [--project ID] [--stills-only]
@@ -388,6 +388,13 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     // in the photo's local time, not UTC.
     metadata::fill_tz_offsets(&mut final_assets);
 
+    // The same file in the library twice: its copies share their caption,
+    // people tags and score, and an edit takes what it lacks from its
+    // original, so the one kept below carries all of them. Before
+    // clustering, so an edit that lost its date sits in its original's
+    // chapter.
+    cluster::share_identical_metadata(&mut final_assets, &mut scores);
+
     // Cluster + near-dupe hero picks.
     // Cluster ids restart per scan; prefix with the project id so they stay
     // unique across projects sharing one database.
@@ -395,9 +402,6 @@ fn scan_cmd(flags: &HashMap<String, String>) {
     for c in &mut clusters {
         c.id = format!("{}_{}", project.id, c.id);
     }
-    // The same file in the library twice: its copies share their caption,
-    // people tags and score, so the one kept below carries all of them.
-    cluster::share_identical_metadata(&mut final_assets, &mut scores);
     let groups = cluster::collapse_near_dupes(&final_assets, &scores);
     let best: HashSet<String> = groups.iter().map(|g| g.best_id.clone()).collect();
     // Non-best near-dupe members stay in the DB but are kept out of the plan.
@@ -733,6 +737,9 @@ fn export_cmd(flags: &HashMap<String, String>) {
     let keep_ambience = flags.get("keep-ambience").is_some_and(|v| v != "false");
     // Live Photos move inside hero collages unless switched off.
     let live_collages = !flags.get("no-live-collages").is_some_and(|v| v != "false");
+    // The route map after the title is off unless asked for; the closing
+    // recap always plays.
+    let opening_map = flags.get("opening-map").is_some_and(|v| v != "false");
     // Hero segments rendered at once (default: cores / 4, memory permitting).
     let jobs = flags.get("jobs").map(|v| match v.parse::<usize>() {
         Ok(n) if n >= 1 => n,
@@ -759,6 +766,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             music_paths: music,
             keep_ambience,
             live_collages,
+            opening_map,
             only,
             resolution,
             jobs,
@@ -1056,8 +1064,20 @@ fn edit_cmd(args: &[String]) {
         .unwrap_or_else(|e| die("plan", e))
         .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
     let by_id: HashMap<&str, &Asset> = ep.assets.iter().map(|x| (x.id.as_str(), x)).collect();
+    // A copy the scan left out stands for its byte-identical twin in the
+    // plan, so either file name works.
     let resolve_one = |q: &str| -> &Asset {
-        asset_ref::resolve_asset(&ep.assets, q).unwrap_or_else(|e| die("edit", e))
+        let named = asset_ref::resolve_asset(&ep.assets, q).unwrap_or_else(|e| die("edit", e));
+        let twin =
+            asset_ref::planned_twin(&ep.assets, named, |id| ep.base.chapter_of(id).is_some());
+        if twin.id != named.id {
+            println!(
+                "{} is an identical copy of {}, which is in the plan: using it",
+                asset_label(named),
+                asset_label(twin)
+            );
+        }
+        twin
     };
     let resolve =
         |refs: &[String]| -> Vec<&Asset> { refs.iter().map(|q| resolve_one(q)).collect() };

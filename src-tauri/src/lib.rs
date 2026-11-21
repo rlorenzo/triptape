@@ -464,6 +464,20 @@ impl StoryData {
             .collect())
     }
 
+    /// The id to pin for `asset_id`: itself, or the byte-identical copy the
+    /// plan kept when this copy was left out (the Library lists both).
+    pub fn planned_twin_id(&self, asset_id: &str) -> String {
+        let assets = &self.0.assets;
+        let in_plan = |id: &str| self.0.base.chapter_of(id).is_some();
+        assets
+            .iter()
+            .find(|a| a.id == asset_id)
+            .map_or(asset_id, |a| {
+                &triptape_core::asset_ref::planned_twin(assets, a, in_plan).id
+            })
+            .to_string()
+    }
+
     /// Only assets of a scan-time chapter can be pinned into the film
     /// (the plan needs the chapter to trade a shot off against).
     pub fn check_include(&self, asset_id: &str) -> Result<(), String> {
@@ -1347,6 +1361,30 @@ mod tests {
     }
 
     #[test]
+    fn story_include_of_a_left_out_copy_pins_its_planned_twin() {
+        let (db, pid) = story_db(&["a", "b"]);
+        // "copy" is b's byte-identical twin, added after the plan was built
+        // (as the scan leaves a collapsed copy out of every chapter).
+        let mut copy = Asset::new("copy", story_asset_path("copy"), AssetKind::Photo);
+        std::fs::write(&copy.path, b"").unwrap();
+        copy.content_hash = Some("h".into());
+        db.upsert_asset(&pid, &copy).unwrap();
+        let mut b = db
+            .list_assets(&pid)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.id == "b")
+            .unwrap();
+        b.content_hash = Some("h".into());
+        db.upsert_asset(&pid, &b).unwrap();
+        let data = StoryData::load(&db, &pid).unwrap();
+        assert!(data.check_include("copy").is_err());
+        assert_eq!(data.planned_twin_id("copy"), "b");
+        assert_eq!(data.planned_twin_id("a"), "a");
+        assert_eq!(data.planned_twin_id("missing"), "missing");
+    }
+
+    #[test]
     fn story_entry_serializes_flat_for_the_webview() {
         let (db, pid) = story_db(&["a"]);
         let view = StoryData::load(&db, &pid).unwrap().view();
@@ -2030,6 +2068,23 @@ mod tests {
             "duration comes from the motion"
         );
         assert_eq!(lp.taken_at, Some(1_714_557_600), "still capture time kept");
+    }
+
+    /// The motion half is probed like any video, so it carries its own
+    /// capture time and offset (Apple's creation date); folding it into the
+    /// pair must leave the still's EXIF date and offset in place.
+    #[test]
+    fn pairing_keeps_the_stills_date_over_the_motions() {
+        let mut still = pairing_asset("s", "/t/IMG_106.HEIC", AssetKind::Photo, None);
+        still.tz_offset_secs = Some(9 * 3600);
+        let mut mov = pairing_asset("m", "/t/IMG_106.MOV", AssetKind::Video, Some(2.0));
+        mov.taken_at = Some(1_800_000_000);
+        mov.tz_offset_secs = Some(-7 * 3600);
+        let out = apply_live_photo_pairing(vec![still, mov]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, AssetKind::LivePhoto);
+        assert_eq!(out[0].taken_at, Some(1_714_557_600));
+        assert_eq!(out[0].tz_offset_secs, Some(9 * 3600));
     }
 
     #[test]

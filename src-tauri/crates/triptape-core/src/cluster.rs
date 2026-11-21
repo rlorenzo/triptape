@@ -11,6 +11,7 @@ use crate::geo::haversine_m;
 use crate::hash::is_near_dupe;
 use crate::types::{Asset, AssetKind, Cluster, Score};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 /// A time gap this large always starts a new cluster (4 h).
 pub const TIME_GAP_SECS: i64 = 4 * 3600;
@@ -293,7 +294,8 @@ fn looks_alike(a: &Asset, b: &Asset) -> bool {
 /// content hash) always collapse, clips included. Otherwise videos never
 /// collapse: their pHash is only the poster frame, so two clips (or a
 /// clip and a photo) opening on the same view can still hold different
-/// footage.
+/// footage. An edit and its original ([`edit_families`]) always collapse
+/// too, and the edit is always the kept one, whatever the scores.
 pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) -> Vec<DupeGroup> {
     let n = assets.len();
     let mut parent: Vec<usize> = (0..n).collect();
@@ -319,6 +321,22 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
         let root = twins[0];
         for &t in &twins[1..] {
             union(&mut parent, &mut members, root, t);
+        }
+    }
+    // An edit and its original are one item too, whatever their bytes,
+    // timestamps or pixels (a crop or trim changes all three); the edit
+    // is the one kept, below.
+    let mut is_edit = vec![false; n];
+    for (edits, originals) in edit_families(assets) {
+        for &e in &edits {
+            is_edit[e] = true;
+        }
+        let root = find(&mut parent, edits[0]);
+        for &m in edits[1..].iter().chain(&originals) {
+            let r = find(&mut parent, m);
+            if r != root {
+                union(&mut parent, &mut members, root, r);
+            }
         }
     }
     for i in 0..n {
@@ -348,18 +366,24 @@ pub fn collapse_near_dupes(assets: &[Asset], scores: &HashMap<String, Score>) ->
         let r = find(&mut parent, i);
         groups.entry(r).or_default().push(i);
     }
-    let score_of = |id: &str| scores.get(id).map(|s| s.total).unwrap_or(0.5);
+    let score_of = |i: usize| scores.get(&assets[i].id).map(|s| s.total).unwrap_or(0.5);
     let mut out: Vec<DupeGroup> = groups
         .into_values()
         .map(|idx| {
-            let members: Vec<String> = idx.iter().map(|&i| assets[i].id.clone()).collect();
-            let mut best_id = members[0].clone();
-            for m in &members[1..] {
-                if score_of(m) > score_of(&best_id) {
-                    best_id = m.clone();
+            // "I want to keep my edits": an edit of an original beats any
+            // score; among edits (or with none), the best score wins.
+            let mut best = idx[0];
+            for &m in &idx[1..] {
+                let better = (is_edit[m], score_of(m)) > (is_edit[best], score_of(best));
+                if better {
+                    best = m;
                 }
             }
-            DupeGroup { members, best_id }
+            let members: Vec<String> = idx.iter().map(|&i| assets[i].id.clone()).collect();
+            DupeGroup {
+                members,
+                best_id: assets[best].id.clone(),
+            }
         })
         .collect();
     out.sort_by(|a, b| a.best_id.cmp(&b.best_id));
@@ -380,6 +404,61 @@ fn identical_files(assets: &[Asset]) -> Vec<Vec<usize>> {
     twins
 }
 
+/// The original's stem behind a file name, lowercased, and whether the
+/// name is an edit. Apple Photos / osxphotos export an edit as
+/// `IMG_1234_edited.heic` next to `IMG_1234.HEIC`, and number copies of
+/// either with a trailing ` (n)` (`IMG_1234 (1).HEIC`,
+/// `IMG_1234_edited (1).heic`), so both forms map to `img_1234`.
+pub fn edit_stem(file_name: &str) -> (String, bool) {
+    fn strip_copy(s: &str) -> &str {
+        // ` (n)` with n all digits, at the very end.
+        if let Some(open) = s.strip_suffix(')').and_then(|r| r.rfind(" (")) {
+            let n = &s[open + 2..s.len() - 1];
+            if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) {
+                return &s[..open];
+            }
+        }
+        s
+    }
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file_name);
+    let stem = strip_copy(stem).to_lowercase();
+    match stem.strip_suffix("_edited") {
+        Some(base) if !base.is_empty() => (strip_copy(base).to_string(), true),
+        _ => (stem, false),
+    }
+}
+
+/// Indices of one original's edits, then of its originals.
+type EditFamily = (Vec<usize>, Vec<usize>);
+
+/// Edits that have an original beside them: for each (folder, original
+/// stem, kind family) holding at least one edit and one non-edit, the
+/// indices of its edits and of its originals, in input order. Families
+/// are stills (photos and Live Photos) and videos, so a Live Photo's edit
+/// never joins a same-named clip. Different folders never join.
+fn edit_families(assets: &[Asset]) -> Vec<EditFamily> {
+    let mut by_key: HashMap<(&Path, String, bool), EditFamily> = HashMap::new();
+    for (i, a) in assets.iter().enumerate() {
+        let (Some(dir), Some(name)) = (a.path.parent(), a.path.file_name()) else {
+            continue;
+        };
+        let (stem, edit) = edit_stem(&name.to_string_lossy());
+        let e = by_key
+            .entry((dir, stem, a.kind == AssetKind::Video))
+            .or_default();
+        if edit { &mut e.0 } else { &mut e.1 }.push(i);
+    }
+    let mut fams: Vec<_> = by_key
+        .into_values()
+        .filter(|(e, o)| !e.is_empty() && !o.is_empty())
+        .collect();
+    fams.sort();
+    fams
+}
+
 /// Make byte-identical copies of a file agree before they are collapsed.
 ///
 /// A photo library can hold the same file twice with the caption on one
@@ -389,6 +468,10 @@ fn identical_files(assets: &[Asset]) -> Vec<Vec<usize>> {
 /// becomes the best one any copy earned. So whichever copy
 /// [`collapse_near_dupes`] keeps carries everything the owner entered.
 /// Each copy's own file facts (path, dates, size) are left alone.
+///
+/// An edit and its original ([`edit_families`]) share too, one way: the
+/// edit takes what it lacks from the original. Run this before clustering
+/// so an edit that lost its date is placed by its original's.
 pub fn share_identical_metadata(assets: &mut [Asset], scores: &mut HashMap<String, Score>) {
     for twins in identical_files(assets) {
         let caption = twins.iter().find_map(|&i| assets[i].user_caption.clone());
@@ -414,6 +497,52 @@ pub fn share_identical_metadata(assets: &mut [Asset], scores: &mut HashMap<Strin
             a.library_score = library;
             if let Some(s) = &best_score {
                 scores.insert(a.id.clone(), s.clone());
+            }
+        }
+    }
+    // An edit inherits what the owner entered on its original (caption,
+    // people tags, library score) and, only where the edit has none, the
+    // original's capture time, offset and place: an exported edit often
+    // loses its EXIF, and would otherwise be dated by its file time.
+    for (edits, originals) in edit_families(assets) {
+        let caption = originals
+            .iter()
+            .find_map(|&i| assets[i].user_caption.clone());
+        let people = originals
+            .iter()
+            .map(|&i| (assets[i].people_count, assets[i].people_sig))
+            .max_by_key(|(count, _)| count.unwrap_or(0));
+        let library = originals
+            .iter()
+            .filter_map(|&i| assets[i].library_score)
+            .max_by(f32::total_cmp);
+        let dated = originals
+            .iter()
+            .map(|&i| &assets[i])
+            .find(|o| o.taken_at.is_some() && !o.time_guessed)
+            .map(|o| (o.taken_at, o.tz_offset_secs));
+        let gps = originals.iter().find_map(|&i| assets[i].gps);
+        for &i in &edits {
+            let a = &mut assets[i];
+            if a.user_caption.is_none() {
+                a.user_caption = caption.clone();
+            }
+            if let Some((count, sig)) = people {
+                if count.unwrap_or(0) > a.people_count.unwrap_or(0) {
+                    (a.people_count, a.people_sig) = (count, sig);
+                }
+            }
+            a.library_score = match (a.library_score, library) {
+                (Some(x), Some(y)) => Some(x.max(y)),
+                (x, y) => x.or(y),
+            };
+            if a.taken_at.is_none() || a.time_guessed {
+                if let Some((t, o)) = dated {
+                    (a.taken_at, a.tz_offset_secs, a.time_guessed) = (t, o, false);
+                }
+            }
+            if a.gps.is_none() {
+                a.gps = gps;
             }
         }
     }
@@ -550,6 +679,143 @@ mod tests {
         let suppressed = suppressed_ids(&groups);
         assert_eq!(suppressed.len(), 2);
         assert!(suppressed.contains("clip-twin") && suppressed.contains("photo-twin"));
+    }
+
+    #[test]
+    fn edit_stem_forms_seen_in_osxphotos_exports() {
+        let e = |n: &str| edit_stem(n);
+        assert_eq!(e("IMG_6674.MOV"), ("img_6674".into(), false));
+        assert_eq!(e("IMG_6674_edited.mov"), ("img_6674".into(), true));
+        assert_eq!(e("IMG_1132 (1).HEIC"), ("img_1132".into(), false));
+        assert_eq!(e("IMG_1095_edited (1).heic"), ("img_1095".into(), true));
+        assert_eq!(e("IMG_1273_EDITED.jpeg"), ("img_1273".into(), true));
+        // Not the form osxphotos writes, but harmless to accept.
+        assert_eq!(e("IMG_1 (2)_edited.heic"), ("img_1".into(), true));
+        // Only a trailing all-digit copy number is stripped.
+        assert_eq!(e("Trip (Day 2).jpg"), ("trip (day 2)".into(), false));
+        assert_eq!(e("_edited.jpg"), ("_edited".into(), false));
+        assert_eq!(e("noext"), ("noext".into(), false));
+    }
+
+    fn at(id: &str, path: &str, kind: AssetKind, taken: Option<i64>, phash: u64) -> Asset {
+        let mut a = Asset::new(id, path.into(), kind);
+        a.taken_at = taken;
+        a.phash = Some(phash);
+        a
+    }
+
+    #[test]
+    fn an_edit_beats_a_higher_scored_original() {
+        let score = |total: f32| Score {
+            total,
+            ..Default::default()
+        };
+        // Different pixels, a day apart: only the names tie them.
+        let orig = at("o", "/t/d/IMG_6674.MOV", AssetKind::Video, Some(1000), 0);
+        let copy = at(
+            "c",
+            "/t/d/IMG_6674 (1).MOV",
+            AssetKind::Video,
+            Some(1000),
+            1,
+        );
+        let edit = at(
+            "e",
+            "/t/d/IMG_6674_edited.mov",
+            AssetKind::Video,
+            Some(90_000),
+            u64::MAX,
+        );
+        let scores = HashMap::from([
+            ("o".to_string(), score(0.9)),
+            ("c".to_string(), score(0.95)),
+            ("e".to_string(), score(0.2)),
+        ]);
+        let g = collapse_near_dupes(&[orig, copy, edit], &scores);
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert_eq!(g[0].best_id, "e");
+        assert_eq!(g[0].members.len(), 3);
+    }
+
+    #[test]
+    fn edits_join_only_their_own_original() {
+        let t = Some(1000);
+        let a = [
+            // A still's edit and a same-named clip: different families.
+            at("pe", "/t/d/IMG_1_edited.heic", AssetKind::LivePhoto, t, 0),
+            at("vo", "/t/d/IMG_1.MOV", AssetKind::Video, t, u64::MAX),
+            // An edit with no original beside it.
+            at(
+                "lone",
+                "/t/d/IMG_2_edited.heic",
+                AssetKind::Photo,
+                t,
+                0xFFFF_FFFF_0000_0000,
+            ),
+            // The same stem in another folder is another photo.
+            at(
+                "x",
+                "/t/other/IMG_2.HEIC",
+                AssetKind::Photo,
+                Some(500_000),
+                0xF0F0,
+            ),
+        ];
+        let g = collapse_near_dupes(&a, &HashMap::new());
+        assert_eq!(g.len(), 4, "{g:?}");
+        assert!(g.iter().all(|g| g.members.len() == 1));
+    }
+
+    #[test]
+    fn an_edit_inherits_what_the_original_carries() {
+        let mut orig = at("o", "/t/d/IMG_7.HEIC", AssetKind::LivePhoto, Some(1_000), 0);
+        orig.user_caption = Some("Night market".into());
+        (orig.people_count, orig.people_sig) = (Some(2), Some(7));
+        orig.library_score = Some(0.6);
+        orig.tz_offset_secs = Some(8 * 3600);
+        orig.gps = Some((1.29, 103.85));
+        // The exported edit lost its EXIF: dated by mtime, no place.
+        let mut edit = at(
+            "e",
+            "/t/d/IMG_7_edited.heic",
+            AssetKind::Photo,
+            Some(9_999),
+            1,
+        );
+        edit.time_guessed = true;
+        // A dated edit with its own caption keeps its own.
+        let mut orig2 = at("o2", "/t/d/IMG_8.HEIC", AssetKind::Photo, Some(2_000), 0);
+        orig2.user_caption = Some("old".into());
+        orig2.gps = Some((1.0, 1.0));
+        let mut edit2 = at(
+            "e2",
+            "/t/d/IMG_8_edited.heic",
+            AssetKind::Photo,
+            Some(2_100),
+            1,
+        );
+        edit2.user_caption = Some("new".into());
+        edit2.tz_offset_secs = Some(3600);
+        edit2.gps = Some((2.0, 2.0));
+        let mut assets = [orig, edit, orig2, edit2];
+        share_identical_metadata(&mut assets, &mut HashMap::new());
+        let e = &assets[1];
+        assert_eq!(e.user_caption.as_deref(), Some("Night market"));
+        assert_eq!((e.people_count, e.people_sig), (Some(2), Some(7)));
+        assert_eq!(e.library_score, Some(0.6));
+        assert_eq!(
+            (e.taken_at, e.tz_offset_secs),
+            (Some(1_000), Some(8 * 3600))
+        );
+        assert!(!e.time_guessed);
+        assert_eq!(e.gps, Some((1.29, 103.85)));
+        let e2 = &assets[3];
+        assert_eq!(e2.user_caption.as_deref(), Some("new"));
+        assert_eq!((e2.taken_at, e2.tz_offset_secs), (Some(2_100), Some(3600)));
+        assert_eq!(e2.gps, Some((2.0, 2.0)));
+        // The originals are left as they were.
+        assert_eq!(assets[0].taken_at, Some(1_000));
+        assert_eq!(assets[2].user_caption.as_deref(), Some("old"));
     }
 
     #[test]
