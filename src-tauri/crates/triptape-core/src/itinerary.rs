@@ -665,10 +665,15 @@ pub fn name_film_chapters(
                 (away && !aboard).then(|| city.clone())
             });
             if let Some(p) = next {
-                anchor = a.gps.or(anchor);
                 if p != current {
+                    // A new place's anchor is its own shot: a named place
+                    // without GPS (a time window) leaves none rather than
+                    // measuring the next shots from the place before.
+                    anchor = a.gps;
                     ch.film_place_changes.push((a.id.clone(), p.clone()));
                     current = p;
+                } else {
+                    anchor = a.gps.or(anchor);
                 }
             }
         }
@@ -1046,6 +1051,25 @@ mod tests {
         assert_eq!(out.map_polyline.len(), 7);
     }
 
+    /// A plan whose hero shows `ids` as stills, in order, with no chapters.
+    fn hero_plan(ids: &[&str]) -> Plan {
+        let hero: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "asset_id": id, "content_hash": null, "size_bytes": 0, "mtime": 0,
+                    "rendition": "still"
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "plan_version": 1, "schema_version": 1, "reel_selects": [], "chapters": [],
+            "captions": {}, "map_polyline": [], "music": {"track": "", "rationale": ""},
+            "hero": hero,
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn place_names_match_without_accents() {
         assert_eq!(fold_name("Meiji Jingū"), fold_name("meiji jingu"));
@@ -1082,18 +1106,7 @@ mod tests {
             film_place: None,
             film_place_changes: vec![],
         };
-        let entry = |id: &str| {
-            serde_json::json!({
-                "asset_id": id, "content_hash": null, "size_bytes": 0, "mtime": 0,
-                "rendition": "still"
-            })
-        };
-        let mut plan: Plan = serde_json::from_value(serde_json::json!({
-            "plan_version": 1, "schema_version": 1, "reel_selects": [], "chapters": [],
-            "captions": {}, "map_polyline": [], "music": {"track": "", "rationale": ""},
-            "hero": [entry("m1"), entry("m2"), entry("t1")],
-        }))
-        .unwrap();
+        let mut plan = hero_plan(&["m1", "m2", "t1"]);
         plan.chapters = vec![
             chapter(&["t1", "t2", "t3", "m1", "m2"]),
             chapter(&["t1", "t2", "t3"]),
@@ -1114,6 +1127,50 @@ mod tests {
         // A chapter the user renamed keeps their name.
         name_film_chapters(&mut plan, &assets, &it, |c| c.asset_ids.len() == 5);
         assert_eq!(plan.chapters[0].film_place, None);
+    }
+
+    #[test]
+    fn a_film_shot_far_from_the_heading_returns_to_the_city() {
+        let mut it = itin();
+        it.places = serde_json::from_str(
+            r#"[{ "name": "Kiyosumi Garden", "lat": 35.6810, "lon": 139.7980, "radius_m": 150 }]"#,
+        )
+        .unwrap();
+        let garden = Some((35.6811, 139.7981));
+        // Beside the garden, outside its radius: still the garden.
+        let near = Some((35.6830, 139.7990));
+        // Several km away, with no place of its own: back in Tokyo.
+        let far = Some((35.6500, 139.8400));
+        let assets = vec![
+            photo("g1", "2026-10-06", garden),
+            photo("n1", "2026-10-06", near),
+            photo("f1", "2026-10-06", far),
+            photo("g2", "2026-10-06", garden),
+        ];
+        let mut plan = hero_plan(&["g1", "n1", "f1", "g2"]);
+        plan.chapters = vec![Chapter {
+            title: "Tokyo".into(),
+            asset_ids: ["g1", "n1", "f1", "g2"].map(String::from).to_vec(),
+            place: Some("Tokyo".into()),
+            day_index: Some(3),
+            date_label: None,
+            film_place: None,
+            film_place_changes: vec![],
+        }];
+        name_film_chapters(&mut plan, &assets, &it, |_| false);
+        let ch = &plan.chapters[0];
+        assert_eq!(ch.film_place.as_deref(), Some("Kiyosumi Garden"));
+        assert_eq!(
+            ch.film_place_changes,
+            [
+                ("f1".to_string(), "Tokyo".to_string()),
+                ("g2".to_string(), "Kiyosumi Garden".to_string()),
+            ]
+        );
+        assert_eq!(
+            ch.film_places().collect::<Vec<_>>(),
+            ["Kiyosumi Garden", "Tokyo", "Kiyosumi Garden"]
+        );
     }
 
     #[test]

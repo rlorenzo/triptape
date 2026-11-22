@@ -1074,20 +1074,26 @@ pub fn render_hero_video(
                     date_range.clone(),
                 ))
             } else {
-                let heading = if chapter_start[i] {
-                    chapter_of_entry
-                        .get(id)
-                        .and_then(|ch| crate::titlecard::chapter_film_lines(ch))
-                } else {
-                    // Any shot on screen (a collage's members too) that
-                    // reaches a new place starts its heading here.
-                    collage_members
-                        .get(id)
-                        .map_or_else(|| vec![id], |ms| ms.iter().map(String::as_str).collect())
-                        .into_iter()
-                        .find_map(|m| place_change.get(m).zip(chapter_of_entry.get(m)))
-                        .and_then(|(p, ch)| crate::titlecard::chapter_lines_at(ch, p))
-                };
+                // Any shot on screen (a collage's members too) that reaches
+                // a new place starts its heading here, even where a chapter
+                // resumes on it; otherwise a chapter start names its first
+                // place.
+                let heading = std::iter::once(id)
+                    .chain(
+                        collage_members
+                            .get(id)
+                            .into_iter()
+                            .flatten()
+                            .map(String::as_str),
+                    )
+                    .find_map(|m| place_change.get(m).zip(chapter_of_entry.get(m)))
+                    .and_then(|(p, ch)| crate::titlecard::chapter_lines_at(ch, p))
+                    .or_else(|| {
+                        chapter_start[i]
+                            .then(|| chapter_of_entry.get(id))
+                            .flatten()
+                            .and_then(|ch| crate::titlecard::chapter_film_lines(ch))
+                    });
                 heading.filter(|lines| {
                     let repeat = last_heading.as_ref() == Some(lines);
                     last_heading = Some(lines.clone());
