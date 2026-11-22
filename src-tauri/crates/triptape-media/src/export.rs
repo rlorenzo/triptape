@@ -849,17 +849,8 @@ fn export_inner(
             let place = book_places.get(&a.id).cloned();
             let closing = plan.closing.as_deref() == Some(a.id.as_str());
             let itin = opts.itinerary.as_ref();
-            let located;
-            let spot = match (a.gps, borrowed.get(a.id.as_str())) {
-                (None, Some(&fix)) => {
-                    located = triptape_core::types::Asset {
-                        gps: Some(fix),
-                        ..a.clone()
-                    };
-                    triptape_core::places::spot(itin, &located)
-                }
-                _ => triptape_core::places::spot(itin, a),
-            };
+            let spot =
+                triptape_core::places::spot_with_fix(itin, a, borrowed.get(a.id.as_str()).copied());
             book_photos.push(BookPhoto {
                 asset_id: a.id.clone(),
                 path: a.path.clone(),
