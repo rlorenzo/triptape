@@ -493,6 +493,21 @@ fn book_heading_place(
     if triptape_core::itinerary::is_ship_place(ships, place) {
         return None;
     }
+    // A place that already names its town ("Kamakura, Japan · Tsurugaoka
+    // Hachimangū", a day trip out of the stop's city) leads with the town
+    // and drops the country: no stop city in front of it.
+    if let Some((town, rest)) = place
+        .split_once(" \u{b7} ")
+        .map_or((place, None), |(a, b)| (a, Some(b)))
+        .0
+        .split_once(", ")
+        .map(|(t, _)| (t, place.split_once(" \u{b7} ").map(|(_, b)| b)))
+    {
+        return Some(match rest {
+            Some(r) => format!("{town} \u{b7} {r}"),
+            None => town.to_string(),
+        });
+    }
     // A day trip out of the city (Kamakura from Tokyo) keeps the sight
     // alone.
     let fixes: Vec<(f64, f64)> = shots.iter().filter_map(|a| a.gps).collect();
@@ -1109,6 +1124,11 @@ mod tests {
         assert_eq!(
             heading("asakusa", "Senso-ji").as_deref(),
             Some("Tokyo \u{b7} Senso-ji")
+        );
+        // A place naming its own town leads with it, without the country.
+        assert_eq!(
+            heading("asakusa", "Kamakura, Japan \u{b7} Tsurugaoka Hachimangū").as_deref(),
+            Some("Kamakura \u{b7} Tsurugaoka Hachimangū")
         );
         // A day trip out of the city, and a sight already naming it, keep
         // the chapter's own place.
