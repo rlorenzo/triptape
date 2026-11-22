@@ -1262,23 +1262,21 @@ pub fn render_book(
             "book: selected {keep} of {of} photos (your captioned photos first, then the best-scored of each chapter) to fit the {cap}-page cap"
         ));
     }
-    // The closing page's photo, chosen now from what the pages leave out:
-    // a strong people shot of the last days that the book doesn't print
-    // elsewhere, so the last page is new, not a repeat.
-    // The owner's choice first; it then leaves the pages, so it never
-    // prints twice.
+    // The closing page's photo: the owner's choice (taken off the pages,
+    // so it never prints twice), else a strong people shot of the last
+    // days the pages leave out, so the last page is new, not a repeat.
     let owner_closing = viable.iter().find(|p| p.closing).cloned();
     if let Some(c) = &owner_closing {
         pruned.retain(|p| p.asset_id != c.asset_id);
     }
-    let closing_pick: Option<BookPhoto> = owner_closing.or_else(|| {
+    let mut closing_pick: Option<BookPhoto> = owner_closing.or_else(|| {
         let placed: HashSet<&str> = pruned.iter().map(|p| p.asset_id.as_str()).collect();
         let last_day = viable.iter().filter_map(|p| p.day).max();
+        let (w, h) = slot_inches(opts.preset, PageKind::Closing, 1);
         viable
             .iter()
             .filter(|p| {
                 // Big, sharp faces that print well on a full page.
-                let (w, h) = slot_inches(opts.preset, PageKind::Closing, 1);
                 !placed.contains(p.asset_id.as_str())
                     && cover_rank(p) == 2
                     && p.tagged_people >= 3
@@ -1311,6 +1309,15 @@ pub fn render_book(
             found
                 .borrow_mut()
                 .insert(p.asset_id.clone(), p.faces.clone());
+        }
+        // The closing photo is off the pages: its faces too, so its full
+        // page frames like any other.
+        if let Some(c) = closing_pick.as_mut() {
+            let src = load(c, &opts.ffmpeg_bin, &mut fallbacks);
+            c.faces = (finder.0)(&src);
+            found
+                .borrow_mut()
+                .insert(c.asset_id.clone(), c.faces.clone());
         }
     }
     let photos: &[BookPhoto] = &pruned;
@@ -2134,7 +2141,13 @@ fn fit_photo_focused(
             "crop: {} cannot keep every face in its cell; shown whole",
             p.display_name()
         ));
-        return contain_on_page(&src, tw, th, 0);
+        let strip_px = (reserve.clamp(0.0, 1.0) * th_f).round() as u32;
+        return contain_on_page(&src, tw, th, strip_px);
+    } else if cut {
+        fb.push(format!(
+            "crop: {} cannot keep every face in its cell; the biggest stay",
+            p.display_name()
+        ));
     }
     crop_window(&src, window, tw, th)
 }
@@ -2176,6 +2189,20 @@ const FACE_BELOW: f32 = 0.15;
 pub struct KnownBox {
     pub b: FaceBox,
     pub body: bool,
+}
+
+impl From<&triptape_core::types::KnownFace> for KnownBox {
+    fn from(k: &triptape_core::types::KnownFace) -> Self {
+        KnownBox {
+            b: FaceBox {
+                x: k.x,
+                y: k.y,
+                w: k.w,
+                h: k.h,
+            },
+            body: k.body,
+        }
+    }
 }
 
 /// What framing weighs a family member's face (with head room) at.
@@ -2254,7 +2281,17 @@ fn framing_window(
     let (cw, ch) = ((tw / scale).min(sw), (th / scale).min(sh));
     let usable_h = ch * (1.0 - reserve.clamp(0.0, 0.5));
     let (slack_x, slack_y) = ((sw - cw).max(0.0), (sh - ch).max(0.0));
-    let steps = |slack: f64| if slack > 0.5 { FRAMING_STEPS } else { 1 };
+    // Candidate offsets along an axis: evenly across its slack, or the
+    // middle when there is none to speak of.
+    let offsets = |slack: f64| -> Vec<f64> {
+        if slack > 0.5 {
+            (0..FRAMING_STEPS)
+                .map(|i| slack * i as f64 / (FRAMING_STEPS - 1) as f64)
+                .collect()
+        } else {
+            vec![slack / 2.0]
+        }
+    };
     let fraction_in = |b: &FaceBox, x: f64, y: f64| {
         let (bx0, by0) = (f64::from(b.x) * sw, f64::from(b.y) * sh);
         let (bx1, by1) = (bx0 + f64::from(b.w) * sw, by0 + f64::from(b.h) * sh);
@@ -2270,30 +2307,21 @@ fn framing_window(
         }
     };
     let mut best: Option<(f64, f64, f64, bool)> = None;
-    for i in 0..steps(slack_x) {
-        let x = if steps(slack_x) == 1 {
-            slack_x / 2.0
-        } else {
-            slack_x * i as f64 / (FRAMING_STEPS - 1) as f64
-        };
-        for j in 0..steps(slack_y) {
-            let y = if steps(slack_y) == 1 {
-                slack_y / 2.0
-            } else {
-                slack_y * j as f64 / (FRAMING_STEPS - 1) as f64
-            };
+    let ys = offsets(slack_y);
+    for x in offsets(slack_x) {
+        for &y in &ys {
             let mut score = 0.0;
             let mut family_cut = false;
             for (b, w) in targets {
                 let f = fraction_in(b, x, y);
                 if f >= 0.98 {
                     score += w;
-                } else if f > 0.02 {
-                    score -= PARTIAL_PENALTY * w;
-                    family_cut |= *w > STRANGER_WEIGHT;
-                } else {
-                    family_cut |= *w > STRANGER_WEIGHT;
+                    continue;
                 }
+                if f > 0.02 {
+                    score -= PARTIAL_PENALTY * w;
+                }
+                family_cut |= *w > STRANGER_WEIGHT;
             }
             // Ties: the window nearest the middle of the photo.
             let off = ((x - slack_x / 2.0).abs() + (y - slack_y / 2.0).abs()) / (sw + sh);
@@ -2778,7 +2806,7 @@ fn typst_text_png(
     scratch_png: &Path,
 ) -> Option<image::DynamicImage> {
     let doc = format!(
-        "#set page(width: 11in, height: auto, fill: none, margin: 0in)\n#set text(font: {BOOK_FONTS}, fill: white)\n#align(center)[#text(size: 44pt, weight: \"bold\")[{}]]\n#align(center)[#text(size: 20pt)[{}]]\n",
+        "#set page(width: 11in, height: auto, fill: none, margin: 0in)\n#set text(font: {BOOK_FONTS}, fill: white)\n#align(center)[#text(size: 44pt, weight: \"bold\")[{}]]\n#align(center)[#text(size: 20pt, weight: \"medium\")[{}]]\n",
         typ_escape(title),
         typ_escape(sub)
     );
@@ -2846,11 +2874,12 @@ fn cover_picks(photos: &[BookPhoto], opening: &[usize]) -> Vec<usize> {
     // One tile per day where the trip allows: two tiles of one scene (a
     // pinned waterfall beside another shot of it) waste the cover.
     let mut days: HashSet<u32> = picks.iter().filter_map(|&i| photos[i].day).collect();
+    // Ranked once: each rank runs a framing search.
+    let rank: Vec<u8> = photos.iter().map(cover_rank).collect();
     let better = |a: &usize, b: &usize| {
-        let (a, b) = (&photos[*a], &photos[*b]);
-        cover_rank(a)
-            .cmp(&cover_rank(b))
-            .then(a.score.total_cmp(&b.score))
+        rank[*a]
+            .cmp(&rank[*b])
+            .then(photos[*a].score.total_cmp(&photos[*b].score))
     };
     for k in 0..slots {
         let stretch = &pool[k * pool.len() / slots..(k + 1) * pool.len() / slots];
@@ -3080,8 +3109,7 @@ fn write_typst_and_compile(
                 // the places beneath it in caption size, never fused into
                 // one three-line block.
                 let (head, rest) = (clean[0], clean[1..].join(" · "));
-                strip_pt =
-                    strip_height_pt(head, size, inset, pw) + strip_height_pt(&rest, 14, 0, pw);
+                strip_pt = title_strip_pt(&clean, size, inset, pw);
                 typ.push_str(&format!(
                     "#place(bottom + center)[#rect(fill: rgb(18, 20, 26).transparentize(20%), inset: {inset}pt)[#align(center)[#text(size: {size}pt)[{}] \\ #text(size: 14pt)[{}]]]]\n",
                     typ_escape(head),
@@ -3229,14 +3257,20 @@ fn strip_px(lines: &[String], title: bool, preset: BookPreset, th: u32) -> u32 {
     }
     let (size, inset) = if title { (24, 14) } else { (14, 8) };
     let (w_in, h_in) = preset.trim_inches();
-    // As the burn draws it: a title on its own line, the rest beneath.
     let pt = if title && lines.len() > 1 {
-        strip_height_pt(&lines[0], size, inset, w_in)
-            + strip_height_pt(&lines[1..].join(" · "), 14, 0, w_in)
+        title_strip_pt(lines, size, inset, w_in)
     } else {
         strip_height_pt(&lines.join(" · "), size, inset, w_in)
     };
     (pt / (h_in * 72.0) * f64::from(th)).round() as u32
+}
+
+/// Height (pt) of a title page's strip as the burn draws it: the heading
+/// on its own line at `size`, the rest beneath it at caption size.
+fn title_strip_pt<S: AsRef<str>>(lines: &[S], size: u32, inset: u32, page_w: f64) -> f64 {
+    let rest: Vec<&str> = lines[1..].iter().map(AsRef::as_ref).collect();
+    strip_height_pt(lines[0].as_ref(), size, inset, page_w)
+        + strip_height_pt(&rest.join(" · "), 14, 0, page_w)
 }
 
 /// Height in points of a bottom strip of `text` at `size` pt with `inset`

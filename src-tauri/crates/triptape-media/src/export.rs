@@ -470,6 +470,42 @@ fn record_cache_use(cache: &SegmentCache, evicted: usize, report: &mut ExportRep
     }
 }
 
+/// The place a chapter's book heading names, when the itinerary adds to
+/// the chapter's own: a port day aboard names the port beside the ship
+/// ("Carnival Luminosa · Fukuoka"), and a sight leads with the stop it
+/// was in ("Singapore · Mount Faber Peak"). `None` keeps the chapter's.
+fn book_heading_place(
+    ch: &triptape_core::types::Chapter,
+    itin: &triptape_core::itinerary::Itinerary,
+    ships: &[String],
+    by_id: &HashMap<&str, &triptape_core::types::Asset>,
+) -> Option<String> {
+    let place = ch.place.as_deref()?;
+    let shots: Vec<&triptape_core::types::Asset> = ch
+        .asset_ids
+        .iter()
+        .filter_map(|id| by_id.get(id.as_str()).copied())
+        .collect();
+    let day = shots.iter().find_map(|a| asset_day(a))?;
+    if ships.iter().any(|s| s == place) {
+        return itin
+            .port_call(day)
+            .map(|port| format!("{place} \u{b7} {port}"));
+    }
+    if ships.iter().any(|s| place.contains(s.as_str())) {
+        return None;
+    }
+    // The middle of the day's fixes: a day trip out of the city (Kamakura
+    // from Tokyo) keeps the sight alone.
+    let (mut lats, mut lons): (Vec<f64>, Vec<f64>) = shots.iter().filter_map(|a| a.gps).unzip();
+    lats.sort_by(f64::total_cmp);
+    lons.sort_by(f64::total_cmp);
+    let at = (!lats.is_empty()).then(|| (lats[lats.len() / 2], lons[lons.len() / 2]));
+    itin.stop_on(day, at)
+        .filter(|city| !place.contains(city.as_str()))
+        .map(|city| format!("{city} \u{b7} {place}"))
+}
+
 fn export_inner(
     caps: &Capabilities,
     plan: &Plan,
@@ -816,19 +852,7 @@ fn export_inner(
                 family: opts
                     .known_faces
                     .get(&a.id)
-                    .map(|list| {
-                        list.iter()
-                            .map(|k| render_book::KnownBox {
-                                b: triptape_ai_local::FaceBox {
-                                    x: k.x,
-                                    y: k.y,
-                                    w: k.w,
-                                    h: k.h,
-                                },
-                                body: k.body,
-                            })
-                            .collect()
-                    })
+                    .map(|list| list.iter().map(render_book::KnownBox::from).collect())
                     .unwrap_or_default(),
                 area: match spot {
                     Spot::Named(name) => Some(name.to_string()),
@@ -889,9 +913,6 @@ fn export_inner(
         let book_dir = out_dir.join("book");
         let staged_book = stage.join("book");
         // Day-marker titles: day once, with the location.
-        // A port day's chapter aboard is the ship's, but the day was the
-        // port's too: its heading names both ("Carnival Luminosa ·
-        // Fukuoka").
         let ships: Vec<String> = opts
             .itinerary
             .as_ref()
@@ -903,56 +924,17 @@ fn export_inner(
             .chapters
             .iter()
             .map(|ch| {
-                let port = opts.itinerary.as_ref().and_then(|itin| {
-                    let place = ch.place.as_deref()?;
-                    if !ships.iter().any(|s| s == place) {
-                        return None;
-                    }
-                    let day = ch.asset_ids.iter().find_map(|id| {
-                        triptape_core::itinerary::asset_day(by_id.get(id.as_str())?)
-                    })?;
-                    itin.port_call(day)
-                });
-                // A sight names the day; the stop it was in leads, so the
-                // book says where the trip was ("Singapore · Mount Faber
-                // Peak", "Jeju · Jeongbang Waterfall").
-                let stop = opts.itinerary.as_ref().and_then(|itin| {
-                    let place = ch.place.as_deref()?;
-                    if ships.iter().any(|s| place.contains(s.as_str())) {
-                        return None;
-                    }
-                    let day = ch.asset_ids.iter().find_map(|id| {
-                        triptape_core::itinerary::asset_day(by_id.get(id.as_str())?)
-                    })?;
-                    // The middle of the day's fixes: a day trip out of the
-                    // city (Kamakura from Tokyo) keeps the sight alone.
-                    let mut lats: Vec<f64> = vec![];
-                    let mut lons: Vec<f64> = vec![];
-                    for a in ch.asset_ids.iter().filter_map(|id| by_id.get(id.as_str())) {
-                        if let Some((la, lo)) = a.gps {
-                            lats.push(la);
-                            lons.push(lo);
-                        }
-                    }
-                    lats.sort_by(f64::total_cmp);
-                    lons.sort_by(f64::total_cmp);
-                    let at =
-                        (!lats.is_empty()).then(|| (lats[lats.len() / 2], lons[lons.len() / 2]));
-                    itin.stop_on(day, at)
-                        .filter(|city| !place.contains(city.as_str()))
-                });
-                match (port, stop, &ch.place) {
-                    (Some(port), _, Some(place)) => {
+                let place = opts
+                    .itinerary
+                    .as_ref()
+                    .and_then(|itin| book_heading_place(ch, itin, &ships, &by_id));
+                match place {
+                    Some(place) => {
                         let mut named = ch.clone();
-                        named.place = Some(format!("{place} \u{b7} {port}"));
+                        named.place = Some(place);
                         crate::titlecard::chapter_book_title(&named)
                     }
-                    (None, Some(city), Some(place)) => {
-                        let mut named = ch.clone();
-                        named.place = Some(format!("{city} \u{b7} {place}"));
-                        crate::titlecard::chapter_book_title(&named)
-                    }
-                    _ => crate::titlecard::chapter_book_title(ch),
+                    None => crate::titlecard::chapter_book_title(ch),
                 }
             })
             .collect();
@@ -1077,6 +1059,67 @@ fn chapter_slideshow(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn book_headings_name_the_port_beside_the_ship_and_the_city_before_a_sight() {
+        let itin = triptape_core::itinerary::Itinerary::from_json(
+            r#"{
+          "stops": [
+            { "id": "lax", "label": "Los Angeles", "lat": 33.94, "lon": -118.41, "depart": "2026-10-03", "kind": "home" },
+            { "id": "tokyo", "label": "Tokyo", "lat": 35.71, "lon": 139.80, "arrive": "2026-10-04", "depart": "2026-10-09" },
+            { "id": "osaka", "label": "Osaka", "lat": 34.656, "lon": 135.4306, "arrive": "2026-10-11", "depart": "2026-10-11", "kind": "port" },
+            { "id": "lax2", "label": "Los Angeles", "lat": 33.94, "lon": -118.41, "arrive": "2026-10-20", "kind": "home" }
+          ],
+          "legs": [
+            { "from": "lax", "to": "tokyo", "mode": "flight" },
+            { "from": "tokyo", "to": "osaka", "mode": "ship", "ship": "Carnival Luminosa" },
+            { "from": "osaka", "to": "lax2", "mode": "flight" }
+          ]
+        }"#,
+        )
+        .unwrap();
+        let ships = vec!["Carnival Luminosa".to_string()];
+        let shot = |id: &str, taken_at: i64, gps: (f64, f64)| {
+            let mut a = triptape_core::types::Asset::new(
+                id,
+                format!("/t/{id}.jpg").into(),
+                AssetKind::Photo,
+            );
+            a.taken_at = Some(taken_at);
+            a.tz_offset_secs = Some(9 * 3600);
+            a.gps = Some(gps);
+            a
+        };
+        // Oct 5 and Oct 11, noon in Japan.
+        let assets = [
+            shot("asakusa", 1_791_169_200, (35.7148, 139.7967)),
+            shot("kamakura", 1_791_169_200, (35.3192, 139.5467)),
+            shot("ship", 1_791_687_600, (34.65, 135.43)),
+        ];
+        let by_id: HashMap<&str, &triptape_core::types::Asset> =
+            assets.iter().map(|a| (a.id.as_str(), a)).collect();
+        let chapter = |id: &str, place: &str| triptape_core::types::Chapter {
+            title: String::new(),
+            asset_ids: vec![id.to_string()],
+            place: Some(place.to_string()),
+            day_index: None,
+            date_label: None,
+            film_place: None,
+        };
+        let heading = |id, place| book_heading_place(&chapter(id, place), &itin, &ships, &by_id);
+        assert_eq!(
+            heading("ship", "Carnival Luminosa").as_deref(),
+            Some("Carnival Luminosa \u{b7} Osaka")
+        );
+        assert_eq!(
+            heading("asakusa", "Senso-ji").as_deref(),
+            Some("Tokyo \u{b7} Senso-ji")
+        );
+        // A day trip out of the city, and a sight already naming it, keep
+        // the chapter's own place.
+        assert_eq!(heading("kamakura", "Kotoku-in"), None);
+        assert_eq!(heading("asakusa", "Tokyo Tower"), None);
+    }
 
     #[test]
     fn promote_dir_replaces_the_old_folder_and_cleans_up() {

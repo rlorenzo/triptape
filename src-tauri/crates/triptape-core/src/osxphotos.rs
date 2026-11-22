@@ -429,7 +429,7 @@ const KNOWN_FACE_MATCH_SECS: i64 = 120;
 /// The file stem a trip file shares with its library original:
 /// `IMG_1208 (1).HEIC` → `img_1208`. `None` for an `_edited` file, whose
 /// crop may differ from the original the regions describe.
-fn library_stem(path: &std::path::Path) -> Option<String> {
+fn library_stem(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_string_lossy().to_lowercase();
     if stem.ends_with("_edited") {
         return None;
@@ -455,20 +455,16 @@ fn library_stem(path: &std::path::Path) -> Option<String> {
 pub fn known_faces_from_osxphotos(
     json: &str,
     assets: &[crate::types::Asset],
-) -> Result<std::collections::HashMap<String, Vec<crate::types::KnownFace>>, String> {
+) -> Result<HashMap<String, Vec<crate::types::KnownFace>>, String> {
     use crate::types::KnownFace;
     let items: Vec<serde_json::Value> = serde_json::from_str(json).map_err(|e| e.to_string())?;
-    let mut by_stem: std::collections::HashMap<String, Vec<&crate::types::Asset>> =
-        std::collections::HashMap::new();
+    let mut by_stem: HashMap<String, Vec<&crate::types::Asset>> = HashMap::new();
     for a in assets {
         if let Some(s) = library_stem(&a.path) {
             by_stem.entry(s).or_default().push(a);
         }
     }
-    let num = |v: &serde_json::Value, k: &str| {
-        v.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32
-    };
-    let mut out = std::collections::HashMap::new();
+    let mut out = HashMap::new();
     for item in &items {
         let Some(name) = item.get("original_filename").and_then(|v| v.as_str()) else {
             continue;
@@ -480,49 +476,19 @@ pub fn known_faces_from_osxphotos(
         else {
             continue;
         };
-        let stem = library_stem(std::path::Path::new(name)).unwrap_or_default();
+        let Some(stem) = library_stem(Path::new(name)) else {
+            continue;
+        };
         let Some(files) = by_stem.get(&stem) else {
             continue;
         };
-        let mut faces: Vec<KnownFace> = vec![];
-        for f in item
+        let mut faces: Vec<KnownFace> = item
             .get("face_info")
             .and_then(|v| v.as_array())
             .into_iter()
             .flatten()
-        {
-            let person = f.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if person.is_empty() || f.get("is_pet").and_then(|v| v.as_bool()) == Some(true) {
-                continue;
-            }
-            let area = f.get("mwg_rs_area").cloned().unwrap_or_default();
-            let (w, h) = (num(&area, "w"), num(&area, "h"));
-            if w > 0.0 && h > 0.0 {
-                // MWG regions: centre x, y and size, top-left origin.
-                faces.push(KnownFace {
-                    name: person.to_string(),
-                    x: num(&area, "x") - w / 2.0,
-                    y: num(&area, "y") - h / 2.0,
-                    w,
-                    h,
-                    body: false,
-                });
-            } else {
-                let (bw, bh) = (num(f, "body_width"), num(f, "body_height"));
-                if bw > 0.0 && bh > 0.0 {
-                    // Body centres count from the bottom edge.
-                    let (cx, cy) = (num(f, "body_center_x"), 1.0 - num(f, "body_center_y"));
-                    faces.push(KnownFace {
-                        name: person.to_string(),
-                        x: cx - bw / 2.0,
-                        y: cy - bh / 2.0,
-                        w: bw,
-                        h: bh,
-                        body: true,
-                    });
-                }
-            }
-        }
+            .filter_map(known_face)
+            .collect();
         if faces.is_empty() {
             continue;
         }
@@ -546,6 +512,41 @@ pub fn known_faces_from_osxphotos(
         }
     }
     Ok(out)
+}
+
+/// One `face_info` entry as a [`KnownFace`](crate::types::KnownFace): its
+/// face region, else its body's; `None` for a stranger (no name), a pet,
+/// or no region at all.
+fn known_face(f: &serde_json::Value) -> Option<crate::types::KnownFace> {
+    let num = |v: &serde_json::Value, k: &str| {
+        v.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32
+    };
+    let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if name.is_empty() || f.get("is_pet").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+    let area = f.get("mwg_rs_area").cloned().unwrap_or_default();
+    let (w, h) = (num(&area, "w"), num(&area, "h"));
+    let (cx, cy, w, h, body) = if w > 0.0 && h > 0.0 {
+        // MWG regions: centre x, y and size, top-left origin.
+        (num(&area, "x"), num(&area, "y"), w, h, false)
+    } else {
+        let (bw, bh) = (num(f, "body_width"), num(f, "body_height"));
+        if bw <= 0.0 || bh <= 0.0 {
+            return None;
+        }
+        // Body centres count from the bottom edge.
+        let (cx, cy) = (num(f, "body_center_x"), 1.0 - num(f, "body_center_y"));
+        (cx, cy, bw, bh, true)
+    };
+    Some(crate::types::KnownFace {
+        name: name.to_string(),
+        x: cx - w / 2.0,
+        y: cy - h / 2.0,
+        w,
+        h,
+        body,
+    })
 }
 
 /// Turn a region from the camera's stored frame (where Photos keeps face

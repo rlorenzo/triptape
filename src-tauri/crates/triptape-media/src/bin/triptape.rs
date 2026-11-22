@@ -1596,8 +1596,6 @@ fn edit_cmd(args: &[String]) {
     println!("film now has {} shots", hero.len());
 }
 
-/// `learn`: show, reset or apply the story-score weights learned from the
-/// owner's Story-editor edits. Never changes a plan unless `--apply`.
 /// `triptape faces --db trip.db --osxphotos photos.json [--project ID]`:
 /// import named people's face regions from `osxphotos query --json` output
 /// (Apple Photos' face tags), so the book frames the family first.
@@ -1635,6 +1633,8 @@ fn faces_cmd(flags: &HashMap<String, String>) {
     );
 }
 
+/// `learn`: show, reset or apply the story-score weights learned from the
+/// owner's Story-editor edits. Never changes a plan unless `--apply`.
 fn learn_cmd(flags: &HashMap<String, String>) {
     let db_path = need(flags, "db");
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
@@ -2058,6 +2058,16 @@ mod tests {
             ]
         );
         assert!(parse_edit_args(&args("--caption a")).is_err());
+    }
+
+    #[test]
+    fn edit_args_set_and_clear_the_closing_photo() {
+        let a = parse_edit_args(&args("--closing a")).unwrap();
+        assert_eq!((a.closing.as_deref(), a.no_closing), (Some("a"), false));
+        let a = parse_edit_args(&args("--no-closing")).unwrap();
+        assert_eq!((a.closing, a.no_closing), (None, true));
+        assert!(parse_edit_args(&args("--no-closing a")).is_err());
+        assert!(parse_edit_args(&args("--closing")).is_err());
     }
 
     #[test]
