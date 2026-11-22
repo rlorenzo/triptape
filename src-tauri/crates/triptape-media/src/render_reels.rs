@@ -108,12 +108,13 @@ fn burn_place_overlay(
     let png = dir.join(".place-overlay.png");
     let doc = crate::titlecard::lower_third_doc(place, None);
     let result = crate::titlecard::render_text_png(typst_bin, &doc, &png, 72).and_then(|()| {
-        crate::render_video::burn_png_overlay(
+        crate::render_video::burn_png_overlay_capped(
             caps,
             out,
             &png,
             "[1:v]scale=972:-2[png];[0:v][png]overlay=54:H-300:format=yuv420:enable='between(t,0.3,4.2)'[v]",
             20,
+            ffmpeg::FILM_1080P_MAX_KBPS,
         )
     });
     let _ = std::fs::remove_file(&png);
@@ -462,6 +463,8 @@ fn vertical_vf(caps: &Capabilities, src_w: u32, src_h: u32) -> String {
 
 fn quality_tail(out: &Path) -> Vec<String> {
     let mut args = ffmpeg::x264_aac("veryfast", 20);
+    // Streamable like the film: capped for a TV on a home network.
+    args.extend(ffmpeg::bitrate_cap_args(ffmpeg::FILM_1080P_MAX_KBPS));
     // Every reel encode ends here: no source tags in a reel (Sec 14).
     args.extend(triptape_core::privacy::exif_strip_args());
     args.extend(["-r".into(), "30".into(), "-shortest".into(), s(out)]);
@@ -712,6 +715,13 @@ fn render_still_reel_png(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reels_are_capped_to_stream() {
+        let a = quality_tail(Path::new("/tmp/r.mp4"));
+        let at = |k| ffmpeg::arg_after(&a, k);
+        assert_eq!((at("-maxrate"), at("-bufsize")), ("15000k", "15000k"));
+    }
 
     #[test]
     fn decode_still_fails_closed_on_missing_file() {

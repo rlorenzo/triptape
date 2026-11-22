@@ -14,6 +14,8 @@ use triptape_core::process;
 use triptape_core::proxies;
 use triptape_core::types::AssetKind;
 
+use crate::resolution::Resolution;
+
 /// Single-pass EBU R128 loudness target shared by every renderer.
 pub const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
 
@@ -182,16 +184,31 @@ pub fn path_arg(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
+/// The value following `flag` in an FFmpeg arg list (tests only).
+#[cfg(test)]
+pub(crate) fn arg_after<'a>(args: &'a [String], flag: &str) -> &'a str {
+    let i = args
+        .iter()
+        .position(|x| x == flag)
+        .unwrap_or_else(|| panic!("no {flag} in {args:?}"));
+    &args[i + 1]
+}
+
 /// Shared libx264 + AAC 48 kHz stereo encode args (yuv420p, faststart).
 /// Callers append frame-rate/`-shortest` flags and the output path.
 pub fn x264_aac(preset: &str, crf: u32) -> Vec<String> {
+    let mut args: Vec<String> = ["-c:v", "libx264", "-preset", preset, "-crf"]
+        .map(String::from)
+        .to_vec();
+    args.push(crf.to_string());
+    args.extend(yuv420p_aac_faststart());
+    args
+}
+
+/// The encoder-independent tail of [`x264_aac`]: yuv420p, AAC 48 kHz
+/// stereo, faststart.
+fn yuv420p_aac_faststart() -> Vec<String> {
     [
-        "-c:v",
-        "libx264",
-        "-preset",
-        preset,
-        "-crf",
-        &crf.to_string(),
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -207,12 +224,72 @@ pub fn x264_aac(preset: &str, crf: u32) -> Vec<String> {
     .to_vec()
 }
 
+/// Peak video bitrate of a 4K film, kbit/s. A Roku (player or TV) on
+/// Ethernet has a 100 Mbit/s port, and Plex direct-plays only what the
+/// link sustains: an uncapped CRF encode peaked near 300 Mbit/s and
+/// buffered. 30 Mbit/s leaves room for Wi-Fi and other traffic.
+pub const FILM_4K_MAX_KBPS: u32 = 30_000;
+/// Peak video bitrate of a 1080p film or a 1080x1920 reel, kbit/s.
+pub const FILM_1080P_MAX_KBPS: u32 = 15_000;
+
+/// `-maxrate`/`-bufsize` capping an H.264 encode at `kbps` second by
+/// second, so every video TripTape writes streams on a home network.
+pub fn bitrate_cap_args(kbps: u32) -> Vec<String> {
+    vec![
+        "-maxrate".into(),
+        format!("{kbps}k"),
+        "-bufsize".into(),
+        format!("{kbps}k"),
+    ]
+}
+
+/// Final film encode (video and audio), made to stream on a home network
+/// to a Roku or other TV player through Plex: the bitrate is capped
+/// (`FILM_4K_MAX_KBPS` / `FILM_1080P_MAX_KBPS`, one-second buffer so the
+/// cap holds second by second). 4K is HEVC when this FFmpeg has libx265
+/// (half the bitrate of H.264 for the same picture; every 4K Roku plays
+/// it), tagged `hvc1` for Apple players; otherwise H.264 High 5.1. 1080p
+/// stays H.264, which every player handles. Yuv420p, AAC 48 kHz stereo,
+/// faststart, as [`x264_aac`].
+pub fn film_encode_args(caps: &Capabilities, res: Resolution) -> Vec<String> {
+    let max = match res {
+        Resolution::Uhd4k => FILM_4K_MAX_KBPS,
+        Resolution::Hd1080 => FILM_1080P_MAX_KBPS,
+    };
+    if res == Resolution::Uhd4k && caps.libx265 {
+        let mut args: Vec<String> = [
+            "-c:v",
+            "libx265",
+            "-preset",
+            "fast",
+            "-crf",
+            "21",
+            "-tag:v",
+            "hvc1",
+            "-x265-params",
+        ]
+        .map(String::from)
+        .to_vec();
+        args.push(format!(
+            "vbv-maxrate={max}:vbv-bufsize={max}:log-level=error"
+        ));
+        args.extend(yuv420p_aac_faststart());
+        return args;
+    }
+    let mut args = x264_aac("medium", 19);
+    args.extend(res.x264_level_args());
+    args.extend(bitrate_cap_args(max));
+    args
+}
+
 /// Encoder/filter capabilities relevant to the three renderers.
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
     pub ffmpeg_bin: String,
     pub ffprobe_bin: String,
     pub libx264: bool,
+    /// HEVC encoder, for the streamable 4K film ([`film_encode_args`]).
+    pub libx265: bool,
     pub aac: bool,
     pub xfade: bool,
     pub perspective: bool,
@@ -351,6 +428,7 @@ pub fn probe_capabilities(ffmpeg_bin: &str, ffprobe_bin: &str) -> Capabilities {
         ffmpeg_bin: ffmpeg_bin.to_string(),
         ffprobe_bin: ffprobe_bin.to_string(),
         libx264: flag_present(&encoders, "libx264"),
+        libx265: flag_present(&encoders, "libx265"),
         aac: flag_present(&encoders, "aac"),
         xfade: filter("xfade"),
         perspective: filter("perspective"),
@@ -1519,9 +1597,43 @@ mod tests {
     }
 
     #[test]
+    fn the_film_encode_is_capped_to_stream() {
+        let at = arg_after;
+        let with = Capabilities {
+            libx264: true,
+            libx265: true,
+            ..Default::default()
+        };
+        let hevc = film_encode_args(&with, Resolution::Uhd4k);
+        assert_eq!(at(&hevc, "-c:v"), "libx265");
+        assert_eq!(at(&hevc, "-tag:v"), "hvc1");
+        assert!(at(&hevc, "-x265-params").contains("vbv-maxrate=30000:vbv-bufsize=30000"));
+        assert_eq!(at(&hevc, "-pix_fmt"), "yuv420p");
+        assert_eq!(at(&hevc, "-c:a"), "aac");
+        assert_eq!(at(&hevc, "-movflags"), "+faststart");
+        assert_eq!(at(&hevc, "-preset"), "fast");
+        // No libx265: capped H.264 High 5.1.
+        let without = Capabilities {
+            libx264: true,
+            ..Default::default()
+        };
+        let avc = film_encode_args(&without, Resolution::Uhd4k);
+        assert_eq!(at(&avc, "-c:v"), "libx264");
+        assert_eq!(at(&avc, "-level:v"), "5.1");
+        assert_eq!(
+            (at(&avc, "-maxrate"), at(&avc, "-bufsize")),
+            ("30000k", "30000k")
+        );
+        // 1080p stays H.264 at its own cap.
+        let hd = film_encode_args(&with, Resolution::Hd1080);
+        assert_eq!(at(&hd, "-c:v"), "libx264");
+        assert_eq!(at(&hd, "-maxrate"), "15000k");
+    }
+
+    #[test]
     fn x264_aac_carries_preset_crf_and_fixed_tail() {
         let a = x264_aac("medium", 19);
-        let at = |k: &str| a[a.iter().position(|x| x == k).unwrap() + 1].as_str();
+        let at = |k| arg_after(&a, k);
         assert_eq!(at("-c:v"), "libx264");
         assert_eq!(at("-preset"), "medium");
         assert_eq!(at("-crf"), "19");
