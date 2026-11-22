@@ -5,7 +5,7 @@
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m] [--models DIR]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
-//!                [--solo REF...] [--unsolo REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--list]
+//!                [--solo REF...] [--unsolo REF...] [--live REF...] [--unlive REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
@@ -1025,7 +1025,7 @@ fn cache_cmd(sub: &str, flags: &HashMap<String, String>) {
 }
 
 /// Parsed `edit` arguments. `--include`, `--exclude`, `--uninclude`,
-/// `--unexclude`, `--solo`, `--unsolo` and `--unjoin` each take one or more
+/// `--unexclude`, `--solo`, `--unsolo`, `--live`, `--unlive` and `--unjoin` each take one or more
 /// asset references (id, file name or path) and may repeat; `--join` takes
 /// exactly two and may repeat. `--move REF` is followed by `--after REF` or
 /// `--before REF`; `--unmove` takes one or more references.
@@ -1040,6 +1040,10 @@ struct EditArgs {
     unexclude: Vec<String>,
     solo: Vec<String>,
     unsolo: Vec<String>,
+    /// Live Photos to play their motion in the film (`--live`), or back
+    /// to the planner's choice (`--unlive`).
+    live: Vec<String>,
+    unlive: Vec<String>,
     join: Vec<(String, String)>,
     unjoin: Vec<String>,
     /// (asset, caption); an empty caption clears the override.
@@ -1138,8 +1142,9 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     .ok_or_else(|| format!("--{flag} follows --move REF"))?;
                 out.moves.push((asset, single(values)?, flag == "after"));
             }
-            "include" | "exclude" | "uninclude" | "unexclude" | "solo" | "unsolo" | "unjoin"
-            | "unmove" | "uncover" | "hide-caption" | "uncrop" | "book" | "unbook" => {
+            "include" | "exclude" | "uninclude" | "unexclude" | "solo" | "unsolo" | "live"
+            | "unlive" | "unjoin" | "unmove" | "uncover" | "hide-caption" | "uncrop" | "book"
+            | "unbook" => {
                 if values.is_empty() {
                     return Err(format!("--{flag} wants at least one asset"));
                 }
@@ -1150,6 +1155,8 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     "unexclude" => out.unexclude.extend(values),
                     "solo" => out.solo.extend(values),
                     "unsolo" => out.unsolo.extend(values),
+                    "live" => out.live.extend(values),
+                    "unlive" => out.unlive.extend(values),
                     "unmove" => out.unmove.extend(values),
                     "uncover" => out.uncover.extend(values),
                     "hide-caption" => out.hide_caption.extend(values),
@@ -1223,6 +1230,10 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
     let collage = &edits.collage;
     println!("on their own: {}", collage.solo.len());
     for id in &collage.solo {
+        println!("  {}", show(id));
+    }
+    println!("play as Live Photo: {}", edits.motion.len());
+    for id in &edits.motion {
         println!("  {}", show(id));
     }
     println!("joins: {}", collage.joins.len());
@@ -1317,8 +1328,22 @@ fn edit_cmd(args: &[String]) {
     type Setter = fn(&mut PlanEdits, String, bool);
     let set_solo: Setter = |e, id, on| e.collage.set_solo(id, on);
     let solos = resolve(&a.solo);
+    let set_live: Setter = PlanEdits::set_motion;
+    let lives = resolve(&a.live);
+    if let Some(asset) = lives
+        .iter()
+        .find(|x| !(x.kind == AssetKind::LivePhoto && x.companion_path.is_some()))
+    {
+        die(
+            "edit",
+            format!(
+                "{} is not a Live Photo with its video: nothing to play as motion",
+                asset_label(asset)
+            ),
+        );
+    }
     // Un-dos first, then removals, then pins.
-    let ops: [(Vec<&Asset>, &str, Setter, bool); 6] = [
+    let ops: [(Vec<&Asset>, &str, Setter, bool); 8] = [
         (
             resolve(&a.uninclude),
             "uninclude",
@@ -1341,6 +1366,9 @@ fn edit_cmd(args: &[String]) {
         // Collage edits after the picks they apply to.
         (resolve(&a.unsolo), "unsolo", set_solo, false),
         (solos.clone(), "solo", set_solo, true),
+        // Motion after the pins, which it may apply to.
+        (resolve(&a.unlive), "unlive", set_live, false),
+        (lives, "live", set_live, true),
     ];
     let unjoins = resolve(&a.unjoin);
     let joins: Vec<(&Asset, &Asset)> = a
@@ -1418,7 +1446,7 @@ fn edit_cmd(args: &[String]) {
     if !changed && !a.list {
         die(
             "edit",
-            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--book/--unbook/--closing/--no-closing or --list",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--live/--unlive/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--book/--unbook/--closing/--no-closing or --list",
         );
     }
     let mut edits = ep.edits.clone();
@@ -1541,7 +1569,7 @@ fn edit_cmd(args: &[String]) {
                 "edit",
                 format!(
                     "{} and {} can't share a collage: they must be neighbouring film photos of one day, \
-                     without a caption, not panoramas or videos, in a collage of at most {}",
+                     not panoramas or videos, in a collage of at most {}",
                     asset_label(first),
                     asset_label(second),
                     planmod::MAX_COLLAGE
@@ -2148,5 +2176,14 @@ mod tests {
         assert_eq!(a.unsolo, ["c"]);
         assert_eq!(a.join, [("d".into(), "e".into()), ("f".into(), "g".into())]);
         assert_eq!(a.unjoin, ["h"]);
+    }
+
+    #[test]
+    fn edit_args_take_live_and_unlive() {
+        let a = parse_edit_args(&args("--db t.db --live a b --unlive c --live d")).unwrap();
+        assert_eq!(a.live, ["a", "b", "d"]);
+        assert_eq!(a.unlive, ["c"]);
+        assert!(parse_edit_args(&args("--live")).is_err());
+        assert!(parse_edit_args(&args("--unlive")).is_err());
     }
 }

@@ -2302,12 +2302,13 @@ fn cached_segment(
     Ok((out, secs, kind.into()))
 }
 
-/// Whether an entry may join a collage: a still that is not a panorama
-/// (panoramas pan solo) and has no caption (a caption describes one photo,
-/// so a captioned still plays solo; same rule as the plan's timing model
-/// and the Story editor, through [`plan::entry_plays_alone`]).
-fn collage_eligible(e: &ResolvedEntry) -> bool {
-    plan::entry_plays_alone(&e.entry.rendition, e.aspect, e.caption.as_deref()).is_none()
+/// How an entry may join a collage: a plain still does; a captioned still
+/// or a Live Photo playing its motion only when the user joined it to a
+/// neighbour; a panorama (pans solo) or a clip never does. Same rule as
+/// the plan's timing model and the Story editor, through
+/// [`plan::entry_candidacy`].
+fn collage_candidacy(e: &ResolvedEntry) -> plan::Candidacy {
+    plan::entry_candidacy(&e.entry.rendition, e.aspect, e.caption.as_deref())
 }
 
 /// Each hero asset's place section within its chapter: how many of the
@@ -2356,7 +2357,7 @@ fn hero_groups<'a, C: PartialEq>(
             (
                 r.entry.asset_id.as_str(),
                 chapter_of(r),
-                collage_eligible(r),
+                collage_candidacy(r),
                 r.taken_at,
             )
         }),
@@ -3697,21 +3698,71 @@ mod tests {
             ..card_entry("s", Path::new("s.jpg"))
         };
         let unknown = card_entry("u", Path::new("u.jpg"));
-        assert!(!collage_eligible(&pano));
-        assert!(collage_eligible(&plain) && collage_eligible(&unknown));
+        assert_eq!(collage_candidacy(&pano), plan::Candidacy::Never);
+        assert_eq!(collage_candidacy(&plain), plan::Candidacy::Plain);
+        assert_eq!(collage_candidacy(&unknown), plan::Candidacy::Plain);
     }
 
     #[test]
-    fn captioned_stills_never_join_collages() {
+    fn captioned_stills_join_collages_only_when_the_user_joins_them() {
         let with = |c: Option<&str>| ResolvedEntry {
             caption: c.map(String::from),
             ..card_entry("s", Path::new("s.jpg"))
         };
-        assert!(!collage_eligible(&with(Some("Mia on the ferry"))));
-        assert!(!collage_eligible(&with(Some(" x "))));
+        let if_joined = plan::Candidacy::IfJoined;
+        assert_eq!(
+            collage_candidacy(&with(Some("Mia on the ferry"))),
+            if_joined
+        );
+        assert_eq!(collage_candidacy(&with(Some(" x "))), if_joined);
         // Blank captions are no captions.
-        assert!(collage_eligible(&with(Some("  "))));
-        assert!(collage_eligible(&with(None)));
+        assert_eq!(collage_candidacy(&with(Some("  "))), plan::Candidacy::Plain);
+        assert_eq!(collage_candidacy(&with(None)), plan::Candidacy::Plain);
+    }
+
+    #[test]
+    fn a_joined_captioned_live_photo_groups_as_the_planner_groups_it() {
+        let mut live = ResolvedEntry {
+            caption: Some("Egg tarts".into()),
+            ..card_entry("live", Path::new("live.heic"))
+        };
+        live.entry.rendition = Rendition::Motion {
+            trim_start: 0.0,
+            trim_end: 3.0,
+        };
+        live.motion_path = Some(PathBuf::from("live.mov"));
+        let (b, c) = (
+            card_entry("b", Path::new("b.jpg")),
+            card_entry("c", Path::new("c.jpg")),
+        );
+        let entries = [&live, &b, &c];
+        let ids = |g: Vec<Vec<&ResolvedEntry>>| -> Vec<Vec<String>> {
+            g.iter()
+                .map(|g| g.iter().map(|e| e.entry.asset_id.clone()).collect())
+                .collect()
+        };
+        let group = |edits: &CollageEdits| ids(hero_groups(&entries, |_| 0, edits));
+        // Alone by default (taken_at is unknown, so b and c join nothing
+        // on their own).
+        assert!(group(&CollageEdits::default()).iter().all(|g| g.len() == 1));
+        let mut joined = CollageEdits::default();
+        joined.join("live".into(), "b".into());
+        joined.join("b".into(), "c".into());
+        assert_eq!(group(&joined), [["live", "b", "c"]]);
+        // The collage's caption is the member's.
+        assert_eq!(collage_caption(&entries).as_deref(), Some("Egg tarts"),);
+        // Clips never join, even when linked.
+        let mut clip = card_entry("clip", Path::new("clip.mov"));
+        clip.entry.rendition = Rendition::Clip {
+            trim_start: 0.0,
+            trim_end: 3.0,
+        };
+        let mut with_clip = CollageEdits::default();
+        with_clip.join("clip".into(), "b".into());
+        let pair = [&clip, &b];
+        assert!(hero_groups(&pair, |_| 0, &with_clip)
+            .iter()
+            .all(|g| g.len() == 1));
     }
 
     #[test]
