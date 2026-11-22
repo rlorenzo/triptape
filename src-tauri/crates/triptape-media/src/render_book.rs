@@ -481,6 +481,25 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
             }
         }
     }
+    // The owner's featured photo leads its page (top left) when it was
+    // taken within [`FEATURE_LEAD_SECS`] of the page's first photo: a
+    // moment, not a reordering of the day.
+    for &(p, s) in &pages {
+        if p.kind != PageKind::Grid || p.take < 2 {
+            continue;
+        }
+        let end = (s + p.take).min(order.len());
+        let Some(pos) = (s + 1..end).find(|&k| photos[order[k]].feature) else {
+            continue;
+        };
+        let near = photos[order[pos]]
+            .taken_at
+            .zip(photos[order[s]].taken_at)
+            .is_some_and(|(a, b)| (a - b).abs() <= FEATURE_LEAD_SECS);
+        if near && !photos[order[s]].feature {
+            order[s..=pos].rotate_right(1);
+        }
+    }
     order
 }
 
@@ -2866,9 +2885,13 @@ const WHOLE_MIN_FILL: f64 = 0.75;
 /// page's biggest cell: more than anything else a layout can cost.
 const FEATURE_COST: f64 = 20.0;
 
+/// How close in time a featured photo must be to its page's first photo to
+/// lead the page.
+const FEATURE_LEAD_SECS: i64 = 600;
+
 /// What a never-cropped photo pays per unit of shape mismatch with its
 /// cell (the bars it leaves).
-const WHOLE_MISMATCH_COST: f64 = 4.0;
+const WHOLE_MISMATCH_COST: f64 = 10.0;
 
 /// What a grid layout pays for a cell that cuts a detected face: more
 /// than any amount of ordinary cropping.
@@ -2994,11 +3017,25 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
         // Unequal sizes: shrinking a photo costs as much more as
         // cropping it does, so people photos get the big cells.
         let areas: Vec<f64> = cells.iter().map(|c| c.2 * c.3).collect();
-        // The owner's featured photo takes the biggest cell.
-        let biggest = areas.iter().copied().fold(0.0, f64::max);
+        // The owner's featured photo takes the biggest cell: by the area it
+        // fills (a never-cropped photo fills only its shape of the cell).
+        let shown: Vec<f64> = slot
+            .iter()
+            .zip(&cells)
+            .map(|(p, c)| {
+                let area = c.2 * c.3;
+                if p.whole && c.3 > 0.0 {
+                    let (ca, pa) = (c.2 / c.3, aspect(p));
+                    area * (ca / pa).min(pa / ca)
+                } else {
+                    area
+                }
+            })
+            .collect();
+        let biggest = shown.iter().copied().fold(0.0, f64::max);
         if slot
             .iter()
-            .zip(&areas)
+            .zip(&shown)
             .any(|(p, &a)| p.feature && a < biggest * 0.98)
         {
             cost += FEATURE_COST;
@@ -3815,6 +3852,45 @@ mod tests {
         let one: Vec<bool> = vec![false, false, true, true, true, true, true, true];
         let flow = flow_pages_marked(&chapters, &days, &[], &one, None, false, 60);
         assert!(flow.iter().any(|p| p.take == 6), "{flow:?}");
+    }
+
+    #[test]
+    fn a_featured_photo_leads_its_page_only_within_a_moment() {
+        let shot = |t: i64, feature: bool| BookPhoto {
+            taken_at: Some(t),
+            feature,
+            width: 4000,
+            height: 3000,
+            chapter: Some(0),
+            day: Some(1),
+            ..BookPhoto::blank()
+        };
+        let flow = vec![
+            FlowPage {
+                kind: PageKind::CoverProxy,
+                take: 0,
+            },
+            FlowPage {
+                kind: PageKind::Hero,
+                take: 1,
+            },
+            FlowPage {
+                kind: PageKind::Grid,
+                take: 2,
+            },
+            FlowPage {
+                kind: PageKind::Closing,
+                take: 0,
+            },
+        ];
+        // The plate at :00, the featured group 48 s later: the group leads.
+        let near = vec![shot(0, false), shot(1000, false), shot(1048, true)];
+        let order = consumption_order(&near, &flow, BookPreset::P1);
+        assert_eq!(&order[1..], [2, 1]);
+        // Fifty minutes apart: time order stays.
+        let far = vec![shot(0, false), shot(1000, false), shot(4000, true)];
+        let order = consumption_order(&far, &flow, BookPreset::P1);
+        assert_eq!(&order[1..], [1, 2]);
     }
 
     #[test]
