@@ -117,9 +117,14 @@ fn wrapped(p: (f64, f64)) -> (f64, f64) {
 /// arrival airport is rarely the house (LAX to Ontario is 50 km).
 pub const HOME_REACH_M: f64 = 150_000.0;
 
+/// Whether `gps` is within [`HOME_REACH_M`] of the home stop at `home`.
+fn within_home_reach(gps: (f64, f64), home: (f64, f64)) -> bool {
+    crate::geo::haversine_m(gps, home) <= HOME_REACH_M
+}
+
 /// Whether a shot at `gps` was taken back home, at `hop`'s destination.
 fn at_home(hop: &Hop, gps: Option<(f64, f64)>) -> bool {
-    gps.is_some_and(|g| crate::geo::haversine_m(g, hop.pos) <= HOME_REACH_M)
+    gps.is_some_and(|g| within_home_reach(g, hop.pos))
 }
 
 /// Where each hop plays in a film whose shots were taken at `shots` (unix
@@ -247,16 +252,13 @@ impl Journey {
         self.schedule().total_secs
     }
 
-    /// The journey as hops between named stops, for a film that shows each
-    /// one where the trip reaches it. A waypoint (an embarkation terminal)
-    /// joins the hop that leaves it.
     /// Whether `gps` is back home: within [`HOME_REACH_M`] of a stop the
     /// trip starts or ends at.
     pub fn near_home(&self, gps: (f64, f64)) -> bool {
         self.nodes
             .iter()
             .filter(|n| n.home)
-            .any(|n| crate::geo::haversine_m(gps, wrapped(n.pos)) <= HOME_REACH_M)
+            .any(|n| within_home_reach(gps, wrapped(n.pos)))
     }
 
     /// The labels of the stops the trip starts or ends at (`Los Angeles`).
@@ -267,6 +269,9 @@ impl Journey {
             .filter_map(|n| n.label.as_deref())
     }
 
+    /// The journey as hops between named stops, for a film that shows each
+    /// one where the trip reaches it. A waypoint (an embarkation terminal)
+    /// joins the hop that leaves it.
     pub fn hops(&self) -> Vec<Hop> {
         let mut out = vec![];
         let mut start = 0;
@@ -793,6 +798,11 @@ mod tests {
         // The round trip plays on its first day, not the day it returns.
         assert_eq!(hops[8].day, Some(jiff::civil::date(2026, 10, 26)));
         assert!(hops[9].home && !hops[0].home);
+        assert_eq!(
+            j.home_labels().collect::<Vec<_>>(),
+            ["Los Angeles"],
+            "the unnamed arrival home adds no label"
+        );
         assert_eq!(
             date_span(
                 jiff::civil::date(2026, 10, 30),

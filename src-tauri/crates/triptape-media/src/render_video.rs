@@ -901,14 +901,9 @@ pub fn render_hero_video(
                     .or_insert(home);
             }
         }
+        near_home.extend(j.home_labels().map(|l| (l, true)));
     }
-    let is_home = |p: &str| {
-        near_home.get(p) == Some(&true)
-            || opts
-                .journey
-                .as_ref()
-                .is_some_and(|j| j.home_labels().any(|l| l == p))
-    };
+    let is_home = |p: &str| near_home.get(p) == Some(&true);
     for p in plan.chapters.iter().flat_map(|c| c.film_places()) {
         if !is_ship(p) && !is_home(p) && !places.iter().any(|q| q == p) {
             places.push(p.to_string());
@@ -3127,7 +3122,8 @@ fn render_hold_segment(
     caps.run(&hold_args(caps, img, dur, variant, res, out), out)
 }
 
-/// Encode a text card that holds perfectly still for `dur` seconds.
+/// Encode a text card that holds perfectly still for `dur` seconds, at the
+/// film's 30 fps so it crossfades with the moving segments around it.
 fn render_still_card(
     caps: &Capabilities,
     img: &Path,
@@ -3144,7 +3140,7 @@ fn still_card_args(img: &Path, dur: f64, res: Resolution, out: &Path) -> Vec<Str
         img,
         dur,
         format!(
-            "[0:v]scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,\
+            "[0:v]fps=30,scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,\
              pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v]"
         ),
         out,
@@ -3209,6 +3205,7 @@ mod tests {
             !graph.contains("zoompan") && !graph.contains("perspective") && !graph.contains("crop")
         );
         assert!(graph.contains("scale=1920:1080"));
+        assert!(graph.starts_with("[0:v]fps=30,"), "{graph}");
     }
 
     #[test]
