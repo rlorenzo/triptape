@@ -718,7 +718,7 @@ mod tests {
     #[test]
     fn reels_are_capped_to_stream() {
         let a = quality_tail(Path::new("/tmp/r.mp4"));
-        let at = |k: &str| a[a.iter().position(|x| x == k).unwrap() + 1].as_str();
+        let at = |k| ffmpeg::arg_after(&a, k);
         assert_eq!((at("-maxrate"), at("-bufsize")), ("15000k", "15000k"));
     }
 

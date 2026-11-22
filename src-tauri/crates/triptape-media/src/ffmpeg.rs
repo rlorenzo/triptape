@@ -14,6 +14,8 @@ use triptape_core::process;
 use triptape_core::proxies;
 use triptape_core::types::AssetKind;
 
+use crate::resolution::Resolution;
+
 /// Single-pass EBU R128 loudness target shared by every renderer.
 pub const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
 
@@ -182,6 +184,16 @@ pub fn path_arg(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
+/// The value following `flag` in an FFmpeg arg list (tests only).
+#[cfg(test)]
+pub(crate) fn arg_after<'a>(args: &'a [String], flag: &str) -> &'a str {
+    let i = args
+        .iter()
+        .position(|x| x == flag)
+        .unwrap_or_else(|| panic!("no {flag} in {args:?}"));
+    &args[i + 1]
+}
+
 /// Shared libx264 + AAC 48 kHz stereo encode args (yuv420p, faststart).
 /// Callers append frame-rate/`-shortest` flags and the output path.
 pub fn x264_aac(preset: &str, crf: u32) -> Vec<String> {
@@ -239,8 +251,7 @@ pub fn bitrate_cap_args(kbps: u32) -> Vec<String> {
 /// it), tagged `hvc1` for Apple players; otherwise H.264 High 5.1. 1080p
 /// stays H.264, which every player handles. Yuv420p, AAC 48 kHz stereo,
 /// faststart, as [`x264_aac`].
-pub fn film_encode_args(caps: &Capabilities, res: crate::resolution::Resolution) -> Vec<String> {
-    use crate::resolution::Resolution;
+pub fn film_encode_args(caps: &Capabilities, res: Resolution) -> Vec<String> {
     let max = match res {
         Resolution::Uhd4k => FILM_4K_MAX_KBPS,
         Resolution::Hd1080 => FILM_1080P_MAX_KBPS,
@@ -1587,8 +1598,7 @@ mod tests {
 
     #[test]
     fn the_film_encode_is_capped_to_stream() {
-        use crate::resolution::Resolution;
-        let at = |a: &[String], k: &str| a[a.iter().position(|x| x == k).unwrap() + 1].clone();
+        let at = arg_after;
         let with = Capabilities {
             libx264: true,
             libx265: true,
@@ -1612,7 +1622,7 @@ mod tests {
         assert_eq!(at(&avc, "-level:v"), "5.1");
         assert_eq!(
             (at(&avc, "-maxrate"), at(&avc, "-bufsize")),
-            ("30000k".into(), "30000k".into())
+            ("30000k", "30000k")
         );
         // 1080p stays H.264 at its own cap.
         let hd = film_encode_args(&with, Resolution::Hd1080);
@@ -1623,7 +1633,7 @@ mod tests {
     #[test]
     fn x264_aac_carries_preset_crf_and_fixed_tail() {
         let a = x264_aac("medium", 19);
-        let at = |k: &str| a[a.iter().position(|x| x == k).unwrap() + 1].as_str();
+        let at = |k| arg_after(&a, k);
         assert_eq!(at("-c:v"), "libx264");
         assert_eq!(at("-preset"), "medium");
         assert_eq!(at("-crf"), "19");
