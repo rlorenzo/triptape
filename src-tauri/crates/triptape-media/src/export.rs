@@ -807,6 +807,17 @@ fn export_inner(
         // Where `photo_places` stood a shot without GPS: the same borrowed
         // fix, so its spot (aboard, ashore) agrees with its place.
         let borrowed = triptape_core::places::borrowed_fixes(assets);
+        // "Kamakura, Japan" (the nearest town, off the itinerary) prints as
+        // "Kamakura" in captions and headings: the book is one trip abroad.
+        let book_places: HashMap<String, String> = places
+            .iter()
+            .map(|(id, p)| {
+                (
+                    id.clone(),
+                    triptape_core::geo::without_country(p).to_string(),
+                )
+            })
+            .collect();
         for a in assets
             .iter()
             .filter(|a| a.kind != AssetKind::Video && in_book_flow(&chapter_of, &a.id))
@@ -838,9 +849,7 @@ fn export_inner(
             let day = asset_day(a).zip(trip_start).map(|(d, s)| trip_day(d, s));
             // "Kamakura, Japan" (the nearest town, off the itinerary)
             // prints as "Kamakura": the book is all one trip abroad.
-            let place = places
-                .get(&a.id)
-                .map(|p| triptape_core::geo::without_country(p).to_string());
+            let place = book_places.get(&a.id).cloned();
             let itin = opts.itinerary.as_ref();
             let located;
             let spot = match (a.gps, borrowed.get(a.id.as_str())) {
@@ -858,7 +867,7 @@ fn export_inner(
                 path: a.path.clone(),
                 width: w,
                 height: h,
-                caption: book_caption(plan, &places, &a.id),
+                caption: book_caption(plan, &book_places, &a.id),
                 place,
                 aboard: matches!(spot, Spot::Aboard(_)),
                 faces: vec![],
