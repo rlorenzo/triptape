@@ -185,13 +185,18 @@ pub fn path_arg(p: &Path) -> String {
 /// Shared libx264 + AAC 48 kHz stereo encode args (yuv420p, faststart).
 /// Callers append frame-rate/`-shortest` flags and the output path.
 pub fn x264_aac(preset: &str, crf: u32) -> Vec<String> {
+    let mut args: Vec<String> = ["-c:v", "libx264", "-preset", preset, "-crf"]
+        .map(String::from)
+        .to_vec();
+    args.push(crf.to_string());
+    args.extend(yuv420p_aac_faststart());
+    args
+}
+
+/// The encoder-independent tail of [`x264_aac`]: yuv420p, AAC 48 kHz
+/// stereo, faststart.
+fn yuv420p_aac_faststart() -> Vec<String> {
     [
-        "-c:v",
-        "libx264",
-        "-preset",
-        preset,
-        "-crf",
-        &crf.to_string(),
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -231,16 +236,22 @@ pub fn film_encode_args(caps: &Capabilities, res: crate::resolution::Resolution)
     };
     if res == Resolution::Uhd4k && caps.libx265 {
         let mut args: Vec<String> = [
-            "-c:v", "libx265", "-preset", "fast", "-crf", "21", "-tag:v", "hvc1",
+            "-c:v",
+            "libx265",
+            "-preset",
+            "fast",
+            "-crf",
+            "21",
+            "-tag:v",
+            "hvc1",
+            "-x265-params",
         ]
         .map(String::from)
         .to_vec();
-        args.extend([
-            "-x265-params".into(),
-            format!("vbv-maxrate={max}:vbv-bufsize={max}:log-level=error"),
-        ]);
-        // x264_aac's tail: pixel format, audio and faststart.
-        args.extend(x264_aac("medium", 19).into_iter().skip(6));
+        args.push(format!(
+            "vbv-maxrate={max}:vbv-bufsize={max}:log-level=error"
+        ));
+        args.extend(yuv420p_aac_faststart());
         return args;
     }
     let mut args = x264_aac("medium", 19);
