@@ -397,10 +397,18 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
             let p = &photos[order[pos]];
             dpi_verdict(p.width, p.height, w, h) != DpiVerdict::Block
         };
-        if let Some(pos) = run[..run.len().min(DIVIDER_WINDOW)]
+        // A tagged family face beats a stranger's elbow behind a plate.
+        let window = &run[..run.len().min(DIVIDER_WINDOW)];
+        if let Some(pos) = window
             .iter()
             .copied()
-            .find(|&pos| printable(pos) && photos[order[pos]].is_of_people())
+            .find(|&pos| printable(pos) && photos[order[pos]].family.iter().any(|k| !k.body))
+            .or_else(|| {
+                window
+                    .iter()
+                    .copied()
+                    .find(|&pos| printable(pos) && photos[order[pos]].is_of_people())
+            })
             .or_else(|| run.iter().copied().find(|&pos| printable(pos)))
         {
             order[at..=pos].rotate_right(1);
@@ -1973,6 +1981,22 @@ fn page_caption(slot: &[&BookPhoto], kind: PageKind) -> Vec<String> {
                     .iter()
                     .any(|w| w.to_lowercase().contains(&pl.to_lowercase()))
         });
+        let mut words = words;
+        if place.is_some() {
+            // The owner's sentence ends before its place: "…for 8 years. ·
+            // Paradox Singapore". Place names are capitalised; a sentence
+            // has lowercase words.
+            for w in &mut words {
+                let sentence = w
+                    .split_whitespace()
+                    .filter(|t| t.starts_with(|ch: char| ch.is_lowercase()))
+                    .count()
+                    >= 3;
+                if sentence && !w.ends_with(['.', '!', '?', '\u{2026}', ')', '"', '\u{201d}']) {
+                    w.push('.');
+                }
+            }
+        }
         lines.extend(words.into_iter().chain(place));
     }
     collapse_lines(lines, kind)
@@ -2215,20 +2239,32 @@ const STRANGER_WEIGHT: f64 = 0.5;
 /// A target only partly in a window counts this many times against it:
 /// a sliced face is worse than one left out.
 const PARTIAL_PENALTY: f64 = 1.5;
+/// A target's head room (its padded box) fully in the window earns this
+/// share of its weight on top: nice to have, never worth slicing a face.
+const ROOM_BONUS: f64 = 0.3;
 /// Candidate positions tried along each axis.
 const FRAMING_STEPS: usize = 25;
+
+/// A region framing tries to keep: the face itself (`core`), which must
+/// not be sliced, and the face with head room (`room`), a bonus.
+#[derive(Debug, Clone)]
+struct Target {
+    core: FaceBox,
+    room: FaceBox,
+    weight: f64,
+}
 
 /// The regions framing tries to keep, each with its weight: family faces
 /// (with head room), the top quarter of a family body (its head), and the
 /// detected faces no family region covers, lightly (strangers).
-fn framing_targets(p: &BookPhoto, detected: &[FaceBox]) -> Vec<(FaceBox, f64)> {
+fn framing_targets(p: &BookPhoto, detected: &[FaceBox]) -> Vec<Target> {
     let pad = |b: FaceBox| FaceBox {
         x: b.x - FACE_SIDE * b.w,
         y: b.y - HEAD_ABOVE * b.h,
         w: b.w * (1.0 + 2.0 * FACE_SIDE),
         h: b.h * (1.0 + HEAD_ABOVE + FACE_BELOW),
     };
-    let mut out: Vec<(FaceBox, f64)> = p
+    let mut out: Vec<Target> = p
         .family
         .iter()
         .map(|k| {
@@ -2237,9 +2273,17 @@ fn framing_targets(p: &BookPhoto, detected: &[FaceBox]) -> Vec<(FaceBox, f64)> {
                     h: k.b.h * 0.25,
                     ..k.b.clone()
                 };
-                (head, FAMILY_BODY_WEIGHT)
+                Target {
+                    room: head.clone(),
+                    core: head,
+                    weight: FAMILY_BODY_WEIGHT,
+                }
             } else {
-                (pad(k.b.clone()), FAMILY_FACE_WEIGHT)
+                Target {
+                    core: k.b.clone(),
+                    room: pad(k.b.clone()),
+                    weight: FAMILY_FACE_WEIGHT,
+                }
             }
         })
         .collect();
@@ -2253,12 +2297,11 @@ fn framing_targets(p: &BookPhoto, detected: &[FaceBox]) -> Vec<(FaceBox, f64)> {
                 && cy <= b.y + b.h * if k.body { 0.5 } else { 1.25 }
         })
     };
-    out.extend(
-        detected
-            .iter()
-            .filter(|d| !covered(d))
-            .map(|d| (pad(d.clone()), STRANGER_WEIGHT)),
-    );
+    out.extend(detected.iter().filter(|d| !covered(d)).map(|d| Target {
+        core: d.clone(),
+        room: pad(d.clone()),
+        weight: STRANGER_WEIGHT,
+    }));
     out
 }
 
@@ -2274,7 +2317,7 @@ fn framing_window(
     sh: f64,
     tw: f64,
     th: f64,
-    targets: &[(FaceBox, f64)],
+    targets: &[Target],
     reserve: f64,
 ) -> ((f64, f64, f64, f64), bool) {
     let scale = (tw / sw).max(th / sh);
@@ -2312,16 +2355,20 @@ fn framing_window(
         for &y in &ys {
             let mut score = 0.0;
             let mut family_cut = false;
-            for (b, w) in targets {
-                let f = fraction_in(b, x, y);
+            for t in targets {
+                let w = t.weight;
+                let f = fraction_in(&t.core, x, y);
                 if f >= 0.98 {
                     score += w;
+                    if fraction_in(&t.room, x, y) >= 0.98 {
+                        score += ROOM_BONUS * w;
+                    }
                     continue;
                 }
                 if f > 0.02 {
                     score -= PARTIAL_PENALTY * w;
                 }
-                family_cut |= *w > STRANGER_WEIGHT;
+                family_cut |= w > STRANGER_WEIGHT;
             }
             // Ties: the window nearest the middle of the photo.
             let off = ((x - slack_x / 2.0).abs() + (y - slack_y / 2.0).abs()) / (sw + sh);
@@ -3382,6 +3429,19 @@ mod tests {
     }
 
     #[test]
+    fn an_owner_sentence_ends_before_its_place() {
+        let mut b = BookPhoto::blank();
+        b.caption = Some("It served us well for 8 years".into());
+        b.place = Some("Paradox Singapore".into());
+        b.keep = true;
+        let caps = page_caption(&[&b], PageKind::PhotoCaption);
+        assert_eq!(
+            caps,
+            ["It served us well for 8 years.", "Paradox Singapore"]
+        );
+    }
+
+    #[test]
     fn captioned_photos_still_name_their_place() {
         let shot = |cap: &str, place: &str, keep: bool| BookPhoto {
             caption: Some(cap.to_string()),
@@ -3892,6 +3952,34 @@ mod tests {
     }
 
     #[test]
+    fn framing_trims_head_room_before_it_slices_a_face() {
+        // IMG_6872: three family faces stacked down a 4032x3024 selfie, in
+        // a wide cell that can't hold all of them with head room. Every
+        // face stays whole; only spare room goes.
+        let fb = |x: f32, y: f32, w: f32, h: f32| KnownBox {
+            b: FaceBox { x, y, w, h },
+            body: false,
+        };
+        let p = BookPhoto {
+            width: 4032,
+            height: 3024,
+            family: vec![
+                fb(0.15, 0.37, 0.12, 0.16),
+                fb(0.69, 0.59, 0.19, 0.25),
+                fb(0.31, 0.82, 0.08, 0.10),
+            ],
+            ..BookPhoto::blank()
+        };
+        let ((_, y, _, h), cut) = frame_photo(&p, (4032.0, 3024.0), (2.3, 1.0), &[], 0.0);
+        let (top, bottom) = (y / 3024.0, (y + h) / 3024.0);
+        assert!(
+            top <= 0.37 && bottom >= 0.92,
+            "all three faces: {top:.3}..{bottom:.3}"
+        );
+        assert!(!cut);
+    }
+
+    #[test]
     fn framing_keeps_the_family_over_strangers() {
         let fb = |x: f32, y: f32, side: f32| FaceBox {
             x,
@@ -3943,7 +4031,7 @@ mod tests {
             (x0 >= x && x1 <= x + w) || x1 <= x || x0 >= x + w
         };
         assert!(
-            targets.iter().all(|(b, _)| whole(b)),
+            targets.iter().all(|t| whole(&t.core)),
             "nobody sliced: x={x}"
         );
         assert!(cut, "someone left out");
