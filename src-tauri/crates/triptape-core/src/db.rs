@@ -1234,6 +1234,7 @@ mod tests {
                 solo: vec!["a4".into()],
                 joins: vec![("a5".into(), "a6".into())],
             },
+            motion: vec!["a2".into()],
             cover: Default::default(),
             crop: Default::default(),
             book: Default::default(),
