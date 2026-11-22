@@ -433,6 +433,9 @@ pub struct ResolvedEntry {
     /// Display width / height (EXIF rotation applied) when known; lets
     /// panoramas be kept out of collages before anything is decoded.
     pub aspect: Option<f64>,
+    /// Where it was taken, when known: places the travel map home before
+    /// the first shot back home.
+    pub gps: Option<(f64, f64)>,
 }
 
 /// How an itinerary's travel is shown in the film.
@@ -698,6 +701,7 @@ fn card_entry(id: &str, path: &Path) -> ResolvedEntry {
         taken_at: None,
         tz_offset_secs: None,
         aspect: None,
+        gps: None,
     }
 }
 
@@ -907,7 +911,11 @@ pub fn render_hero_video(
             .filter(|_| opts.map_style == MapStyle::Parchment)
             .map_or_else(Vec::new, |j| j.hops());
         let stage_of = |r: &ResolvedEntry| {
-            triptape_core::journey::hops_reached(&hops, r.taken_at.map(|t| (t, r.tz_offset_secs)))
+            triptape_core::journey::hops_reached(
+                &hops,
+                r.taken_at.map(|t| (t, r.tz_offset_secs)),
+                r.gps,
+            )
         };
         hero_groups(
             &selected,
@@ -1050,7 +1058,8 @@ pub fn render_hero_video(
             .iter()
             .map(|s| s.0.taken_at.map(|t| (t, s.0.tz_offset_secs)))
             .collect();
-        let cuts = triptape_core::journey::hop_cuts(&hops, &shots);
+        let gps: Vec<Option<(f64, f64)>> = segs[first_shot..].iter().map(|s| s.0.gps).collect();
+        let cuts = triptape_core::journey::hop_cuts(&hops, &shots, &gps);
         let adopt = own_clips && !hops.is_empty() && opts.hop_clips.len() == hops.len();
         if own_clips && !adopt && !hops.is_empty() {
             fallbacks.push(format!(
@@ -4030,6 +4039,7 @@ mod tests {
             taken_at: None,
             tz_offset_secs: None,
             aspect: None,
+            gps: None,
         }
     }
 
@@ -4699,6 +4709,7 @@ mod tests {
                 taken_at: Some(1791288000 + [0, 600, 2 * 86400][i]),
                 tz_offset_secs: None,
                 aspect: None,
+                gps: None,
             });
         }
         let mut captions = HashMap::new();
@@ -4896,6 +4907,7 @@ mod tests {
                 taken_at: None,
                 tz_offset_secs: None,
                 aspect: None,
+                gps: None,
             })
             .collect();
         let refs: Vec<&ResolvedEntry> = entries.iter().collect();
@@ -4965,6 +4977,7 @@ mod tests {
                 taken_at: Some(1791288000),
                 tz_offset_secs: None,
                 aspect: None,
+                gps: None,
             })
             .collect();
         let plan = Plan {
@@ -5105,6 +5118,7 @@ mod tests {
                 taken_at: Some(1791288000),
                 tz_offset_secs: None,
                 aspect: None,
+                gps: None,
             },
             ResolvedEntry {
                 entry: PlanEntry {
@@ -5121,6 +5135,7 @@ mod tests {
                 taken_at: Some(1791374400),
                 tz_offset_secs: None,
                 aspect: None,
+                gps: None,
             },
         ];
         let plan = Plan {
@@ -5519,6 +5534,7 @@ mod tests {
                 taken_at: Some(1791288000 + i as i64 * 60),
                 tz_offset_secs: None,
                 aspect: Some(f64::from(320 + 16 * i as u32) / 240.0),
+                gps: None,
             });
         }
         let plan = Plan {
