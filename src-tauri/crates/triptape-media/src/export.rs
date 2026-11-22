@@ -130,6 +130,7 @@ fn resolve_entry(
         taken_at: a.taken_at,
         tz_offset_secs: a.tz_offset_secs,
         aspect: a.display_aspect(),
+        gps: a.gps,
     })
 }
 
@@ -1515,6 +1516,7 @@ mod tests {
             taken_at: None,
             tz_offset_secs: None,
             aspect: None,
+            gps: None,
         };
         // Both selected stills are reserved up front, as export_all does.
         let mut used: HashSet<PathBuf> = [&by_id["p1"].path, &by_id["p3"].path]

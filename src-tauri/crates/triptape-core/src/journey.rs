@@ -103,26 +103,45 @@ pub struct Hop {
     pub day: Option<jiff::civil::Date>,
     /// It arrives home.
     pub home: bool,
+    /// Where it arrives (`lat, lon`, longitude in -180..180).
+    pub pos: (f64, f64),
+}
+
+/// How near home a shot must be for the hop home to play before it: the
+/// arrival airport is rarely the house (LAX to Ontario is 50 km).
+pub const HOME_REACH_M: f64 = 150_000.0;
+
+/// Whether a shot at `gps` was taken back home, at `hop`'s destination.
+fn at_home(hop: &Hop, gps: Option<(f64, f64)>) -> bool {
+    gps.is_some_and(|g| crate::geo::haversine_m(g, hop.pos) <= HOME_REACH_M)
 }
 
 /// Where each hop plays in a film whose shots were taken at `shots` (unix
-/// seconds and UTC offset, in film order; `None` for an undated shot): the
-/// index of the shot it goes in front of, which is the first one taken on
-/// or after the hop's day, or `shots.len()` to follow them all. Hops keep
-/// their order, and the last hop home closes the trip, after every shot.
-pub fn hop_cuts(hops: &[Hop], shots: &[Option<(i64, Option<i32>)>]) -> Vec<usize> {
+/// seconds and UTC offset, in film order; `None` for an undated shot) and
+/// `gps`: the index of the shot it goes in front of, which is the first one
+/// taken on or after the hop's day, or `shots.len()` to follow them all.
+/// Hops keep their order. The last hop home plays before the first shot
+/// taken back home (within [`HOME_REACH_M`], on or after its day), or after
+/// every shot when none was.
+pub fn hop_cuts(
+    hops: &[Hop],
+    shots: &[Option<(i64, Option<i32>)>],
+    gps: &[Option<(f64, f64)>],
+) -> Vec<usize> {
+    let day_of = |s: usize| shots[s].and_then(|(t, tz)| crate::metadata::local_date(t, tz));
     let mut at = 0;
     let mut out = vec![];
     for (i, hop) in hops.iter().enumerate() {
         if hop.home && i + 1 == hops.len() {
-            at = shots.len();
-        } else if let Some(day) = hop.day {
             at = (at..shots.len())
                 .find(|&s| {
-                    shots[s]
-                        .and_then(|(t, tz)| crate::metadata::local_date(t, tz))
-                        .is_some_and(|d| d >= day)
+                    at_home(hop, gps.get(s).copied().flatten())
+                        && hop.day.is_none_or(|d| day_of(s).is_some_and(|sd| sd >= d))
                 })
+                .unwrap_or(shots.len());
+        } else if let Some(day) = hop.day {
+            at = (at..shots.len())
+                .find(|&s| day_of(s).is_some_and(|d| d >= day))
                 .unwrap_or(shots.len());
         }
         out.push(at);
@@ -131,18 +150,22 @@ pub fn hop_cuts(hops: &[Hop], shots: &[Option<(i64, Option<i32>)>]) -> Vec<usize
 }
 
 /// How many hops the trip has made by the time a shot was taken (unix
-/// seconds and UTC offset): the hops whose day is on or before the shot's.
-/// Shots either side of a hop get different counts, so a film can keep
-/// them in separate segments and play the hop between them. An undated
-/// shot counts none, and the last hop home is never counted (it follows
-/// every shot; see [`hop_cuts`]).
-pub fn hops_reached(hops: &[Hop], shot: Option<(i64, Option<i32>)>) -> usize {
+/// seconds and UTC offset) at `gps`: the hops whose day is on or before the
+/// shot's. Shots either side of a hop get different counts, so a film can
+/// keep them in separate segments and play the hop between them. An undated
+/// shot counts none; the last hop home counts only for a shot taken back
+/// home (see [`hop_cuts`]).
+pub fn hops_reached(
+    hops: &[Hop],
+    shot: Option<(i64, Option<i32>)>,
+    gps: Option<(f64, f64)>,
+) -> usize {
     let Some(day) = shot.and_then(|(t, tz)| crate::metadata::local_date(t, tz)) else {
         return 0;
     };
     hops.iter()
         .enumerate()
-        .filter(|(i, h)| !(h.home && i + 1 == hops.len()))
+        .filter(|(i, h)| !(h.home && i + 1 == hops.len()) || at_home(h, gps))
         .filter(|(_, h)| h.day.is_some_and(|d| d <= day))
         .count()
 }
@@ -243,6 +266,7 @@ impl Journey {
                     .map(|d| d.0)
                     .or(node.arrive),
                 home: node.home,
+                pos: (node.pos.0, (node.pos.1 + 180.0).rem_euclid(360.0) - 180.0),
             });
             start = i + 1;
         }
@@ -777,7 +801,8 @@ mod tests {
             shot(27),
             shot(30),
         ];
-        let cuts = hop_cuts(&hops, &shots);
+        let no_gps = [None; 10];
+        let cuts = hop_cuts(&hops, &shots, &no_gps);
         assert_eq!(cuts[0], 1, "Tokyo after the airport shot");
         assert_eq!(cuts[1], 4, "Osaka after the sea day");
         // No Fukuoka shots: its hop plays back to back with Jeju's.
@@ -785,18 +810,28 @@ mod tests {
         // Ports with no shots at all queue up before the next dated shot.
         assert_eq!(&cuts[4..8], [7, 7, 7, 7]);
         assert_eq!(cuts[8], 8, "the cruise before its first day's shots");
-        // Home closes the trip even though shots share its date.
+        // Home closes the trip when no shot was taken back home, even
+        // though shots share its date.
         assert_eq!(cuts[9], shots.len());
+        // A last shot back home (Ontario, 50 km from LAX): the hop home
+        // plays before it, after the morning in Singapore.
+        let mut gps = no_gps.to_vec();
+        gps[8] = Some((1.36, 103.99));
+        gps[9] = Some((34.06, -117.6));
+        let home_cuts = hop_cuts(&hops, &shots, &gps);
+        assert_eq!(home_cuts[9], 9, "home before the shot taken at home");
+        assert_eq!(hops_reached(&hops, shot(30), Some((34.06, -117.6))), 10);
+        assert_eq!(hops_reached(&hops, shot(30), Some((1.36, 103.99))), 9);
         assert!(cuts.windows(2).all(|w| w[0] <= w[1]));
-        assert_eq!(hop_cuts(&hops, &[]), vec![0; hops.len()]);
+        assert_eq!(hop_cuts(&hops, &[], &[]), vec![0; hops.len()]);
         // Shots either side of a hop's day count a different number of
         // hops made, so they are never shown in one collage.
-        assert_eq!(hops_reached(&hops, shot(3)), 0);
-        assert_eq!(hops_reached(&hops, shot(10)), 1);
-        assert_eq!(hops_reached(&hops, shot(11)), 2);
-        assert_eq!(hops_reached(&hops, None), 0);
-        // The hop home follows every shot, so it splits nothing.
-        assert_eq!(hops_reached(&hops, shot(30)), 9);
+        assert_eq!(hops_reached(&hops, shot(3), None), 0);
+        assert_eq!(hops_reached(&hops, shot(10), None), 1);
+        assert_eq!(hops_reached(&hops, shot(11), None), 2);
+        assert_eq!(hops_reached(&hops, None, None), 0);
+        // Away from home the hop home splits nothing.
+        assert_eq!(hops_reached(&hops, shot(30), None), 9);
         // A stop with only a departure date still dates its hop.
         let itin = Itinerary::from_json(
             r#"{"stops": [
