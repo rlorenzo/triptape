@@ -630,11 +630,13 @@ pub fn flow_pages_marked(
             segs
         })
         .collect();
-    let pages_for = |&(len, one): &(usize, bool), per: usize| {
-        if one && len <= MAX_PAGE_PHOTOS {
-            vec![len]
+    // An owner's group that fits one page prints whole on it.
+    let one_page_seg = |&(len, one): &(usize, bool)| one && len <= MAX_PAGE_PHOTOS;
+    let pages_for = |seg: &(usize, bool), per: usize| {
+        if one_page_seg(seg) {
+            vec![seg.0]
         } else {
-            even_split(len, per)
+            even_split(seg.0, per)
         }
     };
     let photo_budget = cap
@@ -644,7 +646,7 @@ pub fn flow_pages_marked(
         .find(|&p| {
             runs.iter()
                 .flatten()
-                .map(|s| pages_for(s, p).len())
+                .map(|s| if one_page_seg(s) { 1 } else { s.0.div_ceil(p) })
                 .sum::<usize>()
                 <= photo_budget
         })
@@ -857,7 +859,8 @@ fn wide_index(photos: &[BookPhoto]) -> Option<usize> {
         .skip(1)
         .take(SPREAD_WINDOW)
         .take_while(|p| p.chapter == opening)
-        .position(|p| p.height > 0 && p.width as f64 / p.height as f64 >= 1.5)
+        // An owner's page group stays whole: none of it becomes the spread.
+        .position(|p| !p.page_group && p.height > 0 && p.width as f64 / p.height as f64 >= 1.5)
         .map(|i| i + 1)
 }
 
@@ -878,8 +881,12 @@ fn book_flow(photos: &[BookPhoto], has_map: bool, cap: usize) -> Vec<FlowPage> {
         .collect();
     // A day opening on the owner's captioned shot with no one in it (a
     // plate of food) keeps its time order: no divider pulls a later family
-    // photo ahead of it.
-    let no_divider: Vec<bool> = photos.iter().map(|p| p.keep && !p.is_of_people()).collect();
+    // photo ahead of it. Nor does a divider take a photo out of the
+    // owner's page group.
+    let no_divider: Vec<bool> = photos
+        .iter()
+        .map(|p| p.page_group || (p.keep && !p.is_of_people()))
+        .collect();
     let one_page: Vec<bool> = photos.iter().map(|p| p.page_group).collect();
     flow_pages_marked(
         &chapter_of,
@@ -1064,7 +1071,8 @@ fn fold_lone_kept(photos: &mut [BookPhoto]) {
             runs.get(r + 1)
                 .into_iter()
                 .chain(r.checked_sub(1).map(|i| &runs[i]))
-                .filter(|&&(a, _)| photos[a].day == day)
+                // An owner's page group takes no one it wasn't given.
+                .filter(|&&(a, _)| photos[a].day == day && !photos[a].page_group)
         };
         // The next stretch, else the one before; one with two or more
         // photos first (a lone one may become the day's divider and leave
@@ -2295,33 +2303,30 @@ fn load(photo: &BookPhoto, ffmpeg_bin: &str, fallbacks: &mut Vec<String>) -> Rgb
     }
 }
 
-/// Decode a still the `image` crate cannot read (HEIC) through FFmpeg
-/// (with the macOS `sips` fallback for tmap/Dolby Vision items).
 /// One frame of the video at `path`, `ms` milliseconds in, upright (FFmpeg
-/// applies the video's rotation).
+/// applies the video's rotation), piped back as PNG so no temp file is shared.
 fn video_frame(ffmpeg_bin: &str, path: &std::path::Path, ms: u32) -> Option<RgbImage> {
-    let out = std::env::temp_dir().join(format!("triptape-still-{}-{ms}.png", std::process::id()));
-    let ok = std::process::Command::new(ffmpeg_bin)
-        .args([
-            "-v",
-            "error",
-            "-y",
-            "-ss",
-            &format!("{:.3}", f64::from(ms) / 1000.0),
-            "-i",
-        ])
-        .arg(path)
-        .args(["-frames:v", "1"])
-        .arg(&out)
-        .status()
-        .is_ok_and(|s| s.success());
-    let img = ok
-        .then(|| image::open(&out).ok().map(|d| d.to_rgb8()))
-        .flatten();
-    let _ = std::fs::remove_file(&out);
-    img
+    let out = triptape_core::process::output(
+        Command::new(ffmpeg_bin)
+            .args([
+                "-v",
+                "error",
+                "-ss",
+                &format!("{:.3}", f64::from(ms) / 1000.0),
+                "-i",
+            ])
+            .arg(path)
+            .args(["-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"]),
+    )
+    .ok()
+    .filter(|o| o.status.success())?;
+    image::load_from_memory(&out.stdout)
+        .ok()
+        .map(|d| d.to_rgb8())
 }
 
+/// Decode a still the `image` crate cannot read (HEIC) through FFmpeg
+/// (with the macOS `sips` fallback for tmap/Dolby Vision items).
 fn decode_via_ffmpeg(ffmpeg_bin: &str, path: &std::path::Path) -> Option<RgbImage> {
     let png = crate::ffmpeg::decode_still_to_png(ffmpeg_bin, path).ok()?;
     image::open(&png.path).ok().map(|d| d.to_rgb8())
@@ -2969,7 +2974,8 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
             }
             // A cell that would cut a detected face costs far more than any
             // crop: that layout loses.
-            if frame_cuts(slot[i], cw, row_h[r], 0.0) {
+            // A whole photo is never cropped, so it cuts no one.
+            if !slot[i].whole && frame_cuts(slot[i], cw, row_h[r], 0.0) {
                 cost += FACE_CUT_COST;
             }
             cost += if slot[i].whole {
@@ -3682,6 +3688,26 @@ fn guide_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_still_is_one_frame_of_its_video() {
+        let ff = &triptape_core::process::Toolchain::global().ffmpeg.bin;
+        if Command::new(ff).arg("-version").output().is_err() {
+            eprintln!("ffmpeg missing; skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        let made = Command::new(ff)
+            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc2=s=320x180:d=2"])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let frame = video_frame(ff, &src, 1500).expect("a frame 1.5s in");
+        assert_eq!(frame.dimensions(), (320, 180));
+        assert!(video_frame(ff, &dir.path().join("missing.mp4"), 0).is_none());
+    }
 
     /// Book options for a P1 test book named `Test`, run with `typst_bin`.
     fn test_opts(typst_bin: &str) -> BookOptions {

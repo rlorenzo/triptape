@@ -333,7 +333,7 @@ pub struct BookLayout {
     /// Videos shown in the book as one frame: asset id -> milliseconds in.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub stills: BTreeMap<String, u32>,
-    /// Photos that share one page, in the order given.
+    /// Photos that share one page (printed in story order).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<Vec<String>>,
 }
@@ -346,16 +346,73 @@ impl BookLayout {
             && self.groups.is_empty()
     }
 
+    /// Whether any layout choice names this asset.
+    pub fn mentions(&self, id: &str) -> bool {
+        self.feature.iter().any(|x| x == id)
+            || self.whole.iter().any(|x| x == id)
+            || self.stills.contains_key(id)
+            || self.groups.iter().flatten().any(|x| x == id)
+    }
+
+    /// Feature a photo (biggest cell on its page), or stop featuring it.
+    pub fn set_feature(&mut self, asset: String, on: bool) {
+        set_listed(&mut self.feature, asset, on);
+    }
+
+    /// Show a photo whole (never cropped), or let it crop again.
+    pub fn set_whole(&mut self, asset: String, on: bool) {
+        set_listed(&mut self.whole, asset, on);
+    }
+
+    /// Show a video as its frame `ms` milliseconds in, or (`None`) not at all.
+    pub fn set_still(&mut self, asset: String, ms: Option<u32>) {
+        match ms {
+            Some(ms) => self.stills.insert(asset, ms),
+            None => self.stills.remove(&asset),
+        };
+    }
+
+    /// Put these photos on one page. A photo is in at most one group, so
+    /// they leave any earlier group.
+    pub fn group(&mut self, assets: Vec<String>) {
+        let mut unique: Vec<String> = Vec::with_capacity(assets.len());
+        for id in assets {
+            if !unique.contains(&id) {
+                unique.push(id);
+            }
+        }
+        self.retain_grouped(|id| !unique.iter().any(|a| a == id));
+        self.groups.push(unique);
+        self.groups.retain(|g| g.len() >= 2);
+    }
+
+    /// Take a photo out of its page group.
+    pub fn ungroup(&mut self, asset: &str) {
+        self.retain_grouped(|id| id != asset);
+    }
+
     /// Keep only the asset ids `keep` accepts; groups left with fewer
     /// than two photos go.
     pub fn retain_assets(&mut self, keep: impl Fn(&str) -> bool) {
         self.feature.retain(|id| keep(id));
         self.whole.retain(|id| keep(id));
         self.stills.retain(|id, _| keep(id));
+        self.retain_grouped(keep);
+    }
+
+    fn retain_grouped(&mut self, keep: impl Fn(&str) -> bool) {
         for g in &mut self.groups {
             g.retain(|id| keep(id));
         }
         self.groups.retain(|g| g.len() >= 2);
+    }
+}
+
+/// Add `asset` to the end of `list` (once), or remove it.
+fn set_listed(list: &mut Vec<String>, asset: String, on: bool) {
+    list.retain(|id| *id != asset);
+    if on {
+        list.push(asset);
     }
 }
 
@@ -597,6 +654,31 @@ pub struct Job {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn book_layout_setters_keep_one_entry_and_one_group_per_photo() {
+        let mut l = BookLayout::default();
+        l.set_feature("a".into(), true);
+        l.set_feature("a".into(), true);
+        l.set_whole("b".into(), true);
+        l.set_still("v".into(), Some(1500));
+        assert_eq!(l.feature, ["a"]);
+        assert!(l.mentions("a") && l.mentions("b") && l.mentions("v"));
+        l.group(vec!["a".into(), "b".into(), "c".into()]);
+        l.group(vec!["c".into(), "d".into()]);
+        assert_eq!(l.groups, [vec!["a", "b"], vec!["c", "d"]], "c moved groups");
+        l.ungroup("d");
+        assert_eq!(l.groups, [vec!["a", "b"]], "a group of one goes");
+        l.group(vec!["e".into(), "e".into()]);
+        assert_eq!(l.groups, [vec!["a", "b"]], "one photo twice is no group");
+        assert!(!l.mentions("e"));
+        assert!(!l.mentions("c") && !l.mentions("d"));
+        l.set_feature("a".into(), false);
+        l.set_whole("b".into(), false);
+        l.set_still("v".into(), None);
+        l.ungroup("a");
+        assert!(l.is_empty());
+    }
 
     #[test]
     fn old_single_clip_window_loads_as_one_window() {

@@ -171,47 +171,36 @@ fn book_chapter_of(plan: &Plan) -> HashMap<&str, usize> {
         .collect()
 }
 
-/// A book photo's caption: the user's, else its shared place
-/// ([`triptape_core::places::photo_places`]).
 /// The owner's page groups (`--group`): each group's photos move together
 /// to where its earliest photo stands in story order and become one stretch
 /// of that photo's day, so they share a page.
 fn group_pages(photos: &mut Vec<BookPhoto>, groups: &[Vec<String>]) {
     for (n, group) in groups.iter().enumerate() {
-        let mut members: Vec<BookPhoto> = vec![];
-        let mut at = None;
-        let mut k = 0;
-        while k < photos.len() {
-            if group.contains(&photos[k].asset_id) {
-                at.get_or_insert(k);
-                members.push(photos.remove(k));
-            } else {
-                k += 1;
-            }
-        }
-        let (Some(at), Some(first)) = (at, members.first()) else {
+        let in_group = |p: &mut BookPhoto| group.contains(&p.asset_id);
+        let Some(at) = photos.iter_mut().position(in_group) else {
             continue;
         };
-        if members.len() < 2 {
-            photos.splice(at..at, members);
-            continue;
-        }
-        let (day, chapter) = (first.day, first.chapter);
-        let area = Some(format!(
-            "{} \u{b7} page {}",
-            first.area.clone().unwrap_or_default(),
-            n + 1
-        ));
-        for m in &mut members {
-            m.day = day;
-            m.chapter = chapter;
-            m.area = area.clone();
-            m.page_group = true;
+        let mut members: Vec<BookPhoto> = photos.extract_if(at.., in_group).collect();
+        if let [first, _, ..] = members.as_slice() {
+            let (day, chapter) = (first.day, first.chapter);
+            let area = Some(format!(
+                "{} \u{b7} page {}",
+                first.area.clone().unwrap_or_default(),
+                n + 1
+            ));
+            for m in &mut members {
+                m.day = day;
+                m.chapter = chapter;
+                m.area = area.clone();
+                m.page_group = true;
+            }
         }
         photos.splice(at..at, members);
     }
 }
 
+/// A book photo's caption: the user's, else its shared place
+/// ([`triptape_core::places::photo_places`]).
 fn book_caption(plan: &Plan, places: &HashMap<String, String>, id: &str) -> Option<String> {
     // A hidden (blank) caption still leaves the photo its place.
     plan.captions
@@ -858,12 +847,6 @@ fn export_inner(
             })
             .collect();
         let layout = &plan.book_layout;
-        let laid_out = |id: &str| {
-            layout.feature.iter().any(|x| x == id)
-                || layout.whole.iter().any(|x| x == id)
-                || layout.stills.contains_key(id)
-                || layout.groups.iter().flatten().any(|x| x == id)
-        };
         for a in assets
             .iter()
             // Videos only as the frame the owner chose (`--still`).
@@ -899,6 +882,11 @@ fn export_inner(
             let day = asset_day(a).zip(trip_start).map(|(d, s)| trip_day(d, s));
             let place = book_places.get(&a.id).cloned();
             let closing = plan.closing.as_deref() == Some(a.id.as_str());
+            // Pinned by the owner: into the book, onto the cover, or by a
+            // layout choice.
+            let pinned = plan.book.contains(&a.id)
+                || plan.book_layout.mentions(&a.id)
+                || plan.cover.contains_key(&a.id);
             let itin = opts.itinerary.as_ref();
             let spot =
                 triptape_core::places::spot_with_fix(itin, a, borrowed.get(a.id.as_str()).copied());
@@ -930,14 +918,10 @@ fn export_inner(
                 }),
                 // Captioned, pinned into the book, or pinned to the cover by
                 // the owner: always placed (the page cap never drops it).
-                keep: plan.book.contains(&a.id)
-                    || laid_out(&a.id)
-                    || plan.cover.contains_key(&a.id)
+                keep: pinned
                     || closing
                     || has_caption(plan.captions.get(&a.id).map(String::as_str)),
-                pinned: plan.book.contains(&a.id)
-                    || laid_out(&a.id)
-                    || plan.cover.contains_key(&a.id),
+                pinned,
                 taken_at: a.taken_at,
                 phash: a.phash,
                 people_sig: a.people_sig,

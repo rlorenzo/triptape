@@ -1475,15 +1475,12 @@ fn edit_cmd(args: &[String]) {
     let groups: Vec<Vec<&Asset>> = a.group.iter().map(|g| resolve(g)).collect();
     let ungroups = resolve(&a.ungroup);
     // Layout choices only reach photos the plan holds.
-    let laid_out = features
+    let mut laid_out = features
         .iter()
         .chain(&wholes)
         .chain(stills.iter().map(|(x, _)| x))
         .chain(groups.iter().flatten());
-    if let Some(asset) = laid_out
-        .into_iter()
-        .find(|x| ep.base.chapter_of(&x.id).is_none())
-    {
+    if let Some(asset) = laid_out.find(|x| ep.base.chapter_of(&x.id).is_none()) {
         die(
             "edit",
             format!(
@@ -1551,46 +1548,35 @@ fn edit_cmd(args: &[String]) {
     {
         let layout = &mut edits.book_layout;
         for asset in &unfeatures {
-            layout.feature.retain(|id| *id != asset.id);
+            layout.set_feature(asset.id.clone(), false);
             println!("unfeature: {}", asset_label(asset));
         }
         for asset in &features {
-            layout.feature.retain(|id| *id != asset.id);
-            layout.feature.push(asset.id.clone());
+            layout.set_feature(asset.id.clone(), true);
             println!("feature: {}", asset_label(asset));
         }
         for asset in &unwholes {
-            layout.whole.retain(|id| *id != asset.id);
+            layout.set_whole(asset.id.clone(), false);
             println!("unwhole: {}", asset_label(asset));
         }
         for asset in &wholes {
-            layout.whole.retain(|id| *id != asset.id);
-            layout.whole.push(asset.id.clone());
+            layout.set_whole(asset.id.clone(), true);
             println!("whole: {}", asset_label(asset));
         }
         for asset in &unstills {
-            layout.stills.remove(&asset.id);
+            layout.set_still(asset.id.clone(), None);
             println!("unstill: {}", asset_label(asset));
         }
         for (asset, t) in &stills {
-            layout
-                .stills
-                .insert(asset.id.clone(), (t * 1000.0).round() as u32);
+            layout.set_still(asset.id.clone(), Some((t * 1000.0).round() as u32));
             println!("still: {} at {t}s", asset_label(asset));
         }
         for asset in &ungroups {
-            for g in &mut layout.groups {
-                g.retain(|id| *id != asset.id);
-            }
+            layout.ungroup(&asset.id);
             println!("ungroup: {}", asset_label(asset));
         }
         for g in &groups {
-            let ids: Vec<String> = g.iter().map(|x| x.id.clone()).collect();
-            // A photo is in at most one group: the newest one.
-            for old in &mut layout.groups {
-                old.retain(|id| !ids.contains(id));
-            }
-            layout.groups.push(ids);
+            layout.group(g.iter().map(|x| x.id.clone()).collect());
             println!(
                 "group: {}",
                 g.iter()
@@ -1599,7 +1585,6 @@ fn edit_cmd(args: &[String]) {
                     .join(" + ")
             );
         }
-        layout.groups.retain(|g| g.len() >= 2);
     }
     for asset in &unbooks {
         edits.set_book(asset.id.clone(), false);
