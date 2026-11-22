@@ -1242,8 +1242,9 @@ pub fn render_hero_video(
         "-map".into(),
         "[aout]".into(),
     ]);
-    args.extend(ffmpeg::x264_aac("medium", 19));
-    args.extend(opts.resolution.x264_level_args());
+    // Streamable on a home network (Plex to a Roku): capped bitrate, HEVC
+    // at 4K when available.
+    args.extend(ffmpeg::film_encode_args(caps, opts.resolution));
     // Nothing from a source file's tags reaches the shared film (Sec 14).
     args.extend(triptape_core::privacy::exif_strip_args());
     args.extend(["-r".into(), "30".into(), s(out_mp4)]);
