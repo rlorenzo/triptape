@@ -130,6 +130,28 @@ pub fn spot<'a>(itin: Option<&'a Itinerary>, a: &Asset) -> Spot<'a> {
         .map_or(Spot::Ashore, |l| Spot::Aboard(l.place))
 }
 
+/// [`spot`] for a shot that may stand at a borrowed `fix` (its own GPS is
+/// missing; see [`borrowed_fixes`]). A time-window place judges the shot by
+/// its own missing GPS, so the window alone places it, as the film does;
+/// only then does the borrowed fix stand in for radius places and the ship.
+pub fn spot_with_fix<'a>(
+    itin: Option<&'a Itinerary>,
+    a: &Asset,
+    fix: Option<(f64, f64)>,
+) -> Spot<'a> {
+    let (None, Some(fix)) = (a.gps, fix) else {
+        return spot(itin, a);
+    };
+    if let Some(name) = itin.and_then(|i| i.place_of(a)) {
+        return Spot::Named(name);
+    }
+    let located = Asset {
+        gps: Some(fix),
+        ..a.clone()
+    };
+    spot(itin, &located)
+}
+
 /// A chapter's attraction for its name when the plan has no itinerary:
 /// the one its photos visited (a single-photo chapter needs only that
 /// shot there), never one of the trip's [`home_bases`].
@@ -219,17 +241,19 @@ pub fn photo_places(
         // A shot without GPS (a friend's phone, a screenshot) stands where
         // the trip's nearest shot in time was: dinner aboard after leaving
         // port reads as the ship, not the port.
+        let fix = borrowed.get(a.id.as_str()).copied();
         let located;
-        let at: &Asset = match (a.gps, borrowed.get(a.id.as_str())) {
-            (None, Some(&fix)) => {
-                let mut c = a.clone();
-                c.gps = Some(fix);
-                located = c;
+        let at: &Asset = match (a.gps, fix) {
+            (None, Some(fix)) => {
+                located = Asset {
+                    gps: Some(fix),
+                    ..a.clone()
+                };
                 &located
             }
             _ => a,
         };
-        let own = match spot(itin, at) {
+        let own = match spot_with_fix(itin, a, fix) {
             Spot::Named(name) => Some(name.to_string()),
             Spot::Aboard(ship) => Some(ship),
             Spot::Ashore => poi
@@ -290,6 +314,34 @@ mod tests {
             })
             .collect();
         plan
+    }
+
+    #[test]
+    fn a_window_place_judges_a_borrowed_fix_shot_by_its_own_time() {
+        let itin = Itinerary::from_json(
+            r#"{"stops": [{"id": "sg", "label": "Singapore", "lat": 1.29, "lon": 103.85,
+                           "arrive": "2026-10-23", "depart": "2026-10-23"},
+                          {"id": "home", "label": "Home", "lat": 33.94, "lon": -118.41,
+                           "arrive": "2026-10-30", "kind": "home"}],
+                "legs": [{"from": "sg", "to": "home", "mode": "flight"}],
+                "places": [{"name": "Flower Dome", "lat": 1.2846, "lon": 103.865, "radius_m": 200,
+                            "from": "2026-10-23 15:40", "until": "2026-10-23 16:30"}]}"#,
+        )
+        .unwrap();
+        // 16:00 local (UTC+8), no GPS of its own; the nearest same-camera
+        // fix was taken 2 km away before they arrived.
+        let mut a = photo("a", 1_792_742_400, None);
+        a.tz_offset_secs = Some(8 * 3600);
+        assert!(matches!(
+            spot_with_fix(Some(&itin), &a, Some((1.30, 103.85))),
+            Spot::Named("Flower Dome")
+        ));
+        // With GPS of its own outside the radius, the window doesn't hold.
+        a.gps = Some((1.30, 103.85));
+        assert!(!matches!(
+            spot_with_fix(Some(&itin), &a, None),
+            Spot::Named("Flower Dome")
+        ));
     }
 
     #[test]

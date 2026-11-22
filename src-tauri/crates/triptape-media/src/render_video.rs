@@ -307,6 +307,22 @@ fn plan_chunks(
     }
 }
 
+/// A chapter heading as shown: the day line (`Day 16 · Sun, Oct 18`) on
+/// the day's first heading, then only the place for later moves that day,
+/// so a new place doesn't look like a new day. `last_day` tracks the day
+/// line shown last.
+fn day_once(
+    last_day: &mut Option<String>,
+    (top, bottom): (String, Option<String>),
+) -> (String, Option<String>) {
+    let same_day = last_day.as_deref() == Some(top.as_str());
+    *last_day = Some(top.clone());
+    match bottom {
+        Some(place) if same_day => (place, None),
+        bottom => (top, bottom),
+    }
+}
+
 /// Per-cut overlap for a transition: slow fades get room to breathe,
 /// everything else takes the 0.5 s standard.
 pub fn transition_overlap(t: &Transition) -> f64 {
@@ -417,6 +433,9 @@ pub struct ResolvedEntry {
     /// Display width / height (EXIF rotation applied) when known; lets
     /// panoramas be kept out of collages before anything is decoded.
     pub aspect: Option<f64>,
+    /// Where it was taken, when known: places the travel map home before
+    /// the first shot back home.
+    pub gps: Option<(f64, f64)>,
 }
 
 /// How an itinerary's travel is shown in the film.
@@ -682,6 +701,7 @@ fn card_entry(id: &str, path: &Path) -> ResolvedEntry {
         taken_at: None,
         tz_offset_secs: None,
         aspect: None,
+        gps: None,
     }
 }
 
@@ -891,7 +911,11 @@ pub fn render_hero_video(
             .filter(|_| opts.map_style == MapStyle::Parchment)
             .map_or_else(Vec::new, |j| j.hops());
         let stage_of = |r: &ResolvedEntry| {
-            triptape_core::journey::hops_reached(&hops, r.taken_at.map(|t| (t, r.tz_offset_secs)))
+            triptape_core::journey::hops_reached(
+                &hops,
+                r.taken_at.map(|t| (t, r.tz_offset_secs)),
+                r.gps,
+            )
         };
         hero_groups(
             &selected,
@@ -1034,7 +1058,8 @@ pub fn render_hero_video(
             .iter()
             .map(|s| s.0.taken_at.map(|t| (t, s.0.tz_offset_secs)))
             .collect();
-        let cuts = triptape_core::journey::hop_cuts(&hops, &shots);
+        let gps: Vec<Option<(f64, f64)>> = segs[first_shot..].iter().map(|s| s.0.gps).collect();
+        let cuts = triptape_core::journey::hop_cuts(&hops, &shots, &gps);
         let adopt = own_clips && !hops.is_empty() && opts.hop_clips.len() == hops.len();
         if own_clips && !adopt && !hops.is_empty() {
             fallbacks.push(format!(
@@ -1230,6 +1255,8 @@ pub fn render_hero_video(
         // A chapter heading identical to the last one shown (the same day
         // and place, split by a few shots elsewhere) is not repeated.
         let mut last_heading: Option<(String, Option<String>)> = None;
+        // The day line shown last, for `day_once`.
+        let mut last_day: Option<String> = None;
         for (i, (r, _, _, _)) in segs.iter().enumerate() {
             let id = r.entry.asset_id.as_str();
             if id == "title" || id == "credits" {
@@ -1250,11 +1277,13 @@ pub fn render_hero_video(
                     0 => crate::titlecard::chapter_film_lines(ch),
                     k => crate::titlecard::chapter_lines_at(ch, section_place(ch, k)?),
                 });
-                heading.filter(|lines| {
-                    let repeat = last_heading.as_ref() == Some(lines);
-                    last_heading = Some(lines.clone());
-                    !repeat
-                })
+                heading
+                    .filter(|lines| {
+                        let repeat = last_heading.as_ref() == Some(lines);
+                        last_heading = Some(lines.clone());
+                        !repeat
+                    })
+                    .map(|lines| day_once(&mut last_day, lines))
             };
             let Some((top, bottom)) = lines else { continue };
             todo.push((
@@ -3085,6 +3114,29 @@ mod tests {
     use triptape_core::plan::{CAPTION_MAX_SECS, PLACES_CARD_MAX_SECS};
 
     #[test]
+    fn the_day_line_shows_once_a_day() {
+        let mut last = None;
+        let h = |d: &str, p: &str| (d.to_string(), Some(p.to_string()));
+        assert_eq!(
+            day_once(&mut last, h("Day 16 · Sun, Oct 18", "Victoria Peak")),
+            h("Day 16 · Sun, Oct 18", "Victoria Peak")
+        );
+        assert_eq!(
+            day_once(&mut last, h("Day 16 · Sun, Oct 18", "Stanley Market")),
+            ("Stanley Market".to_string(), None)
+        );
+        assert_eq!(
+            day_once(&mut last, h("Day 17 · Mon, Oct 19", "Carnival Luminosa")),
+            h("Day 17 · Mon, Oct 19", "Carnival Luminosa")
+        );
+        // An old plan's title-only heading passes through.
+        assert_eq!(
+            day_once(&mut last, ("Chapter".to_string(), None)),
+            ("Chapter".to_string(), None)
+        );
+    }
+
+    #[test]
     fn a_long_film_is_joined_in_chunks_on_the_same_timeline() {
         let n = 2 * ASSEMBLY_CHUNK + 5;
         let durations: Vec<f64> = (0..n).map(|i| 3.0 + (i % 4) as f64).collect();
@@ -4038,6 +4090,7 @@ mod tests {
             taken_at: None,
             tz_offset_secs: None,
             aspect: None,
+            gps: None,
         }
     }
 
@@ -4707,6 +4760,7 @@ mod tests {
                 taken_at: Some(1791288000 + [0, 600, 2 * 86400][i]),
                 tz_offset_secs: None,
                 aspect: None,
+                gps: None,
             });
         }
         let mut captions = HashMap::new();
@@ -4904,6 +4958,7 @@ mod tests {
                 taken_at: None,
                 tz_offset_secs: None,
                 aspect: None,
+                gps: None,
             })
             .collect();
         let refs: Vec<&ResolvedEntry> = entries.iter().collect();
@@ -4973,6 +5028,7 @@ mod tests {
                 taken_at: Some(1791288000),
                 tz_offset_secs: None,
                 aspect: None,
+                gps: None,
             })
             .collect();
         let plan = Plan {
@@ -5113,6 +5169,7 @@ mod tests {
                 taken_at: Some(1791288000),
                 tz_offset_secs: None,
                 aspect: None,
+                gps: None,
             },
             ResolvedEntry {
                 entry: PlanEntry {
@@ -5129,6 +5186,7 @@ mod tests {
                 taken_at: Some(1791374400),
                 tz_offset_secs: None,
                 aspect: None,
+                gps: None,
             },
         ];
         let plan = Plan {
@@ -5527,6 +5585,7 @@ mod tests {
                 taken_at: Some(1791288000 + i as i64 * 60),
                 tz_offset_secs: None,
                 aspect: Some(f64::from(320 + 16 * i as u32) / 240.0),
+                gps: None,
             });
         }
         let plan = Plan {
