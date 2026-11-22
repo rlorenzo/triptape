@@ -1268,10 +1268,10 @@ pub fn render_book(
                 let (w, h) = slot_inches(opts.preset, PageKind::Closing, 1);
                 !placed.contains(p.asset_id.as_str())
                     && cover_rank(p) == 2
-                    && p.tagged_people >= 2
+                    && p.tagged_people >= 3
                     && p.face_size >= CLOSING_FACE
                     && dpi_verdict(p.width, p.height, w, h) == DpiVerdict::Ok
-                    && p.day.zip(last_day).is_some_and(|(d, l)| d + 2 >= l)
+                    && p.day.zip(last_day).is_some_and(|(d, l)| d + 1 >= l)
             })
             .max_by(|a, b| a.score.total_cmp(&b.score))
             .cloned()
@@ -2067,7 +2067,7 @@ fn solid(w: u32, h: u32, c: Rgb<u8>) -> RgbImage {
 /// faces (with room above for the head) in frame. When they cannot all
 /// fit, the biggest stay and the render notes the photo.
 fn fit_photo(p: &BookPhoto, tw: u32, th: u32, fit: &Fit, fb: &mut Vec<String>) -> RgbImage {
-    fit_photo_focused(p, p.crop_focus, tw, th, 0.0, fit, fb)
+    fit_photo_focused(p, p.crop_focus, (tw, th), 0.0, true, fit, fb)
 }
 
 /// [`fit_photo`] centred on `focus` (fractions of the photo) when set,
@@ -2075,9 +2075,9 @@ fn fit_photo(p: &BookPhoto, tw: u32, th: u32, fit: &Fit, fb: &mut Vec<String>) -
 fn fit_photo_focused(
     p: &BookPhoto,
     focus: Option<(f32, f32)>,
-    tw: u32,
-    th: u32,
+    (tw, th): (u32, u32),
     reserve: f64,
+    whole_if_cut: bool,
     fit: &Fit,
     fb: &mut Vec<String>,
 ) -> RgbImage {
@@ -2105,7 +2105,7 @@ fn fit_photo_focused(
         None if !faces.is_empty() => face_window_clear(sw, sh, tw_f, th_f, &faces, reserve),
         None => (focus_window(sw, sh, tw_f, th_f, (0.5, 0.5)), false),
     };
-    if cut {
+    if cut && whole_if_cut {
         // No crop of this cell keeps every face: show the whole photo in it
         // on the page's dark ground rather than slice someone in half.
         fb.push(format!(
@@ -2293,7 +2293,7 @@ fn draw_fullbleed(
         return save_jpg(&contain_on_page(&src, tw, th, strip_px), out);
     }
     save_jpg(
-        &fit_photo_focused(p, p.crop_focus, tw, th, reserve, ff, fb),
+        &fit_photo_focused(p, p.crop_focus, (tw, th), reserve, true, ff, fb),
         out,
     )
 }
@@ -2328,7 +2328,8 @@ fn draw_half(
     ff: &Fit,
     fb: &mut Vec<String>,
 ) -> Result<(), crate::MediaError> {
-    let full = fit_photo(p, tw * 2, th, ff, fb);
+    // A spread's two halves are one photo: crop it, never letterbox it.
+    let full = fit_photo_focused(p, p.crop_focus, (tw * 2, th), 0.0, false, ff, fb);
     let x = if left { 0 } else { tw };
     save_jpg(
         &image::imageops::crop_imm(&full, x, 0, tw, th).to_image(),
@@ -2598,7 +2599,7 @@ fn typst_text_png(
     scratch_png: &Path,
 ) -> Option<image::DynamicImage> {
     let doc = format!(
-        "#set page(width: 11in, height: auto, fill: none, margin: 0in)\n#set text(font: \"DejaVu Sans\", fill: white)\n#align(center)[#text(size: 44pt, weight: \"bold\")[{}]]\n#align(center)[#text(size: 20pt)[{}]]\n",
+        "#set page(width: 11in, height: auto, fill: none, margin: 0in)\n#set text(font: {BOOK_FONTS}, fill: white)\n#align(center)[#text(size: 44pt, weight: \"bold\")[{}]]\n#align(center)[#text(size: 20pt)[{}]]\n",
         typ_escape(title),
         typ_escape(sub)
     );
@@ -2607,6 +2608,11 @@ fn typst_text_png(
     let _ = std::fs::remove_file(scratch_png);
     img
 }
+
+/// Typst font list for every caption, title and the cover: the bundled
+/// sans first, then sans faces macOS and Windows ship. Typst's own
+/// fallback serif prints a comma like a full stop ("October 3–30. 2026").
+const BOOK_FONTS: &str = r#"("DejaVu Sans", "Avenir Next", "Helvetica Neue", "Arial")"#;
 
 /// Photos at the start of the book (hero, spread, the first pages) the
 /// cover never repeats.
@@ -2725,7 +2731,9 @@ fn draw_cover_collage(
             .filter(|&fx| fx != 0.5)
             .map(|fx| (fx, p.crop_focus.map_or(0.5, |c| c.1)))
             .or(p.crop_focus);
-        let tile = fit_photo_focused(p, focus, tile_w, tile_h, 0.0, fit, fallbacks);
+        // Cover tiles always fill their cell: letterboxed tiles leave ragged
+        // gaps in the mosaic.
+        let tile = fit_photo_focused(p, focus, (tile_w, tile_h), 0.0, false, fit, fallbacks);
         image::imageops::replace(
             &mut canvas,
             &tile,
@@ -2842,7 +2850,7 @@ fn write_typst_and_compile(
     let pdf_name = if bleed { "press.pdf" } else { "proof.pdf" };
     let typ_name = if bleed { "press.typ" } else { "proof.typ" };
     let mut typ = format!(
-        "#set page(width: {pw}in, height: {ph}in, margin: 0in)\n#set text(font: \"DejaVu Sans\", size: 14pt, fill: white)\n"
+        "#set page(width: {pw}in, height: {ph}in, margin: 0in)\n#set text(font: {BOOK_FONTS}, size: 14pt, fill: white)\n"
     );
     match cover {
         Some(c) => typ.push_str(&format!(
@@ -2882,16 +2890,31 @@ fn write_typst_and_compile(
             };
             // "…for 8 years. · Paradox Singapore": no full stop before a
             // separator.
-            let text = lines
+            let clean: Vec<&str> = lines
                 .iter()
                 .map(|l| l.trim_end().trim_end_matches('.'))
-                .collect::<Vec<_>>()
-                .join(" · ");
-            strip_pt = strip_height_pt(&text, size, inset, pw);
-            typ.push_str(&format!(
-                "#place(bottom + center)[#rect(fill: rgb(18, 20, 26).transparentize(20%), inset: {inset}pt)[#text(size: {size}pt)[{}]]]\n",
-                typ_escape(&text)
-            ));
+                .collect();
+            let title_page = texts.titles.contains(&page_no);
+            if title_page && clean.len() > 1 {
+                // The day heading on its own line; the owner's words and
+                // the places beneath it in caption size, never fused into
+                // one three-line block.
+                let (head, rest) = (clean[0], clean[1..].join(" · "));
+                strip_pt =
+                    strip_height_pt(head, size, inset, pw) + strip_height_pt(&rest, 14, 0, pw);
+                typ.push_str(&format!(
+                    "#place(bottom + center)[#rect(fill: rgb(18, 20, 26).transparentize(20%), inset: {inset}pt)[#align(center)[#text(size: {size}pt)[{}] \\ #text(size: 14pt)[{}]]]]\n",
+                    typ_escape(head),
+                    typ_escape(&rest)
+                ));
+            } else {
+                let text = clean.join(" · ");
+                strip_pt = strip_height_pt(&text, size, inset, pw);
+                typ.push_str(&format!(
+                    "#place(bottom + center)[#rect(fill: rgb(18, 20, 26).transparentize(20%), inset: {inset}pt)[#text(size: {size}pt)[{}]]]\n",
+                    typ_escape(&text)
+                ));
+            }
         }
         for (rect, text) in texts.cells.get(&page_no).into_iter().flatten() {
             // Grid cells end above the page strip, so a cell caption needs

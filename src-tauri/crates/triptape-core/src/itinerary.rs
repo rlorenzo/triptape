@@ -511,6 +511,15 @@ impl Itinerary {
     /// `… Disembarkation` on its last: what a day spent boarding the ship
     /// was about, rather than whatever stands near the terminal (Miraikan
     /// and Shiokaze Park face Tokyo's Aomi terminal).
+    /// The port the ship calls at on `day`, by its label, if any (and
+    /// not hidden): the book names it beside the ship on a port day.
+    pub fn port_call(&self, day: NaiveDate) -> Option<String> {
+        self.stops
+            .iter()
+            .find(|s| s.kind == StopKind::Port && !s.hide_label && s.active_on(day))
+            .map(|s| s.label.clone())
+    }
+
     pub fn boarding(&self, day: NaiveDate) -> Option<String> {
         self.cruises().into_iter().find_map(|c| {
             let [on, off] = BOARDING_SUFFIXES;

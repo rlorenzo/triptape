@@ -867,10 +867,39 @@ fn export_inner(
         let book_dir = out_dir.join("book");
         let staged_book = stage.join("book");
         // Day-marker titles: day once, with the location.
+        // A port day's chapter aboard is the ship's, but the day was the
+        // port's too: its heading names both ("Carnival Luminosa ·
+        // Fukuoka").
+        let ships: Vec<String> = opts
+            .itinerary
+            .as_ref()
+            .map(|i| i.cruises().into_iter().map(|c| c.ship).collect())
+            .unwrap_or_default();
+        let by_id: HashMap<&str, &triptape_core::types::Asset> =
+            assets.iter().map(|a| (a.id.as_str(), a)).collect();
         let chapter_titles: Vec<String> = plan
             .chapters
             .iter()
-            .map(crate::titlecard::chapter_book_title)
+            .map(|ch| {
+                let port = opts.itinerary.as_ref().and_then(|itin| {
+                    let place = ch.place.as_deref()?;
+                    if !ships.iter().any(|s| s == place) {
+                        return None;
+                    }
+                    let day = ch.asset_ids.iter().find_map(|id| {
+                        triptape_core::itinerary::asset_day(by_id.get(id.as_str())?)
+                    })?;
+                    itin.port_call(day)
+                });
+                match (port, &ch.place) {
+                    (Some(port), Some(place)) => {
+                        let mut named = ch.clone();
+                        named.place = Some(format!("{place} \u{b7} {port}"));
+                        crate::titlecard::chapter_book_title(&named)
+                    }
+                    _ => crate::titlecard::chapter_book_title(ch),
+                }
+            })
             .collect();
         // The book's route map: a square card of the trip itself, without
         // the long-haul flights from and to home, which would stretch it
