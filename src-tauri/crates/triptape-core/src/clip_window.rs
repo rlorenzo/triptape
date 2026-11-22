@@ -354,10 +354,13 @@ pub fn pick_windows(scores: &[f32], cuts: &[usize], duration: f64) -> Vec<ClipSp
         } else {
             a as f64 * SAMPLE_SECS
         };
+        // Every scene keeps the closing margin clear: a cut inside it would
+        // otherwise let the scene before it run into the lowered phone.
         let hi = match starts.get(i + 1) {
             Some(&b) => (b - 1) as f64 * SAMPLE_SECS,
-            None => duration - END_SKIP_SECS,
-        };
+            None => duration,
+        }
+        .min(duration - END_SKIP_SECS);
         let n = (((hi - lo).min(TARGET_WINDOW_SECS)) / SAMPLE_SECS).floor() as usize;
         if (n as f64) * SAMPLE_SECS < MIN_SCENE_WINDOW_SECS {
             continue;
@@ -704,6 +707,16 @@ mod tests {
         let w = pick_windows(&s, &[30], 60.0);
         let last = w.last().unwrap();
         assert_eq!((last.start, last.end), (52.0, 58.0));
+    }
+
+    #[test]
+    fn a_cut_inside_the_closing_margin_keeps_it_clear() {
+        // 60.2 s, scores climb to the end, a cut at sample 60 (inside the
+        // last 1.6 s): no window may end after 60.2 - 1.6 = 58.6 s.
+        let s: Vec<f32> = (0..61).map(|i| 0.5 + i as f32 / 200.0).collect();
+        let w = pick_windows(&s, &[30, 60], 60.2);
+        let end = w.iter().map(|w| w.end).fold(0.0, f64::max);
+        assert!(end <= 60.2 - END_SKIP_SECS, "{w:?}");
     }
 
     #[test]
