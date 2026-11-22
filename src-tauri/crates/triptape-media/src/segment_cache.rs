@@ -663,7 +663,42 @@ fn touch(path: &Path) {
 /// Give the new path `dst` its own reference to `src`'s data: hard link, else
 /// a copy (different volumes; on macOS `fs::copy` clones on APFS first).
 fn link_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::hard_link(src, dst).or_else(|_| std::fs::copy(src, dst).map(|_| ()))
+    link_or_copy_with(
+        src,
+        dst,
+        |s, d| std::fs::hard_link(s, d),
+        |s, d| std::fs::copy(s, d).map(|_| ()),
+    )
+}
+
+/// [`link_or_copy`] with the link and the OS copy swappable. Both can fail on
+/// a network share: SMB has no hard links, and `fs::copy` on macOS (which
+/// goes through `copyfile` and carries metadata along) is refused with
+/// "permission denied" there even though plain reads and writes work. The
+/// last resort is therefore a byte-stream copy, which only needs those.
+fn link_or_copy_with(
+    src: &Path,
+    dst: &Path,
+    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+    copy: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    link(src, dst)
+        .or_else(|_| copy(src, dst))
+        .or_else(|_| stream_copy(src, dst))
+}
+
+/// Copy the bytes of `src` to a fresh `dst`, nothing else.
+fn stream_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let result = (|| {
+        let mut from = std::fs::File::open(src)?;
+        let mut to = std::fs::File::create(dst)?;
+        std::io::copy(&mut from, &mut to)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(dst);
+    }
+    result
 }
 
 /// [`link_or_copy`] onto a work-dir path that may already exist: staged in a
@@ -1275,6 +1310,28 @@ mod tests {
         for f in &foreign {
             assert!(f.exists(), "{} was deleted", f.display());
         }
+    }
+
+    /// Regression: on an SMB share (the owner's NAS) hard links are
+    /// unsupported (ENOTSUP) and macOS `fs::copy` fails with EACCES, so every
+    /// store failed after creating its empty shard dir, and every fetch of
+    /// an entry failed too: the cache silently never held anything.
+    #[test]
+    fn placing_falls_back_to_a_plain_byte_copy_when_link_and_os_copy_fail() {
+        let t = tempfile::tempdir().unwrap();
+        let src = produce(t.path(), "src.mp4", 5000);
+        let dst = t.path().join("dst.mp4");
+        let denied = |_: &Path, _: &Path| {
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        };
+        link_or_copy_with(&src, &dst, denied, denied).expect("byte copy still works");
+        assert_eq!(std::fs::read(&dst).unwrap(), std::fs::read(&src).unwrap());
+
+        // A missing source fails cleanly and leaves nothing behind.
+        let gone = t.path().join("gone.mp4");
+        let dst2 = t.path().join("dst2.mp4");
+        assert!(link_or_copy_with(&gone, &dst2, denied, denied).is_err());
+        assert!(!dst2.exists());
     }
 
     #[test]
