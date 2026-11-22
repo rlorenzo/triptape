@@ -53,6 +53,9 @@ pub struct ExportOptions {
     pub itinerary: Option<triptape_core::itinerary::Itinerary>,
     /// Face detection for book crops; `None` crops around the centre.
     pub faces: Option<render_book::FaceFinder>,
+    /// Named people's regions per asset (from the photo library): the book
+    /// frames photos around them first.
+    pub known_faces: HashMap<String, Vec<triptape_core::types::KnownFace>>,
     /// How the itinerary's travel is shown in the film.
     pub map_style: crate::render_video::MapStyle,
     /// The owner's own hop clips, one per hop of the itinerary, in order.
@@ -810,6 +813,23 @@ fn export_inner(
                 aboard: matches!(spot, Spot::Aboard(_)),
                 faces: vec![],
                 closing: plan.closing.as_deref() == Some(a.id.as_str()),
+                family: opts
+                    .known_faces
+                    .get(&a.id)
+                    .map(|list| {
+                        list.iter()
+                            .map(|k| render_book::KnownBox {
+                                b: triptape_ai_local::FaceBox {
+                                    x: k.x,
+                                    y: k.y,
+                                    w: k.w,
+                                    h: k.h,
+                                },
+                                body: k.body,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 area: match spot {
                     Spot::Named(name) => Some(name.to_string()),
                     _ => None,
@@ -1293,6 +1313,7 @@ mod tests {
                 segment_cache: None,
                 itinerary: None,
                 faces: None,
+                known_faces: Default::default(),
                 map_style: Default::default(),
                 hop_clips: vec![],
                 back_cover: None,
@@ -1350,6 +1371,7 @@ mod tests {
             segment_cache: Some(SegmentCacheConfig::roomy(t.path().join("cache"))),
             itinerary: None,
             faces: None,
+            known_faces: Default::default(),
             map_style: Default::default(),
             hop_clips: vec![],
             back_cover: None,

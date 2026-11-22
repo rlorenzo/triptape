@@ -770,6 +770,9 @@ fn export_cmd(flags: &HashMap<String, String>) {
         .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
     // Rendered maps get the same home fuzzing as `plan` JSON (Sec 14).
     hide_home(flags, &mut plan.map_polyline);
+    let known_faces = db
+        .known_faces(&project_id)
+        .unwrap_or_else(|e| die("known faces", e));
     let trip_name = db
         .get_project(&project_id)
         .unwrap_or_else(|e| die("project", e))
@@ -887,6 +890,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             map_style,
             hop_clips,
             back_cover,
+            known_faces,
         },
     );
     console.finish();
@@ -1594,6 +1598,43 @@ fn edit_cmd(args: &[String]) {
 
 /// `learn`: show, reset or apply the story-score weights learned from the
 /// owner's Story-editor edits. Never changes a plan unless `--apply`.
+/// `triptape faces --db trip.db --osxphotos photos.json [--project ID]`:
+/// import named people's face regions from `osxphotos query --json` output
+/// (Apple Photos' face tags), so the book frames the family first.
+fn faces_cmd(flags: &HashMap<String, String>) {
+    let db_path = need(flags, "db");
+    let json_path = need(flags, "osxphotos");
+    let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
+    let project_id = match flags.get("project") {
+        Some(id) => id.clone(),
+        None => {
+            db.latest_project()
+                .unwrap_or_else(|e| die("project", e))
+                .unwrap_or_else(|| die("faces", "no project in db"))
+                .id
+        }
+    };
+    let assets = db
+        .list_assets(&project_id)
+        .unwrap_or_else(|e| die("assets", e));
+    let json = std::fs::read_to_string(&json_path)
+        .unwrap_or_else(|e| die(&format!("read {}", json_path.display()), e));
+    let faces = triptape_core::osxphotos::known_faces_from_osxphotos(&json, &assets)
+        .unwrap_or_else(|e| die("osxphotos json", e));
+    db.replace_known_faces(&faces)
+        .unwrap_or_else(|e| die("save faces", e));
+    let regions: usize = faces.values().map(Vec::len).sum();
+    let mut people: Vec<&str> = faces.values().flatten().map(|f| f.name.as_str()).collect();
+    people.sort_unstable();
+    people.dedup();
+    println!("project: {project_id}");
+    println!(
+        "known faces: {regions} regions on {} photos, {} people",
+        faces.len(),
+        people.len()
+    );
+}
+
 fn learn_cmd(flags: &HashMap<String, String>) {
     let db_path = need(flags, "db");
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
@@ -1910,6 +1951,7 @@ fn main() {
         "pick" => pick_cmd(&flags),
         "maps" => maps_cmd(&flags),
         "learn" => learn_cmd(&flags),
+        "faces" => faces_cmd(&flags),
         "cache" => cache_cmd(std::env::args().nth(2).as_deref().unwrap_or(""), &flags),
         "edit" => edit_cmd(&std::env::args().skip(2).collect::<Vec<_>>()),
         _ => {

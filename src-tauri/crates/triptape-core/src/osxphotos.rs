@@ -421,3 +421,198 @@ mod tests {
         assert_eq!(stored_key("../x.jpg"), None);
     }
 }
+
+/// How far apart (seconds) a library photo and a trip file may be dated
+/// and still be the same shot.
+const KNOWN_FACE_MATCH_SECS: i64 = 120;
+
+/// The file stem a trip file shares with its library original:
+/// `IMG_1208 (1).HEIC` → `img_1208`. `None` for an `_edited` file, whose
+/// crop may differ from the original the regions describe.
+fn library_stem(path: &std::path::Path) -> Option<String> {
+    let stem = path.file_stem()?.to_string_lossy().to_lowercase();
+    if stem.ends_with("_edited") {
+        return None;
+    }
+    let base = match stem.rsplit_once(" (") {
+        Some((b, n))
+            if n.ends_with(')') && n[..n.len() - 1].bytes().all(|c| c.is_ascii_digit()) =>
+        {
+            b.to_string()
+        }
+        _ => stem,
+    };
+    Some(base)
+}
+
+/// Named people's regions per trip asset, from `osxphotos query --json`
+/// output (Apple Photos' face tags). A library photo matches a trip file
+/// with the same file stem taken within [`KNOWN_FACE_MATCH_SECS`]. Faces
+/// with a name become [`KnownFace`](crate::types::KnownFace)s (unnamed
+/// ones are strangers to the library); a named person with only a body
+/// region gives that body's box, marked `body`. Regions are in the upright
+/// photo, top-left origin, as Photos stores them.
+pub fn known_faces_from_osxphotos(
+    json: &str,
+    assets: &[crate::types::Asset],
+) -> Result<std::collections::HashMap<String, Vec<crate::types::KnownFace>>, String> {
+    use crate::types::KnownFace;
+    let items: Vec<serde_json::Value> = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let mut by_stem: std::collections::HashMap<String, Vec<&crate::types::Asset>> =
+        std::collections::HashMap::new();
+    for a in assets {
+        if let Some(s) = library_stem(&a.path) {
+            by_stem.entry(s).or_default().push(a);
+        }
+    }
+    let num = |v: &serde_json::Value, k: &str| {
+        v.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32
+    };
+    let mut out = std::collections::HashMap::new();
+    for item in &items {
+        let Some(name) = item.get("original_filename").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(when) = item
+            .get("date")
+            .and_then(|v| v.as_str())
+            .and_then(|d| d.parse::<jiff::Timestamp>().ok())
+        else {
+            continue;
+        };
+        let stem = library_stem(std::path::Path::new(name)).unwrap_or_default();
+        let Some(files) = by_stem.get(&stem) else {
+            continue;
+        };
+        let mut faces: Vec<KnownFace> = vec![];
+        for f in item
+            .get("face_info")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let person = f.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if person.is_empty() || f.get("is_pet").and_then(|v| v.as_bool()) == Some(true) {
+                continue;
+            }
+            let area = f.get("mwg_rs_area").cloned().unwrap_or_default();
+            let (w, h) = (num(&area, "w"), num(&area, "h"));
+            if w > 0.0 && h > 0.0 {
+                // MWG regions: centre x, y and size, top-left origin.
+                faces.push(KnownFace {
+                    name: person.to_string(),
+                    x: num(&area, "x") - w / 2.0,
+                    y: num(&area, "y") - h / 2.0,
+                    w,
+                    h,
+                    body: false,
+                });
+            } else {
+                let (bw, bh) = (num(f, "body_width"), num(f, "body_height"));
+                if bw > 0.0 && bh > 0.0 {
+                    // Body centres count from the bottom edge.
+                    let (cx, cy) = (num(f, "body_center_x"), 1.0 - num(f, "body_center_y"));
+                    faces.push(KnownFace {
+                        name: person.to_string(),
+                        x: cx - bw / 2.0,
+                        y: cy - bh / 2.0,
+                        w: bw,
+                        h: bh,
+                        body: true,
+                    });
+                }
+            }
+        }
+        if faces.is_empty() {
+            continue;
+        }
+        let orientation = item
+            .get("orientation")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1);
+        for f in &mut faces {
+            upright(f, orientation);
+        }
+        let t = when.as_second();
+        for a in files.iter().filter(|a| {
+            a.taken_at
+                .is_some_and(|u| (u - t).abs() <= KNOWN_FACE_MATCH_SECS)
+        }) {
+            // The same shot can sit in the library twice (an import and
+            // a synced copy); the one with more people tagged wins.
+            if faces.len() > out.get(&a.id).map_or(0, Vec::len) {
+                out.insert(a.id.clone(), faces.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Turn a region from the camera's stored frame (where Photos keeps face
+/// regions) into the upright photo, by its EXIF `orientation`.
+fn upright(f: &mut crate::types::KnownFace, orientation: u64) {
+    let map = |x: f32, y: f32| match orientation {
+        2 => (1.0 - x, y),
+        3 => (1.0 - x, 1.0 - y),
+        4 => (x, 1.0 - y),
+        5 => (y, x),
+        6 => (1.0 - y, x),
+        7 => (1.0 - y, 1.0 - x),
+        8 => (y, 1.0 - x),
+        _ => (x, y),
+    };
+    let (ax, ay) = map(f.x, f.y);
+    let (bx, by) = map(f.x + f.w, f.y + f.h);
+    f.x = ax.min(bx);
+    f.y = ay.min(by);
+    f.w = (ax - bx).abs();
+    f.h = (ay - by).abs();
+}
+
+#[cfg(test)]
+mod known_face_tests {
+    use super::*;
+    use crate::types::{Asset, AssetKind};
+
+    #[test]
+    fn library_faces_reach_every_copy_of_the_shot() {
+        let mut a = Asset::new("a", "/t/IMG_1208 (1).HEIC".into(), AssetKind::Photo);
+        a.taken_at = Some(1_791_865_165);
+        let mut b = Asset::new("b", "/t/IMG_1208.HEIC".into(), AssetKind::Photo);
+        b.taken_at = a.taken_at;
+        let mut old = Asset::new("c", "/old/IMG_1208.JPG".into(), AssetKind::Photo);
+        old.taken_at = Some(1_300_000_000);
+        let edited = Asset::new("d", "/t/IMG_1208_edited.heic".into(), AssetKind::Photo);
+        let json = r#"[{"original_filename":"IMG_1208.HEIC","date":"2026-10-13T13:19:25.336000+09:00",
+          "face_info":[
+            {"name":"Lana","is_pet":false,"mwg_rs_area":{"x":0.157,"y":0.631,"w":0.1,"h":0.135}},
+            {"name":"","is_pet":false,"mwg_rs_area":{"x":0.5,"y":0.5,"w":0.1,"h":0.1}},
+            {"name":"Ailan","is_pet":false,"mwg_rs_area":{"x":0,"y":1,"w":0,"h":0},
+             "body_center_x":0.732,"body_center_y":0.532,"body_width":0.162,"body_height":0.497}]}]"#;
+        let faces = known_faces_from_osxphotos(json, &[a, b, old, edited]).unwrap();
+        assert_eq!(faces.len(), 2, "both copies, not the 2010 file or the edit");
+        let lana = &faces["a"][0];
+        assert_eq!(lana.name, "Lana");
+        assert!((lana.x - 0.107).abs() < 1e-3 && (lana.y - 0.5635).abs() < 1e-3);
+        assert_eq!(faces["a"].len(), 2, "the stranger is skipped");
+        let ailan = &faces["a"][1];
+        assert!(ailan.body && (ailan.y - (0.468 - 0.2485)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_portrait_shot_turns_its_regions_upright() {
+        // Orientation 6: a face left of centre in the stored frame sits
+        // near the top of the upright photo.
+        let mut f = crate::types::KnownFace {
+            name: "Lana".into(),
+            x: 0.183,
+            y: 0.477,
+            w: 0.087,
+            h: 0.116,
+            body: false,
+        };
+        upright(&mut f, 6);
+        assert!((f.x - 0.407).abs() < 1e-3 && (f.y - 0.183).abs() < 1e-3);
+        assert!((f.w - 0.116).abs() < 1e-3 && (f.h - 0.087).abs() < 1e-3);
+    }
+}

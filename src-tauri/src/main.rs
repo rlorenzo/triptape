@@ -1269,6 +1269,7 @@ fn export_blocking(
         // Face-aware book crops are CLI-only for now (see `book_faces` in
         // the triptape bin); the app's book crops around the centre.
         faces: None,
+        known_faces: Default::default(),
         map_style: Default::default(),
         hop_clips: vec![],
         back_cover: None,

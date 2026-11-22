@@ -100,6 +100,16 @@ CREATE TABLE IF NOT EXISTS people (
     display_name TEXT,
     face_count INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS known_faces (
+    asset_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    x REAL NOT NULL,
+    y REAL NOT NULL,
+    w REAL NOT NULL,
+    h REAL NOT NULL,
+    body INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_known_faces_asset ON known_faces(asset_id);
 CREATE TABLE IF NOT EXISTS plans (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
@@ -327,6 +337,64 @@ impl Db {
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Replace the known faces (named people's regions from the photo
+    /// library) of the given assets; assets absent from `faces` keep theirs.
+    pub fn replace_known_faces(
+        &self,
+        faces: &HashMap<String, Vec<crate::types::KnownFace>>,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        for (asset, list) in faces {
+            tx.execute("DELETE FROM known_faces WHERE asset_id=?1", params![asset])
+                .map_err(|e| e.to_string())?;
+            for f in list {
+                tx.execute(
+                    "INSERT INTO known_faces (asset_id,name,x,y,w,h,body) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![asset, f.name, f.x, f.y, f.w, f.h, i64::from(f.body)],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Known faces of a project's assets, by asset id.
+    pub fn known_faces(
+        &self,
+        project_id: &str,
+    ) -> Result<HashMap<String, Vec<crate::types::KnownFace>>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT k.asset_id,k.name,k.x,k.y,k.w,k.h,k.body FROM known_faces k JOIN assets a ON a.id=k.asset_id WHERE a.project_id=?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map(params![project_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    crate::types::KnownFace {
+                        name: r.get(1)?,
+                        x: r.get::<_, f64>(2)? as f32,
+                        y: r.get::<_, f64>(3)? as f32,
+                        w: r.get::<_, f64>(4)? as f32,
+                        h: r.get::<_, f64>(5)? as f32,
+                        body: r.get::<_, i64>(6)? != 0,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out: HashMap<String, Vec<crate::types::KnownFace>> = HashMap::new();
+        for row in rows {
+            let (id, f) = row.map_err(|e| e.to_string())?;
+            out.entry(id).or_default().push(f);
+        }
+        Ok(out)
     }
 
     /// Mark a project as just updated, so [`Db::latest_project`] opens it:
@@ -1759,6 +1827,31 @@ mod tests {
         assert_eq!(db.latest_project().unwrap().unwrap().id, b.id);
         db.set_project_folder(&b.id, "/b2").unwrap();
         assert_eq!(db.project_for_folder("/b2").unwrap().unwrap().id, b.id);
+    }
+
+    #[test]
+    fn known_faces_round_trip_per_asset() {
+        let db = mem();
+        let p = db.create_project("t", "/t").unwrap();
+        let a = Asset::new(
+            format!("{}_a00000", p.id),
+            "/t/a.jpg".into(),
+            AssetKind::Photo,
+        );
+        db.upsert_asset(&p.id, &a).unwrap();
+        let face = crate::types::KnownFace {
+            name: "Lana".into(),
+            x: 0.1,
+            y: 0.5,
+            w: 0.1,
+            h: 0.13,
+            body: false,
+        };
+        let faces: HashMap<String, Vec<_>> = [(a.id.clone(), vec![face.clone()])].into();
+        db.replace_known_faces(&faces).unwrap();
+        db.replace_known_faces(&faces).unwrap();
+        let back = db.known_faces(&p.id).unwrap();
+        assert_eq!(back[&a.id], vec![face]);
     }
 
     #[test]

@@ -143,6 +143,9 @@ pub struct BookPhoto {
     pub faces: Vec<FaceBox>,
     /// The owner chose this photo for the closing page.
     pub closing: bool,
+    /// Named people's regions from the photo library: framing keeps them
+    /// first.
+    pub family: Vec<KnownBox>,
 }
 
 impl BookPhoto {
@@ -181,6 +184,7 @@ impl BookPhoto {
             aboard: false,
             faces: vec![],
             closing: false,
+            family: vec![],
         }
     }
 
@@ -2112,7 +2116,9 @@ fn fit_photo_focused(
             focus_window(sw, sh, tw_f, th_f, (f64::from(fx), f64::from(fy))),
             false,
         ),
-        None if !faces.is_empty() => face_window_clear(sw, sh, tw_f, th_f, &faces, reserve),
+        None if !faces.is_empty() || !p.family.is_empty() => {
+            frame_photo(p, (sw, sh), (tw_f, th_f), &faces, reserve)
+        }
         None => (focus_window(sw, sh, tw_f, th_f, (0.5, 0.5)), false),
     };
     // Shown whole only when that still fills most of the cell: a 4:3 photo
@@ -2164,10 +2170,183 @@ const HEAD_ABOVE: f32 = 0.6;
 const FACE_SIDE: f32 = 0.2;
 const FACE_BELOW: f32 = 0.15;
 
+/// A named person's region in a photo (from the photo library's face
+/// tags): a face, or a body whose top stands in for the head.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KnownBox {
+    pub b: FaceBox,
+    pub body: bool,
+}
+
+/// What framing weighs a family member's face (with head room) at.
+const FAMILY_FACE_WEIGHT: f64 = 10.0;
+/// What framing weighs the head end of a family member's body at.
+const FAMILY_BODY_WEIGHT: f64 = 6.0;
+/// What a detected face no family region covers weighs, on a photo with
+/// family tags: most likely a stranger.
+const STRANGER_WEIGHT: f64 = 0.5;
+/// A target only partly in a window counts this many times against it:
+/// a sliced face is worse than one left out.
+const PARTIAL_PENALTY: f64 = 1.5;
+/// Candidate positions tried along each axis.
+const FRAMING_STEPS: usize = 25;
+
+/// The regions framing tries to keep, each with its weight: family faces
+/// (with head room), the top quarter of a family body (its head), and the
+/// detected faces no family region covers, lightly (strangers).
+fn framing_targets(p: &BookPhoto, detected: &[FaceBox]) -> Vec<(FaceBox, f64)> {
+    let pad = |b: FaceBox| FaceBox {
+        x: b.x - FACE_SIDE * b.w,
+        y: b.y - HEAD_ABOVE * b.h,
+        w: b.w * (1.0 + 2.0 * FACE_SIDE),
+        h: b.h * (1.0 + HEAD_ABOVE + FACE_BELOW),
+    };
+    let mut out: Vec<(FaceBox, f64)> = p
+        .family
+        .iter()
+        .map(|k| {
+            if k.body {
+                let head = FaceBox {
+                    h: k.b.h * 0.25,
+                    ..k.b.clone()
+                };
+                (head, FAMILY_BODY_WEIGHT)
+            } else {
+                (pad(k.b.clone()), FAMILY_FACE_WEIGHT)
+            }
+        })
+        .collect();
+    let covered = |d: &FaceBox| {
+        let (cx, cy) = (d.x + d.w / 2.0, d.y + d.h / 2.0);
+        p.family.iter().any(|k| {
+            let b = &k.b;
+            cx >= b.x - b.w * 0.25
+                && cx <= b.x + b.w * 1.25
+                && cy >= b.y - b.h * 0.25
+                && cy <= b.y + b.h * if k.body { 0.5 } else { 1.25 }
+        })
+    };
+    out.extend(
+        detected
+            .iter()
+            .filter(|d| !covered(d))
+            .map(|d| (pad(d.clone()), STRANGER_WEIGHT)),
+    );
+    out
+}
+
+/// The `tw`x`th`-shaped source window of an `sw`x`sh` photo that best
+/// frames `targets` (see [`framing_targets`]): each target fully inside
+/// adds its weight, one only partly inside subtracts
+/// [`PARTIAL_PENALTY`] times it, and nothing counts for one left out. The
+/// bottom `reserve` of the window (a caption strip) counts as outside.
+/// Also whether a family member (weight above the strangers') is cut or
+/// left out.
+fn framing_window(
+    sw: f64,
+    sh: f64,
+    tw: f64,
+    th: f64,
+    targets: &[(FaceBox, f64)],
+    reserve: f64,
+) -> ((f64, f64, f64, f64), bool) {
+    let scale = (tw / sw).max(th / sh);
+    let (cw, ch) = ((tw / scale).min(sw), (th / scale).min(sh));
+    let usable_h = ch * (1.0 - reserve.clamp(0.0, 0.5));
+    let (slack_x, slack_y) = ((sw - cw).max(0.0), (sh - ch).max(0.0));
+    let steps = |slack: f64| if slack > 0.5 { FRAMING_STEPS } else { 1 };
+    let fraction_in = |b: &FaceBox, x: f64, y: f64| {
+        let (bx0, by0) = (f64::from(b.x) * sw, f64::from(b.y) * sh);
+        let (bx1, by1) = (bx0 + f64::from(b.w) * sw, by0 + f64::from(b.h) * sh);
+        let (ix0, iy0) = (bx0.max(x).max(0.0), by0.max(y).max(0.0));
+        let (ix1, iy1) = (bx1.min(x + cw).min(sw), by1.min(y + usable_h).min(sh));
+        let inside = (ix1 - ix0).max(0.0) * (iy1 - iy0).max(0.0);
+        // Only the part of the box within the photo can be framed.
+        let area = (bx1.min(sw) - bx0.max(0.0)).max(0.0) * (by1.min(sh) - by0.max(0.0)).max(0.0);
+        if area <= 0.0 {
+            1.0
+        } else {
+            inside / area
+        }
+    };
+    let mut best: Option<(f64, f64, f64, bool)> = None;
+    for i in 0..steps(slack_x) {
+        let x = if steps(slack_x) == 1 {
+            slack_x / 2.0
+        } else {
+            slack_x * i as f64 / (FRAMING_STEPS - 1) as f64
+        };
+        for j in 0..steps(slack_y) {
+            let y = if steps(slack_y) == 1 {
+                slack_y / 2.0
+            } else {
+                slack_y * j as f64 / (FRAMING_STEPS - 1) as f64
+            };
+            let mut score = 0.0;
+            let mut family_cut = false;
+            for (b, w) in targets {
+                let f = fraction_in(b, x, y);
+                if f >= 0.98 {
+                    score += w;
+                } else if f > 0.02 {
+                    score -= PARTIAL_PENALTY * w;
+                    family_cut |= *w > STRANGER_WEIGHT;
+                } else {
+                    family_cut |= *w > STRANGER_WEIGHT;
+                }
+            }
+            // Ties: the window nearest the middle of the photo.
+            let off = ((x - slack_x / 2.0).abs() + (y - slack_y / 2.0).abs()) / (sw + sh);
+            let score = score - 0.01 * off;
+            if best.is_none_or(|(s, ..)| score > s) {
+                best = Some((score, x, y, family_cut));
+            }
+        }
+    }
+    let (_, x, y, cut) = best.unwrap_or((0.0, slack_x / 2.0, slack_y / 2.0, false));
+    ((x, y, cw, ch), cut)
+}
+
+/// The window a photo is cropped to in a `tw`x`th` cell, and whether it
+/// cuts someone who matters: by [`framing_window`] when the photo carries
+/// family regions, else by the detected faces alone ([`face_window_clear`]).
+fn frame_photo(
+    p: &BookPhoto,
+    (sw, sh): (f64, f64),
+    (tw, th): (f64, f64),
+    detected: &[FaceBox],
+    reserve: f64,
+) -> ((f64, f64, f64, f64), bool) {
+    if !p.family.is_empty() {
+        framing_window(sw, sh, tw, th, &framing_targets(p, detected), reserve)
+    } else if !detected.is_empty() {
+        face_window_clear(sw, sh, tw, th, detected, reserve)
+    } else {
+        (focus_window(sw, sh, tw, th, (0.5, 0.5)), false)
+    }
+}
+
+/// Whether the photo's own pixel size can be framed into a `tw`x`th` cell
+/// without cutting someone who matters.
+fn frame_cuts(p: &BookPhoto, tw: f64, th: f64, reserve: f64) -> bool {
+    p.width > 0
+        && p.height > 0
+        && (!p.family.is_empty() || !p.faces.is_empty())
+        && frame_photo(
+            p,
+            (f64::from(p.width), f64::from(p.height)),
+            (tw, th),
+            &p.faces,
+            reserve,
+        )
+        .1
+}
+
 /// The source window (x, y, w, h in pixels) a cover-fit of an `sw`x`sh`
 /// photo into a `tw`x`th` cell keeps: as many faces as fit, biggest
 /// first, each with its head room, centred between them; centred on the
 /// photo when it has none. Also whether a face was left out or cut.
+#[cfg(test)]
 fn face_window(
     sw: f64,
     sh: f64,
@@ -2293,17 +2472,7 @@ fn draw_fullbleed(
     // A wide group photo squared off for a full page would lose the
     // people at its sides: then the whole photo sits on the page instead,
     // above the strip.
-    let cuts_faces = p.crop_focus.is_none()
-        && !p.faces.is_empty()
-        && face_window_clear(
-            f64::from(p.width.max(1)),
-            f64::from(p.height.max(1)),
-            f64::from(tw),
-            f64::from(th),
-            &p.faces,
-            reserve,
-        )
-        .1;
+    let cuts_faces = p.crop_focus.is_none() && frame_cuts(p, f64::from(tw), f64::from(th), reserve);
     if cuts_faces {
         let src = load(p, ff.ffmpeg, fb);
         return save_jpg(&contain_on_page(&src, tw, th, strip_px), out);
@@ -2490,18 +2659,8 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
             }
             // A cell that would cut a detected face costs far more than any
             // crop: that layout loses.
-            let p = slot[i];
-            if !p.faces.is_empty() && p.width > 0 && p.height > 0 {
-                let (_, cut) = face_window(
-                    f64::from(p.width),
-                    f64::from(p.height),
-                    cw,
-                    row_h[r],
-                    &p.faces,
-                );
-                if cut {
-                    cost += FACE_CUT_COST;
-                }
+            if frame_cuts(slot[i], cw, row_h[r], 0.0) {
+                cost += FACE_CUT_COST;
             }
             cost += weight
                 * if c < a {
@@ -2658,17 +2817,7 @@ fn cover_rank(p: &BookPhoto) -> u8 {
         .is_some_and(|e| e.eq_ignore_ascii_case("png"));
     let panorama = p.height > 0 && f64::from(p.width) / f64::from(p.height) >= PANORAMA_ASPECT;
     // Faces that a squarish tile would cut (a wide group) make a poor tile.
-    let tile_cuts = !p.faces.is_empty()
-        && p.width > 0
-        && p.height > 0
-        && face_window(
-            f64::from(p.width),
-            f64::from(p.height),
-            COVER_TILE_ASPECT,
-            1.0,
-            &p.faces,
-        )
-        .1;
+    let tile_cuts = frame_cuts(p, COVER_TILE_ASPECT, 1.0, 0.0);
     if png || panorama || tile_cuts {
         0
     } else if p.is_of_people() {
@@ -3706,6 +3855,64 @@ mod tests {
             shot("menu", 4, false, true),
         ];
         assert_eq!(lone_scenery(&photos), ["food"]);
+    }
+
+    #[test]
+    fn framing_keeps_the_family_over_strangers() {
+        let fb = |x: f32, y: f32, side: f32| FaceBox {
+            x,
+            y,
+            w: side,
+            h: side * 1.33,
+        };
+        // A wide 4000x3000 photo into a square cell: Lana at the far left,
+        // three strangers at the right.
+        let p = BookPhoto {
+            width: 4000,
+            height: 3000,
+            family: vec![KnownBox {
+                b: fb(0.05, 0.4, 0.08),
+                body: false,
+            }],
+            ..BookPhoto::blank()
+        };
+        let strangers = [
+            fb(0.75, 0.4, 0.06),
+            fb(0.82, 0.4, 0.06),
+            fb(0.89, 0.4, 0.06),
+        ];
+        let ((x, _, w, _), cut) = frame_photo(&p, (4000.0, 3000.0), (1.0, 1.0), &strangers, 0.0);
+        assert!(
+            x <= 0.05 * 4000.0 && x + w >= 0.13 * 4000.0,
+            "Lana in: x={x}"
+        );
+        assert!(!cut);
+        // Two family members too far apart for the cell: one stays whole,
+        // the other is left out rather than sliced, and the cut is noted.
+        let p2 = BookPhoto {
+            family: vec![
+                KnownBox {
+                    b: fb(0.05, 0.4, 0.08),
+                    body: false,
+                },
+                KnownBox {
+                    b: fb(0.85, 0.4, 0.08),
+                    body: false,
+                },
+            ],
+            ..p.clone()
+        };
+        let targets = framing_targets(&p2, &[]);
+        let ((x, _, w, _), cut) = framing_window(4000.0, 3000.0, 1.0, 1.0, &targets, 0.0);
+        let whole = |b: &FaceBox| {
+            let (x0, x1) = (f64::from(b.x) * 4000.0, f64::from(b.x + b.w) * 4000.0);
+            (x0 >= x && x1 <= x + w) || x1 <= x || x0 >= x + w
+        };
+        assert!(
+            targets.iter().all(|(b, _)| whole(b)),
+            "nobody sliced: x={x}"
+        );
+        assert!(cut, "someone left out");
     }
 
     #[test]
