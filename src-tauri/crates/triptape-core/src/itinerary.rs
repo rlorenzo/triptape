@@ -465,7 +465,11 @@ impl Itinerary {
         let port = docks.iter().find(|s| s.active_on(day));
         let port_call = port.is_some_and(|s| s.kind == StopKind::Port);
         let on_board = match gps {
-            None => !port_call,
+            // No fix on a cruise day: the phone was aboard (in airplane
+            // mode at sea, or on the ship's wifi in port). A shot ashore
+            // without GPS borrows a nearby shot's fix before it gets here
+            // (`places::borrowed_fixes`).
+            None => true,
             Some(p) => {
                 let at_dock = self
                     .docks()
@@ -701,11 +705,18 @@ fn chapter_name(
     min_shots: usize,
 ) -> String {
     let named = crate::places::tally(members.iter().filter_map(|a| itin.place_of(a)));
-    // A chapter spanning several named places (the Flower Dome, then the
-    // Cloud Forest) is named for what holds them, not its biggest part.
-    let several = named.iter().filter(|(_, c)| *c >= min_shots.max(1)).count() > 1;
+    // A chapter spanning several named places (Mount Faber, then the
+    // Oceanarium) is named for the first one visited, as a day is named
+    // for its first sight.
+    let mut visited = named
+        .iter()
+        .filter(|(_, c)| *c >= min_shots.max(1))
+        .map(|(n, _)| *n);
+    if let (Some(first), Some(_)) = (visited.next(), visited.next()) {
+        return first.to_string();
+    }
     if let Some((name, _)) =
-        crate::places::most_counted(named).filter(|(_, c)| !several && 2 * c >= members.len())
+        crate::places::most_counted(named).filter(|(_, c)| 2 * c >= members.len())
     {
         return name.to_string();
     }
@@ -714,7 +725,14 @@ fn chapter_name(
         // that stayed on the ship) are the ship's, not the port's.
         return itin.boarding(day).unwrap_or(label.place);
     }
-    let fixes: Vec<(f64, f64)> = members.iter().filter_map(|a| a.gps).collect();
+    // Shots inside a place the owner named are that place, not the
+    // built-in landmark next door (the Oceanarium is not Universal
+    // Studios).
+    let fixes: Vec<(f64, f64)> = members
+        .iter()
+        .filter(|a| itin.place_of(a).is_none())
+        .filter_map(|a| a.gps)
+        .collect();
     // Neither a hidden name nor the hotel's neighbourhood (a home base).
     crate::places::visited_attraction(&fixes, min_shots, |n| {
         itin.hides_attraction(n) || home.contains(n)
@@ -836,9 +854,13 @@ mod tests {
             .label_for(day("2026-10-11"), Some((34.6687, 135.4986)))
             .unwrap();
         assert_eq!((ashore.place.as_str(), ashore.on_ship), ("Osaka", false));
-        // No GPS on a port day: most shots that day are ashore.
+        // No GPS on a cruise day, port day included: the ship (a shot ashore
+        // borrows a nearby shot's fix before it gets here).
         let unfixed = it.label_for(day("2026-10-11"), None).unwrap();
-        assert_eq!((unfixed.place.as_str(), unfixed.on_ship), ("Osaka", false));
+        assert_eq!(
+            (unfixed.place.as_str(), unfixed.on_ship),
+            ("Carnival Luminosa", true)
+        );
         // At sea, or with no GPS, on a sea day: the ship.
         let sea = it
             .label_for(day("2026-10-10"), Some((30.0, 140.0)))
@@ -915,6 +937,9 @@ mod tests {
                 track: String::new(),
                 rationale: String::new(),
             },
+            cover: Default::default(),
+            crop: Default::default(),
+            book: Default::default(),
         };
         let out = apply_itinerary(&plan, &assets, &itin());
         let places: Vec<_> = out
@@ -1087,7 +1112,7 @@ mod tests {
         );
         // Ashore: a named place, then a visited attraction, then the city.
         assert_eq!(name(&it, "2026-10-11", (34.6687, 135.5013), 3), "Dotonbori");
-        // Two named places in one chapter: neither names it.
+        // Two named places in one chapter: the first one visited names it.
         it.places.push(
             serde_json::from_str(
                 r#"{ "name": "Kuromon Market", "lat": 34.6655, "lon": 135.5065, "radius_m": 200 }"#,
@@ -1108,7 +1133,7 @@ mod tests {
         let label = chapter_label(&it, day("2026-10-11"), &refs).unwrap();
         assert_eq!(
             chapter_name(&it, day("2026-10-11"), &refs, label, &Default::default(), 3),
-            "Osaka"
+            "Dotonbori"
         );
         assert_eq!(
             name(&it, "2026-10-06", (35.6267, 139.8881), 3),
@@ -1198,11 +1223,10 @@ mod tests {
         assert_eq!(ashore.place, "Osaka");
         let at_sea = itin().label_for(day("2026-10-10"), Some(seaside)).unwrap();
         assert_eq!(at_sea.place, "Carnival Luminosa");
-        // No GPS anywhere: the no-fix rule (ashore on a port day, on board
-        // on a sea day).
+        // No GPS anywhere: the no-fix rule (on board on any cruise day).
         let blind = photo("x", "2026-10-11", None);
         let label = chapter_label(&itin(), day("2026-10-11"), &[&blind]).unwrap();
-        assert_eq!(label.place, "Osaka");
+        assert_eq!(label.place, "Carnival Luminosa");
         let blind = photo("x", "2026-10-10", None);
         let label = chapter_label(&itin(), day("2026-10-10"), &[&blind]).unwrap();
         assert_eq!(label.place, "Carnival Luminosa");

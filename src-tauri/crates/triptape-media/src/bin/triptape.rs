@@ -5,7 +5,7 @@
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m] [--models DIR]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
-//!                [--solo REF...] [--unsolo REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--list]
+//!                [--solo REF...] [--unsolo REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--book REF...] [--unbook REF...] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
@@ -1043,6 +1043,17 @@ struct EditArgs {
     /// (asset, anchor, after): play the asset right after/before the anchor.
     moves: Vec<(String, String, bool)>,
     unmove: Vec<String>,
+    /// Cover pins: (asset, horizontal focus percent).
+    cover: Vec<(String, u8)>,
+    uncover: Vec<String>,
+    /// Photos whose caption (their own or the library's) is hidden.
+    hide_caption: Vec<String>,
+    /// Crop focus: (asset, x percent, y percent).
+    crop: Vec<(String, u8, u8)>,
+    uncrop: Vec<String>,
+    /// Photos pinned into (or out of) the book.
+    book: Vec<String>,
+    unbook: Vec<String>,
 }
 
 const MOVE_USAGE: &str = "--move wants --after REF or --before REF";
@@ -1083,6 +1094,28 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     )
                 }
             },
+            "cover" => {
+                if values.is_empty() {
+                    return Err("--cover wants at least one asset (REF or REF@PERCENT)".into());
+                }
+                for v in values {
+                    out.cover.push(parse_cover_pin(&v)?);
+                }
+            }
+            "crop" => match <[String; 3]>::try_from(values) {
+                Ok([a, x, y]) => {
+                    let pct = |v: &str| match v.parse::<u8>() {
+                        Ok(p) if p <= 100 => Ok(p),
+                        _ => Err(format!("--crop focus must be 0-100, got {v:?}")),
+                    };
+                    out.crop.push((a, pct(&x)?, pct(&y)?));
+                }
+                Err(_) => {
+                    return Err(
+                        "--crop wants an asset and its focus X Y in percent (0 0 top left)".into(),
+                    )
+                }
+            },
             "move" => {
                 if pending_move.is_some() {
                     return Err(MOVE_USAGE.to_string());
@@ -1096,7 +1129,7 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                 out.moves.push((asset, single(values)?, flag == "after"));
             }
             "include" | "exclude" | "uninclude" | "unexclude" | "solo" | "unsolo" | "unjoin"
-            | "unmove" => {
+            | "unmove" | "uncover" | "hide-caption" | "uncrop" | "book" | "unbook" => {
                 if values.is_empty() {
                     return Err(format!("--{flag} wants at least one asset"));
                 }
@@ -1108,6 +1141,11 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     "solo" => out.solo.extend(values),
                     "unsolo" => out.unsolo.extend(values),
                     "unmove" => out.unmove.extend(values),
+                    "uncover" => out.uncover.extend(values),
+                    "hide-caption" => out.hide_caption.extend(values),
+                    "uncrop" => out.uncrop.extend(values),
+                    "book" => out.book.extend(values),
+                    "unbook" => out.unbook.extend(values),
                     _ => out.unjoin.extend(values),
                 }
             }
@@ -1118,6 +1156,19 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
         return Err(MOVE_USAGE.to_string());
     }
     Ok(out)
+}
+
+/// `REF` or `REF@PERCENT`: a cover pin and its horizontal focus (0 left
+/// edge .. 100 right edge; 50 when left out).
+fn parse_cover_pin(v: &str) -> Result<(String, u8), String> {
+    match v.rsplit_once('@') {
+        Some(("", _)) => Err(format!("--cover wants REF or REF@PERCENT, got {v:?}")),
+        Some((r, pct)) => match pct.parse::<u8>() {
+            Ok(p) if p <= 100 => Ok((r.to_string(), p)),
+            _ => Err(format!("--cover focus must be 0-100, got {pct:?}")),
+        },
+        None => Ok((v.to_string(), 50)),
+    }
 }
 
 /// File name and id of an asset, for messages.
@@ -1164,6 +1215,18 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
     println!("joins: {}", collage.joins.len());
     for (a, b) in &collage.joins {
         println!("  {} + {}", show(a), show(b));
+    }
+    println!("book pins: {}", edits.book.len());
+    for id in &edits.book {
+        println!("  {}", show(id));
+    }
+    println!("crop focus: {}", edits.crop.len());
+    for (id, (x, y)) in &edits.crop {
+        println!("  {} at {x}%, {y}%", show(id));
+    }
+    println!("cover pins: {}", edits.cover.len());
+    for (id, focus) in &edits.cover {
+        println!("  {} (focus {focus}%)", show(id));
     }
 }
 
@@ -1280,16 +1343,45 @@ fn edit_cmd(args: &[String]) {
         .map(|(x, y, after)| (resolve_one(x), resolve_one(y), *after))
         .collect();
     let unmoves = resolve(&a.unmove);
+    let covers: Vec<(&Asset, u8)> = a.cover.iter().map(|(q, f)| (resolve_one(q), *f)).collect();
+    let uncovers = resolve(&a.uncover);
+    let hidden = resolve(&a.hide_caption);
+    let crops: Vec<(&Asset, u8, u8)> = a
+        .crop
+        .iter()
+        .map(|(q, x, y)| (resolve_one(q), *x, *y))
+        .collect();
+    let uncrops = resolve(&a.uncrop);
+    let books = resolve(&a.book);
+    // A pin only places a photo the plan holds (a near-duplicate the scan
+    // set aside has no page to go to): refuse it rather than save a no-op.
+    if let Some(asset) = books.iter().find(|x| ep.base.chapter_of(&x.id).is_none()) {
+        die(
+            "edit",
+            format!(
+                "{} is not in any chapter of the plan, so the book can't place it",
+                asset_label(asset)
+            ),
+        );
+    }
+    let unbooks = resolve(&a.unbook);
     let changed = ops.iter().any(|(assets, ..)| !assets.is_empty())
         || !unjoins.is_empty()
         || !joins.is_empty()
         || !captions.is_empty()
         || !moves.is_empty()
-        || !unmoves.is_empty();
+        || !unmoves.is_empty()
+        || !covers.is_empty()
+        || !uncovers.is_empty()
+        || !hidden.is_empty()
+        || !crops.is_empty()
+        || !uncrops.is_empty()
+        || !books.is_empty()
+        || !unbooks.is_empty();
     if !changed && !a.list {
         die(
             "edit",
-            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin/--caption/--move/--unmove or --list",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--book/--unbook or --list",
         );
     }
     let mut edits = ep.edits.clone();
@@ -1310,6 +1402,37 @@ fn edit_cmd(args: &[String]) {
             (!text.is_empty()).then(|| text.to_string()),
         );
         println!("caption: {} = {text:?}", asset_label(asset));
+    }
+    for asset in &unbooks {
+        edits.set_book(asset.id.clone(), false);
+        println!("unbook: {}", asset_label(asset));
+    }
+    for asset in &books {
+        edits.set_book(asset.id.clone(), true);
+        println!("book: {}", asset_label(asset));
+    }
+    for asset in &hidden {
+        edits.hide_caption(asset.id.clone());
+        println!("hide caption: {}", asset_label(asset));
+    }
+    for asset in &uncrops {
+        edits.set_crop(asset.id.clone(), None);
+        println!("uncrop: {}", asset_label(asset));
+    }
+    for (asset, x, y) in &crops {
+        edits.set_crop(asset.id.clone(), Some((*x, *y)));
+        println!(
+            "crop: {} centred at {x}% across, {y}% down",
+            asset_label(asset)
+        );
+    }
+    for asset in &uncovers {
+        edits.set_cover(asset.id.clone(), None);
+        println!("uncover: {}", asset_label(asset));
+    }
+    for (asset, focus) in &covers {
+        edits.set_cover(asset.id.clone(), Some(*focus));
+        println!("cover: {} (focus {focus}%)", asset_label(asset));
     }
     for asset in &unmoves {
         if edits.unmove(&asset.id) {
@@ -1864,6 +1987,29 @@ mod tests {
             ]
         );
         assert!(parse_edit_args(&args("--caption a")).is_err());
+    }
+
+    #[test]
+    fn edit_args_set_book_pins() {
+        let a = parse_edit_args(&args(
+            "--cover a@80 b --crop c 10 90 --hide-caption d --book e --unbook f --uncover g --uncrop h",
+        ))
+        .unwrap();
+        assert_eq!(a.cover, [("a".to_string(), 80), ("b".to_string(), 50)]);
+        assert_eq!(a.crop, [("c".to_string(), 10, 90)]);
+        assert_eq!(a.hide_caption, ["d"]);
+        assert_eq!(
+            (a.book, a.unbook),
+            (vec!["e".to_string()], vec!["f".to_string()])
+        );
+        assert_eq!(
+            (a.uncover, a.uncrop),
+            (vec!["g".to_string()], vec!["h".to_string()])
+        );
+        assert!(parse_edit_args(&args("--cover a@101")).is_err());
+        assert!(parse_edit_args(&args("--cover")).is_err());
+        assert!(parse_edit_args(&args("--crop a 10")).is_err());
+        assert!(parse_edit_args(&args("--crop a 10 200")).is_err());
     }
 
     #[test]

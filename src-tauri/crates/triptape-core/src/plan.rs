@@ -1091,6 +1091,16 @@ pub struct PlanEdits {
     /// flat (`solo`, `joins`) beside the other edits. See [`collage_slots`].
     #[serde(flatten)]
     pub collage: CollageEdits,
+    /// Book cover pins: asset id -> horizontal focus percent (see
+    /// [`crate::types::Plan::cover`]).
+    #[serde(default)]
+    pub cover: BTreeMap<String, u8>,
+    /// Per-photo crop focus (see [`crate::types::Plan::crop`]).
+    #[serde(default)]
+    pub crop: BTreeMap<String, (u8, u8)>,
+    /// Photos pinned into the book (see [`crate::types::Plan::book`]).
+    #[serde(default)]
+    pub book: Vec<String>,
 }
 
 impl PlanEdits {
@@ -1102,6 +1112,32 @@ impl PlanEdits {
             && self.caption_overrides.is_empty()
             && self.moves.is_empty()
             && self.collage.is_empty()
+            && self.cover.is_empty()
+            && self.crop.is_empty()
+            && self.book.is_empty()
+    }
+
+    /// Pin a photo into the book, or unpin it.
+    pub fn set_book(&mut self, asset: String, on: bool) {
+        self.book.retain(|id| *id != asset);
+        if on {
+            self.book.push(asset);
+        }
+    }
+
+    /// Set (or clear, `None`) where a photo's crops centre, in percent.
+    pub fn set_crop(&mut self, asset: String, focus: Option<(u8, u8)>) {
+        set_pin(
+            &mut self.crop,
+            asset,
+            focus.map(|(x, y)| (x.min(100), y.min(100))),
+        );
+    }
+
+    /// Pin `asset` to the book cover with a horizontal focus percent, or
+    /// unpin it (`None`).
+    pub fn set_cover(&mut self, asset: String, focus: Option<u8>) {
+        set_pin(&mut self.cover, asset, focus.map(|f| f.min(100)));
     }
 
     /// Play `asset` right after (or before) `anchor` in the film,
@@ -1130,6 +1166,13 @@ impl PlanEdits {
     /// Set or (when blank) clear the caption for an asset.
     pub fn set_caption(&mut self, asset_id: String, caption: Option<String>) {
         set_override(&mut self.caption_overrides, asset_id, caption);
+    }
+
+    /// Hide an asset's caption, its own and the library's: a blank
+    /// override counts as no caption (see [`has_caption`]), which
+    /// [`Self::set_caption`] would clear instead.
+    pub fn hide_caption(&mut self, asset_id: String) {
+        self.caption_overrides.insert(asset_id, String::new());
     }
 
     /// Remove an asset from the keepsakes, or restore it.
@@ -1286,6 +1329,14 @@ fn apply_moves(
     }
 }
 
+/// Insert `value` under `key`, or remove the key for `None`.
+fn set_pin<V>(map: &mut BTreeMap<String, V>, key: String, value: Option<V>) {
+    match value {
+        Some(v) => map.insert(key, v),
+        None => map.remove(&key),
+    };
+}
+
 fn set_override(map: &mut BTreeMap<String, String>, key: String, value: Option<String>) {
     match value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
         Some(v) => map.insert(key, v.to_string()),
@@ -1420,6 +1471,19 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
     // Collage overrides ride along for the grouping (`collage_slots`),
     // which ignores any that no longer fit the film.
     out.collage = edits.collage.clone();
+    out.cover = edits
+        .cover
+        .iter()
+        .filter(|(id, _)| !dead.contains(id.as_str()))
+        .map(|(id, f)| (id.clone(), *f))
+        .collect();
+    out.crop = edits.crop.clone();
+    out.book = edits
+        .book
+        .iter()
+        .filter(|id| in_plan.contains(id.as_str()) && !dead.contains(id.as_str()))
+        .cloned()
+        .collect();
     out.collage
         .retain_assets(|id| in_plan.contains(id) && !dead.contains(id));
     out
@@ -1806,6 +1870,9 @@ pub fn build_plan_with_length(
             rationale: "Vibe fit: mid-tempo acoustic for mixed daylight outdoor moments"
                 .to_string(),
         },
+        cover: Default::default(),
+        crop: Default::default(),
+        book: Default::default(),
     }
 }
 
@@ -2548,6 +2615,37 @@ mod tests {
         edits.set_place("k".into(), Some("Hotel".into()));
         edits.set_place("k".into(), None);
         assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn book_pin_setters_clamp_replace_and_clear() {
+        let mut edits = PlanEdits::default();
+        edits.set_cover("a".into(), Some(30));
+        edits.set_cover("a".into(), Some(250));
+        assert_eq!(edits.cover["a"], 100);
+        edits.set_crop("a".into(), Some((120, 40)));
+        assert_eq!(edits.crop["a"], (100, 40));
+        edits.set_book("b".into(), true);
+        edits.set_book("c".into(), true);
+        edits.set_book("b".into(), true);
+        assert_eq!(edits.book, ["c", "b"]);
+        edits.set_cover("a".into(), None);
+        edits.set_crop("a".into(), None);
+        edits.set_book("b".into(), false);
+        edits.set_book("c".into(), false);
+        assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn a_hidden_caption_beats_the_librarys() {
+        let assets = vec![asset("a", 1_714_557_600, AssetKind::Photo)];
+        let mut base = build_plan(&assets, &HashMap::new(), &HashMap::new());
+        base.captions.insert("a".into(), "From the library".into());
+        let mut edits = PlanEdits::default();
+        edits.hide_caption("a".into());
+        assert!(!edits.is_empty());
+        let out = apply_edits(&base, &assets, &edits);
+        assert!(!has_caption(out.captions.get("a").map(String::as_str)));
     }
 
     #[test]
@@ -4927,6 +5025,9 @@ mod tests {
                 track: "t".into(),
                 rationale: "r".into(),
             },
+            cover: Default::default(),
+            crop: Default::default(),
+            book: Default::default(),
         };
         // a4 is a panorama: solo. a1 and a3 join across the clip; b1 and
         // b3 across the captioned b2; nothing joins across the chapters.

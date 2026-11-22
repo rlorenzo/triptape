@@ -139,6 +139,38 @@ pub fn chapter_attraction(fixes: &[(f64, f64)], home: &HashSet<String>) -> Optio
     })
 }
 
+/// How far in time a shot without GPS may borrow another's fix.
+pub const BORROW_FIX_SECS: i64 = 30 * 60;
+
+/// For each asset without GPS, the fix of the nearest-in-time asset of
+/// the same day and camera that has one, within [`BORROW_FIX_SECS`]. A
+/// file with no camera counter (a shared image) borrows nothing.
+pub fn borrowed_fixes(assets: &[Asset]) -> HashMap<&str, (f64, f64)> {
+    // Only from the same camera: on a day the group split, another
+    // phone's fix is another place (one party in the city, the rest aboard).
+    let stream = crate::party::camera_streams(assets);
+    let mut out = HashMap::new();
+    for (i, a) in assets.iter().enumerate().filter(|(_, a)| a.gps.is_none()) {
+        let (Some(t), day, Some(s)) = (a.taken_at, asset_day(a), stream[i]) else {
+            continue;
+        };
+        // Cheap checks first: the calendar day only for shots close in time.
+        let near = assets
+            .iter()
+            .enumerate()
+            .filter_map(|(j, b)| {
+                let (gps, gap) = (b.gps?, (b.taken_at? - t).abs());
+                (stream[j] == Some(s) && gap <= BORROW_FIX_SECS && asset_day(b) == day)
+                    .then_some((gap, gps))
+            })
+            .min_by_key(|&(gap, _)| gap);
+        if let Some((_, fix)) = near {
+            out.insert(a.id.as_str(), fix);
+        }
+    }
+    out
+}
+
 /// Each planned photo's place, by asset id: a place the owner named in
 /// the itinerary; the ship for shots the itinerary puts on board (even at
 /// a dock beside Miraikan or the Osaka Aquarium); else the attraction it
@@ -182,8 +214,22 @@ pub fn photo_places(
             .or_else(|| crate::geo::city_name(a.gps?))
     };
     let mut out = HashMap::new();
+    let borrowed = borrowed_fixes(assets);
     for (a, poi) in planned {
-        let own = match spot(itin, a) {
+        // A shot without GPS (a friend's phone, a screenshot) stands where
+        // the trip's nearest shot in time was: dinner aboard after leaving
+        // port reads as the ship, not the port.
+        let located;
+        let at: &Asset = match (a.gps, borrowed.get(a.id.as_str())) {
+            (None, Some(&fix)) => {
+                let mut c = a.clone();
+                c.gps = Some(fix);
+                located = c;
+                &located
+            }
+            _ => a,
+        };
+        let own = match spot(itin, at) {
             Spot::Named(name) => Some(name.to_string()),
             Spot::Aboard(ship) => Some(ship),
             Spot::Ashore => poi
@@ -204,7 +250,7 @@ pub fn photo_places(
             if !sights.contains(p) || poi.as_deref() == Some(p) {
                 return Some(p.to_string());
             }
-            Some(city_of(a).unwrap_or_else(|| p.to_string()))
+            Some(city_of(at).unwrap_or_else(|| p.to_string()))
         };
         if let Some(p) = own.or_else(fallback) {
             out.insert(a.id.clone(), p);
@@ -251,6 +297,31 @@ mod tests {
         assert_eq!(t, [("b", 2), ("a", 2), ("c", 1)]);
         assert_eq!(most_counted(t), Some(("b", 2)));
         assert_eq!(most_counted(tally(Vec::<&str>::new())), None);
+    }
+
+    #[test]
+    fn a_shot_without_gps_stands_where_the_nearest_shot_was() {
+        let noon = 1_791_288_000;
+        let ship = (33.20, 126.51);
+        let mut assets = vec![
+            photo("a", noon, Some(ship)),
+            photo("b", noon + 600, None),
+            photo("c", noon + 4 * 3600, None),
+            photo("d", noon + 300, None),
+        ];
+        for (a, name) in assets.iter_mut().zip([
+            "IMG_1001.HEIC",
+            "IMG_1002.HEIC",
+            "IMG_1003.HEIC",
+            "81424954837__X.heic",
+        ]) {
+            a.path = name.into();
+        }
+        let fixes = borrowed_fixes(&assets);
+        assert_eq!(fixes.get("b"), Some(&ship));
+        assert!(!fixes.contains_key("c"), "hours later: no fix");
+        assert!(!fixes.contains_key("a"));
+        assert!(!fixes.contains_key("d"), "no camera counter: no borrowing");
     }
 
     #[test]

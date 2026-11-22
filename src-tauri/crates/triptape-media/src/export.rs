@@ -15,7 +15,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use triptape_core::itinerary::asset_day;
 use triptape_core::places::Spot;
-use triptape_core::plan::{check_source_integrity, plan_eligibility, trip_day, Integrity};
+use triptape_core::plan::{
+    check_source_integrity, has_caption, plan_eligibility, trip_day, Integrity,
+};
 use triptape_core::types::{distinct_assets, AssetKind, Plan, PlanEntry, Rendition};
 
 #[derive(Debug, Clone)]
@@ -115,7 +117,13 @@ fn resolve_entry(
         entry: entry.clone(),
         still_path,
         motion_path,
-        caption: plan.captions.get(asset_id).cloned(),
+        // A hidden (blank) caption is no caption: the reel falls back to
+        // its place, as the book does.
+        caption: plan
+            .captions
+            .get(asset_id)
+            .filter(|c| has_caption(Some(c)))
+            .cloned(),
         taken_at: a.taken_at,
         tz_offset_secs: a.tz_offset_secs,
         aspect: a.display_aspect(),
@@ -162,7 +170,12 @@ fn book_chapter_of(plan: &Plan) -> HashMap<&str, usize> {
 /// A book photo's caption: the user's, else its shared place
 /// ([`triptape_core::places::photo_places`]).
 fn book_caption(plan: &Plan, places: &HashMap<String, String>, id: &str) -> Option<String> {
-    plan.captions.get(id).or_else(|| places.get(id)).cloned()
+    // A hidden (blank) caption still leaves the photo its place.
+    plan.captions
+        .get(id)
+        .filter(|c| has_caption(Some(c)))
+        .or_else(|| places.get(id))
+        .cloned()
 }
 
 /// Book score added to a sharp, well-exposed panorama: on a grid page it
@@ -203,6 +216,50 @@ fn book_story_positions<'a>(
         .enumerate()
         .map(|(i, id)| (id, i))
         .collect()
+}
+
+/// A leg this long at either end of the route is the flight there or
+/// home, not part of the trip (Los Angeles to Tokyo is ~8,800 km; the
+/// longest cruise leg, Osaka to Singapore, ~4,900 km).
+const LONG_HAUL_M: f64 = 7_000_000.0;
+
+/// `route` without its long-haul legs at the start and end (home to the
+/// first stop, the last stop home).
+fn trip_route(route: &[(f64, f64)]) -> &[(f64, f64)] {
+    let far = |a: (f64, f64), b: (f64, f64)| triptape_core::geo::haversine_m(a, b) > LONG_HAUL_M;
+    let mut start = 0;
+    while start + 1 < route.len() && far(route[start], route[start + 1]) {
+        start += 1;
+    }
+    let mut end = route.len();
+    while end > start + 1 && far(route[end - 2], route[end - 1]) {
+        end -= 1;
+    }
+    &route[start..end]
+}
+
+/// Drop every photo whose `_edited` version is in the book too (Photos
+/// exports both, and they read as one photo printed twice).
+fn drop_originals_of_edits(photos: &mut Vec<render_book::BookPhoto>) {
+    // Keyed by folder too, like `cluster::edit_families`: two cameras'
+    // IMG_0042 in different folders are different photos.
+    let key = |p: &render_book::BookPhoto| {
+        let (dir, name) = (p.path.parent()?, p.path.file_name()?);
+        let (stem, edited) = triptape_core::cluster::edit_stem(&name.to_string_lossy());
+        Some((dir.to_path_buf(), stem, edited))
+    };
+    let keys: Vec<Option<(std::path::PathBuf, String, bool)>> = photos.iter().map(key).collect();
+    let edited: HashSet<(&std::path::Path, &str)> = keys
+        .iter()
+        .flatten()
+        .filter(|(_, _, e)| *e)
+        .map(|(d, s, _)| (d.as_path(), s.as_str()))
+        .collect();
+    let mut keys = keys.iter();
+    photos.retain(|_| match keys.next() {
+        Some(Some((d, s, e))) => *e || !edited.contains(&(d.as_path(), s.as_str())),
+        _ => true,
+    });
 }
 
 /// Whether the book may use this asset. The plan's chapters hold near-dupe
@@ -698,6 +755,9 @@ fn export_inner(
         };
         let trip_start = photo_span.map(|(s, _)| s);
         let mut book_photos: Vec<BookPhoto> = vec![];
+        // Where `photo_places` stood a shot without GPS: the same borrowed
+        // fix, so its spot (aboard, ashore) agrees with its place.
+        let borrowed = triptape_core::places::borrowed_fixes(assets);
         for a in assets
             .iter()
             .filter(|a| a.kind != AssetKind::Video && in_book_flow(&chapter_of, &a.id))
@@ -729,7 +789,17 @@ fn export_inner(
             let day = asset_day(a).zip(trip_start).map(|(d, s)| trip_day(d, s));
             let place = places.get(&a.id).cloned();
             let itin = opts.itinerary.as_ref();
-            let spot = triptape_core::places::spot(itin, a);
+            let located;
+            let spot = match (a.gps, borrowed.get(a.id.as_str())) {
+                (None, Some(&fix)) => {
+                    located = triptape_core::types::Asset {
+                        gps: Some(fix),
+                        ..a.clone()
+                    };
+                    triptape_core::places::spot(itin, &located)
+                }
+                _ => triptape_core::places::spot(itin, a),
+            };
             book_photos.push(BookPhoto {
                 asset_id: a.id.clone(),
                 path: a.path.clone(),
@@ -737,6 +807,8 @@ fn export_inner(
                 height: h,
                 caption: book_caption(plan, &places, &a.id),
                 place,
+                aboard: matches!(spot, Spot::Aboard(_)),
+                faces: vec![],
                 area: match spot {
                     Spot::Named(name) => Some(name.to_string()),
                     _ => None,
@@ -748,10 +820,12 @@ fn export_inner(
                 score: a.score.as_ref().map_or(render_book::NEUTRAL_SCORE, |s| {
                     s.tech_quality() + s.bonus + panorama_bonus(a, s.tech_quality())
                 }),
-                keep: plan
-                    .captions
-                    .get(&a.id)
-                    .is_some_and(|c| !c.trim().is_empty()),
+                // Captioned, pinned into the book, or pinned to the cover by
+                // the owner: always placed (the page cap never drops it).
+                keep: plan.book.contains(&a.id)
+                    || plan.cover.contains_key(&a.id)
+                    || has_caption(plan.captions.get(&a.id).map(String::as_str)),
+                pinned: plan.book.contains(&a.id) || plan.cover.contains_key(&a.id),
                 taken_at: a.taken_at,
                 phash: a.phash,
                 people_sig: a.people_sig,
@@ -762,7 +836,25 @@ fn export_inner(
                     .people_count
                     .unwrap_or(0)
                     .max(a.faces.as_ref().map_or(0, |f| f.count)),
+                tagged_people: a.people_count.unwrap_or(0),
+                face_size: a.faces.as_ref().map_or(0.0, |f| f.largest),
+                cover_focus: plan.cover.get(&a.id).map(|&f| f32::from(f) / 100.0),
+                crop_focus: plan
+                    .crop
+                    .get(&a.id)
+                    .map(|&(x, y)| (f32::from(x) / 100.0, f32::from(y) / 100.0)),
             });
+        }
+        // A photo and the owner's `_edited` version of it are one photo:
+        // the edit stays.
+        drop_originals_of_edits(&mut book_photos);
+        // A cover pin outside the book's photos can't show: say so.
+        for id in plan.cover.keys() {
+            if !book_photos.iter().any(|p| &p.asset_id == id) {
+                report.fallbacks.push(format!(
+                    "cover: pinned {id} is not among the book's photos (a near-duplicate, an excluded shot or an original whose _edited version is in); pin a photo the book uses"
+                ));
+            }
         }
         // The film's story order (stable, so ties keep db order).
         let story_pos = book_story_positions(plan, assets);
@@ -780,9 +872,31 @@ fn export_inner(
             .iter()
             .map(crate::titlecard::chapter_book_title)
             .collect();
+        // The book's route map: a square card of the trip itself, without
+        // the long-haul flights from and to home, which would stretch it
+        // across an ocean and shrink the trip to a corner.
+        let book_route = trip_route(&plan.map_polyline);
+        // The owner's back cover is the trip's map: no second, plainer
+        // route map before it.
+        let book_map = if book_route.len() >= 2 && opts.back_cover.is_none() {
+            let card = work.join("route_card_book.png");
+            match crate::map::save_route_card(book_route, &[], 1800, 1800, &card) {
+                Ok(_) => Some(card),
+                Err(e) => {
+                    report.fallbacks.push(format!("book map failed: {e}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         match render_book::render_book(
             &book_photos,
-            map_card.as_deref(),
+            // Nor the film's card in its place.
+            book_map
+                .as_deref()
+                .or(map_card.as_deref())
+                .filter(|_| opts.back_cover.is_none()),
             &chapter_titles,
             &staged_book,
             &BookOptions {
@@ -1038,6 +1152,54 @@ mod tests {
     }
 
     #[test]
+    fn the_book_map_leaves_out_the_flights_home() {
+        let (lax, tokyo, osaka, sg) = (
+            (33.94, -118.41),
+            (35.71, 139.80),
+            (34.66, 135.43),
+            (1.27, 103.86),
+        );
+        assert_eq!(
+            trip_route(&[lax, tokyo, osaka, sg, lax]),
+            [tokyo, osaka, sg]
+        );
+        assert_eq!(trip_route(&[tokyo, osaka]), [tokyo, osaka]);
+    }
+
+    #[test]
+    fn an_edited_photo_replaces_its_original_in_the_book() {
+        let photo = |name: &str| render_book::BookPhoto {
+            path: PathBuf::from(format!("/t/{name}")),
+            ..render_book::BookPhoto::blank()
+        };
+        let mut photos = vec![
+            photo("IMG_6448.HEIC"),
+            photo("IMG_6448 (1).HEIC"),
+            photo("IMG_6448_edited.heic"),
+            photo("IMG_7000.HEIC"),
+        ];
+        drop_originals_of_edits(&mut photos);
+        let names: Vec<String> = photos
+            .iter()
+            .map(|p| p.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["IMG_6448_edited.heic", "IMG_7000.HEIC"]);
+        // Another folder's same-named original is a different photo.
+        let mut photos = vec![
+            render_book::BookPhoto {
+                path: PathBuf::from("/t/alice/IMG_0042.HEIC"),
+                ..render_book::BookPhoto::blank()
+            },
+            render_book::BookPhoto {
+                path: PathBuf::from("/t/bob/IMG_0042_edited.heic"),
+                ..render_book::BookPhoto::blank()
+            },
+        ];
+        drop_originals_of_edits(&mut photos);
+        assert_eq!(photos.len(), 2);
+    }
+
+    #[test]
     fn a_cancelled_export_writes_nothing_and_cleans_up() {
         let d = tempfile::tempdir().unwrap();
         let out = d.path().join("trip");
@@ -1109,6 +1271,9 @@ mod tests {
                 track: "t".into(),
                 rationale: "r".into(),
             },
+            cover: Default::default(),
+            crop: Default::default(),
+            book: Default::default(),
         }
     }
 
