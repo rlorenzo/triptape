@@ -824,6 +824,17 @@ fn book_flow(photos: &[BookPhoto], has_map: bool, cap: usize) -> Vec<FlowPage> {
     flow_pages(&chapter_of, &stretch_of, wide_index(photos), has_map, cap)
 }
 
+/// The selected photos as the pages print them: the owner's closing photo
+/// off the pages, lone captioned shots folded into a neighbouring stretch,
+/// and lone scenery left out, as [`render_book`] does after selection.
+fn printed_pool(mut picked: Vec<BookPhoto>) -> Vec<BookPhoto> {
+    picked.retain(|p| !p.closing);
+    fold_lone_kept(&mut picked);
+    let lone: HashSet<String> = lone_scenery(&picked).into_iter().collect();
+    picked.retain(|p| !lone.contains(&p.asset_id));
+    picked
+}
+
 /// Largest selection size found whose flowed book fits `cap` counted pages.
 /// Pages depend on which chapters the selection keeps, not only on its size,
 /// so each candidate is flowed for real. That also makes fit non-monotonic:
@@ -837,6 +848,10 @@ fn fitting_count(pool: &[BookPhoto], has_map: bool, cap: usize) -> usize {
             .into_iter()
             .map(|i| pool[i].clone())
             .collect();
+        // Counted as the pages will be printed: the owner's closing photo
+        // leaves the pages and lone scenery shots drop (see `render_book`),
+        // so the selection fills the cap instead of falling short of it.
+        let picked = printed_pool(picked);
         count_pages(
             &book_flow(&picked, has_map, cap)
                 .iter()
