@@ -1335,7 +1335,9 @@ fn lower_third_graph(seg_dur: f64, res: Resolution) -> String {
 
 /// Re-encode `video` in place with `png` composited by `filter_graph`
 /// (inputs `[0:v]` and `[1:v]`, output `[v]`); audio is carried over.
-pub(crate) fn burn_png_overlay(
+/// A film segment is an intermediate the final encode caps, so it has no
+/// bitrate cap of its own.
+fn burn_png_overlay(
     caps: &Capabilities,
     video: &Path,
     png: &Path,
@@ -1343,6 +1345,37 @@ pub(crate) fn burn_png_overlay(
     crf: u32,
 ) -> Result<(), crate::MediaError> {
     caps.run(&overlay_args(video, png, filter_graph, crf), video)
+}
+
+/// [`burn_png_overlay`] for a finished deliverable (a reel): the re-encode
+/// keeps the streaming cap of `cap_kbps` ([`ffmpeg::bitrate_cap_args`]).
+pub(crate) fn burn_png_overlay_capped(
+    caps: &Capabilities,
+    video: &Path,
+    png: &Path,
+    filter_graph: &str,
+    crf: u32,
+    cap_kbps: u32,
+) -> Result<(), crate::MediaError> {
+    caps.run(
+        &capped_overlay_args(video, png, filter_graph, crf, cap_kbps),
+        video,
+    )
+}
+
+fn capped_overlay_args(
+    video: &Path,
+    png: &Path,
+    filter_graph: &str,
+    crf: u32,
+    cap_kbps: u32,
+) -> Vec<String> {
+    let mut args = overlay_args(video, png, filter_graph, crf);
+    // Before the output path, which ends the argument list.
+    let out = args.pop();
+    args.extend(ffmpeg::bitrate_cap_args(cap_kbps));
+    args.extend(out);
+    args
 }
 
 fn overlay_args(video: &Path, png: &Path, filter_graph: &str, crf: u32) -> Vec<String> {
@@ -2824,6 +2857,18 @@ fn graph_segment_args(img: &Path, dur: f64, graph: String, out: &Path) -> Vec<St
 mod tests {
     use super::*;
     use triptape_core::plan::{CAPTION_MAX_SECS, PLACES_CARD_MAX_SECS};
+
+    #[test]
+    fn a_capped_overlay_keeps_the_streaming_cap() {
+        let a = capped_overlay_args(Path::new("/r.mp4"), Path::new("/p.png"), "[v]", 20, 15_000);
+        let at = |k: &str| a[a.iter().position(|x| x == k).unwrap() + 1].as_str();
+        assert_eq!((at("-maxrate"), at("-bufsize")), ("15000k", "15000k"));
+        assert_eq!(
+            a.last().map(String::as_str),
+            Some("/r.mp4"),
+            "output stays last"
+        );
+    }
 
     #[test]
     fn film_graph_chains_cuts_into_one_graph() {

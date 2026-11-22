@@ -108,12 +108,13 @@ fn burn_place_overlay(
     let png = dir.join(".place-overlay.png");
     let doc = crate::titlecard::lower_third_doc(place, None);
     let result = crate::titlecard::render_text_png(typst_bin, &doc, &png, 72).and_then(|()| {
-        crate::render_video::burn_png_overlay(
+        crate::render_video::burn_png_overlay_capped(
             caps,
             out,
             &png,
             "[1:v]scale=972:-2[png];[0:v][png]overlay=54:H-300:format=yuv420:enable='between(t,0.3,4.2)'[v]",
             20,
+            ffmpeg::FILM_1080P_MAX_KBPS,
         )
     });
     let _ = std::fs::remove_file(&png);
