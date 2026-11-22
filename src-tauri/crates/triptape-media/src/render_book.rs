@@ -1250,6 +1250,23 @@ pub fn render_book(
             "book: selected {keep} of {of} photos (your captioned photos first, then the best-scored of each chapter) to fit the {cap}-page cap"
         ));
     }
+    // The closing page's photo, chosen now from what the pages leave out:
+    // a strong people shot of the last days that the book doesn't print
+    // elsewhere, so the last page is new, not a repeat.
+    let closing_pick: Option<BookPhoto> = {
+        let placed: HashSet<&str> = pruned.iter().map(|p| p.asset_id.as_str()).collect();
+        let last_day = viable.iter().filter_map(|p| p.day).max();
+        viable
+            .iter()
+            .filter(|p| {
+                !placed.contains(p.asset_id.as_str())
+                    && cover_rank(p) == 2
+                    && p.tagged_people >= 2
+                    && p.day.zip(last_day).is_some_and(|(d, l)| d + 2 >= l)
+            })
+            .max_by(|a, b| a.score.total_cmp(&b.score))
+            .cloned()
+    };
     // A photo alone in its stretch (its day or named place) would fill a
     // page by itself: worth it for people or the owner's caption, not for
     // a plate of food or a candy bucket.
@@ -1528,16 +1545,20 @@ pub fn render_book(
                         .map(|&i| photos[i].asset_id.as_str())
                         .collect();
                     let last_day = photos.iter().filter_map(|p| p.day).max();
-                    let last = photos
-                        .iter()
-                        .filter(|p| {
-                            // A people photo that fills a page well: no
-                            // panorama, no group a square would cut.
-                            cover_rank(p) == 2
-                                && !recent.contains(&p.asset_id.as_str())
-                                && p.day.zip(last_day).is_some_and(|(d, l)| d + 2 >= l)
+                    let last = closing_pick
+                        .as_ref()
+                        .or_else(|| {
+                            photos
+                                .iter()
+                                .filter(|p| {
+                                    // A people photo that fills a page well: no
+                                    // panorama, no group a square would cut.
+                                    cover_rank(p) == 2
+                                        && !recent.contains(&p.asset_id.as_str())
+                                        && p.day.zip(last_day).is_some_and(|(d, l)| d + 2 >= l)
+                                })
+                                .max_by(|a, b| a.score.total_cmp(&b.score))
                         })
-                        .max_by(|a, b| a.score.total_cmp(&b.score))
                         .unwrap_or(&photos[photos.len() - 1]);
                     shown.push(last);
                     draw_fullbleed(last, (tw, th), 0, &out, &fit, &mut fallbacks)?;
@@ -2105,9 +2126,9 @@ fn crop_window(src: &RgbImage, (x, y, w, h): (f64, f64, f64, f64), tw: u32, th: 
 }
 
 /// Share of a crop's spare height left above the faces (the rest goes
-/// below): what towers over people (mascots, statues) matters more than
-/// the floor.
-const ABOVE_SHARE: f64 = 0.6;
+/// below): children in strollers sit below the adults' faces more often
+/// than a mascot towers over them (a mascot gets an owner crop focus).
+const ABOVE_SHARE: f64 = 0.35;
 
 /// Room kept around a face, as fractions of its box: the detector boxes
 /// the face, so the top of the head and hair sit well above it.
@@ -2330,6 +2351,14 @@ fn row_splits(n: usize) -> Vec<Vec<usize>> {
     out
 }
 
+/// Cell width / height below which a cell is a sliver, and the share of
+/// a photo's width below which a sliver guts it (a 4:3 shot in a third of
+/// the page keeps a quarter of its width; a portrait in half a page keeps
+/// two thirds and is fine).
+const NARROW_CELL: f64 = 0.55;
+/// What a grid layout pays for a sliver that guts its photo.
+const NARROW_CELL_COST: f64 = 1.5;
+
 /// What a grid layout pays for a cell that cuts a detected face: more
 /// than any amount of ordinary cropping.
 const FACE_CUT_COST: f64 = 3.0;
@@ -2420,6 +2449,12 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
             x += cw + gap;
             let (a, c) = (aspect(slot[i]), cw / row_h[r]);
             let weight = people_weight(slot[i]);
+            // A tall sliver (a third of the page wide, full height) leaves
+            // no room around anyone: such layouts lose unless nothing else
+            // fits.
+            if c < NARROW_CELL && c / a < NARROW_CELL {
+                cost += NARROW_CELL_COST;
+            }
             // A cell that would cut a detected face costs far more than any
             // crop: that layout loses.
             let p = slot[i];
