@@ -462,6 +462,8 @@ fn vertical_vf(caps: &Capabilities, src_w: u32, src_h: u32) -> String {
 
 fn quality_tail(out: &Path) -> Vec<String> {
     let mut args = ffmpeg::x264_aac("veryfast", 20);
+    // Streamable like the film: capped for a TV on a home network.
+    args.extend(ffmpeg::bitrate_cap_args(ffmpeg::FILM_1080P_MAX_KBPS));
     // Every reel encode ends here: no source tags in a reel (Sec 14).
     args.extend(triptape_core::privacy::exif_strip_args());
     args.extend(["-r".into(), "30".into(), "-shortest".into(), s(out)]);
@@ -712,6 +714,13 @@ fn render_still_reel_png(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reels_are_capped_to_stream() {
+        let a = quality_tail(Path::new("/tmp/r.mp4"));
+        let at = |k: &str| a[a.iter().position(|x| x == k).unwrap() + 1].as_str();
+        assert_eq!((at("-maxrate"), at("-bufsize")), ("15000k", "15000k"));
+    }
 
     #[test]
     fn decode_still_fails_closed_on_missing_file() {

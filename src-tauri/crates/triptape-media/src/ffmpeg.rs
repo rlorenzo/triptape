@@ -217,8 +217,19 @@ fn yuv420p_aac_faststart() -> Vec<String> {
 /// link sustains: an uncapped CRF encode peaked near 300 Mbit/s and
 /// buffered. 30 Mbit/s leaves room for Wi-Fi and other traffic.
 pub const FILM_4K_MAX_KBPS: u32 = 30_000;
-/// Peak video bitrate of a 1080p film, kbit/s.
+/// Peak video bitrate of a 1080p film or a 1080x1920 reel, kbit/s.
 pub const FILM_1080P_MAX_KBPS: u32 = 15_000;
+
+/// `-maxrate`/`-bufsize` capping an H.264 encode at `kbps` second by
+/// second, so every video TripTape writes streams on a home network.
+pub fn bitrate_cap_args(kbps: u32) -> Vec<String> {
+    vec![
+        "-maxrate".into(),
+        format!("{kbps}k"),
+        "-bufsize".into(),
+        format!("{kbps}k"),
+    ]
+}
 
 /// Final film encode (video and audio), made to stream on a home network
 /// to a Roku or other TV player through Plex: the bitrate is capped
@@ -256,12 +267,7 @@ pub fn film_encode_args(caps: &Capabilities, res: crate::resolution::Resolution)
     }
     let mut args = x264_aac("medium", 19);
     args.extend(res.x264_level_args());
-    args.extend([
-        "-maxrate".into(),
-        format!("{max}k"),
-        "-bufsize".into(),
-        format!("{max}k"),
-    ]);
+    args.extend(bitrate_cap_args(max));
     args
 }
 
