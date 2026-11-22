@@ -233,6 +233,13 @@ pub struct Chapter {
     /// Set by [`crate::itinerary::name_film_chapters`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub film_place: Option<String>,
+    /// Where the film moves on to another place within the chapter:
+    /// `(asset_id, place)` for the first film shot at each new place, in
+    /// film order (lunch in town, then the lava cliffs; the Flower Dome,
+    /// then the Cloud Forest). Each gets its own lower third. Set by
+    /// [`crate::itinerary::name_film_chapters`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub film_place_changes: Vec<(String, String)>,
 }
 
 impl Chapter {
@@ -240,6 +247,14 @@ impl Chapter {
     /// when set, else [`Self::place`].
     pub fn film_heading_place(&self) -> Option<&str> {
         self.film_place.as_deref().or(self.place.as_deref())
+    }
+
+    /// Every place the film names in this chapter, in film order: its
+    /// heading place, then [`Self::film_place_changes`].
+    pub fn film_places(&self) -> impl Iterator<Item = &str> {
+        self.film_heading_place()
+            .into_iter()
+            .chain(self.film_place_changes.iter().map(|(_, p)| p.as_str()))
     }
 }
 

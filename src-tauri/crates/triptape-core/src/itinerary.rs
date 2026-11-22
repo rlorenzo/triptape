@@ -262,6 +262,16 @@ impl Itinerary {
             .map(|pl| pl.name.as_str())
     }
 
+    /// The label of the stop active on `day` nearest to `gps`: on the day
+    /// a trip flies home, a shot back home is home, not the last city.
+    fn stop_near(&self, day: NaiveDate, gps: (f64, f64)) -> Option<String> {
+        self.stops
+            .iter()
+            .filter(|s| s.active_on(day))
+            .min_by(|a, b| haversine_m(gps, a.pos()).total_cmp(&haversine_m(gps, b.pos())))
+            .map(|s| s.label.clone())
+    }
+
     /// Whether the owner asked never to name this attraction.
     pub fn hides_attraction(&self, name: &str) -> bool {
         self.hide_attractions.iter().any(|h| h.trim() == name)
@@ -621,14 +631,20 @@ pub fn apply_itinerary(plan: &Plan, assets: &[Asset], itin: &Itinerary) -> Plan 
     out
 }
 
-/// Name what the film shows: for each chapter, [`chapter_name`] over only
-/// its shots in `plan.hero`, kept in [`Chapter::film_place`] when it
-/// differs from the chapter's own place. A chapter often spans more than
-/// the film keeps (Osaka Castle in the morning, Dotonbori in the
-/// afternoon, with only Dotonbori in the film), and its lower third should
-/// name what is on screen. Run after the user's edits, on the final hero;
-/// chapters `renamed` by the user keep their name. A visit needs fewer
-/// shots here, as the film keeps only a few of each place.
+/// Name what the film shows. A chapter often spans more than the film
+/// keeps (Osaka Castle in the morning, Dotonbori in the afternoon, with
+/// only Dotonbori in the film), and its lower thirds should name what is on
+/// screen: for each chapter, in film order, every shot that has a place of
+/// its own ([`film_shot_place`]: a place the owner named, else an
+/// attraction it was taken at) starts a heading there when that place
+/// differs from the current one; shots without one keep the current
+/// heading. The chapter's first heading is its first shot's place, else
+/// the day's city (lunch in town is not the lava cliffs visited after), or
+/// for a chapter aboard, its usual ship or boarding name.
+/// [`Chapter::film_place`] holds the first heading when it differs from
+/// the chapter's place; [`Chapter::film_place_changes`] the rest. Run after
+/// the user's edits, on the final hero; chapters `renamed` by the user
+/// keep their name and get no changes.
 pub fn name_film_chapters(
     plan: &mut Plan,
     assets: &[Asset],
@@ -649,6 +665,7 @@ pub fn name_film_chapters(
     let home = crate::places::home_bases(assets);
     for ch in &mut plan.chapters {
         ch.film_place = None;
+        ch.film_place_changes.clear();
         if renamed(ch) {
             continue;
         }
@@ -673,12 +690,112 @@ pub fn name_film_chapters(
         let Some(label) = chapter_label(itin, day, &on_screen) else {
             continue;
         };
-        let min_shots = crate::places::PLACE_MIN_SHOTS.min(on_screen.len().div_ceil(2));
-        let name = chapter_name(itin, day, &on_screen, label, &home, min_shots);
-        if ch.place.as_deref() != Some(name.as_str()) {
-            ch.film_place = Some(name);
+        let own = |a: &Asset| film_shot_place(itin, &home, a);
+        let (aboard, city) = (label.on_ship, label.place.clone());
+        let first = if aboard {
+            let min_shots = crate::places::PLACE_MIN_SHOTS.min(on_screen.len().div_ceil(2));
+            chapter_name(itin, day, &on_screen, label, &home, min_shots)
+        } else {
+            own(on_screen[0]).unwrap_or_else(|| city.clone())
+        };
+        let mut current = first.clone();
+        // Where the current heading was set: a shot with no place of its
+        // own that is well away from it (Dotonbori, 3 km from the castle)
+        // is back in the day's city, the stop that day nearest to it (home,
+        // not Singapore, for a clip back in California).
+        let mut anchor = on_screen[0].gps;
+        for a in &on_screen[1..] {
+            let next = own(a).or_else(|| {
+                let away = matches!(
+                    (anchor, a.gps),
+                    (Some(p), Some(q)) if crate::geo::haversine_m(p, q) > FILM_PLACE_LEFT_M
+                );
+                (away && !aboard).then(|| {
+                    a.gps
+                        .and_then(|g| itin.stop_near(day, g))
+                        .unwrap_or_else(|| city.clone())
+                })
+            });
+            if let Some(p) = next {
+                if p != current {
+                    // A new place's anchor is its own shot: a named place
+                    // without GPS (a time window) leaves none rather than
+                    // measuring the next shots from the place before.
+                    anchor = a.gps;
+                    ch.film_place_changes.push((a.id.clone(), p.clone()));
+                    current = p;
+                } else {
+                    anchor = a.gps.or(anchor);
+                }
+            }
+        }
+        if ch.place.as_deref() != Some(first.as_str()) {
+            ch.film_place = Some(first);
         }
     }
+}
+
+/// How far a film shot without a place of its own must be from where the
+/// current heading was set to leave that place: twice the reach of an
+/// attraction ([`crate::places::PLACE_RADIUS_M`]).
+const FILM_PLACE_LEFT_M: f64 = 2.0 * crate::places::PLACE_RADIUS_M;
+
+/// A film shot's own place: the place the owner named it at (radius or
+/// time window); aboard, the ship (or its boarding), never an attraction
+/// (the ship docked beside Miraikan is not a visit to it); ashore, the
+/// attraction it was taken at, unless hidden or the hotel's neighbourhood
+/// (a home base). An
+/// attraction the owner also named (another spelling: "Meiji Jingū" for
+/// their "Meiji Jingu") takes the owner's name.
+fn film_shot_place(
+    itin: &Itinerary,
+    home: &std::collections::HashSet<String>,
+    a: &Asset,
+) -> Option<String> {
+    if let Some(p) = itin.place_of(a) {
+        return Some(p.to_string());
+    }
+    // Aboard (by its own fix): the ship, or the boarding on a cruise's
+    // first or last day, even inside a chapter mostly ashore. A shot
+    // without GPS can't tell, and keeps the current heading.
+    if let (Some(day), Some(_)) = (asset_day(a), a.gps) {
+        if let Some(l) = itin.label_for(day, a.gps).filter(|l| l.on_ship) {
+            return Some(itin.boarding(day).unwrap_or(l.place));
+        }
+    }
+    let n = crate::places::photo_attraction(a)
+        .filter(|n| !itin.hides_attraction(n) && !home.contains(n))?;
+    let key = fold_name(&n);
+    Some(
+        itin.places
+            .iter()
+            .find(|pl| fold_name(&pl.name) == key)
+            .map_or(n, |pl| pl.name.clone()),
+    )
+}
+
+/// A place name compared without case or accents: `Meiji Jingū` and
+/// `meiji jingu` are one place. Covers the Latin accents and macrons of
+/// romanized place names (Japanese, Vietnamese, European).
+fn fold_name(s: &str) -> String {
+    s.chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| match c {
+            'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' | 'ā' | 'ă' | 'ạ' | 'ả' | 'ấ' | 'ầ' | 'ậ' => {
+                'a'
+            }
+            'é' | 'è' | 'ê' | 'ë' | 'ē' | 'ẹ' | 'ế' | 'ề' | 'ệ' => 'e',
+            'í' | 'ì' | 'î' | 'ï' | 'ī' | 'ị' => 'i',
+            'ó' | 'ò' | 'ô' | 'ö' | 'õ' | 'ō' | 'ơ' | 'ọ' | 'ố' | 'ồ' | 'ộ' | 'ớ' | 'ờ' => {
+                'o'
+            }
+            'ú' | 'ù' | 'û' | 'ü' | 'ū' | 'ư' | 'ụ' | 'ứ' | 'ừ' => 'u',
+            'ñ' => 'n',
+            'ç' => 'c',
+            'đ' => 'd',
+            other => other,
+        })
+        .collect()
 }
 
 /// The label most of a chapter's GPS fixes get on `day` (ties: the label
@@ -1027,6 +1144,55 @@ mod tests {
         assert_eq!(out.map_polyline.len(), 7);
     }
 
+    /// A plan whose hero shows `ids` as stills, in order, with no chapters.
+    fn hero_plan(ids: &[&str]) -> Plan {
+        let hero: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "asset_id": id, "content_hash": null, "size_bytes": 0, "mtime": 0,
+                    "rendition": "still"
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "plan_version": 1, "schema_version": 1, "reel_selects": [], "chapters": [],
+            "captions": {}, "map_polyline": [], "music": {"track": "", "rationale": ""},
+            "hero": hero,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_film_shot_aboard_names_the_ship() {
+        let it = itin();
+        let home = std::collections::HashSet::new();
+        // Osaka port day, at the terminal (the dock): aboard.
+        let dock = photo("d", "2026-10-11", Some((34.656, 135.4306)));
+        assert_eq!(
+            film_shot_place(&it, &home, &dock).as_deref(),
+            Some("Carnival Luminosa")
+        );
+        // The cruise's first day at the Tokyo terminal: the boarding.
+        let board = photo("b", "2026-10-09", Some((35.6190, 139.7766)));
+        assert_eq!(
+            film_shot_place(&it, &home, &board).as_deref(),
+            Some("Carnival Luminosa Embarkation")
+        );
+        // No fix: can't tell, keeps the current heading.
+        assert_eq!(
+            film_shot_place(&it, &home, &photo("n", "2026-10-11", None)),
+            None
+        );
+    }
+
+    #[test]
+    fn place_names_match_without_accents() {
+        assert_eq!(fold_name("Meiji Jingū"), fold_name("meiji jingu"));
+        assert_eq!(fold_name("Sensō-ji"), "senso-ji");
+        assert_ne!(fold_name("Taipei 101"), fold_name("Taipei"));
+    }
+
     #[test]
     fn the_film_names_the_shots_it_shows() {
         let mut it = itin();
@@ -1054,19 +1220,9 @@ mod tests {
             day_index: Some(14),
             date_label: None,
             film_place: None,
+            film_place_changes: vec![],
         };
-        let entry = |id: &str| {
-            serde_json::json!({
-                "asset_id": id, "content_hash": null, "size_bytes": 0, "mtime": 0,
-                "rendition": "still"
-            })
-        };
-        let mut plan: Plan = serde_json::from_value(serde_json::json!({
-            "plan_version": 1, "schema_version": 1, "reel_selects": [], "chapters": [],
-            "captions": {}, "map_polyline": [], "music": {"track": "", "rationale": ""},
-            "hero": [entry("m1"), entry("m2"), entry("t1")],
-        }))
-        .unwrap();
+        let mut plan = hero_plan(&["m1", "m2", "t1"]);
         plan.chapters = vec![
             chapter(&["t1", "t2", "t3", "m1", "m2"]),
             chapter(&["t1", "t2", "t3"]),
@@ -1077,11 +1233,60 @@ mod tests {
             plan.chapters[0].film_place.as_deref(),
             Some("Raohe Night Market")
         );
+        // The film then reaches the tower: a heading of its own there.
+        assert_eq!(
+            plan.chapters[0].film_place_changes,
+            [("t1".to_string(), "Taipei 101".to_string())]
+        );
         // Shown where the chapter is named: nothing to add.
         assert_eq!(plan.chapters[1].film_place, None);
         // A chapter the user renamed keeps their name.
         name_film_chapters(&mut plan, &assets, &it, |c| c.asset_ids.len() == 5);
         assert_eq!(plan.chapters[0].film_place, None);
+    }
+
+    #[test]
+    fn a_film_shot_far_from_the_heading_returns_to_the_city() {
+        let mut it = itin();
+        it.places = serde_json::from_str(
+            r#"[{ "name": "Kiyosumi Garden", "lat": 35.6810, "lon": 139.7980, "radius_m": 150 }]"#,
+        )
+        .unwrap();
+        let garden = Some((35.6811, 139.7981));
+        // Beside the garden, outside its radius: still the garden.
+        let near = Some((35.6830, 139.7990));
+        // Several km away, with no place of its own: back in Tokyo.
+        let far = Some((35.6500, 139.8400));
+        let assets = vec![
+            photo("g1", "2026-10-06", garden),
+            photo("n1", "2026-10-06", near),
+            photo("f1", "2026-10-06", far),
+            photo("g2", "2026-10-06", garden),
+        ];
+        let mut plan = hero_plan(&["g1", "n1", "f1", "g2"]);
+        plan.chapters = vec![Chapter {
+            title: "Tokyo".into(),
+            asset_ids: ["g1", "n1", "f1", "g2"].map(String::from).to_vec(),
+            place: Some("Tokyo".into()),
+            day_index: Some(3),
+            date_label: None,
+            film_place: None,
+            film_place_changes: vec![],
+        }];
+        name_film_chapters(&mut plan, &assets, &it, |_| false);
+        let ch = &plan.chapters[0];
+        assert_eq!(ch.film_place.as_deref(), Some("Kiyosumi Garden"));
+        assert_eq!(
+            ch.film_place_changes,
+            [
+                ("f1".to_string(), "Tokyo".to_string()),
+                ("g2".to_string(), "Kiyosumi Garden".to_string()),
+            ]
+        );
+        assert_eq!(
+            ch.film_places().collect::<Vec<_>>(),
+            ["Kiyosumi Garden", "Tokyo", "Kiyosumi Garden"]
+        );
     }
 
     #[test]
