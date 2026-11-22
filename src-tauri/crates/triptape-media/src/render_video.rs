@@ -385,16 +385,19 @@ const SHORT_FILM_SECS: f64 = 30.0;
 const CREDITS_SECS: f64 = 4.5;
 /// Longest places card hold, however many places.
 const CREDITS_MAX_SECS: f64 = 9.0;
+/// Time to take in the places card before reading its names.
+const CREDITS_BASE_SECS: f64 = 3.0;
 /// Reading time per place name on the closing card.
 const CREDITS_SECS_PER_PLACE: f64 = 0.2;
+/// Closing map recap runs this much longer than the opening map.
+const CLOSING_MAP_EXTRA_SECS: f64 = 1.5;
 
 /// How long the closing card holds for `places` names: long enough to
 /// read them (28 names were on screen for 4.5 s), within a ceiling.
 fn credits_secs(places: usize) -> f64 {
-    (3.0 + CREDITS_SECS_PER_PLACE * places as f64).clamp(CREDITS_SECS, CREDITS_MAX_SECS)
+    (CREDITS_BASE_SECS + CREDITS_SECS_PER_PLACE * places as f64)
+        .clamp(CREDITS_SECS, CREDITS_MAX_SECS)
 }
-/// Closing map recap runs this much longer than the opening map.
-const CLOSING_MAP_EXTRA_SECS: f64 = 1.5;
 
 /// Seconds the closing map runs: the animated recap's budgeted length when
 /// there are stops to travel between, else the static card's hold.
@@ -1448,8 +1451,9 @@ fn write_captions_srt(
             }
             n += 1;
             let st = starts[i] + 0.3;
-            // Multi-line (collage) cues get reading time per caption.
-            let read_secs = 3.5 * c.trim().lines().count() as f64;
+            // As long as the shot was held to read it; multi-line
+            // (collage) cues get at least 3.5 s per caption.
+            let read_secs = caption_read_secs(Some(c)).max(3.5 * c.trim().lines().count() as f64);
             let en = (starts[i] + (d - 0.6).min(read_secs)).max(st + 0.5);
             body.push_str(&format!(
                 "{n}\n{} --> {}\n{}\n\n",
@@ -1626,21 +1630,20 @@ fn render_group(
 ) -> Result<GroupOutcome, crate::MediaError> {
     let r = present[0];
     let mut fallbacks = vec![];
-    // Long enough to read what is written on it.
-    let read_secs = if present.len() == 1 {
-        caption_read_secs(r.caption.as_deref())
-    } else {
-        caption_read_secs(collage_caption(present).as_deref())
-    }
-    .min(limits.budget);
-    let still_secs = still_secs.max(read_secs);
+    // Long enough to read what is written on it (a lone entry's caption
+    // is its collage caption, trimmed).
+    // Short mode also keeps it within the group's fair share, so one long
+    // caption neither starves later chapters nor freezes a clip just trimmed.
+    let read_secs = caption_read_secs(collage_caption(present).as_deref())
+        .min(limits.cap)
+        .min(limits.budget);
     let rendered = if present.len() == 1 {
         render_entry_segment(
             caps,
             r,
             idx,
             variant,
-            still_secs,
+            still_secs.max(read_secs),
             limits.cap,
             opts.resolution,
             work_dir,
@@ -1652,7 +1655,9 @@ fn render_group(
             present,
             idx,
             variant,
-            still_secs,
+            // The collage's scaled hold, raised to the reading time (not the
+            // reading time scaled, which would overrun CAPTION_MAX_SECS).
+            still_secs.max(read_secs / collage_hold_secs(present.len(), 1.0)),
             opts.live_collages,
             opts.resolution,
             work_dir,
