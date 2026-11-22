@@ -825,21 +825,32 @@ fn book_flow(photos: &[BookPhoto], has_map: bool, cap: usize) -> Vec<FlowPage> {
 }
 
 /// The selected photos as the pages print them: the owner's closing photo
-/// off the pages, lone captioned shots folded into a neighbouring stretch,
-/// and lone scenery left out, as [`render_book`] does after selection.
-fn printed_pool(mut picked: Vec<BookPhoto>) -> Vec<BookPhoto> {
-    picked.retain(|p| !p.closing);
-    fold_lone_kept(&mut picked);
-    let lone: HashSet<String> = lone_scenery(&picked).into_iter().collect();
-    picked.retain(|p| !lone.contains(&p.asset_id));
+/// (`closing_id`, once it passes the full-page check) off the pages, lone
+/// captioned shots folded into a neighbouring stretch, and lone scenery
+/// left out, as [`render_book`] does after selection.
+fn printed_pool(mut picked: Vec<BookPhoto>, closing_id: Option<&str>) -> Vec<BookPhoto> {
+    if let Some(id) = closing_id {
+        picked.retain(|p| p.asset_id != id);
+    }
+    drop_lone_scenery(&mut picked);
     picked
+}
+
+/// Folds lone captioned shots into a neighbouring stretch, then removes
+/// the lone scenery left over; returns the removed asset ids. Shared by
+/// the page count and [`render_book`] so the two never disagree.
+fn drop_lone_scenery(photos: &mut Vec<BookPhoto>) -> HashSet<String> {
+    fold_lone_kept(photos);
+    let lone: HashSet<String> = lone_scenery(photos).into_iter().collect();
+    photos.retain(|p| !lone.contains(&p.asset_id));
+    lone
 }
 
 /// Largest selection size found whose flowed book fits `cap` counted pages.
 /// Pages depend on which chapters the selection keeps, not only on its size,
 /// so each candidate is flowed for real. That also makes fit non-monotonic:
 /// the search may settle a little low, but what it returns always fits.
-fn fitting_count(pool: &[BookPhoto], has_map: bool, cap: usize) -> usize {
+fn fitting_count(pool: &[BookPhoto], has_map: bool, cap: usize, closing_id: Option<&str>) -> usize {
     // Scenes depend only on the pool: link them once for every probe.
     let scene = scenes(pool);
     let fits = |n: usize| {
@@ -851,7 +862,7 @@ fn fitting_count(pool: &[BookPhoto], has_map: bool, cap: usize) -> usize {
         // Counted as the pages will be printed: the owner's closing photo
         // leaves the pages and lone scenery shots drop (see `render_book`),
         // so the selection fills the cap instead of falling short of it.
-        let picked = printed_pool(picked);
+        let picked = printed_pool(picked, closing_id);
         count_pages(
             &book_flow(&picked, has_map, cap)
                 .iter()
@@ -1273,6 +1284,21 @@ pub fn render_book(
         })
         .cloned()
         .collect();
+    // The owner's closing photo, resolved before the cap math so the page
+    // count takes exactly this photo off the pages. Like every page, it
+    // must print sharp enough: a blocked choice gives way to the automatic
+    // pick, with a note, and stays on the pages.
+    let (closing_w, closing_h) = slot_inches(opts.preset, PageKind::Closing, 1);
+    let mut owner_closing = viable.iter().find(|p| p.closing).cloned();
+    if let Some(p) = owner_closing
+        .take_if(|p| dpi_verdict(p.width, p.height, closing_w, closing_h) == DpiVerdict::Block)
+    {
+        fallbacks.push(format!(
+            "closing: {} is too small to print a full page; another photo closes the book",
+            p.display_name()
+        ));
+    }
+    let closing_id: Option<String> = owner_closing.as_ref().map(|c| c.asset_id.clone());
     // Cap selection + placement-aware prune, iterated: a photo that blocks
     // at its assigned slot (a mid-size photo can pass the smallest slot yet
     // block as hero) is excluded and the selection is redone from the
@@ -1290,7 +1316,7 @@ pub fn render_book(
             .collect();
         // Cap math runs on the survivors: dropping the only wide photo
         // removes the spread, which can let more photos fit.
-        let keep = fitting_count(&pool, route_card.is_some(), cap);
+        let keep = fitting_count(&pool, route_card.is_some(), cap, closing_id.as_deref());
         let sel: Vec<BookPhoto> = if keep < pool.len() {
             let (sel, dropped) = select_for_cap(&pool, keep);
             // Plan captions are auto-generated for every photo, so caption
@@ -1332,18 +1358,6 @@ pub fn render_book(
     // The closing page's photo: the owner's choice (taken off the pages,
     // so it never prints twice), else a strong people shot of the last
     // days the pages leave out, so the last page is new, not a repeat.
-    // Like every page, it must print sharp enough: a blocked choice gives
-    // way to the automatic pick, with a note.
-    let (closing_w, closing_h) = slot_inches(opts.preset, PageKind::Closing, 1);
-    let mut owner_closing = viable.iter().find(|p| p.closing).cloned();
-    if let Some(p) = owner_closing
-        .take_if(|p| dpi_verdict(p.width, p.height, closing_w, closing_h) == DpiVerdict::Block)
-    {
-        fallbacks.push(format!(
-            "closing: {} is too small to print a full page; another photo closes the book",
-            p.display_name()
-        ));
-    }
     if let Some(c) = &owner_closing {
         pruned.retain(|p| p.asset_id != c.asset_id);
     }
@@ -1371,14 +1385,11 @@ pub fn render_book(
     // A photo alone in its stretch (its day or named place) would fill a
     // page by itself: worth it for people or the owner's caption, not for
     // a plate of food or a candy bucket.
-    fold_lone_kept(&mut pruned);
-    let lone: HashSet<String> = lone_scenery(&pruned).into_iter().collect();
-    for id in &lone {
+    for id in &drop_lone_scenery(&mut pruned) {
         fallbacks.push(format!(
             "book: {id} left out (alone on its page, no people)"
         ));
     }
-    pruned.retain(|p| !lone.contains(&p.asset_id));
     // Faces first, so page layouts can keep them whole: the detector runs
     // once per photo here and the painters reuse it.
     let found: std::cell::RefCell<HashMap<String, Vec<FaceBox>>> = Default::default();
@@ -3416,12 +3427,12 @@ fn title_rest_lines<S: AsRef<str>>(rest: &[S]) -> Vec<String> {
     let mut out: Vec<Vec<&str>> = vec![];
     let mut new_line = true;
     for l in rest {
-        let l = l.as_ref();
+        let l = l.as_ref().trim_end();
         if new_line {
             out.push(vec![]);
         }
         out.last_mut().expect("pushed above").push(l);
-        new_line = l.ends_with(['.', '!', '?', '\u{2026}']);
+        new_line = l.ends_with(['.', '!', '?', '\u{2026}', ')', '"', '\u{201d}']);
     }
     out.iter().map(|g| g.join(" · ")).collect()
 }
@@ -4118,6 +4129,28 @@ mod tests {
         assert_eq!(lone_scenery(&photos), ["food"]);
     }
 
+    #[test]
+    fn the_page_count_sees_only_photos_that_print_on_pages() {
+        let shot = |id: &str, day: u32, of_people: bool, closing: bool| BookPhoto {
+            asset_id: id.to_string(),
+            day: Some(day),
+            tagged_people: u32::from(of_people),
+            closing,
+            ..BookPhoto::blank()
+        };
+        let picked = vec![
+            shot("a", 1, true, false),
+            shot("b", 1, false, false),
+            shot("food", 2, false, false),
+            shot("end", 3, true, true),
+        ];
+        let ids: Vec<String> = printed_pool(picked, Some("end"))
+            .into_iter()
+            .map(|p| p.asset_id)
+            .collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
     /// [`face_window_clear`] with no caption strip.
     fn face_window(
         sw: f64,
@@ -4553,7 +4586,7 @@ mod tests {
                 ..BookPhoto::blank()
             })
             .collect();
-        let keep = fitting_count(&pool, true, 60);
+        let keep = fitting_count(&pool, true, 60, None);
         assert!(keep < 901, "901 photos cannot fit 60 pages untrimmed");
         let picked: Vec<BookPhoto> = select_for_cap(&pool, keep)
             .0
@@ -5242,8 +5275,8 @@ mod tests {
                 ..BookPhoto::blank()
             })
             .collect();
-        let at_60 = fitting_count(&pool, false, 60);
-        let at_111 = fitting_count(&pool, false, 111);
+        let at_60 = fitting_count(&pool, false, 60, None);
+        let at_111 = fitting_count(&pool, false, 111, None);
         assert!(at_111 > at_60, "{at_111} > {at_60}");
         let flow = book_flow(&pool[..at_111], false, 111);
         let kinds: Vec<PageKind> = flow.iter().map(|p| p.kind).collect();
