@@ -286,32 +286,38 @@ pub fn collage_slots<'a, C: PartialEq>(
     let entries: Vec<_> = entries.into_iter().collect();
     let candidate = |i: usize| entries[i].2 != Candidacy::Never && !edits.is_solo(entries[i].0);
     let plain = |i: usize| entries[i].2 == Candidacy::Plain && candidate(i);
-    // An `IfJoined` entry is eligible when it is linked to a candidate of
-    // its chapter with no plain collage photo between them: entries that
-    // play on their own (unjoined captioned or motion ones included) do
-    // not separate the two.
-    let joined_near = |i: usize, side: &mut dyn Iterator<Item = usize>| {
-        for j in side {
-            if entries[j].1 != entries[i].1 {
-                return false;
+    // An `IfJoined` entry is eligible while a link of its still holds: it
+    // is linked to its nearest eligible neighbour, before or after, in its
+    // chapter. Start from every candidate and drop the ones whose links
+    // can't hold until none change, so a saved join that a move broke
+    // never puts the photo beside one it wasn't joined to.
+    let mut can_join: Vec<bool> = (0..entries.len()).map(candidate).collect();
+    let nearest = |can: &[bool], i: usize, side: &mut dyn Iterator<Item = usize>| {
+        side.take_while(|&j| entries[j].1 == entries[i].1)
+            .find(|&j| can[j])
+    };
+    loop {
+        let mut changed = false;
+        for i in 0..entries.len() {
+            if !can_join[i] || plain(i) {
+                continue;
             }
-            if candidate(j) && edits.linked(entries[j].0, entries[i].0) {
-                return true;
-            }
-            if plain(j) {
-                return false;
+            let held = [
+                nearest(&can_join, i, &mut (0..i).rev()),
+                nearest(&can_join, i, &mut (i + 1..entries.len())),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|j| edits.linked(entries[j].0, entries[i].0));
+            if !held {
+                can_join[i] = false;
+                changed = true;
             }
         }
-        false
-    };
-    let can_join: Vec<bool> = (0..entries.len())
-        .map(|i| {
-            plain(i)
-                || (candidate(i)
-                    && (joined_near(i, &mut (0..i).rev())
-                        || joined_near(i, &mut (i + 1..entries.len()))))
-        })
-        .collect();
+        if !changed {
+            break;
+        }
+    }
     let mut prev: Option<&str> = None;
     entries
         .into_iter()
@@ -5194,6 +5200,22 @@ mod tests {
         let mut edits = CollageEdits::default();
         edits.join("a".into(), "b".into());
         assert_eq!(joined_groups(&film, &edits), [vec![0, 2], vec![1]]);
+        // A move that breaks a saved join leaves the captioned photo on
+        // its own, never beside photos it wasn't joined to (`x` was joined
+        // to `c`, then moved after `a`).
+        let film = [
+            ("a", Plain),
+            ("x", IfJoined),
+            ("b", IfJoined),
+            ("c", Plain),
+            ("d", Plain),
+        ];
+        let mut edits = CollageEdits::default();
+        edits.join("a".into(), "b".into());
+        edits.join("x".into(), "c".into());
+        let groups = joined_groups(&film, &edits);
+        assert!(groups.contains(&vec![1]), "{groups:?}");
+        assert!(groups.iter().any(|g| g.starts_with(&[0, 2])), "{groups:?}");
         // A stale link into another chapter does not make it eligible, so
         // it is not grouped with its own chapter's stills either.
         let mut edits = CollageEdits::default();
