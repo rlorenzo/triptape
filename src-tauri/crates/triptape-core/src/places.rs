@@ -286,6 +286,7 @@ mod tests {
                 day_index: None,
                 date_label: None,
                 film_place: None,
+                film_place_changes: vec![],
             })
             .collect();
         plan

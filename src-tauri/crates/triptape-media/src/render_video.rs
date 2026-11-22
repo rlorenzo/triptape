@@ -661,11 +661,9 @@ pub fn render_hero_video(
     let ships = opts.journey.as_ref().map(|j| j.ships()).unwrap_or_default();
     // A ship is where we slept, not a place we went.
     let is_ship = |p: &str| triptape_core::itinerary::is_ship_place(&ships, p);
-    for c in &plan.chapters {
-        if let Some(p) = c.film_heading_place().filter(|p| !is_ship(p)) {
-            if !places.iter().any(|q| q == p) {
-                places.push(p.to_string());
-            }
+    for p in plan.chapters.iter().flat_map(|c| c.film_places()) {
+        if !is_ship(p) && !places.iter().any(|q| q == p) {
+            places.push(p.to_string());
         }
     }
 
@@ -1058,6 +1056,13 @@ pub fn render_hero_video(
         // A chapter heading identical to the last one shown (the same day
         // and place, split by a few shots elsewhere) is not repeated.
         let mut last_heading: Option<(String, Option<String>)> = None;
+        // Where the film moves on to another place inside a chapter.
+        let place_change: HashMap<&str, &str> = plan
+            .chapters
+            .iter()
+            .flat_map(|c| c.film_place_changes.iter())
+            .map(|(id, p)| (id.as_str(), p.as_str()))
+            .collect();
         for (i, (r, _, _, _)) in segs.iter().enumerate() {
             let id = r.entry.asset_id.as_str();
             if id == "title" || id == "credits" {
@@ -1068,17 +1073,26 @@ pub fn render_hero_video(
                     crate::titlecard::ROUTE_LABEL.to_string(),
                     date_range.clone(),
                 ))
-            } else if chapter_start[i] {
-                chapter_of_entry
-                    .get(id)
-                    .and_then(|ch| crate::titlecard::chapter_film_lines(ch))
-                    .filter(|lines| {
-                        let repeat = last_heading.as_ref() == Some(lines);
-                        last_heading = Some(lines.clone());
-                        !repeat
-                    })
             } else {
-                None
+                let heading = if chapter_start[i] {
+                    chapter_of_entry
+                        .get(id)
+                        .and_then(|ch| crate::titlecard::chapter_film_lines(ch))
+                } else {
+                    // Any shot on screen (a collage's members too) that
+                    // reaches a new place starts its heading here.
+                    collage_members
+                        .get(id)
+                        .map_or_else(|| vec![id], |ms| ms.iter().map(String::as_str).collect())
+                        .into_iter()
+                        .find_map(|m| place_change.get(m).zip(chapter_of_entry.get(m)))
+                        .and_then(|(p, ch)| crate::titlecard::chapter_lines_at(ch, p))
+                };
+                heading.filter(|lines| {
+                    let repeat = last_heading.as_ref() == Some(lines);
+                    last_heading = Some(lines.clone());
+                    !repeat
+                })
             };
             let Some((top, bottom)) = lines else { continue };
             todo.push((
@@ -4889,6 +4903,7 @@ mod tests {
             day_index: Some(day),
             date_label: Some("Wed, Oct 8".into()),
             film_place: None,
+            film_place_changes: vec![],
         };
         let plan = Plan {
             plan_version: 1,
