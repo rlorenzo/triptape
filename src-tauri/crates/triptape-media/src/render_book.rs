@@ -947,29 +947,39 @@ fn lone_scenery(photos: &[BookPhoto]) -> Vec<String> {
 /// taking a full page of its own.
 fn fold_lone_kept(photos: &mut [BookPhoto]) {
     let key = |p: &BookPhoto| (p.day, p.area.clone());
+    // Stretches as (start, end) runs of one key.
+    let mut runs: Vec<(usize, usize)> = vec![];
     let mut start = 0;
     while start < photos.len() {
         let end = (start..photos.len())
             .find(|&i| key(&photos[i]) != key(&photos[start]))
             .unwrap_or(photos.len());
-        let p = &photos[start];
-        if end - start == 1 && p.keep && !p.is_of_people() && p.day.is_some() {
-            let day = p.day;
-            let neighbour = photos
-                .get(end)
-                .filter(|n| n.day == day)
-                .or_else(|| {
-                    start
-                        .checked_sub(1)
-                        .and_then(|i| photos.get(i))
-                        .filter(|n| n.day == day)
-                })
-                .map(|n| n.area.clone());
-            if let Some(area) = neighbour {
-                photos[start].area = area;
-            }
-        }
+        runs.push((start, end));
         start = end;
+    }
+    for (r, &(start, end)) in runs.iter().enumerate() {
+        let p = &photos[start];
+        if end - start != 1 || !p.keep || p.is_of_people() || p.day.is_none() {
+            continue;
+        }
+        let day = p.day;
+        // The nearest stretch of the day with two or more photos (a lone
+        // one may become the day's divider and leave this one alone
+        // again): later ones first, then earlier ones.
+        let target = runs[r + 1..]
+            .iter()
+            .chain(runs[..r].iter().rev())
+            .find(|&&(a, b)| b - a >= 2 && photos[a].day == day)
+            .or_else(|| {
+                runs[r + 1..]
+                    .iter()
+                    .chain(runs[..r].iter().rev())
+                    .find(|&&(a, _)| photos[a].day == day)
+            })
+            .map(|&(a, _)| photos[a].area.clone());
+        if let Some(area) = target {
+            photos[start].area = area;
+        }
     }
 }
 
@@ -3509,6 +3519,16 @@ mod tests {
         ];
         fold_lone_kept(&mut photos);
         assert_eq!(photos[0].area.as_deref(), Some("Mount Faber Peak"));
+        // A lone photo next door (the day's divider-to-be) is skipped for
+        // the stretch after it.
+        let mut photos = vec![
+            shot("durian", "food court", 0, true),
+            shot("dome", "Flower Dome", 3, false),
+            shot("cloud", "Cloud Forest", 3, false),
+            shot("cloud2", "Cloud Forest", 4, false),
+        ];
+        fold_lone_kept(&mut photos);
+        assert_eq!(photos[0].area.as_deref(), Some("Cloud Forest"));
         // A lone people photo keeps its own stretch.
         let mut photos = vec![
             BookPhoto {
