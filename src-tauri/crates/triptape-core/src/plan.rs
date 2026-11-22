@@ -751,7 +751,7 @@ pub fn estimate_hero_secs<'e, 'c>(
 fn distinct_places(chapters: &[Chapter]) -> usize {
     chapters
         .iter()
-        .filter_map(|c| c.film_place.as_deref().or(c.place.as_deref()))
+        .flat_map(|c| c.film_places())
         .collect::<HashSet<_>>()
         .len()
 }
@@ -1716,6 +1716,7 @@ pub fn build_plan_with_length(
                 day_index: first_date.zip(trip_start).map(|(d, s)| trip_day(d, s)),
                 date_label: first_date.map(|d| d.strftime(DAY_FORMAT).to_string()),
                 film_place: None,
+                film_place_changes: vec![],
             }
         })
         .collect();

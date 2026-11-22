@@ -17,7 +17,7 @@ use triptape_core::plan::{
     self, caption_read_secs, collage_hold_secs, is_panorama, pano_coverage, pano_motion,
     places_card_secs, MAX_CLIP_SECS, MAX_COLLAGE, MIN_SEGMENT_SECS,
 };
-use triptape_core::types::{CollageEdits, Plan, PlanEntry, Rendition};
+use triptape_core::types::{Chapter, CollageEdits, Plan, PlanEntry, Rendition};
 
 /// Crossfade applied at the cut *into* a segment (PLAN.md Sec 9, 6-pack).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -583,6 +583,11 @@ pub fn render_hero_video(
     // Chapter breaks: cut into segment i when its chapter differs.
     let chapter_index = plan::chapter_index(plan);
     let chapter_of = |id: &str| chapter_index.get(id).copied().unwrap_or(usize::MAX);
+    // Place sections: a chapter's film shots from one place change
+    // (`Chapter::film_place_changes`) to the next, in film order. A collage
+    // never spans two, and each names its own place.
+    let section_of = place_sections(plan, chapter_of);
+    let section = |id: &str| section_of.get(id).copied().unwrap_or(0);
 
     // 1. Normalize segments (skip missing sources, never fail the film).
     let still_secs = if opts.short_mode {
@@ -661,11 +666,9 @@ pub fn render_hero_video(
     let ships = opts.journey.as_ref().map(|j| j.ships()).unwrap_or_default();
     // A ship is where we slept, not a place we went.
     let is_ship = |p: &str| triptape_core::itinerary::is_ship_place(&ships, p);
-    for c in &plan.chapters {
-        if let Some(p) = c.film_heading_place().filter(|p| !is_ship(p)) {
-            if !places.iter().any(|q| q == p) {
-                places.push(p.to_string());
-            }
+    for p in plan.chapters.iter().flat_map(|c| c.film_places()) {
+        if !is_ship(p) && !places.iter().any(|q| q == p) {
+            places.push(p.to_string());
         }
     }
 
@@ -726,7 +729,10 @@ pub fn render_hero_video(
         };
         hero_groups(
             &selected,
-            |r| (chapter_of(&r.entry.asset_id), stage_of(r)),
+            |r| {
+                let id = r.entry.asset_id.as_str();
+                (chapter_of(id), section(id), stage_of(r))
+            },
             &plan.collage,
         )
     };
@@ -1068,17 +1074,21 @@ pub fn render_hero_video(
                     crate::titlecard::ROUTE_LABEL.to_string(),
                     date_range.clone(),
                 ))
-            } else if chapter_start[i] {
-                chapter_of_entry
-                    .get(id)
-                    .and_then(|ch| crate::titlecard::chapter_film_lines(ch))
-                    .filter(|lines| {
-                        let repeat = last_heading.as_ref() == Some(lines);
-                        last_heading = Some(lines.clone());
-                        !repeat
-                    })
             } else {
-                None
+                // Every segment names its chapter's place at this point in
+                // the film (its place section), shown when it differs from
+                // the last heading: a chapter start, a move to another place,
+                // a chapter resuming where it had got to.
+                let heading = chapter_of_entry.get(id).and_then(|ch| match section(id) {
+                    // The chapter's own heading (old plans: its title).
+                    0 => crate::titlecard::chapter_film_lines(ch),
+                    k => crate::titlecard::chapter_lines_at(ch, section_place(ch, k)?),
+                });
+                heading.filter(|lines| {
+                    let repeat = last_heading.as_ref() == Some(lines);
+                    last_heading = Some(lines.clone());
+                    !repeat
+                })
             };
             let Some((top, bottom)) = lines else { continue };
             todo.push((
@@ -2116,6 +2126,37 @@ fn collage_eligible(e: &ResolvedEntry) -> bool {
     plan::entry_plays_alone(&e.entry.rendition, e.aspect, e.caption.as_deref()).is_none()
 }
 
+/// Each hero asset's place section within its chapter: how many of the
+/// chapter's place changes ([`Chapter::film_place_changes`]) the film has
+/// reached at it, in hero order.
+fn place_sections(plan: &Plan, chapter_of: impl Fn(&str) -> usize) -> HashMap<&str, usize> {
+    let changes: std::collections::HashSet<&str> = plan
+        .chapters
+        .iter()
+        .flat_map(|c| c.film_place_changes.iter().map(|(id, _)| id.as_str()))
+        .collect();
+    let mut reached: HashMap<usize, usize> = HashMap::new();
+    let mut out = HashMap::new();
+    for e in &plan.hero {
+        let id = e.asset_id.as_str();
+        let n = reached.entry(chapter_of(id)).or_default();
+        if changes.contains(id) && !out.contains_key(id) {
+            *n += 1;
+        }
+        out.entry(id).or_insert(*n);
+    }
+    out
+}
+
+/// The place a chapter's film names in place section `k`
+/// ([`place_sections`]): its heading place, then each change in turn.
+fn section_place(ch: &Chapter, k: usize) -> Option<&str> {
+    match k {
+        0 => ch.film_heading_place(),
+        k => ch.film_place_changes.get(k - 1).map(|(_, p)| p.as_str()),
+    }
+}
+
 /// Hero segments in playback order: each is one entry or a collage of
 /// same-chapter stills, as [`plan::collage_groups`] decides under the
 /// user's `collage` overrides (the plan's length estimate and the Story
@@ -2857,6 +2898,41 @@ fn graph_segment_args(img: &Path, dur: f64, graph: String, out: &Path) -> Vec<St
 mod tests {
     use super::*;
     use triptape_core::plan::{CAPTION_MAX_SECS, PLACES_CARD_MAX_SECS};
+
+    #[test]
+    fn place_sections_follow_each_chapter_through_the_film() {
+        let hero: Vec<serde_json::Value> = ["a1", "a2", "b1", "a3", "a4"]
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "asset_id": id, "content_hash": null, "size_bytes": 0, "mtime": 0,
+                    "rendition": "still"
+                })
+            })
+            .collect();
+        let mut plan: Plan = serde_json::from_value(serde_json::json!({
+            "plan_version": 1, "schema_version": 1, "reel_selects": [], "chapters": [],
+            "captions": {}, "map_polyline": [], "music": {"track": "", "rationale": ""},
+            "hero": hero,
+        }))
+        .unwrap();
+        let chapter = |ids: &[&str], place: &str| Chapter {
+            asset_ids: ids.iter().map(|s| s.to_string()).collect(),
+            place: Some(place.into()),
+            ..Default::default()
+        };
+        plan.chapters = vec![
+            chapter(&["a1", "a2", "a3", "a4"], "Garden"),
+            chapter(&["b1"], "Pier"),
+        ];
+        plan.chapters[0].film_place_changes = vec![("a2".into(), "Market".into())];
+        let idx = plan::chapter_index(&plan);
+        let sec = place_sections(&plan, |id| idx.get(id).copied().unwrap_or(usize::MAX));
+        // a3 resumes chapter A after B where it had got to: the market.
+        assert_eq!(["a1", "a2", "a3", "a4"].map(|id| sec[id]), [0, 1, 1, 1]);
+        assert_eq!(section_place(&plan.chapters[0], sec["a3"]), Some("Market"));
+        assert_eq!(section_place(&plan.chapters[0], 0), Some("Garden"));
+    }
 
     #[test]
     fn a_capped_overlay_keeps_the_streaming_cap() {
@@ -4889,6 +4965,7 @@ mod tests {
             day_index: Some(day),
             date_label: Some("Wed, Oct 8".into()),
             film_place: None,
+            film_place_changes: vec![],
         };
         let plan = Plan {
             plan_version: 1,

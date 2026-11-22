@@ -106,11 +106,12 @@ pub fn lower_third_doc(top: &str, bottom: Option<&str>) -> String {
 /// centered, with the trip name and date range as a footer. Gives the
 /// film an ending instead of stopping on the last photo.
 pub fn places_card_doc(trip_name: &str, places: &[String], date_range: Option<&str>) -> String {
-    // A name never breaks across lines ("Victoria / Peak"): its spaces are
-    // non-breaking, so lines wrap only at the separators.
+    // A name never breaks across lines ("Victoria / Peak", "Kōtoku- / in"):
+    // its spaces and hyphens are non-breaking, so lines wrap only at the
+    // separators.
     let list = places
         .iter()
-        .map(|p| p.replace(' ', "\u{a0}"))
+        .map(|p| p.replace(' ', "\u{a0}").replace('-', "\u{2011}"))
         .collect::<Vec<_>>()
         .join("  ·  ");
     let footer = match date_range {
@@ -230,6 +231,12 @@ pub(crate) fn chapter_lines(ch: &Chapter) -> Option<(String, Option<String>)> {
 /// chapter were taken ([`Chapter::film_heading_place`]).
 pub(crate) fn chapter_film_lines(ch: &Chapter) -> Option<(String, Option<String>)> {
     chapter_lines_naming(ch, ch.film_heading_place())
+}
+
+/// A film heading partway through a chapter, at `place` (the chapter's
+/// day and date, another place).
+pub(crate) fn chapter_lines_at(ch: &Chapter, place: &str) -> Option<(String, Option<String>)> {
+    chapter_lines_naming(ch, Some(place))
 }
 
 fn chapter_lines_naming(ch: &Chapter, place: Option<&str>) -> Option<(String, Option<String>)> {
