@@ -883,8 +883,34 @@ pub fn render_hero_video(
     let ships = opts.journey.as_ref().map(|j| j.ships()).unwrap_or_default();
     // A ship is where we slept, not a place we went.
     let is_ship = |p: &str| triptape_core::itinerary::is_ship_place(&ships, p);
+    // Home is where the trip starts and ends, not a place we went: its own
+    // name, and a place every located shot of which was taken near home
+    // (the drive home from the airport), stay off the card.
+    let mut near_home: HashMap<&str, bool> = HashMap::new();
+    if let Some(j) = opts.journey.as_ref() {
+        for r in resolved {
+            let id = r.entry.asset_id.as_str();
+            let Some(ch) = plan.chapters.get(chapter_of(id)) else {
+                continue;
+            };
+            if let (Some(p), Some(g)) = (section_place(ch, section(id)), r.gps) {
+                let home = j.near_home(g);
+                near_home
+                    .entry(p)
+                    .and_modify(|h| *h &= home)
+                    .or_insert(home);
+            }
+        }
+    }
+    let is_home = |p: &str| {
+        near_home.get(p) == Some(&true)
+            || opts
+                .journey
+                .as_ref()
+                .is_some_and(|j| j.home_labels().any(|l| l == p))
+    };
     for p in plan.chapters.iter().flat_map(|c| c.film_places()) {
-        if !is_ship(p) && !places.iter().any(|q| q == p) {
+        if !is_ship(p) && !is_home(p) && !places.iter().any(|q| q == p) {
             places.push(p.to_string());
         }
     }
@@ -1237,7 +1263,8 @@ pub fn render_hero_video(
         )?;
         let places_mp4 = work_dir.join("seg_places.mp4");
         let hold = places_card_secs(places.len());
-        render_hold_segment(caps, &png, hold, segs.len(), opts.resolution, &places_mp4)?;
+        // A card to read: it holds still, with no drift over the names.
+        render_still_card(caps, &png, hold, opts.resolution, &places_mp4)?;
         segs.push((
             card_entry("credits", &png),
             places_mp4,
@@ -3100,6 +3127,30 @@ fn render_hold_segment(
     caps.run(&hold_args(caps, img, dur, variant, res, out), out)
 }
 
+/// Encode a text card that holds perfectly still for `dur` seconds.
+fn render_still_card(
+    caps: &Capabilities,
+    img: &Path,
+    dur: f64,
+    res: Resolution,
+    out: &Path,
+) -> Result<(), crate::MediaError> {
+    caps.run(&still_card_args(img, dur, res, out), out)
+}
+
+fn still_card_args(img: &Path, dur: f64, res: Resolution, out: &Path) -> Vec<String> {
+    let (w, h) = res.dims();
+    graph_segment_args(
+        img,
+        dur,
+        format!(
+            "[0:v]scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,\
+             pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v]"
+        ),
+        out,
+    )
+}
+
 /// Encode a one-image segment of `dur` seconds through `graph` (a
 /// `[0:v]` ... `[v]` filter chain) with silent stereo audio.
 fn render_graph_segment(
@@ -3144,6 +3195,21 @@ fn graph_segment_args(img: &Path, dur: f64, graph: String, out: &Path) -> Vec<St
 mod tests {
     use super::*;
     use triptape_core::plan::{CAPTION_MAX_SECS, PLACES_CARD_MAX_SECS};
+
+    #[test]
+    fn the_places_card_holds_still() {
+        let args = still_card_args(
+            Path::new("p.png"),
+            6.0,
+            Resolution::Hd1080,
+            Path::new("o.mp4"),
+        );
+        let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert!(
+            !graph.contains("zoompan") && !graph.contains("perspective") && !graph.contains("crop")
+        );
+        assert!(graph.contains("scale=1920:1080"));
+    }
 
     #[test]
     fn credits_name_a_shared_parent_place_once() {

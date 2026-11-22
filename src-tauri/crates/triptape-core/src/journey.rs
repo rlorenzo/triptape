@@ -250,6 +250,23 @@ impl Journey {
     /// The journey as hops between named stops, for a film that shows each
     /// one where the trip reaches it. A waypoint (an embarkation terminal)
     /// joins the hop that leaves it.
+    /// Whether `gps` is back home: within [`HOME_REACH_M`] of a stop the
+    /// trip starts or ends at.
+    pub fn near_home(&self, gps: (f64, f64)) -> bool {
+        self.nodes
+            .iter()
+            .filter(|n| n.home)
+            .any(|n| crate::geo::haversine_m(gps, wrapped(n.pos)) <= HOME_REACH_M)
+    }
+
+    /// The labels of the stops the trip starts or ends at (`Los Angeles`).
+    pub fn home_labels(&self) -> impl Iterator<Item = &str> {
+        self.nodes
+            .iter()
+            .filter(|n| n.home)
+            .filter_map(|n| n.label.as_deref())
+    }
+
     pub fn hops(&self) -> Vec<Hop> {
         let mut out = vec![];
         let mut start = 0;
@@ -828,6 +845,8 @@ mod tests {
         gps[9] = Some((34.06, -117.6));
         let home_cuts = hop_cuts(&hops, &shots, &gps);
         assert_eq!(home_cuts[9], 9, "home before the shot taken at home");
+        assert!(j.near_home((34.06, -117.6)), "Ontario is home");
+        assert!(!j.near_home((1.36, 103.99)), "Changi is not");
         // The departure shot at the home airport predates the hop home, so
         // it does not pull the hop home to the start.
         gps[0] = Some((33.94, -118.41));
