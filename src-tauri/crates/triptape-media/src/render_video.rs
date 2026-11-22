@@ -202,6 +202,7 @@ fn prejoin_chunks(
     keep_ambience: bool,
     work_dir: &Path,
     chunk: usize,
+    on_progress: &dyn Fn(f64),
 ) -> Result<JoinedInputs, crate::MediaError> {
     let plan = plan_chunks(durations, transitions, overlaps, chunk);
     let Some(ranges) = plan.ranges else {
@@ -210,10 +211,16 @@ fn prejoin_chunks(
             ..plan.joined
         });
     };
+    // Progress over the whole join, weighted by each chunk's length.
+    let total: f64 = plan.joined.durations.iter().sum::<f64>().max(1e-3);
+    let mut done = 0.0;
     let mut inputs = vec![];
     for (k, r) in ranges.iter().enumerate() {
+        let secs = plan.joined.durations[k];
         // A lone trailing segment needs no join.
         if r.len() == 1 {
+            done += secs;
+            on_progress((done / total).clamp(0.0, 1.0));
             inputs.push(segs[r.start].clone());
             continue;
         }
@@ -236,10 +243,14 @@ fn prejoin_chunks(
         }
         args.extend(ffmpeg::x264_aac("veryfast", CHUNK_CRF));
         args.extend(["-r".into(), "30".into(), s(&out)]);
-        caps.run(&args, &out).map_err(|e| match e {
-            crate::MediaError::Cancelled => e,
-            e => crate::MediaError::Ffmpeg(format!("joining chunk {k}: {e}")),
-        })?;
+        let chunk_progress = |f: f64| on_progress(((done + f * secs) / total).clamp(0.0, 1.0));
+        caps.run_progress(&args, &out, secs, &chunk_progress)
+            .map_err(|e| match e {
+                crate::MediaError::Cancelled => e,
+                e => crate::MediaError::Ffmpeg(format!("joining chunk {k}: {e}")),
+            })?;
+        done += secs;
+        on_progress((done / total).clamp(0.0, 1.0));
         inputs.push(out);
     }
     Ok(JoinedInputs {
@@ -1386,6 +1397,7 @@ pub fn render_hero_video(
     // grew ffmpeg past 80 GB and macOS killed it). The chunks keep every
     // cut's transition and overlap, so the timeline is unchanged.
     let seg_paths: Vec<PathBuf> = segs.iter().map(|s| s.1.clone()).collect();
+    let join_label = "joining film chunks";
     let joined = prejoin_chunks(
         caps,
         &seg_paths,
@@ -1395,7 +1407,9 @@ pub fn render_hero_video(
         opts.keep_ambience,
         work_dir,
         ASSEMBLY_CHUNK,
+        &|f| progress.step("video", join_label, Some(f)),
     )?;
+    progress.step("video", label, Some(0.0));
     let mut args: Vec<String> = vec!["-y".into()];
     for p in &joined.inputs {
         args.extend(["-i".into(), s(p)]);
@@ -4021,6 +4035,7 @@ mod tests {
             Some(Transition::Fade),
         ];
         let overlaps = [0.5, 0.8, 0.5, 0.5];
+        let seen = std::cell::RefCell::new(vec![]);
         let joined = prejoin_chunks(
             &caps,
             &segs,
@@ -4030,9 +4045,17 @@ mod tests {
             false,
             temp.path(),
             2,
+            &|f| seen.borrow_mut().push(f),
         )
         .unwrap();
         assert_eq!(joined.inputs.len(), 3);
+        // Progress climbs to done across the chunks.
+        let seen = seen.into_inner();
+        assert!(seen.windows(2).all(|w| w[0] <= w[1] + 1e-9), "{seen:?}");
+        assert!(
+            (seen.last().copied().unwrap() - 1.0).abs() < 1e-9,
+            "{seen:?}"
+        );
         // The lone trailing segment is used as is, not re-encoded.
         assert_eq!(joined.inputs[2], segs[4]);
         let out = temp.path().join("film.mp4");
