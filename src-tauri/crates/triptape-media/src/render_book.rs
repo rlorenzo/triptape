@@ -1273,7 +1273,22 @@ pub fn render_book(
     // The closing page's photo: the owner's choice (taken off the pages,
     // so it never prints twice), else a strong people shot of the last
     // days the pages leave out, so the last page is new, not a repeat.
-    let owner_closing = viable.iter().find(|p| p.closing).cloned();
+    // Like every page, it must print sharp enough: a blocked choice gives
+    // way to the automatic pick, with a note.
+    let owner_closing = viable.iter().find(|p| p.closing).cloned().filter(|p| {
+        let (w, h) = slot_inches(opts.preset, PageKind::Closing, 1);
+        let ok = dpi_verdict(p.width, p.height, w, h) != DpiVerdict::Block;
+        if !ok {
+            fallbacks.push(format!(
+                "closing: {} is too small to print a full page; another photo closes the book",
+                p.path
+                    .file_name()
+                    .map(|f| f.to_string_lossy())
+                    .unwrap_or_default()
+            ));
+        }
+        ok
+    });
     if let Some(c) = &owner_closing {
         pruned.retain(|p| p.asset_id != c.asset_id);
     }
@@ -1609,6 +1624,8 @@ pub fn render_book(
                         })
                         .unwrap_or_else(|| &photos[photos.len() - 1]);
                     shown.push(last);
+                    let (sw, sh) = slot_inches(opts.preset, PageKind::Closing, 1);
+                    placements.push((page_no, dpi_verdict(last.width, last.height, sw, sh)));
                     draw_fullbleed(last, (tw, th), 0, &out, &fit, &mut fallbacks)?;
                     captions
                         .entry(page_no)

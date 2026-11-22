@@ -1369,6 +1369,15 @@ fn edit_cmd(args: &[String]) {
         .collect();
     let uncrops = resolve(&a.uncrop);
     let closing = a.closing.as_deref().map(resolve_one);
+    if let Some(asset) = closing.filter(|x| x.kind == AssetKind::Video) {
+        die(
+            "edit",
+            format!(
+                "{} is a video; the book closes on a photo",
+                asset_label(asset)
+            ),
+        );
+    }
     if let Some(asset) = closing.filter(|x| ep.base.chapter_of(&x.id).is_none()) {
         die(
             "edit",
