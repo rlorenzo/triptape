@@ -924,7 +924,21 @@ fn export_inner(
                     let day = ch.asset_ids.iter().find_map(|id| {
                         triptape_core::itinerary::asset_day(by_id.get(id.as_str())?)
                     })?;
-                    itin.stop_on(day)
+                    // The middle of the day's fixes: a day trip out of the
+                    // city (Kamakura from Tokyo) keeps the sight alone.
+                    let mut lats: Vec<f64> = vec![];
+                    let mut lons: Vec<f64> = vec![];
+                    for a in ch.asset_ids.iter().filter_map(|id| by_id.get(id.as_str())) {
+                        if let Some((la, lo)) = a.gps {
+                            lats.push(la);
+                            lons.push(lo);
+                        }
+                    }
+                    lats.sort_by(f64::total_cmp);
+                    lons.sort_by(f64::total_cmp);
+                    let at =
+                        (!lats.is_empty()).then(|| (lats[lats.len() / 2], lons[lons.len() / 2]));
+                    itin.stop_on(day, at)
                         .filter(|city| !place.contains(city.as_str()))
                 });
                 match (port, stop, &ch.place) {

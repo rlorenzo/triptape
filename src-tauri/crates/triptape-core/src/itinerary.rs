@@ -96,6 +96,9 @@ impl ItinLeg {
     }
 }
 
+/// How far from a stop a day's photos may be and still be in its city.
+pub const STOP_NEAR_M: f64 = 30_000.0;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Itinerary {
     pub stops: Vec<ItinStop>,
@@ -512,11 +515,15 @@ impl Itinerary {
     /// was about, rather than whatever stands near the terminal (Miraikan
     /// and Shiokaze Park face Tokyo's Aomi terminal).
     /// The stop the trip is at on `day` (a city or a port call, not home),
-    /// by its label, unless hidden.
-    pub fn stop_on(&self, day: NaiveDate) -> Option<String> {
+    /// by its label, unless hidden, or when `at` (where the day's photos
+    /// were) lies beyond [`STOP_NEAR_M`] of it: a day trip out of the city.
+    pub fn stop_on(&self, day: NaiveDate, at: Option<(f64, f64)>) -> Option<String> {
         self.stops
             .iter()
             .find(|s| s.kind != StopKind::Home && !s.hide_label && s.active_on(day))
+            .filter(|s| {
+                at.is_none_or(|p| crate::geo::haversine_m(p, (s.lat, s.lon)) <= STOP_NEAR_M)
+            })
             .map(|s| s.label.clone())
     }
 
