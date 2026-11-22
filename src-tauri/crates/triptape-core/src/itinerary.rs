@@ -466,6 +466,18 @@ impl Itinerary {
             .into_iter()
             .find(|c| c.start <= day && day <= c.end);
         let Some(cruise) = cruise else {
+            // A shot far from every stop active today was on a trip out of
+            // the city (Kamakura from Tokyo): no city is better than the
+            // wrong one.
+            let far = gps.is_some_and(|p| {
+                self.stops
+                    .iter()
+                    .filter(|s| s.active_on(day))
+                    .all(|s| haversine_m(p, s.pos()) > STOP_NEAR_M)
+            });
+            if far {
+                return None;
+            }
             return Some(DayLabel {
                 place: city()?,
                 on_ship: false,
@@ -924,6 +936,17 @@ mod tests {
 
     fn day(s: &str) -> NaiveDate {
         parse_date(s).unwrap()
+    }
+
+    #[test]
+    fn a_shot_far_from_the_city_takes_no_city_label() {
+        let it = itin();
+        let tokyo = it.label_for(day("2026-10-05"), Some((35.7148, 139.7967)));
+        assert_eq!(tokyo.map(|l| l.place).as_deref(), Some("Tokyo"));
+        // Kamakura, ~50 km out: not "Tokyo".
+        assert!(it
+            .label_for(day("2026-10-05"), Some((35.3192, 139.5467)))
+            .is_none());
     }
 
     #[test]

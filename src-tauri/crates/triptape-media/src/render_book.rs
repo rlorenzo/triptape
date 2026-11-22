@@ -941,6 +941,38 @@ fn lone_scenery(photos: &[BookPhoto]) -> Vec<String> {
     out
 }
 
+/// An owner-kept photo with no one in it, alone in its stretch (a plate
+/// of laksa between two sights), joins the next stretch of its day (else
+/// the one before): it keeps its caption on a shared page rather than
+/// taking a full page of its own.
+fn fold_lone_kept(photos: &mut [BookPhoto]) {
+    let key = |p: &BookPhoto| (p.day, p.area.clone());
+    let mut start = 0;
+    while start < photos.len() {
+        let end = (start..photos.len())
+            .find(|&i| key(&photos[i]) != key(&photos[start]))
+            .unwrap_or(photos.len());
+        let p = &photos[start];
+        if end - start == 1 && p.keep && !p.is_of_people() && p.day.is_some() {
+            let day = p.day;
+            let neighbour = photos
+                .get(end)
+                .filter(|n| n.day == day)
+                .or_else(|| {
+                    start
+                        .checked_sub(1)
+                        .and_then(|i| photos.get(i))
+                        .filter(|n| n.day == day)
+                })
+                .map(|n| n.area.clone());
+            if let Some(area) = neighbour {
+                photos[start].area = area;
+            }
+        }
+        start = end;
+    }
+}
+
 /// Same caption text at most this many times in one day: an owner who
 /// captioned a whole series ("Our door decorations") wants the series
 /// named, not printed in full.
@@ -1317,6 +1349,7 @@ pub fn render_book(
     // A photo alone in its stretch (its day or named place) would fill a
     // page by itself: worth it for people or the owner's caption, not for
     // a plate of food or a candy bucket.
+    fold_lone_kept(&mut pruned);
     let lone: HashSet<String> = lone_scenery(&pruned).into_iter().collect();
     for id in &lone {
         fallbacks.push(format!(
@@ -3451,6 +3484,35 @@ mod tests {
             caps,
             ["It served us well for 8 years.", "Paradox Singapore"]
         );
+    }
+
+    #[test]
+    fn a_lone_captioned_plate_joins_the_next_stretch_of_its_day() {
+        let shot = |id: &str, area: &str, people: u32, keep: bool| BookPhoto {
+            asset_id: id.into(),
+            day: Some(22),
+            area: Some(area.into()),
+            people,
+            keep,
+            ..BookPhoto::blank()
+        };
+        let mut photos = vec![
+            shot("laksa", "food court", 0, true),
+            shot("cable", "Mount Faber Peak", 3, false),
+            shot("peak", "Mount Faber Peak", 4, false),
+        ];
+        fold_lone_kept(&mut photos);
+        assert_eq!(photos[0].area.as_deref(), Some("Mount Faber Peak"));
+        // A lone people photo keeps its own stretch.
+        let mut photos = vec![
+            BookPhoto {
+                tagged_people: 2,
+                ..shot("selfie", "food court", 2, true)
+            },
+            shot("cable", "Mount Faber Peak", 3, false),
+        ];
+        fold_lone_kept(&mut photos);
+        assert_eq!(photos[0].area.as_deref(), Some("food court"));
     }
 
     #[test]
