@@ -231,6 +231,7 @@ fn reel_from_a_tagged_rotated_clip_is_clean_and_upright() {
         taken_at: None,
         tz_offset_secs: None,
         aspect: Some(0.75),
+        gps: None,
     };
     let out = t.path().join("reels");
     let made = render_reels(
@@ -297,6 +298,7 @@ fn film_from_tagged_sources_is_clean_and_carries_no_rotation() {
             taken_at: Some(1_791_288_000),
             tz_offset_secs: None,
             aspect: None,
+            gps: None,
         };
     let entries = [
         entry("a0", Rendition::Still, &still, None),
