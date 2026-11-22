@@ -142,6 +142,8 @@ pub struct BookPhoto {
     pub feature: bool,
     /// The owner wants this photo never cropped.
     pub whole: bool,
+    /// In one of the owner's page groups: its stretch prints on one page.
+    pub page_group: bool,
     /// The itinerary puts the shot on board the ship.
     pub aboard: bool,
     /// Detected faces (normalised boxes), when the face models ran: page
@@ -190,6 +192,7 @@ impl BookPhoto {
             still_ms: None,
             feature: false,
             whole: false,
+            page_group: false,
             aboard: false,
             faces: vec![],
             closing: false,
@@ -510,17 +513,23 @@ pub fn flow_pages(
     has_map: bool,
     cap: usize,
 ) -> Vec<FlowPage> {
-    flow_pages_marked(chapter_of, day_of, &[], wide_idx, has_map, cap)
+    flow_pages_marked(chapter_of, day_of, &[], &[], wide_idx, has_map, cap)
 }
+
+/// Most photos one page holds (three rows of three).
+const MAX_PAGE_PHOTOS: usize = 9;
 
 /// [`flow_pages`] where a chapter whose first photo is marked in
 /// `no_divider` gets no divider: its heading goes on its first photo page
 /// (a captioned plate of food opens the day in time order, on a shared
 /// page, instead of yielding to a later family photo pulled ahead of it).
+/// A stretch holding a photo marked in `one_page` (the owner's page group)
+/// prints on one page, up to [`MAX_PAGE_PHOTOS`].
 pub fn flow_pages_marked(
     chapter_of: &[Option<usize>],
     day_of: &[Option<u32>],
     no_divider: &[bool],
+    one_page: &[bool],
     wide_idx: Option<usize>,
     has_map: bool,
     cap: usize,
@@ -603,24 +612,42 @@ pub fn flow_pages_marked(
         start = d + 1;
     }
     bounds.push((start, rest.len()));
-    let runs: Vec<Vec<usize>> = bounds
+    let grouped = |k: usize| one_page.get(rest_idx[k]).copied().unwrap_or(false);
+    // Each segment's length and whether it must stay on one page.
+    let runs: Vec<Vec<(usize, bool)>> = bounds
         .into_iter()
         .map(|(a, b)| {
-            let mut segs: Vec<usize> = vec![];
+            let mut segs: Vec<(usize, bool)> = vec![];
             for k in a..b {
                 match segs.last_mut() {
-                    Some(n) if day_at(k) == day_at(k - 1) => *n += 1,
-                    _ => segs.push(1),
+                    Some((n, g)) if day_at(k) == day_at(k - 1) => {
+                        *n += 1;
+                        *g |= grouped(k);
+                    }
+                    _ => segs.push((1, grouped(k))),
                 }
             }
             segs
         })
         .collect();
+    let pages_for = |&(len, one): &(usize, bool), per: usize| {
+        if one && len <= MAX_PAGE_PHOTOS {
+            vec![len]
+        } else {
+            even_split(len, per)
+        }
+    };
     let photo_budget = cap
         .saturating_sub(counted_before + dividers.len() + extras)
         .max(1);
     let per_page = (1..=4)
-        .find(|&p| runs.iter().flatten().map(|l| l.div_ceil(p)).sum::<usize>() <= photo_budget)
+        .find(|&p| {
+            runs.iter()
+                .flatten()
+                .map(|s| pages_for(s, p).len())
+                .sum::<usize>()
+                <= photo_budget
+        })
         .unwrap_or(4);
     for (i, run) in runs.iter().enumerate() {
         if i > 0 {
@@ -629,8 +656,8 @@ pub fn flow_pages_marked(
                 take: 1,
             });
         }
-        for &seg in run {
-            for take in even_split(seg, per_page) {
+        for seg in run {
+            for take in pages_for(seg, per_page) {
                 pages.push(FlowPage {
                     kind: if take == 1 {
                         PageKind::PhotoCaption
@@ -853,10 +880,12 @@ fn book_flow(photos: &[BookPhoto], has_map: bool, cap: usize) -> Vec<FlowPage> {
     // plate of food) keeps its time order: no divider pulls a later family
     // photo ahead of it.
     let no_divider: Vec<bool> = photos.iter().map(|p| p.keep && !p.is_of_people()).collect();
+    let one_page: Vec<bool> = photos.iter().map(|p| p.page_group).collect();
     flow_pages_marked(
         &chapter_of,
         &stretch_of,
         &no_divider,
+        &one_page,
         wide_index(photos),
         has_map,
         cap,
@@ -3745,6 +3774,24 @@ mod tests {
     }
 
     #[test]
+    fn an_owner_group_stays_on_one_page() {
+        let chapters: Vec<Option<usize>> = vec![Some(0); 8];
+        let days: Vec<Option<u32>> = vec![
+            Some(1),
+            Some(1),
+            Some(2),
+            Some(2),
+            Some(2),
+            Some(2),
+            Some(2),
+            Some(2),
+        ];
+        let one: Vec<bool> = vec![false, false, true, true, true, true, true, true];
+        let flow = flow_pages_marked(&chapters, &days, &[], &one, None, false, 60);
+        assert!(flow.iter().any(|p| p.take == 6), "{flow:?}");
+    }
+
+    #[test]
     fn only_day_headings_print_large() {
         let kinds = vec![
             PageKind::CoverProxy,
@@ -3777,6 +3824,7 @@ mod tests {
             &chapters,
             &[],
             &[false, false, true, false, false],
+            &[],
             None,
             false,
             60,

@@ -206,6 +206,7 @@ fn group_pages(photos: &mut Vec<BookPhoto>, groups: &[Vec<String>]) {
             m.day = day;
             m.chapter = chapter;
             m.area = area.clone();
+            m.page_group = true;
         }
         photos.splice(at..at, members);
     }
@@ -957,6 +958,7 @@ fn export_inner(
                 still_ms: layout.stills.get(&a.id).copied(),
                 feature: layout.feature.contains(&a.id),
                 whole: layout.whole.contains(&a.id),
+                page_group: false,
             });
         }
         // A photo and the owner's `_edited` version of it are one photo:
