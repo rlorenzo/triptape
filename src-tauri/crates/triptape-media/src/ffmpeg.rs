@@ -201,16 +201,16 @@ pub fn x264_aac(preset: &str, crf: u32) -> Vec<String> {
         .map(String::from)
         .to_vec();
     args.push(crf.to_string());
-    args.extend(yuv420p_aac_faststart());
+    args.extend(pix_fmt_aac_faststart("yuv420p"));
     args
 }
 
-/// The encoder-independent tail of [`x264_aac`]: yuv420p, AAC 48 kHz
+/// The encoder-independent tail of [`x264_aac`]: `pix_fmt`, AAC 48 kHz
 /// stereo, faststart.
-fn yuv420p_aac_faststart() -> Vec<String> {
+fn pix_fmt_aac_faststart(pix_fmt: &str) -> Vec<String> {
     [
         "-pix_fmt",
-        "yuv420p",
+        pix_fmt,
         "-c:a",
         "aac",
         "-ar",
@@ -255,8 +255,8 @@ pub fn bitrate_cap_args(kbps: u32) -> Vec<String> {
 /// (half the bitrate of H.264 for the same picture; every 4K Roku plays
 /// it) at CRF 18, 10-bit (Main10) when this libx265 can, tagged `hvc1`
 /// for Apple players; otherwise H.264 High 5.1. 1080p
-/// stays H.264, which every player handles. Yuv420p, AAC 48 kHz stereo,
-/// faststart, as [`x264_aac`].
+/// stays H.264, which every player handles. `yuv420p10le` for 10-bit HEVC
+/// (else `yuv420p`), AAC 48 kHz stereo, faststart, as [`x264_aac`].
 pub fn film_encode_args(caps: &Capabilities, res: Resolution) -> Vec<String> {
     let max = match res {
         Resolution::Uhd4k => FILM_4K_MAX_KBPS,
@@ -279,15 +279,14 @@ pub fn film_encode_args(caps: &Capabilities, res: Resolution) -> Vec<String> {
         args.push(format!(
             "vbv-maxrate={max}:vbv-bufsize={max}:log-level=error"
         ));
-        args.extend(yuv420p_aac_faststart());
         if caps.libx265_10bit {
             // 10-bit HEVC (Main10): smooth skies, sunsets and dark
             // gradients without banding; every 4K Roku and Apple TV plays
             // it, and Plex direct-plays it.
-            if let Some(i) = args.iter().position(|a| a == "-pix_fmt") {
-                args[i + 1] = "yuv420p10le".into();
-            }
+            args.extend(pix_fmt_aac_faststart("yuv420p10le"));
             args.extend(["-profile:v".into(), "main10".into()]);
+        } else {
+            args.extend(pix_fmt_aac_faststart("yuv420p"));
         }
         return args;
     }
@@ -441,12 +440,13 @@ pub fn probe_capabilities(ffmpeg_bin: &str, ffprobe_bin: &str) -> Capabilities {
     let encoders = run_capture(ffmpeg_bin, &["-hide_banner", "-encoders"]).unwrap_or_default();
     let filters = run_capture(ffmpeg_bin, &["-hide_banner", "-filters"]).unwrap_or_default();
     let filter = |name| flag_present(&filters, name);
+    let libx265 = flag_present(&encoders, "libx265");
     Capabilities {
         ffmpeg_bin: ffmpeg_bin.to_string(),
         ffprobe_bin: ffprobe_bin.to_string(),
         libx264: flag_present(&encoders, "libx264"),
-        libx265: flag_present(&encoders, "libx265"),
-        libx265_10bit: flag_present(&encoders, "libx265")
+        libx265,
+        libx265_10bit: libx265
             && run_capture(ffmpeg_bin, &["-hide_banner", "-h", "encoder=libx265"])
                 .is_some_and(|h| h.contains("yuv420p10le")),
         aac: flag_present(&encoders, "aac"),
