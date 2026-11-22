@@ -259,6 +259,16 @@ impl Itinerary {
             .map(|pl| pl.name.as_str())
     }
 
+    /// The label of the stop active on `day` nearest to `gps`: on the day
+    /// a trip flies home, a shot back home is home, not the last city.
+    fn stop_near(&self, day: NaiveDate, gps: (f64, f64)) -> Option<String> {
+        self.stops
+            .iter()
+            .filter(|s| s.active_on(day))
+            .min_by(|a, b| haversine_m(gps, a.pos()).total_cmp(&haversine_m(gps, b.pos())))
+            .map(|s| s.label.clone())
+    }
+
     /// Whether the owner asked never to name this attraction.
     pub fn hides_attraction(&self, name: &str) -> bool {
         self.hide_attractions.iter().any(|h| h.trim() == name)
@@ -654,7 +664,8 @@ pub fn name_film_chapters(
         let mut current = first.clone();
         // Where the current heading was set: a shot with no place of its
         // own that is well away from it (Dotonbori, 3 km from the castle)
-        // is back in the day's city.
+        // is back in the day's city, the stop that day nearest to it (home,
+        // not Singapore, for a clip back in California).
         let mut anchor = on_screen[0].gps;
         for a in &on_screen[1..] {
             let next = own(a).or_else(|| {
@@ -662,7 +673,11 @@ pub fn name_film_chapters(
                     (anchor, a.gps),
                     (Some(p), Some(q)) if crate::geo::haversine_m(p, q) > FILM_PLACE_LEFT_M
                 );
-                (away && !aboard).then(|| city.clone())
+                (away && !aboard).then(|| {
+                    a.gps
+                        .and_then(|g| itin.stop_near(day, g))
+                        .unwrap_or_else(|| city.clone())
+                })
             });
             if let Some(p) = next {
                 if p != current {
@@ -689,9 +704,10 @@ pub fn name_film_chapters(
 const FILM_PLACE_LEFT_M: f64 = 2.0 * crate::places::PLACE_RADIUS_M;
 
 /// A film shot's own place: the place the owner named it at (radius or
-/// time window), else, ashore, the attraction it was taken at, unless
-/// hidden or the hotel's neighbourhood (a home base). A shot aboard has no
-/// attraction (the ship docked beside Miraikan is not a visit to it). An
+/// time window); aboard, the ship (or its boarding), never an attraction
+/// (the ship docked beside Miraikan is not a visit to it); ashore, the
+/// attraction it was taken at, unless hidden or the hotel's neighbourhood
+/// (a home base). An
 /// attraction the owner also named (another spelling: "Meiji Jingū" for
 /// their "Meiji Jingu") takes the owner's name.
 fn film_shot_place(
@@ -702,11 +718,13 @@ fn film_shot_place(
     if let Some(p) = itin.place_of(a) {
         return Some(p.to_string());
     }
-    let aboard = asset_day(a)
-        .and_then(|d| itin.label_for(d, a.gps))
-        .is_some_and(|l| l.on_ship);
-    if aboard {
-        return None;
+    // Aboard (by its own fix): the ship, or the boarding on a cruise's
+    // first or last day, even inside a chapter mostly ashore. A shot
+    // without GPS can't tell, and keeps the current heading.
+    if let (Some(day), Some(_)) = (asset_day(a), a.gps) {
+        if let Some(l) = itin.label_for(day, a.gps).filter(|l| l.on_ship) {
+            return Some(itin.boarding(day).unwrap_or(l.place));
+        }
     }
     let n = crate::places::photo_attraction(a)
         .filter(|n| !itin.hides_attraction(n) && !home.contains(n))?;
@@ -1068,6 +1086,29 @@ mod tests {
             "hero": hero,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_film_shot_aboard_names_the_ship() {
+        let it = itin();
+        let home = std::collections::HashSet::new();
+        // Osaka port day, at the terminal (the dock): aboard.
+        let dock = photo("d", "2026-10-11", Some((34.656, 135.4306)));
+        assert_eq!(
+            film_shot_place(&it, &home, &dock).as_deref(),
+            Some("Carnival Luminosa")
+        );
+        // The cruise's first day at the Tokyo terminal: the boarding.
+        let board = photo("b", "2026-10-09", Some((35.6190, 139.7766)));
+        assert_eq!(
+            film_shot_place(&it, &home, &board).as_deref(),
+            Some("Carnival Luminosa Embarkation")
+        );
+        // No fix: can't tell, keeps the current heading.
+        assert_eq!(
+            film_shot_place(&it, &home, &photo("n", "2026-10-11", None)),
+            None
+        );
     }
 
     #[test]
