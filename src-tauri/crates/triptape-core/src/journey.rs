@@ -107,6 +107,12 @@ pub struct Hop {
     pub pos: (f64, f64),
 }
 
+/// `p` with its longitude wrapped into -180..180 (journey paths unwrap it
+/// across the antimeridian).
+fn wrapped(p: (f64, f64)) -> (f64, f64) {
+    (p.0, (p.1 + 180.0).rem_euclid(360.0) - 180.0)
+}
+
 /// How near home a shot must be for the hop home to play before it: the
 /// arrival airport is rarely the house (LAX to Ontario is 50 km).
 pub const HOME_REACH_M: f64 = 150_000.0;
@@ -122,7 +128,7 @@ fn at_home(hop: &Hop, gps: Option<(f64, f64)>) -> bool {
 /// taken on or after the hop's day, or `shots.len()` to follow them all.
 /// Hops keep their order. The last hop home plays before the first shot
 /// taken back home (within [`HOME_REACH_M`], on or after its day), or after
-/// every shot when none was.
+/// every shot when none was or it has no day.
 pub fn hop_cuts(
     hops: &[Hop],
     shots: &[Option<(i64, Option<i32>)>],
@@ -133,10 +139,15 @@ pub fn hop_cuts(
     let mut out = vec![];
     for (i, hop) in hops.iter().enumerate() {
         if hop.home && i + 1 == hops.len() {
-            at = (at..shots.len())
-                .find(|&s| {
-                    at_home(hop, gps.get(s).copied().flatten())
-                        && hop.day.is_none_or(|d| day_of(s).is_some_and(|sd| sd >= d))
+            // An undated hop home follows every shot, as `hops_reached`
+            // never counts it.
+            at = hop
+                .day
+                .and_then(|day| {
+                    (at..shots.len()).find(|&s| {
+                        at_home(hop, gps.get(s).copied().flatten())
+                            && day_of(s).is_some_and(|sd| sd >= day)
+                    })
                 })
                 .unwrap_or(shots.len());
         } else if let Some(day) = hop.day {
@@ -266,7 +277,7 @@ impl Journey {
                     .map(|d| d.0)
                     .or(node.arrive),
                 home: node.home,
-                pos: (node.pos.0, (node.pos.1 + 180.0).rem_euclid(360.0) - 180.0),
+                pos: wrapped(node.pos),
             });
             start = i + 1;
         }
@@ -707,7 +718,6 @@ mod tests {
             .enumerate()
             .filter(|(_, l)| l.mode == LegMode::Ship && !l.is_loop)
         {
-            let wrapped = |p: (f64, f64)| (p.0, (p.1 + 180.0).rem_euclid(360.0) - 180.0);
             // The first and last hops leave and enter a coastal port (a land
             // cell by the grid); everything between is open water.
             let inner = &leg.path[1..leg.path.len() - 1];
@@ -732,9 +742,7 @@ mod tests {
         let lp = &j.legs[9].path;
         assert_eq!(lp[0], lp[lp.len() - 1]);
         assert!(lp.len() > 10);
-        assert!(lp[1..lp.len() - 1]
-            .iter()
-            .all(|&p| is_water((p.0, (p.1 + 180.0).rem_euclid(360.0) - 180.0))));
+        assert!(lp[1..lp.len() - 1].iter().all(|&p| is_water(wrapped(p))));
     }
 
     #[test]
@@ -820,6 +828,15 @@ mod tests {
         gps[9] = Some((34.06, -117.6));
         let home_cuts = hop_cuts(&hops, &shots, &gps);
         assert_eq!(home_cuts[9], 9, "home before the shot taken at home");
+        // The departure shot at the home airport predates the hop home, so
+        // it does not pull the hop home to the start.
+        gps[0] = Some((33.94, -118.41));
+        assert_eq!(hop_cuts(&hops, &shots, &gps)[9], 9);
+        // An undated hop home closes the trip, as no shot counts it.
+        let mut undated = hops.clone();
+        undated[9].day = None;
+        assert_eq!(hop_cuts(&undated, &shots, &gps)[9], shots.len());
+        assert_eq!(hops_reached(&undated, shot(30), Some((34.06, -117.6))), 9);
         assert_eq!(hops_reached(&hops, shot(30), Some((34.06, -117.6))), 10);
         assert_eq!(hops_reached(&hops, shot(30), Some((1.36, 103.99))), 9);
         assert!(cuts.windows(2).all(|w| w[0] <= w[1]));
