@@ -147,7 +147,7 @@ pub const BORROW_FIX_SECS: i64 = 30 * 60;
 /// file with no camera counter (a shared image) borrows nothing.
 pub fn borrowed_fixes(assets: &[Asset]) -> HashMap<&str, (f64, f64)> {
     // Only from the same camera: on a day the group split, another
-    // phone's fix is another place (Rex in the city, the others aboard).
+    // phone's fix is another place (one party in the city, the rest aboard).
     let stream = crate::party::camera_streams(assets);
     let mut out = HashMap::new();
     for (i, a) in assets.iter().enumerate().filter(|(_, a)| a.gps.is_none()) {
