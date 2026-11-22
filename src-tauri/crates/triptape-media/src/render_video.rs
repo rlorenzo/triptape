@@ -419,6 +419,37 @@ pub fn assign_transitions(
     out
 }
 
+/// The places card's list: two sights in one place (`Flower Dome, Gardens
+/// by the Bay` and `Cloud Forest, Gardens by the Bay`) are named once, by
+/// that place, where the first of them stood. A sight alone keeps its
+/// whole name. A country is no such place: `Tokyo, Japan` and
+/// `Kyoto, Japan` stay two cities.
+fn credit_places(places: &[String]) -> Vec<String> {
+    fn parent(p: &str) -> Option<&str> {
+        if triptape_core::geo::without_country(p) != p {
+            return None;
+        }
+        p.rsplit_once(", ")
+            .map(|(_, par)| par)
+            .filter(|par| !par.is_empty())
+    }
+    let mut sights: HashMap<&str, usize> = HashMap::new();
+    for par in places.iter().filter_map(|p| parent(p.as_str())) {
+        *sights.entry(par).or_default() += 1;
+    }
+    let mut out: Vec<String> = vec![];
+    for p in places {
+        let name = match parent(p) {
+            Some(par) if sights[par] > 1 => par,
+            _ => p.as_str(),
+        };
+        if !out.iter().any(|q| q == name) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
 /// Resolved source files for one plan entry (export layer fills this).
 #[derive(Debug, Clone)]
 pub struct ResolvedEntry {
@@ -857,6 +888,7 @@ pub fn render_hero_video(
             places.push(p.to_string());
         }
     }
+    let places = credit_places(&places);
 
     // Hero entries (short mode: cap the whole film at 30 s).
     // Fixed segments (title, optional map, closing cards) come out of the
@@ -2331,12 +2363,13 @@ fn cached_segment(
     Ok((out, secs, kind.into()))
 }
 
-/// Whether an entry may join a collage: a still that is not a panorama
-/// (panoramas pan solo) and has no caption (a caption describes one photo,
-/// so a captioned still plays solo; same rule as the plan's timing model
-/// and the Story editor, through [`plan::entry_plays_alone`]).
-fn collage_eligible(e: &ResolvedEntry) -> bool {
-    plan::entry_plays_alone(&e.entry.rendition, e.aspect, e.caption.as_deref()).is_none()
+/// How an entry may join a collage: a plain still does; a captioned still
+/// or a Live Photo playing its motion only when the user joined it to a
+/// neighbour; a panorama (pans solo) or a clip never does. Same rule as
+/// the plan's timing model and the Story editor, through
+/// [`plan::entry_candidacy`].
+fn collage_candidacy(e: &ResolvedEntry) -> plan::Candidacy {
+    plan::entry_candidacy(&e.entry.rendition, e.aspect, e.caption.as_deref())
 }
 
 /// Each hero asset's place section within its chapter: how many of the
@@ -2385,7 +2418,7 @@ fn hero_groups<'a, C: PartialEq>(
             (
                 r.entry.asset_id.as_str(),
                 chapter_of(r),
-                collage_eligible(r),
+                collage_candidacy(r),
                 r.taken_at,
             )
         }),
@@ -3113,6 +3146,31 @@ mod tests {
     use triptape_core::plan::{CAPTION_MAX_SECS, PLACES_CARD_MAX_SECS};
 
     #[test]
+    fn credits_name_a_shared_parent_place_once() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            credit_places(&names(&[
+                "Marina Bay Sands",
+                "Flower Dome, Gardens by the Bay",
+                "Cloud Forest, Gardens by the Bay",
+                "Gardens by the Bay",
+                "A-Mei Tea House, Jiufen",
+                "Ontario, California",
+                "Tokyo, Japan",
+                "Kyoto, Japan",
+            ])),
+            names(&[
+                "Marina Bay Sands",
+                "Gardens by the Bay",
+                "A-Mei Tea House, Jiufen",
+                "Ontario, California",
+                "Tokyo, Japan",
+                "Kyoto, Japan",
+            ])
+        );
+    }
+
+    #[test]
     fn the_day_line_shows_once_a_day() {
         let mut last = None;
         let h = |d: &str, p: &str| (d.to_string(), Some(p.to_string()));
@@ -3749,21 +3807,71 @@ mod tests {
             ..card_entry("s", Path::new("s.jpg"))
         };
         let unknown = card_entry("u", Path::new("u.jpg"));
-        assert!(!collage_eligible(&pano));
-        assert!(collage_eligible(&plain) && collage_eligible(&unknown));
+        assert_eq!(collage_candidacy(&pano), plan::Candidacy::Never);
+        assert_eq!(collage_candidacy(&plain), plan::Candidacy::Plain);
+        assert_eq!(collage_candidacy(&unknown), plan::Candidacy::Plain);
     }
 
     #[test]
-    fn captioned_stills_never_join_collages() {
+    fn captioned_stills_join_collages_only_when_the_user_joins_them() {
         let with = |c: Option<&str>| ResolvedEntry {
             caption: c.map(String::from),
             ..card_entry("s", Path::new("s.jpg"))
         };
-        assert!(!collage_eligible(&with(Some("Mia on the ferry"))));
-        assert!(!collage_eligible(&with(Some(" x "))));
+        let if_joined = plan::Candidacy::IfJoined;
+        assert_eq!(
+            collage_candidacy(&with(Some("Mia on the ferry"))),
+            if_joined
+        );
+        assert_eq!(collage_candidacy(&with(Some(" x "))), if_joined);
         // Blank captions are no captions.
-        assert!(collage_eligible(&with(Some("  "))));
-        assert!(collage_eligible(&with(None)));
+        assert_eq!(collage_candidacy(&with(Some("  "))), plan::Candidacy::Plain);
+        assert_eq!(collage_candidacy(&with(None)), plan::Candidacy::Plain);
+    }
+
+    #[test]
+    fn a_joined_captioned_live_photo_groups_as_the_planner_groups_it() {
+        let mut live = ResolvedEntry {
+            caption: Some("Egg tarts".into()),
+            ..card_entry("live", Path::new("live.heic"))
+        };
+        live.entry.rendition = Rendition::Motion {
+            trim_start: 0.0,
+            trim_end: 3.0,
+        };
+        live.motion_path = Some(PathBuf::from("live.mov"));
+        let (b, c) = (
+            card_entry("b", Path::new("b.jpg")),
+            card_entry("c", Path::new("c.jpg")),
+        );
+        let entries = [&live, &b, &c];
+        let ids = |g: Vec<Vec<&ResolvedEntry>>| -> Vec<Vec<String>> {
+            g.iter()
+                .map(|g| g.iter().map(|e| e.entry.asset_id.clone()).collect())
+                .collect()
+        };
+        let group = |edits: &CollageEdits| ids(hero_groups(&entries, |_| 0, edits));
+        // Alone by default (taken_at is unknown, so b and c join nothing
+        // on their own).
+        assert!(group(&CollageEdits::default()).iter().all(|g| g.len() == 1));
+        let mut joined = CollageEdits::default();
+        joined.join("live".into(), "b".into());
+        joined.join("b".into(), "c".into());
+        assert_eq!(group(&joined), [["live", "b", "c"]]);
+        // The collage's caption is the member's.
+        assert_eq!(collage_caption(&entries).as_deref(), Some("Egg tarts"),);
+        // Clips never join, even when linked.
+        let mut clip = card_entry("clip", Path::new("clip.mov"));
+        clip.entry.rendition = Rendition::Clip {
+            trim_start: 0.0,
+            trim_end: 3.0,
+        };
+        let mut with_clip = CollageEdits::default();
+        with_clip.join("clip".into(), "b".into());
+        let pair = [&clip, &b];
+        assert!(hero_groups(&pair, |_| 0, &with_clip)
+            .iter()
+            .all(|g| g.len() == 1));
     }
 
     #[test]

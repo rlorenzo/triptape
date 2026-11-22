@@ -128,6 +128,12 @@ pub struct FaceSignals {
 }
 
 impl Asset {
+    /// Whether this is a Live Photo with its companion video, so it can
+    /// play its motion.
+    pub fn has_live_motion(&self) -> bool {
+        self.kind == AssetKind::LivePhoto && self.companion_path.is_some()
+    }
+
     /// Width / height as displayed (EXIF rotation applied); `None` when
     /// the size is unknown.
     pub fn display_aspect(&self) -> Option<f64> {
