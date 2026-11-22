@@ -1246,8 +1246,7 @@ pub fn render_hero_video(
         // A chapter heading identical to the last one shown (the same day
         // and place, split by a few shots elsewhere) is not repeated.
         let mut last_heading: Option<(String, Option<String>)> = None;
-        // The day line shown last: a later heading the same day names only
-        // its place, so a move within a day doesn't read as a new day.
+        // The day line shown last, for `day_once`.
         let mut last_day: Option<String> = None;
         for (i, (r, _, _, _)) in segs.iter().enumerate() {
             let id = r.entry.asset_id.as_str();
