@@ -1162,6 +1162,9 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
             other => return Err(format!("unknown flag --{other}")),
         }
     }
+    if out.closing.is_some() && out.no_closing {
+        return Err("--closing and --no-closing conflict: pass one".to_string());
+    }
     if pending_move.is_some() {
         return Err(MOVE_USAGE.to_string());
     }
@@ -1603,15 +1606,7 @@ fn faces_cmd(flags: &HashMap<String, String>) {
     let db_path = need(flags, "db");
     let json_path = need(flags, "osxphotos");
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
-    let project_id = match flags.get("project") {
-        Some(id) => id.clone(),
-        None => {
-            db.latest_project()
-                .unwrap_or_else(|e| die("project", e))
-                .unwrap_or_else(|| die("faces", "no project in db"))
-                .id
-        }
-    };
+    let project_id = project_or_latest(&db, flags, "faces");
     let assets = db
         .list_assets(&project_id)
         .unwrap_or_else(|e| die("assets", e));
@@ -1619,18 +1614,25 @@ fn faces_cmd(flags: &HashMap<String, String>) {
         .unwrap_or_else(|e| die(&format!("read {}", json_path.display()), e));
     let faces = triptape_core::osxphotos::known_faces_from_osxphotos(&json, &assets)
         .unwrap_or_else(|e| die("osxphotos json", e));
-    db.replace_known_faces(&faces)
+    db.replace_known_faces(&project_id, &faces)
         .unwrap_or_else(|e| die("save faces", e));
     let regions: usize = faces.values().map(Vec::len).sum();
-    let mut people: Vec<&str> = faces.values().flatten().map(|f| f.name.as_str()).collect();
-    people.sort_unstable();
-    people.dedup();
     println!("project: {project_id}");
-    println!(
-        "known faces: {regions} regions on {} photos, {} people",
-        faces.len(),
-        people.len()
-    );
+    println!("known faces: {regions} regions on {} photos", faces.len());
+}
+
+/// `--project ID`, else the latest project in `db` (dying as `cmd` when
+/// there is none).
+fn project_or_latest(db: &Db, flags: &HashMap<String, String>, cmd: &str) -> String {
+    match flags.get("project") {
+        Some(id) => id.clone(),
+        None => {
+            db.latest_project()
+                .unwrap_or_else(|e| die("project", e))
+                .unwrap_or_else(|| die(cmd, "no project in db"))
+                .id
+        }
+    }
 }
 
 /// `learn`: show, reset or apply the story-score weights learned from the
@@ -1638,15 +1640,7 @@ fn faces_cmd(flags: &HashMap<String, String>) {
 fn learn_cmd(flags: &HashMap<String, String>) {
     let db_path = need(flags, "db");
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
-    let project_id = match flags.get("project") {
-        Some(id) => id.clone(),
-        None => {
-            db.latest_project()
-                .unwrap_or_else(|e| die("project", e))
-                .unwrap_or_else(|| die("learn", "no project in db"))
-                .id
-        }
-    };
+    let project_id = project_or_latest(&db, flags, "learn");
     let on = |k: &str| flags.get(k).is_some_and(|v| v == "true");
     if on("reset") {
         let n = db
@@ -2068,6 +2062,7 @@ mod tests {
         assert_eq!((a.closing, a.no_closing), (None, true));
         assert!(parse_edit_args(&args("--no-closing a")).is_err());
         assert!(parse_edit_args(&args("--closing")).is_err());
+        assert!(parse_edit_args(&args("--closing a --no-closing")).is_err());
     }
 
     #[test]

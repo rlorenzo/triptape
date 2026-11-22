@@ -1277,6 +1277,7 @@ pub fn render_book(
     if let Some(c) = &owner_closing {
         pruned.retain(|p| p.asset_id != c.asset_id);
     }
+    let owner_chose_closing = owner_closing.is_some();
     let mut closing_pick: Option<BookPhoto> = owner_closing.or_else(|| {
         let placed: HashSet<&str> = pruned.iter().map(|p| p.asset_id.as_str()).collect();
         let last_day = viable.iter().filter_map(|p| p.day).max();
@@ -1284,14 +1285,16 @@ pub fn render_book(
         viable
             .iter()
             .filter(|p| {
-                // Big, sharp faces that print well on a full page.
+                // Big, sharp faces that print well on a full page (the
+                // framing search in `cover_rank` last: it is the costly one;
+                // it sees only tagged faces until the detector runs below).
                 !placed.contains(p.asset_id.as_str())
-                    && cover_rank(p) == 2
                     && p.tagged_people >= 3
                     && p.people >= 4
                     && p.face_size >= CLOSING_FACE
-                    && dpi_verdict(p.width, p.height, w, h) == DpiVerdict::Ok
                     && p.day.zip(last_day).is_some_and(|(d, l)| d + 1 >= l)
+                    && dpi_verdict(p.width, p.height, w, h) == DpiVerdict::Ok
+                    && cover_rank(p) == 2
             })
             .max_by(|a, b| a.score.total_cmp(&b.score))
             .cloned()
@@ -1326,6 +1329,11 @@ pub fn render_book(
             found
                 .borrow_mut()
                 .insert(c.asset_id.clone(), c.faces.clone());
+        }
+        // An automatic pick whose detected faces a full page would cut
+        // gives way to the closing page's in-book pick.
+        if !owner_chose_closing && closing_pick.as_ref().is_some_and(|c| cover_rank(c) != 2) {
+            closing_pick = None;
         }
     }
     let photos: &[BookPhoto] = &pruned;
@@ -1568,7 +1576,9 @@ pub fn render_book(
                 }
             }
             PageKind::Closing => {
-                if photos.is_empty() {
+                // The owner's closing photo is off the pages: it still
+                // prints when it was the only photo.
+                if closing_pick.is_none() && photos.is_empty() {
                     draw_text_placeholder(fp.kind, tw, th, &out)?;
                 } else {
                     // The closing photo repeats one from the book: make it the
@@ -1591,13 +1601,13 @@ pub fn render_book(
                                 .filter(|p| {
                                     // A people photo that fills a page well: no
                                     // panorama, no group a square would cut.
-                                    cover_rank(p) == 2
-                                        && !recent.contains(&p.asset_id.as_str())
+                                    !recent.contains(&p.asset_id.as_str())
                                         && p.day.zip(last_day).is_some_and(|(d, l)| d + 2 >= l)
+                                        && cover_rank(p) == 2
                                 })
                                 .max_by(|a, b| a.score.total_cmp(&b.score))
                         })
-                        .unwrap_or(&photos[photos.len() - 1]);
+                        .unwrap_or_else(|| &photos[photos.len() - 1]);
                     shown.push(last);
                     draw_fullbleed(last, (tw, th), 0, &out, &fit, &mut fallbacks)?;
                     captions
@@ -1974,14 +1984,13 @@ fn page_caption(slot: &[&BookPhoto], kind: PageKind) -> Vec<String> {
     for p in slot {
         // A captioned photo's place follows the user's words, unless the
         // words already name it ("…treats in Singapore · Singapore").
-        let words = caption_of(p);
+        let mut words = caption_of(p);
         let place = p.place.clone().filter(|pl| {
             p.own_caption()
                 && !words
                     .iter()
                     .any(|w| w.to_lowercase().contains(&pl.to_lowercase()))
         });
-        let mut words = words;
         if place.is_some() {
             // The owner's sentence ends before its place: "…for 8 years. ·
             // Paradox Singapore". Place names are capitalised; a sentence
@@ -2147,10 +2156,7 @@ fn fit_photo_focused(
             focus_window(sw, sh, tw_f, th_f, (f64::from(fx), f64::from(fy))),
             false,
         ),
-        None if !faces.is_empty() || !p.family.is_empty() => {
-            frame_photo(p, (sw, sh), (tw_f, th_f), &faces, reserve)
-        }
-        None => (focus_window(sw, sh, tw_f, th_f, (0.5, 0.5)), false),
+        None => frame_photo(p, (sw, sh), (tw_f, th_f), &faces, reserve),
     };
     // Shown whole only when that still fills most of the cell: a 4:3 photo
     // pillarboxed in a wide strip leaves black voids worse than a crop.
@@ -2252,6 +2258,8 @@ struct Target {
     core: FaceBox,
     room: FaceBox,
     weight: f64,
+    /// A tagged family member (not a stranger the detector found).
+    family: bool,
 }
 
 /// The regions framing tries to keep, each with its weight: family faces
@@ -2277,12 +2285,14 @@ fn framing_targets(p: &BookPhoto, detected: &[FaceBox]) -> Vec<Target> {
                     room: head.clone(),
                     core: head,
                     weight: FAMILY_BODY_WEIGHT,
+                    family: true,
                 }
             } else {
                 Target {
                     core: k.b.clone(),
                     room: pad(k.b.clone()),
                     weight: FAMILY_FACE_WEIGHT,
+                    family: true,
                 }
             }
         })
@@ -2301,6 +2311,7 @@ fn framing_targets(p: &BookPhoto, detected: &[FaceBox]) -> Vec<Target> {
         core: d.clone(),
         room: pad(d.clone()),
         weight: STRANGER_WEIGHT,
+        family: false,
     }));
     out
 }
@@ -2310,8 +2321,7 @@ fn framing_targets(p: &BookPhoto, detected: &[FaceBox]) -> Vec<Target> {
 /// adds its weight, one only partly inside subtracts
 /// [`PARTIAL_PENALTY`] times it, and nothing counts for one left out. The
 /// bottom `reserve` of the window (a caption strip) counts as outside.
-/// Also whether a family member (weight above the strangers') is cut or
-/// left out.
+/// Also whether a family member is cut or left out.
 fn framing_window(
     sw: f64,
     sh: f64,
@@ -2368,7 +2378,7 @@ fn framing_window(
                 if f > 0.02 {
                     score -= PARTIAL_PENALTY * w;
                 }
-                family_cut |= w > STRANGER_WEIGHT;
+                family_cut |= t.family;
             }
             // Ties: the window nearest the middle of the photo.
             let off = ((x - slack_x / 2.0).abs() + (y - slack_y / 2.0).abs()) / (sw + sh);
@@ -2406,7 +2416,6 @@ fn frame_photo(
 fn frame_cuts(p: &BookPhoto, tw: f64, th: f64, reserve: f64) -> bool {
     p.width > 0
         && p.height > 0
-        && (!p.family.is_empty() || !p.faces.is_empty())
         && frame_photo(
             p,
             (f64::from(p.width), f64::from(p.height)),
@@ -2420,20 +2429,9 @@ fn frame_cuts(p: &BookPhoto, tw: f64, th: f64, reserve: f64) -> bool {
 /// The source window (x, y, w, h in pixels) a cover-fit of an `sw`x`sh`
 /// photo into a `tw`x`th` cell keeps: as many faces as fit, biggest
 /// first, each with its head room, centred between them; centred on the
-/// photo when it has none. Also whether a face was left out or cut.
-#[cfg(test)]
-fn face_window(
-    sw: f64,
-    sh: f64,
-    tw: f64,
-    th: f64,
-    faces: &[FaceBox],
-) -> ((f64, f64, f64, f64), bool) {
-    face_window_clear(sw, sh, tw, th, faces, 0.0)
-}
-
-/// [`face_window`] keeping faces above a band of `reserve` (a fraction of
-/// the cell's height) at its bottom, where the page's caption strip lies.
+/// photo when it has none. Faces stay above a band of `reserve` (a
+/// fraction of the cell's height) at its bottom, where the page's caption
+/// strip lies. Also whether a face was left out or cut.
 fn face_window_clear(
     sw: f64,
     sh: f64,
@@ -3144,12 +3142,9 @@ fn write_typst_and_compile(
             } else {
                 (14, 8)
             };
-            // "…for 8 years. · Paradox Singapore": no full stop before a
-            // separator.
-            let clean: Vec<&str> = lines
-                .iter()
-                .map(|l| l.trim_end().trim_end_matches('.'))
-                .collect();
+            // [`page_caption`] already punctuates: "…for 8 years. ·
+            // Paradox Singapore" keeps its full stop.
+            let clean: Vec<&str> = lines.iter().map(|l| l.trim_end()).collect();
             let title_page = texts.titles.contains(&page_no);
             if title_page && clean.len() > 1 {
                 // The day heading on its own line; the owner's words and
@@ -3949,6 +3944,17 @@ mod tests {
             shot("menu", 4, false, true),
         ];
         assert_eq!(lone_scenery(&photos), ["food"]);
+    }
+
+    /// [`face_window_clear`] with no caption strip.
+    fn face_window(
+        sw: f64,
+        sh: f64,
+        tw: f64,
+        th: f64,
+        faces: &[FaceBox],
+    ) -> ((f64, f64, f64, f64), bool) {
+        face_window_clear(sw, sh, tw, th, faces, 0.0)
     }
 
     #[test]

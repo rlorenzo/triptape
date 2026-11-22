@@ -99,13 +99,12 @@ pub struct Asset {
     pub faces: Option<FaceSignals>,
 }
 
-/// A named person's region in a photo, from the owner's photo library
+/// A named person's region in a photo (never the name itself), from the owner's photo library
 /// (Apple Photos' face tags): who matters in the frame. Normalised to the
 /// upright photo, top-left origin. `body` marks a region known only from
 /// the person's body (no face found), whose top stands in for the head.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct KnownFace {
-    pub name: String,
     pub x: f32,
     pub y: f32,
     pub w: f32,

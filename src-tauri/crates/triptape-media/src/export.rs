@@ -478,21 +478,19 @@ fn book_heading_place(
     ch: &triptape_core::types::Chapter,
     itin: &triptape_core::itinerary::Itinerary,
     ships: &[String],
-    by_id: &HashMap<&str, &triptape_core::types::Asset>,
+    by_id: &HashMap<String, triptape_core::types::Asset>,
 ) -> Option<String> {
     let place = ch.place.as_deref()?;
-    let shots: Vec<&triptape_core::types::Asset> = ch
-        .asset_ids
-        .iter()
-        .filter_map(|id| by_id.get(id.as_str()).copied())
-        .collect();
+    let shots: Vec<&triptape_core::types::Asset> =
+        ch.asset_ids.iter().filter_map(|id| by_id.get(id)).collect();
     let day = shots.iter().find_map(|a| asset_day(a))?;
     if ships.iter().any(|s| s == place) {
         return itin
             .port_call(day)
             .map(|port| format!("{place} \u{b7} {port}"));
     }
-    if ships.iter().any(|s| place.contains(s.as_str())) {
+    // A boarding day (`… Embarkation`) keeps its own heading.
+    if triptape_core::itinerary::is_ship_place(ships, place) {
         return None;
     }
     // The middle of the day's fixes: a day trip out of the city (Kamakura
@@ -918,8 +916,6 @@ fn export_inner(
             .as_ref()
             .map(|i| i.cruises().into_iter().map(|c| c.ship).collect())
             .unwrap_or_default();
-        let by_id: HashMap<&str, &triptape_core::types::Asset> =
-            assets.iter().map(|a| (a.id.as_str(), a)).collect();
         let chapter_titles: Vec<String> = plan
             .chapters
             .iter()
@@ -930,9 +926,10 @@ fn export_inner(
                     .and_then(|itin| book_heading_place(ch, itin, &ships, &by_id));
                 match place {
                     Some(place) => {
-                        let mut named = ch.clone();
-                        named.place = Some(place);
-                        crate::titlecard::chapter_book_title(&named)
+                        crate::titlecard::chapter_book_title(&triptape_core::types::Chapter {
+                            place: Some(place),
+                            ..ch.clone()
+                        })
                     }
                     None => crate::titlecard::chapter_book_title(ch),
                 }
@@ -1096,8 +1093,8 @@ mod tests {
             shot("kamakura", 1_791_169_200, (35.3192, 139.5467)),
             shot("ship", 1_791_687_600, (34.65, 135.43)),
         ];
-        let by_id: HashMap<&str, &triptape_core::types::Asset> =
-            assets.iter().map(|a| (a.id.as_str(), a)).collect();
+        let by_id: HashMap<String, triptape_core::types::Asset> =
+            assets.into_iter().map(|a| (a.id.clone(), a)).collect();
         let chapter = |id: &str, place: &str| triptape_core::types::Chapter {
             title: String::new(),
             asset_ids: vec![id.to_string()],
@@ -1119,6 +1116,8 @@ mod tests {
         // the chapter's own place.
         assert_eq!(heading("kamakura", "Kotoku-in"), None);
         assert_eq!(heading("asakusa", "Tokyo Tower"), None);
+        // A boarding day keeps its own heading.
+        assert_eq!(heading("ship", "Carnival Luminosa Embarkation"), None);
     }
 
     #[test]

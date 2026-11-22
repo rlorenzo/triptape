@@ -510,18 +510,22 @@ impl Itinerary {
         })
     }
 
+    /// Stops active on `day` whose label the book may name (not hidden).
+    fn labelled_on(&self, day: NaiveDate) -> impl Iterator<Item = &ItinStop> {
+        self.stops
+            .iter()
+            .filter(move |s| !s.hide_label && s.active_on(day))
+    }
+
     /// The stop the trip is at on `day` (a city or a port call, not home),
     /// by its label, unless hidden, or when `at` (where the day's photos
     /// were) lies beyond [`STOP_NEAR_M`] of it: a day trip out of the city.
     pub fn stop_on(&self, day: NaiveDate, at: Option<(f64, f64)>) -> Option<String> {
-        self.stops
-            .iter()
+        self.labelled_on(day)
             // Near `at` inside the search: a travel day has both the stop
             // left and the stop reached active.
             .find(|s| {
                 s.kind != StopKind::Home
-                    && !s.hide_label
-                    && s.active_on(day)
                     && at.is_none_or(|p| crate::geo::haversine_m(p, (s.lat, s.lon)) <= STOP_NEAR_M)
             })
             .map(|s| s.label.clone())
@@ -530,9 +534,8 @@ impl Itinerary {
     /// The port the ship calls at on `day`, by its label, if any (and
     /// not hidden): the book names it beside the ship on a port day.
     pub fn port_call(&self, day: NaiveDate) -> Option<String> {
-        self.stops
-            .iter()
-            .find(|s| s.kind == StopKind::Port && !s.hide_label && s.active_on(day))
+        self.labelled_on(day)
+            .find(|s| s.kind == StopKind::Port)
             .map(|s| s.label.clone())
     }
 

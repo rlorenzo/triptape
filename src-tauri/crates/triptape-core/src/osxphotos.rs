@@ -430,19 +430,8 @@ const KNOWN_FACE_MATCH_SECS: i64 = 120;
 /// `IMG_1208 (1).HEIC` → `img_1208`. `None` for an `_edited` file, whose
 /// crop may differ from the original the regions describe.
 fn library_stem(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_string_lossy().to_lowercase();
-    if stem.ends_with("_edited") {
-        return None;
-    }
-    let base = match stem.rsplit_once(" (") {
-        Some((b, n))
-            if n.ends_with(')') && n[..n.len() - 1].bytes().all(|c| c.is_ascii_digit()) =>
-        {
-            b.to_string()
-        }
-        _ => stem,
-    };
-    Some(base)
+    let (stem, edit) = crate::cluster::edit_stem(&path.file_name()?.to_string_lossy());
+    (!edit).then_some(stem)
 }
 
 /// Named people's regions per trip asset, from `osxphotos query --json`
@@ -521,8 +510,13 @@ fn known_face(f: &serde_json::Value) -> Option<crate::types::KnownFace> {
     let num = |v: &serde_json::Value, k: &str| {
         v.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32
     };
-    let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    if name.is_empty() || f.get("is_pet").and_then(|v| v.as_bool()) == Some(true) {
+    // Same rule as [`LibraryEntry::people`]: blank and `"_UNKNOWN_"` are
+    // strangers. The name only decides; it is never kept.
+    let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if name.is_empty()
+        || name == UNKNOWN_PERSON
+        || f.get("is_pet").and_then(|v| v.as_bool()) == Some(true)
+    {
         return None;
     }
     let area = f.get("mwg_rs_area").cloned().unwrap_or_default();
@@ -540,7 +534,6 @@ fn known_face(f: &serde_json::Value) -> Option<crate::types::KnownFace> {
         (cx, cy, bw, bh, true)
     };
     Some(crate::types::KnownFace {
-        name: name.to_string(),
         x: cx - w / 2.0,
         y: cy - h / 2.0,
         w,
@@ -588,16 +581,26 @@ mod known_face_tests {
           "face_info":[
             {"name":"Lana","is_pet":false,"mwg_rs_area":{"x":0.157,"y":0.631,"w":0.1,"h":0.135}},
             {"name":"","is_pet":false,"mwg_rs_area":{"x":0.5,"y":0.5,"w":0.1,"h":0.1}},
+            {"name":"_UNKNOWN_","is_pet":false,"mwg_rs_area":{"x":0.3,"y":0.3,"w":0.1,"h":0.1}},
             {"name":"Ailan","is_pet":false,"mwg_rs_area":{"x":0,"y":1,"w":0,"h":0},
              "body_center_x":0.732,"body_center_y":0.532,"body_width":0.162,"body_height":0.497}]}]"#;
         let faces = known_faces_from_osxphotos(json, &[a, b, old, edited]).unwrap();
         assert_eq!(faces.len(), 2, "both copies, not the 2010 file or the edit");
         let lana = &faces["a"][0];
-        assert_eq!(lana.name, "Lana");
         assert!((lana.x - 0.107).abs() < 1e-3 && (lana.y - 0.5635).abs() < 1e-3);
-        assert_eq!(faces["a"].len(), 2, "the stranger is skipped");
+        assert_eq!(faces["a"].len(), 2, "the strangers are skipped");
         let ailan = &faces["a"][1];
         assert!(ailan.body && (ailan.y - (0.468 - 0.2485)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn library_stems_drop_copy_numbers_and_skip_edits() {
+        let stem = |p: &str| library_stem(Path::new(p));
+        assert_eq!(stem("/t/IMG_1208 (1).HEIC").as_deref(), Some("img_1208"));
+        assert_eq!(stem("/t/IMG_1208.HEIC").as_deref(), Some("img_1208"));
+        assert_eq!(stem("/t/IMG_1208_edited.heic"), None);
+        assert_eq!(stem("/t/IMG_1208_edited (1).heic"), None);
+        assert_eq!(stem("/t/IMG_1208 ().HEIC").as_deref(), Some("img_1208 ()"));
     }
 
     #[test]
@@ -605,7 +608,6 @@ mod known_face_tests {
         // Orientation 6: a face left of centre in the stored frame sits
         // near the top of the upright photo.
         let mut f = crate::types::KnownFace {
-            name: "Lana".into(),
             x: 0.183,
             y: 0.477,
             w: 0.087,

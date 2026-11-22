@@ -101,8 +101,7 @@ CREATE TABLE IF NOT EXISTS people (
     face_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS known_faces (
-    asset_id TEXT NOT NULL,
-    name TEXT NOT NULL,
+    asset_id TEXT NOT NULL REFERENCES assets(id),
     x REAL NOT NULL,
     y REAL NOT NULL,
     w REAL NOT NULL,
@@ -256,6 +255,21 @@ impl Db {
     fn init(conn: Connection) -> Result<Self, String> {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| e.to_string())?;
+        // Early builds kept each known face's person name; names are
+        // personal data and never stored, so that table goes (its regions
+        // come back with the next `triptape faces`).
+        let named_faces = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('known_faces') WHERE name='name'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| e.to_string())?
+            > 0;
+        if named_faces {
+            conn.execute("DROP TABLE known_faces", [])
+                .map_err(|e| e.to_string())?;
+        }
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         // Migrations for DBs created before capture timezones, embedded
         // user captions, people counts/signatures, library scores, image
@@ -339,25 +353,35 @@ impl Db {
         Ok(())
     }
 
-    /// Replace the known faces (named people's regions from the photo
-    /// library) of the given assets; assets absent from `faces` keep theirs.
+    /// Replace a project's known faces (named people's regions from the
+    /// photo library) with `faces`; its assets absent from `faces` lose
+    /// theirs (their tags were removed).
     pub fn replace_known_faces(
         &self,
+        project_id: &str,
         faces: &HashMap<String, Vec<crate::types::KnownFace>>,
     ) -> Result<(), String> {
         let tx = self
             .conn
             .unchecked_transaction()
             .map_err(|e| e.to_string())?;
-        for (asset, list) in faces {
-            tx.execute("DELETE FROM known_faces WHERE asset_id=?1", params![asset])
-                .map_err(|e| e.to_string())?;
-            for f in list {
-                tx.execute(
-                    "INSERT INTO known_faces (asset_id,name,x,y,w,h,body) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                    params![asset, f.name, f.x, f.y, f.w, f.h, i64::from(f.body)],
+        tx.execute(
+            "DELETE FROM known_faces WHERE asset_id IN (SELECT id FROM assets WHERE project_id=?1)",
+            params![project_id],
+        )
+        .map_err(|e| e.to_string())?;
+        {
+            let mut insert = tx
+                .prepare_cached(
+                    "INSERT INTO known_faces (asset_id,x,y,w,h,body) VALUES (?1,?2,?3,?4,?5,?6)",
                 )
                 .map_err(|e| e.to_string())?;
+            for (asset, list) in faces {
+                for f in list {
+                    insert
+                        .execute(params![asset, f.x, f.y, f.w, f.h, i64::from(f.body)])
+                        .map_err(|e| e.to_string())?;
+                }
             }
         }
         tx.commit().map_err(|e| e.to_string())
@@ -371,7 +395,7 @@ impl Db {
         let mut st = self
             .conn
             .prepare(
-                "SELECT k.asset_id,k.name,k.x,k.y,k.w,k.h,k.body FROM known_faces k JOIN assets a ON a.id=k.asset_id WHERE a.project_id=?1",
+                "SELECT k.asset_id,k.x,k.y,k.w,k.h,k.body FROM known_faces k JOIN assets a ON a.id=k.asset_id WHERE a.project_id=?1",
             )
             .map_err(|e| e.to_string())?;
         let rows = st
@@ -379,12 +403,11 @@ impl Db {
                 Ok((
                     r.get::<_, String>(0)?,
                     crate::types::KnownFace {
-                        name: r.get(1)?,
-                        x: r.get::<_, f64>(2)? as f32,
-                        y: r.get::<_, f64>(3)? as f32,
-                        w: r.get::<_, f64>(4)? as f32,
-                        h: r.get::<_, f64>(5)? as f32,
-                        body: r.get::<_, i64>(6)? != 0,
+                        x: r.get::<_, f64>(1)? as f32,
+                        y: r.get::<_, f64>(2)? as f32,
+                        w: r.get::<_, f64>(3)? as f32,
+                        h: r.get::<_, f64>(4)? as f32,
+                        body: r.get::<_, i64>(5)? != 0,
                     },
                 ))
             })
@@ -1840,7 +1863,6 @@ mod tests {
         );
         db.upsert_asset(&p.id, &a).unwrap();
         let face = crate::types::KnownFace {
-            name: "Lana".into(),
             x: 0.1,
             y: 0.5,
             w: 0.1,
@@ -1848,10 +1870,13 @@ mod tests {
             body: false,
         };
         let faces: HashMap<String, Vec<_>> = [(a.id.clone(), vec![face.clone()])].into();
-        db.replace_known_faces(&faces).unwrap();
-        db.replace_known_faces(&faces).unwrap();
+        db.replace_known_faces(&p.id, &faces).unwrap();
+        db.replace_known_faces(&p.id, &faces).unwrap();
         let back = db.known_faces(&p.id).unwrap();
         assert_eq!(back[&a.id], vec![face]);
+        // Tags removed in Photos: a re-import without the asset clears it.
+        db.replace_known_faces(&p.id, &HashMap::new()).unwrap();
+        assert!(db.known_faces(&p.id).unwrap().is_empty());
     }
 
     #[test]
