@@ -254,8 +254,9 @@ pub const COLLAGE_WINDOW_SECS: i64 = 30 * 60;
 pub struct GroupSlot<C> {
     /// The entry's chapter; a collage never spans two chapters.
     pub chapter: C,
-    /// Whether the entry may share a collage: [`collage_eligible`] and not
-    /// set to play on its own by the user.
+    /// Whether the entry may share a collage: a [`Candidacy::Plain`]
+    /// entry, or a [`Candidacy::IfJoined`] one the user joined, and not set
+    /// to play on its own by the user.
     pub eligible: bool,
     /// The user joined this photo to the previous collage photo (the
     /// nearest earlier eligible slot), however many
@@ -278,24 +279,39 @@ pub struct GroupSlot<C> {
 /// captioned or set solo, or a photo now sits between them) do nothing,
 /// like a swap whose asset is gone. The planner estimate, the renderer and
 /// the Story editor all build their slots here.
-pub fn collage_slots<'a, C>(
+pub fn collage_slots<'a, C: PartialEq>(
     entries: impl IntoIterator<Item = (&'a str, C, Candidacy, Option<i64>)>,
     edits: &CollageEdits,
 ) -> Vec<GroupSlot<C>> {
     let entries: Vec<_> = entries.into_iter().collect();
-    // Entries that could be in a collage, in order: the user's join links
-    // run between neighbours of this list.
-    let cands: Vec<usize> = (0..entries.len())
-        .filter(|&i| entries[i].2 != Candidacy::Never && !edits.is_solo(entries[i].0))
+    let candidate = |i: usize| entries[i].2 != Candidacy::Never && !edits.is_solo(entries[i].0);
+    let plain = |i: usize| entries[i].2 == Candidacy::Plain && candidate(i);
+    // An `IfJoined` entry is eligible when it is linked to a candidate of
+    // its chapter with no plain collage photo between them: entries that
+    // play on their own (unjoined captioned or motion ones included) do
+    // not separate the two.
+    let joined_near = |i: usize, side: &mut dyn Iterator<Item = usize>| {
+        for j in side {
+            if entries[j].1 != entries[i].1 {
+                return false;
+            }
+            if candidate(j) && edits.linked(entries[j].0, entries[i].0) {
+                return true;
+            }
+            if plain(j) {
+                return false;
+            }
+        }
+        false
+    };
+    let can_join: Vec<bool> = (0..entries.len())
+        .map(|i| {
+            plain(i)
+                || (candidate(i)
+                    && (joined_near(i, &mut (0..i).rev())
+                        || joined_near(i, &mut (i + 1..entries.len()))))
+        })
         .collect();
-    let mut can_join = vec![false; entries.len()];
-    for (k, &i) in cands.iter().enumerate() {
-        let id = entries[i].0;
-        let linked_to = |j: Option<&usize>| j.is_some_and(|&j| edits.linked(entries[j].0, id));
-        can_join[i] = entries[i].2 == Candidacy::Plain
-            || linked_to(k.checked_sub(1).and_then(|k| cands.get(k)))
-            || linked_to(cands.get(k + 1));
-    }
     let mut prev: Option<&str> = None;
     entries
         .into_iter()
@@ -337,22 +353,18 @@ pub enum PlaysAlone {
     Panorama,
 }
 
-/// Why a hero entry may not join a collage, if it may not: only a still
-/// that is not a panorama and has no caption may.
+/// Why a hero entry plays on its own without the user's say, if it does:
+/// only a still that is not a panorama and has no caption joins on its own.
+/// A panorama reports [`PlaysAlone::Panorama`] whatever its caption, since a
+/// caption never makes it joinable.
 pub fn plays_alone(rendition: &Rendition, panorama: bool, captioned: bool) -> Option<PlaysAlone> {
     match rendition {
         Rendition::Clip { .. } => Some(PlaysAlone::Clip),
         Rendition::Motion { .. } => Some(PlaysAlone::Motion),
-        Rendition::Still if captioned => Some(PlaysAlone::Caption),
         Rendition::Still if panorama => Some(PlaysAlone::Panorama),
+        Rendition::Still if captioned => Some(PlaysAlone::Caption),
         Rendition::Still => None,
     }
-}
-
-/// Whether a hero entry may join a collage without the user's say
-/// ([`plays_alone`] gives none).
-pub fn collage_eligible(rendition: &Rendition, panorama: bool, captioned: bool) -> bool {
-    plays_alone(rendition, panorama, captioned).is_none()
 }
 
 /// How a hero entry may take part in a collage.
@@ -368,16 +380,21 @@ pub enum Candidacy {
     Never,
 }
 
+impl Candidacy {
+    /// The candidacy of an entry that plays alone for `why` ([`plays_alone`]).
+    pub fn of(why: Option<PlaysAlone>) -> Self {
+        match why {
+            None => Self::Plain,
+            Some(PlaysAlone::Motion | PlaysAlone::Caption) => Self::IfJoined,
+            Some(PlaysAlone::Clip | PlaysAlone::Panorama) => Self::Never,
+        }
+    }
+}
+
 /// An entry's [`Candidacy`]. The renderer, [`estimate_hero_secs`] and the
 /// Story editor all decide through this (or [`entry_candidacy`]).
 pub fn collage_candidacy(rendition: &Rendition, panorama: bool, captioned: bool) -> Candidacy {
-    match rendition {
-        Rendition::Clip { .. } => Candidacy::Never,
-        Rendition::Still if panorama => Candidacy::Never,
-        Rendition::Motion { .. } => Candidacy::IfJoined,
-        Rendition::Still if captioned => Candidacy::IfJoined,
-        Rendition::Still => Candidacy::Plain,
-    }
+    Candidacy::of(plays_alone(rendition, panorama, captioned))
 }
 
 /// [`collage_candidacy`] from what the renderer knows of an entry (see
@@ -387,11 +404,7 @@ pub fn entry_candidacy(
     aspect: Option<f64>,
     caption: Option<&str>,
 ) -> Candidacy {
-    collage_candidacy(
-        rendition,
-        aspect.is_some_and(is_panorama),
-        has_caption(caption),
-    )
+    Candidacy::of(entry_plays_alone(rendition, aspect, caption))
 }
 
 /// [`plays_alone`] from what the renderer knows of an entry: its
@@ -442,7 +455,6 @@ pub struct HeroGrouping {
     /// Per hero index: chapter and why it plays alone, if it must.
     chapter: Vec<usize>,
     alone: Vec<Option<PlaysAlone>>,
-    candidacy: Vec<Candidacy>,
     ids: Vec<String>,
     taken_at: Vec<Option<i64>>,
 }
@@ -493,16 +505,6 @@ impl HeroGrouping {
                     )
                 })
                 .collect(),
-            candidacy: hero
-                .iter()
-                .map(|e| {
-                    entry_candidacy(
-                        &e.rendition,
-                        aspect_of(&e.asset_id),
-                        plan.captions.get(&e.asset_id).map(String::as_str),
-                    )
-                })
-                .collect(),
             ids: hero.iter().map(|e| e.asset_id.clone()).collect(),
             taken_at: hero.iter().map(|e| taken_of(&e.asset_id)).collect(),
         }
@@ -524,7 +526,7 @@ impl HeroGrouping {
     /// stills and Live Photo motion can be joined too (the CLI's `--join`),
     /// but the editor does not offer them as neighbours.
     fn collage_photo(&self, hero_index: usize, collage: &CollageEdits) -> bool {
-        self.candidacy[hero_index] == Candidacy::Plain && !collage.is_solo(&self.ids[hero_index])
+        self.alone[hero_index].is_none() && !collage.is_solo(&self.ids[hero_index])
     }
 
     /// The neighbouring collage photo hero entry `i` could join, before it
@@ -569,7 +571,7 @@ impl HeroGrouping {
                 (
                     self.ids[i].as_str(),
                     self.chapter[i],
-                    self.candidacy[i],
+                    Candidacy::of(self.alone[i]),
                     self.taken_at[i],
                 )
             }),
@@ -1963,8 +1965,7 @@ pub fn build_plan_with_length(
     // few days. Fill to the minimum from the remaining best when there
     // are not enough distinct moments. Presented in story order.
     let rank_of = |a: &Asset| {
-        let motion = matches!(a.kind, AssetKind::Video)
-            || (matches!(a.kind, AssetKind::LivePhoto) && a.companion_path.is_some());
+        let motion = matches!(a.kind, AssetKind::Video) || a.has_live_motion();
         score_of(&a.id) + if motion { REEL_MOTION_BONUS } else { 0.0 }
     };
     let mut ranked: Vec<&Asset> = ordered.to_vec();
@@ -2241,7 +2242,7 @@ fn motion_picks<'a, 'c>(
 ) -> HashSet<&'a str> {
     let mut by_chapter: HashMap<&'c str, Vec<&'a Asset>> = HashMap::new();
     for a in ordered {
-        if a.kind == AssetKind::LivePhoto && a.companion_path.is_some() {
+        if a.has_live_motion() {
             by_chapter.entry(chapter_of(&a.id)).or_default().push(a);
         }
     }
@@ -2321,7 +2322,7 @@ fn score_for_asset<'s>(scores: &'s HashMap<String, Score>, a: &'s Asset) -> Opti
 /// The motion rendition of a Live Photo with a companion video: its first
 /// three seconds at most. `None` for any other asset.
 fn live_motion(a: &Asset) -> Option<Rendition> {
-    (a.kind == AssetKind::LivePhoto && a.companion_path.is_some()).then(|| Rendition::Motion {
+    a.has_live_motion().then(|| Rendition::Motion {
         trim_start: 0.0,
         trim_end: a.duration_secs.unwrap_or(3.0).clamp(0.5, 3.0),
     })
@@ -5131,19 +5132,6 @@ mod tests {
         // Captioned stills, panoramas, clips and motion picks are
         // ineligible: never grouped, never moved.
         assert_eq!(groups_of("pcms"), vec![vec![0], vec![1], vec![2], vec![3]]);
-        assert!(collage_eligible(&Rendition::Still, false, false));
-        assert!(!collage_eligible(&Rendition::Still, true, false), "pano");
-        assert!(!collage_eligible(&Rendition::Still, false, true), "caption");
-        let clip = Rendition::Clip {
-            trim_start: 0.0,
-            trim_end: 3.0,
-        };
-        assert!(!collage_eligible(&clip, false, false));
-        let motion = Rendition::Motion {
-            trim_start: 0.0,
-            trim_end: 3.0,
-        };
-        assert!(!collage_eligible(&motion, false, false));
     }
 
     #[test]
@@ -5201,6 +5189,19 @@ mod tests {
         let mut edits = CollageEdits::default();
         edits.join("x".into(), "y".into());
         assert_eq!(joined_groups(&film, &edits), [vec![0, 1], vec![2]]);
+        // An unjoined captioned entry between does not block the join.
+        let film = [("a", Plain), ("x", IfJoined), ("b", IfJoined)];
+        let mut edits = CollageEdits::default();
+        edits.join("a".into(), "b".into());
+        assert_eq!(joined_groups(&film, &edits), [vec![0, 2], vec![1]]);
+        // A stale link into another chapter does not make it eligible, so
+        // it is not grouped with its own chapter's stills either.
+        let mut edits = CollageEdits::default();
+        edits.join("a".into(), "cap".into());
+        let film = [("a", 0, Plain), ("cap", 1, IfJoined), ("b", 1, Plain)];
+        let slots = collage_slots(film.iter().map(|&(id, ch, c)| (id, ch, c, Some(0))), &edits);
+        assert!(!slots[1].eligible);
+        assert_eq!(collage_groups(&slots), [vec![0], vec![1], vec![2]]);
         // Clips and panoramas never join, whatever the edits say; a solo
         // captioned entry stays out too.
         let film = [("a", Plain), ("clip", Never)];
@@ -5467,7 +5468,7 @@ mod tests {
         );
         assert_eq!(
             entry_plays_alone(&Rendition::Still, Some(4.0), Some("x")),
-            Some(PlaysAlone::Caption)
+            Some(PlaysAlone::Panorama)
         );
         assert_eq!(plain.plays_alone(1), Some(PlaysAlone::Clip));
         // Join partners: the nearest collage photo of the chapter, never

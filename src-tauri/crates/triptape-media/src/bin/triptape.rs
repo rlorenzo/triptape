@@ -1330,10 +1330,7 @@ fn edit_cmd(args: &[String]) {
     let solos = resolve(&a.solo);
     let set_live: Setter = PlanEdits::set_motion;
     let lives = resolve(&a.live);
-    if let Some(asset) = lives
-        .iter()
-        .find(|x| !(x.kind == AssetKind::LivePhoto && x.companion_path.is_some()))
-    {
+    if let Some(asset) = lives.iter().find(|x| !x.has_live_motion()) {
         die(
             "edit",
             format!(
@@ -1368,7 +1365,7 @@ fn edit_cmd(args: &[String]) {
         (solos.clone(), "solo", set_solo, true),
         // Motion after the pins, which it may apply to.
         (resolve(&a.unlive), "unlive", set_live, false),
-        (lives, "live", set_live, true),
+        (lives.clone(), "live", set_live, true),
     ];
     let unjoins = resolve(&a.unjoin);
     let joins: Vec<(&Asset, &Asset)> = a
@@ -1545,7 +1542,7 @@ fn edit_cmd(args: &[String]) {
     if !moves.is_empty() {
         plan = edited(&edits);
     }
-    for asset in &solos {
+    for asset in solos.iter().chain(&lives) {
         if !plan.hero.iter().any(|e| e.asset_id == asset.id) {
             die("edit", format!("{} is not in the film", asset_label(asset)));
         }
