@@ -403,6 +403,31 @@ pub fn assign_transitions(
     out
 }
 
+/// The places card's list: two sights in one place (`Flower Dome, Gardens
+/// by the Bay` and `Cloud Forest, Gardens by the Bay`) are named once, by
+/// that place, where the first of them stood. A sight alone keeps its
+/// whole name.
+fn credit_places(places: Vec<String>) -> Vec<String> {
+    let parent = |p: &str| p.rsplit_once(", ").map(|(_, rest)| rest.to_string());
+    let shared = |p: &str| {
+        parent(p).filter(|par| {
+            places
+                .iter()
+                .filter(|q| parent(q).as_ref() == Some(par))
+                .count()
+                > 1
+        })
+    };
+    let mut out: Vec<String> = vec![];
+    for p in &places {
+        let name = shared(p).unwrap_or_else(|| p.clone());
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 /// Resolved source files for one plan entry (export layer fills this).
 #[derive(Debug, Clone)]
 pub struct ResolvedEntry {
@@ -837,6 +862,7 @@ pub fn render_hero_video(
             places.push(p.to_string());
         }
     }
+    let places = credit_places(places);
 
     // Hero entries (short mode: cap the whole film at 30 s).
     // Fixed segments (title, optional map, closing cards) come out of the
@@ -3082,6 +3108,27 @@ fn graph_segment_args(img: &Path, dur: f64, graph: String, out: &Path) -> Vec<St
 mod tests {
     use super::*;
     use triptape_core::plan::{CAPTION_MAX_SECS, PLACES_CARD_MAX_SECS};
+
+    #[test]
+    fn credits_name_a_shared_parent_place_once() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            credit_places(names(&[
+                "Marina Bay Sands",
+                "Flower Dome, Gardens by the Bay",
+                "Cloud Forest, Gardens by the Bay",
+                "Gardens by the Bay",
+                "A-Mei Tea House, Jiufen",
+                "Ontario, California",
+            ])),
+            names(&[
+                "Marina Bay Sands",
+                "Gardens by the Bay",
+                "A-Mei Tea House, Jiufen",
+                "Ontario, California",
+            ])
+        );
+    }
 
     #[test]
     fn a_long_film_is_joined_in_chunks_on_the_same_timeline() {
