@@ -836,7 +836,11 @@ fn export_inner(
             };
             let chapter = chapter_of.get(a.id.as_str()).copied();
             let day = asset_day(a).zip(trip_start).map(|(d, s)| trip_day(d, s));
-            let place = places.get(&a.id).cloned();
+            // "Kamakura, Japan" (the nearest town, off the itinerary)
+            // prints as "Kamakura": the book is all one trip abroad.
+            let place = places
+                .get(&a.id)
+                .map(|p| triptape_core::geo::without_country(p).to_string());
             let itin = opts.itinerary.as_ref();
             let located;
             let spot = match (a.gps, borrowed.get(a.id.as_str())) {
