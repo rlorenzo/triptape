@@ -406,23 +406,29 @@ pub fn assign_transitions(
 /// The places card's list: two sights in one place (`Flower Dome, Gardens
 /// by the Bay` and `Cloud Forest, Gardens by the Bay`) are named once, by
 /// that place, where the first of them stood. A sight alone keeps its
-/// whole name.
-fn credit_places(places: Vec<String>) -> Vec<String> {
-    let parent = |p: &str| p.rsplit_once(", ").map(|(_, rest)| rest.to_string());
-    let shared = |p: &str| {
-        parent(p).filter(|par| {
-            places
-                .iter()
-                .filter(|q| parent(q).as_ref() == Some(par))
-                .count()
-                > 1
-        })
-    };
+/// whole name. A country is no such place: `Tokyo, Japan` and
+/// `Kyoto, Japan` stay two cities.
+fn credit_places(places: &[String]) -> Vec<String> {
+    fn parent(p: &str) -> Option<&str> {
+        if triptape_core::geo::without_country(p) != p {
+            return None;
+        }
+        p.rsplit_once(", ")
+            .map(|(_, par)| par)
+            .filter(|par| !par.is_empty())
+    }
+    let mut sights: HashMap<&str, usize> = HashMap::new();
+    for par in places.iter().filter_map(|p| parent(p.as_str())) {
+        *sights.entry(par).or_default() += 1;
+    }
     let mut out: Vec<String> = vec![];
-    for p in &places {
-        let name = shared(p).unwrap_or_else(|| p.clone());
-        if !out.contains(&name) {
-            out.push(name);
+    for p in places {
+        let name = match parent(p) {
+            Some(par) if sights[par] > 1 => par,
+            _ => p.as_str(),
+        };
+        if !out.iter().any(|q| q == name) {
+            out.push(name.to_string());
         }
     }
     out
@@ -862,7 +868,7 @@ pub fn render_hero_video(
             places.push(p.to_string());
         }
     }
-    let places = credit_places(places);
+    let places = credit_places(&places);
 
     // Hero entries (short mode: cap the whole film at 30 s).
     // Fixed segments (title, optional map, closing cards) come out of the
@@ -3113,19 +3119,23 @@ mod tests {
     fn credits_name_a_shared_parent_place_once() {
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            credit_places(names(&[
+            credit_places(&names(&[
                 "Marina Bay Sands",
                 "Flower Dome, Gardens by the Bay",
                 "Cloud Forest, Gardens by the Bay",
                 "Gardens by the Bay",
                 "A-Mei Tea House, Jiufen",
                 "Ontario, California",
+                "Tokyo, Japan",
+                "Kyoto, Japan",
             ])),
             names(&[
                 "Marina Bay Sands",
                 "Gardens by the Bay",
                 "A-Mei Tea House, Jiufen",
                 "Ontario, California",
+                "Tokyo, Japan",
+                "Kyoto, Japan",
             ])
         );
     }
