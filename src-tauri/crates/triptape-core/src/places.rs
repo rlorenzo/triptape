@@ -143,27 +143,29 @@ pub fn chapter_attraction(fixes: &[(f64, f64)], home: &HashSet<String>) -> Optio
 pub const BORROW_FIX_SECS: i64 = 30 * 60;
 
 /// For each asset without GPS, the fix of the nearest-in-time asset of
-/// the same day that has one, within [`BORROW_FIX_SECS`].
+/// the same day and camera that has one, within [`BORROW_FIX_SECS`]. A
+/// file with no camera counter (a shared image) borrows nothing.
 pub fn borrowed_fixes(assets: &[Asset]) -> HashMap<&str, (f64, f64)> {
-    let mut fixed: Vec<(i64, Option<jiff::civil::Date>, (f64, f64))> = assets
-        .iter()
-        .filter_map(|a| Some((a.taken_at?, asset_day(a), a.gps?)))
-        .collect();
-    fixed.sort_by_key(|f| f.0);
+    // Only from the same camera: on a day the group split, another
+    // phone's fix is another place (Rex in the city, the others aboard).
+    let stream = crate::party::camera_streams(assets);
     let mut out = HashMap::new();
-    for a in assets.iter().filter(|a| a.gps.is_none()) {
-        let (Some(t), day) = (a.taken_at, asset_day(a)) else {
+    for (i, a) in assets.iter().enumerate().filter(|(_, a)| a.gps.is_none()) {
+        let (Some(t), day, Some(s)) = (a.taken_at, asset_day(a), stream[i]) else {
             continue;
         };
-        let k = fixed.partition_point(|f| f.0 < t);
-        let near = [k.checked_sub(1), Some(k)]
-            .into_iter()
-            .flatten()
-            .filter_map(|j| fixed.get(j))
-            .filter(|f| f.1 == day && (f.0 - t).abs() <= BORROW_FIX_SECS)
-            .min_by_key(|f| (f.0 - t).abs());
-        if let Some(f) = near {
-            out.insert(a.id.as_str(), f.2);
+        let near = assets
+            .iter()
+            .enumerate()
+            .filter(|(j, b)| {
+                stream[*j] == Some(s)
+                    && b.gps.is_some()
+                    && asset_day(b) == day
+                    && b.taken_at.is_some_and(|u| (u - t).abs() <= BORROW_FIX_SECS)
+            })
+            .min_by_key(|(_, b)| b.taken_at.map_or(i64::MAX, |u| (u - t).abs()));
+        if let Some((_, b)) = near {
+            out.insert(a.id.as_str(), b.gps.expect("filtered"));
         }
     }
     out
@@ -301,15 +303,25 @@ mod tests {
     fn a_shot_without_gps_stands_where_the_nearest_shot_was() {
         let noon = 1_791_288_000;
         let ship = (33.20, 126.51);
-        let assets = vec![
+        let mut assets = vec![
             photo("a", noon, Some(ship)),
             photo("b", noon + 600, None),
             photo("c", noon + 4 * 3600, None),
+            photo("d", noon + 300, None),
         ];
+        for (a, name) in assets.iter_mut().zip([
+            "IMG_1001.HEIC",
+            "IMG_1002.HEIC",
+            "IMG_1003.HEIC",
+            "81424954837__X.heic",
+        ]) {
+            a.path = name.into();
+        }
         let fixes = borrowed_fixes(&assets);
         assert_eq!(fixes.get("b"), Some(&ship));
         assert!(!fixes.contains_key("c"), "hours later: no fix");
         assert!(!fixes.contains_key("a"));
+        assert!(!fixes.contains_key("d"), "no camera counter: no borrowing");
     }
 
     #[test]

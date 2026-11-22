@@ -1516,12 +1516,19 @@ pub fn render_book(
                     // best of the last days with people in it, not whatever
                     // came last (an airline tray), and never one from the
                     // last few pages.
-                    let recent: Vec<&str> = shown
+                    // Recent = the photos on the last few pages, plus the
+                    // cover's tiles: neither should come round again here.
+                    let mut recent: Vec<&str> = order[..cursor.min(order.len())]
                         .iter()
                         .rev()
                         .take(CLOSING_SKIPS_LAST)
-                        .map(|p| p.asset_id.as_str())
+                        .map(|&i| photos[i].asset_id.as_str())
                         .collect();
+                    recent.extend(
+                        cover_picks(photos, &opening)
+                            .into_iter()
+                            .map(|i| photos[i].asset_id.as_str()),
+                    );
                     let last_day = photos.iter().filter_map(|p| p.day).max();
                     let last = photos
                         .iter()
