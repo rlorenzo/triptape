@@ -717,13 +717,12 @@ fn chapter_name(
     // A chapter spanning several named places (Mount Faber, then the
     // Oceanarium) is named for the first one visited, as a day is named
     // for its first sight.
-    let visited: Vec<&str> = named
+    let mut visited = named
         .iter()
         .filter(|(_, c)| *c >= min_shots.max(1))
-        .map(|(n, _)| *n)
-        .collect();
-    if visited.len() > 1 {
-        return visited[0].to_string();
+        .map(|(n, _)| *n);
+    if let (Some(first), Some(_)) = (visited.next(), visited.next()) {
+        return first.to_string();
     }
     if let Some((name, _)) =
         crate::places::most_counted(named).filter(|(_, c)| 2 * c >= members.len())

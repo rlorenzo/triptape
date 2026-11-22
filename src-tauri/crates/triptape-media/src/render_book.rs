@@ -99,6 +99,10 @@ pub struct BookPhoto {
     /// any scored pick and never dropped silently. The chapter-place
     /// fallback caption does not count.
     pub keep: bool,
+    /// Pinned by the owner (`--book` or `--cover`): placed even when its
+    /// caption repeats another kept photo's. Its caption is the owner's
+    /// only when they wrote one (see [`BookPhoto::own_caption`]).
+    pub pinned: bool,
     /// Capture time (unix seconds), perceptual hash and tagged people: what
     /// [`BookPhoto::repeats`] needs to tell a near-identical shot of the same
     /// people from a new scene.
@@ -140,6 +144,12 @@ pub struct BookPhoto {
 }
 
 impl BookPhoto {
+    /// Whether the caption is the owner's words: a pin without a caption
+    /// of its own falls back to its place name, which is not.
+    fn own_caption(&self) -> bool {
+        self.keep && !(self.pinned && self.caption == self.place)
+    }
+
     /// A 0x0 neutral-score photo with nothing set, for tests to fill in
     /// with struct-update syntax.
     #[cfg(test)]
@@ -153,6 +163,7 @@ impl BookPhoto {
             chapter: None,
             score: NEUTRAL_SCORE,
             keep: false,
+            pinned: false,
             taken_at: None,
             phash: None,
             people_sig: None,
@@ -929,7 +940,8 @@ fn distinct_curated(photos: &[BookPhoto], scene: &[usize]) -> Vec<usize> {
             .unwrap_or_default()
     };
     let mut best: HashMap<(usize, String), usize> = HashMap::new();
-    for i in (0..photos.len()).filter(|&i| photos[i].keep) {
+    // Pins always stay: only captioned photos are told once per moment.
+    for i in (0..photos.len()).filter(|&i| photos[i].keep && !photos[i].pinned) {
         best.entry((scene[i], text(i)))
             .and_modify(|b| {
                 if photos[i].score > photos[*b].score {
@@ -951,6 +963,7 @@ fn distinct_curated(photos: &[BookPhoto], scene: &[usize]) -> Vec<usize> {
         *n += 1;
         *n <= MAX_SAME_CAPTION_PER_DAY
     });
+    kept.extend((0..photos.len()).filter(|&i| photos[i].pinned));
     kept.sort_unstable();
     kept
 }
@@ -969,18 +982,17 @@ fn scenes(photos: &[BookPhoto]) -> Vec<usize> {
     let mut scene: Vec<usize> = Vec::with_capacity(photos.len());
     let mut next = 0;
     for (i, p) in photos.iter().enumerate() {
+        let within = |j: usize, secs: i64| {
+            photos[j]
+                .taken_at
+                .zip(p.taken_at)
+                .is_some_and(|(a, b)| (b - a).abs() <= secs)
+        };
         let linked = (0..i)
             .rev()
-            .take_while(|&j| match (photos[j].taken_at, p.taken_at) {
-                (Some(a), Some(b)) => (b - a).abs() <= SCENE_EMBED_SECS,
-                _ => false,
-            })
+            .take_while(|&j| within(j, SCENE_EMBED_SECS))
             .find(|&j| {
-                let near = match (photos[j].taken_at, p.taken_at) {
-                    (Some(a), Some(b)) => (b - a).abs() <= SAME_MOMENT_SECS,
-                    _ => false,
-                };
-                (near && photos[j].repeats(p))
+                (within(j, SAME_MOMENT_SECS) && photos[j].repeats(p))
                     || triptape_core::embedding::same_scene(
                         photos[j].embedding.as_ref(),
                         p.embedding.as_ref(),
@@ -1241,15 +1253,13 @@ pub fn render_book(
     // A photo alone in its stretch (its day or named place) would fill a
     // page by itself: worth it for people or the owner's caption, not for
     // a plate of food or a candy bucket.
-    let lone: Vec<String> = lone_scenery(&pruned);
-    if !lone.is_empty() {
-        for id in &lone {
-            fallbacks.push(format!(
-                "book: {id} left out (alone on its page, no people)"
-            ));
-        }
-        pruned.retain(|p| !lone.contains(&p.asset_id));
+    let lone: HashSet<String> = lone_scenery(&pruned).into_iter().collect();
+    for id in &lone {
+        fallbacks.push(format!(
+            "book: {id} left out (alone on its page, no people)"
+        ));
     }
+    pruned.retain(|p| !lone.contains(&p.asset_id));
     // Faces first, so page layouts can keep them whole: the detector runs
     // once per photo here and the painters reuse it.
     let found: std::cell::RefCell<HashMap<String, Vec<FaceBox>>> = Default::default();
@@ -1299,9 +1309,10 @@ pub fn render_book(
     // The book's first pages open the trip: the cover shows other photos,
     // so turning the cover never shows the same shot again straight away.
     let opening: Vec<usize> = order.iter().take(COVER_SKIPS_FIRST).copied().collect();
+    let cover_tiles = cover_picks(photos, &opening);
     let cover = draw_cover_collage(
         photos,
-        &opening,
+        &cover_tiles,
         (tw, th),
         opts,
         &fit,
@@ -1408,17 +1419,10 @@ pub fn render_book(
                         draw_fullbleed(slot[0], (tw, th), strip, &out, &fit, &mut fallbacks)?
                     }
                     _ => {
-                        // The strip is below the grid now: nothing to clear.
-                        let bars = caption_bars(&pending_cells, slot.len(), 0, opts.preset, th);
-                        draw_grid(
-                            &slot,
-                            &cells,
-                            (tw, th),
-                            (0, &bars),
-                            &out,
-                            &fit,
-                            &mut fallbacks,
-                        )?;
+                        // The page strip is below the grid: only the cell
+                        // captions need bands of their own.
+                        let bars = caption_bars(&pending_cells, slot.len(), opts.preset, th);
+                        draw_grid(&slot, &cells, (tw, th), &bars, &out, &fit, &mut fallbacks)?;
                         if !pending_cells.is_empty() {
                             cell_captions.insert(
                                 page_no,
@@ -1426,7 +1430,7 @@ pub fn render_book(
                                     .drain(..)
                                     // In its own band below the photo
                                     // (`caption_bars`): never over it.
-                                    .map(|(_, rect, text)| (rect, text, false))
+                                    .map(|(_, rect, text)| (rect, text))
                                     .collect(),
                             );
                         }
@@ -1515,20 +1519,14 @@ pub fn render_book(
                     // The closing photo repeats one from the book: make it the
                     // best of the last days with people in it, not whatever
                     // came last (an airline tray), and never one from the
-                    // last few pages.
-                    // Recent = the photos on the last few pages, plus the
-                    // cover's tiles: neither should come round again here.
-                    let mut recent: Vec<&str> = order[..cursor.min(order.len())]
+                    // last few pages or the cover's tiles.
+                    let recent: HashSet<&str> = order[..cursor.min(order.len())]
                         .iter()
                         .rev()
                         .take(CLOSING_SKIPS_LAST)
+                        .chain(&cover_tiles)
                         .map(|&i| photos[i].asset_id.as_str())
                         .collect();
-                    recent.extend(
-                        cover_picks(photos, &opening)
-                            .into_iter()
-                            .map(|i| photos[i].asset_id.as_str()),
-                    );
                     let last_day = photos.iter().filter_map(|p| p.day).max();
                     let last = photos
                         .iter()
@@ -1860,8 +1858,7 @@ type CellCaption = (usize, String);
 
 /// Per page number: captions on grid photos, each with its photo's cell
 /// `(x, y, w, h)` as fractions of the page.
-/// The bool puts the caption at the cell's top (a face is low in it).
-type CellCaptions = HashMap<usize, Vec<(Rect, String, bool)>>;
+type CellCaptions = HashMap<usize, Vec<(Rect, String)>>;
 
 /// Everything burned over the page JPEGs, keyed by page number.
 struct PageTexts {
@@ -1881,7 +1878,7 @@ fn grid_captions(slot: &[&BookPhoto]) -> (Vec<String>, Vec<CellCaption>) {
     let mut cells = vec![];
     let mut lines: Vec<String> = vec![];
     for (k, p) in slot.iter().enumerate() {
-        match caption_of(p).into_iter().next().filter(|_| p.keep) {
+        match caption_of(p).into_iter().next().filter(|_| p.own_caption()) {
             // The user's words go on the photo; its place still joins the
             // page's location strip (the lounge, the ramen hall). The same
             // words on several photos of one page print once.
@@ -1920,7 +1917,7 @@ fn page_caption(slot: &[&BookPhoto], kind: PageKind) -> Vec<String> {
         // words already name it ("…treats in Singapore · Singapore").
         let words = caption_of(p);
         let place = p.place.clone().filter(|pl| {
-            p.keep
+            p.own_caption()
                 && !words
                     .iter()
                     .any(|w| w.to_lowercase().contains(&pl.to_lowercase()))
@@ -2040,13 +2037,12 @@ fn solid(w: u32, h: u32, c: Rgb<u8>) -> RgbImage {
 /// faces (with room above for the head) in frame. When they cannot all
 /// fit, the biggest stay and the render notes the photo.
 fn fit_photo(p: &BookPhoto, tw: u32, th: u32, fit: &Fit, fb: &mut Vec<String>) -> RgbImage {
-    fit_photo_marked(p, p.crop_focus, tw, th, 0.0, fit, fb).0
+    fit_photo_focused(p, p.crop_focus, tw, th, 0.0, fit, fb)
 }
 
 /// [`fit_photo`] centred on `focus` (fractions of the photo) when set,
-/// plus whether a face sits in the cell's bottom band, where a cell
-/// caption would cover it (the caption then goes on top).
-fn fit_photo_marked(
+/// else keeping faces above a `reserve` band (see [`face_window_clear`]).
+fn fit_photo_focused(
     p: &BookPhoto,
     focus: Option<(f32, f32)>,
     tw: u32,
@@ -2054,7 +2050,7 @@ fn fit_photo_marked(
     reserve: f64,
     fit: &Fit,
     fb: &mut Vec<String>,
-) -> (RgbImage, bool) {
+) -> RgbImage {
     let src = load(p, fit.ffmpeg, fb);
     let faces = match fit.faces {
         Some(f) => fit
@@ -2085,20 +2081,8 @@ fn fit_photo_marked(
             p.display_name()
         ));
     }
-    let (x, y, w, h) = window;
-    let busy = faces.iter().any(|f| {
-        let (fx0, fx1) = (f64::from(f.x) * sw, f64::from(f.x + f.w) * sw);
-        let (fy0, fy1) = (f64::from(f.y) * sh, f64::from(f.y + f.h) * sh);
-        let seen = fx1 > x && fx0 < x + w;
-        let (top, bottom) = ((fy0 - y) / h, (fy1 - y) / h);
-        seen && top < 1.0 && bottom > CAPTION_BAND
-    });
-    (crop_window(&src, window, tw, th), busy)
+    crop_window(&src, window, tw, th)
 }
-
-/// Where a cell caption sits, as a fraction of the cell's height from its
-/// top: a face reaching below this would be covered.
-const CAPTION_BAND: f64 = 0.75;
 
 /// The source window a cover-fit into `tw`x`th` keeps, centred on `focus`
 /// (fractions of the photo) as far as the photo's edges allow.
@@ -2276,7 +2260,7 @@ fn draw_fullbleed(
         return save_jpg(&contain_on_page(&src, tw, th, strip_px), out);
     }
     save_jpg(
-        &fit_photo_marked(p, p.crop_focus, tw, th, reserve, ff, fb).0,
+        &fit_photo_focused(p, p.crop_focus, tw, th, reserve, ff, fb),
         out,
     )
 }
@@ -2493,13 +2477,11 @@ fn draw_grid(
     slot: &[&BookPhoto],
     cells: &[Rect],
     (tw, th): (u32, u32),
-    (strip_px, bars): (u32, &[u32]),
+    bars: &[u32],
     out: &Path,
     ff: &Fit,
     fb: &mut Vec<String>,
-) -> Result<Vec<bool>, crate::MediaError> {
-    // Per photo: a face low in its cell, where a caption would cover it.
-    let mut busy = vec![];
+) -> Result<(), crate::MediaError> {
     let mut page = solid(tw, th, Rgb([18, 20, 26]));
     for (k, (p, &(x, y, w, h))) in slot.iter().zip(cells).enumerate() {
         let (x, y) = (x.round() as u32, y.round() as u32);
@@ -2511,20 +2493,10 @@ fn draw_grid(
         // below it, so the words never cover what the photo shows.
         let bar = bars.get(k).copied().unwrap_or(0).min(h / 2);
         let h = h - bar;
-        // A bottom-row cell lies under the page's caption strip (a
-        // captioned one already cleared it with its band).
-        let reserve = if bar == 0 && f64::from(y + h) >= f64::from(th) * 0.95 {
-            f64::from(strip_px) / f64::from(h.max(1))
-        } else {
-            0.0
-        };
-        let (fit, face_low) =
-            fit_photo_marked(p, p.crop_focus, w.max(1), h.max(1), reserve, ff, fb);
-        busy.push(face_low);
+        let fit = fit_photo(p, w.max(1), h.max(1), ff, fb);
         image::imageops::replace(&mut page, &fit, i64::from(x), i64::from(y));
     }
-    save_jpg(&page, out)?;
-    Ok(busy)
+    save_jpg(&page, out)
 }
 
 /// The whole route map on the page: the card is a wide film frame, and
@@ -2673,11 +2645,11 @@ fn cover_picks(photos: &[BookPhoto], opening: &[usize]) -> Vec<usize> {
     picks
 }
 
-/// Build `cover.jpg`: a mosaic of evenly-spaced trip photos with a darkened
-/// title band. Returns None (with a fallback note) when no photo decodes.
+/// Build `cover.jpg`: a mosaic of the `picks` tiles (from [`cover_picks`])
+/// above a title band. Returns None (with a fallback note) when no photo decodes.
 fn draw_cover_collage(
     photos: &[BookPhoto],
-    opening: &[usize],
+    picks: &[usize],
     (tw, th): (u32, u32),
     opts: &BookOptions,
     fit: &Fit,
@@ -2687,7 +2659,6 @@ fn draw_cover_collage(
     if photos.is_empty() {
         return None;
     }
-    let picks = cover_picks(photos, opening);
     let (cols, rows) = cover_grid(picks.len());
     let gap = 14u32;
     let tile_w = (tw - gap * (cols + 1)) / cols;
@@ -2700,11 +2671,14 @@ fn draw_cover_collage(
         let (cx, cy) = ((k as u32) % cols, (k as u32) / cols);
         let p = &photos[*pi];
         // The owner's cover focus: the tile shows that part of the photo.
+        // A centred pin (`--cover REF`, stored as 50) is no focus at all:
+        // the tile keeps its faces as any other does.
         let focus = p
             .cover_focus
+            .filter(|&fx| fx != 0.5)
             .map(|fx| (fx, p.crop_focus.map_or(0.5, |c| c.1)))
             .or(p.crop_focus);
-        let tile = fit_photo_marked(p, focus, tile_w, tile_h, 0.0, fit, fallbacks).0;
+        let tile = fit_photo_focused(p, focus, tile_w, tile_h, 0.0, fit, fallbacks);
         image::imageops::replace(
             &mut canvas,
             &tile,
@@ -2712,8 +2686,7 @@ fn draw_cover_collage(
             (gap + cy * (tile_h + gap)) as i64,
         );
     }
-    // Darken a bottom title band, then composite the Typst title over it.
-
+    // Composite the Typst title into the band below the tiles.
     match typst_text_png(
         &opts.typst_bin,
         &opts.trip_name,
@@ -2873,13 +2846,10 @@ fn write_typst_and_compile(
                 typ_escape(&text)
             ));
         }
-        for (rect, text, top) in texts.cells.get(&page_no).into_iter().flatten() {
-            // A bottom-row photo's caption sits above the page strip.
-            // Grid cells end above the strip, so a cell caption needs no lift
-            // unless its cell still reaches into the strip's band.
-            let lift = if *top {
-                0.0
-            } else if rect.1 + rect.3 > 1.0 - strip_pt / (ph * 72.0) {
+        for (rect, text) in texts.cells.get(&page_no).into_iter().flatten() {
+            // Grid cells end above the page strip, so a cell caption needs
+            // no lift unless its cell still reaches into the strip's band.
+            let lift = if rect.1 + rect.3 > 1.0 - strip_pt / (ph * 72.0) {
                 strip_pt
             } else {
                 0.0
@@ -2889,7 +2859,6 @@ fn write_typst_and_compile(
                 (tw_in, th_in),
                 *rect,
                 lift,
-                *top,
                 text,
             ));
         }
@@ -2978,23 +2947,12 @@ fn burn_captions(
     result
 }
 
-/// Typst for one caption on a grid photo whose cell is `rect` (fractions
-/// of the page): a strip along the bottom of that photo, wrapped to the
-/// cell's width. `page` is the PDF page and `trim` the page JPEG's size
-/// (inches); with bleed the JPEG is cover-scaled onto the larger page, so
-/// the cell is mapped the same way.
-/// Height in points of a bottom strip of `text` at `size` pt with `inset`
-/// padding on a `page_w`-inch page: a generous estimate (half an em per
-/// character, wrapping at the page width) so a caption lifted above it
-/// clears it.
 /// Height in page pixels of the band each captioned cell keeps below its
 /// photo: the caption box as [`cell_caption_typ`] draws it (11 pt text,
-/// 6 pt inset, wrapped to the cell), plus the page strip it is lifted
-/// above in the bottom row.
+/// 6 pt inset, wrapped to the cell).
 fn caption_bars(
     cells: &[(usize, Rect, String)],
     n: usize,
-    strip_px: u32,
     preset: BookPreset,
     th: u32,
 ) -> Vec<u32> {
@@ -3007,10 +2965,8 @@ fn caption_bars(
             .ceil()
             .max(1.0);
         let box_pt = lines * 11.0 * 1.3 + 12.0 + 10.0;
-        let bottom_row = rect.1 + rect.3 > 0.95;
-        let strip = if bottom_row { f64::from(strip_px) } else { 0.0 };
         if let Some(b) = bars.get_mut(*k) {
-            *b = (box_pt * px_per_pt + strip).round() as u32;
+            *b = (box_pt * px_per_pt).round() as u32;
         }
     }
     bars
@@ -3029,6 +2985,10 @@ fn strip_px(lines: &[String], title: bool, preset: BookPreset, th: u32) -> u32 {
     (pt / (h_in * 72.0) * f64::from(th)).round() as u32
 }
 
+/// Height in points of a bottom strip of `text` at `size` pt with `inset`
+/// padding on a `page_w`-inch page: a generous estimate (half an em per
+/// character, wrapping at the page width) so a caption lifted above it
+/// clears it.
 fn strip_height_pt(text: &str, size: u32, inset: u32, page_w: f64) -> f64 {
     let (size, inset) = (f64::from(size), f64::from(inset));
     let width_pt = text.chars().count() as f64 * size * 0.55;
@@ -3036,12 +2996,16 @@ fn strip_height_pt(text: &str, size: u32, inset: u32, page_w: f64) -> f64 {
     lines * size * 1.3 + 2.0 * inset
 }
 
+/// Typst for one caption on a grid photo whose cell is `rect` (fractions
+/// of the page): a strip along the bottom of that photo, wrapped to the
+/// cell's width. `page` is the PDF page and `trim` the page JPEG's size
+/// (inches); with bleed the JPEG is cover-scaled onto the larger page, so
+/// the cell is mapped the same way.
 fn cell_caption_typ(
     page: (f64, f64),
     trim: (f64, f64),
     (x, y, w, h): Rect,
     lift_pt: f64,
-    top: bool,
     text: &str,
 ) -> String {
     let scale = (page.0 / trim.0).max(page.1 / trim.1);
@@ -3051,13 +3015,12 @@ fn cell_caption_typ(
     );
     let (sw, sh) = (trim.0 * scale, trim.1 * scale);
     format!(
-        "#place(top + left, dx: {:.4}in, dy: {:.4}in)[#box(width: {:.4}in, height: {:.4}in)[#place({} + center, dy: {:.1}pt)[#block(fill: rgb(18, 20, 26).transparentize(20%), inset: 6pt, radius: 2pt)[#text(size: 11pt)[{}]]]]]\n",
+        "#place(top + left, dx: {:.4}in, dy: {:.4}in)[#box(width: {:.4}in, height: {:.4}in)[#place(bottom + center, dy: {:.1}pt)[#block(fill: rgb(18, 20, 26).transparentize(20%), inset: 6pt, radius: 2pt)[#text(size: 11pt)[{}]]]]]\n",
         ox + x * sw,
         oy + y * sh,
         w * sw,
         h * sh,
-        if top { "top" } else { "bottom" },
-        if top { 6.0 } else { -6.0 - lift_pt },
+        -6.0 - lift_pt,
         typ_escape(text)
     )
 }
@@ -3588,6 +3551,40 @@ mod tests {
     }
 
     #[test]
+    fn pinned_photos_sharing_a_place_name_all_stay() {
+        let pin = |i: usize| BookPhoto {
+            asset_id: format!("p{i}"),
+            caption: Some("Tokyo".into()),
+            place: Some("Tokyo".into()),
+            day: Some(1),
+            keep: true,
+            pinned: true,
+            ..BookPhoto::blank()
+        };
+        let photos: Vec<BookPhoto> = (0..4).map(pin).collect();
+        // One scene, one place, more than the day's caption cap: all kept.
+        assert_eq!(distinct_curated(&photos, &[0; 4]), [0, 1, 2, 3]);
+        // Their place name is not the owner's words.
+        assert!(!photos[0].own_caption());
+        let worded = BookPhoto {
+            caption: Some("Our first ramen".into()),
+            ..pin(0)
+        };
+        assert!(worded.own_caption());
+    }
+
+    #[test]
+    fn only_captioned_cells_keep_a_band_sized_to_their_words() {
+        let cell = (0.0, 0.0, 0.5, 0.5);
+        let short = (0, cell, "Tea".to_string());
+        let long = (2, cell, "Tea ".repeat(40));
+        let bars = caption_bars(&[short, long], 3, BookPreset::P1, 3600);
+        assert_eq!(bars.len(), 3);
+        assert!(bars[0] > 0 && bars[1] == 0, "{bars:?}");
+        assert!(bars[2] > bars[0], "longer words wrap: {bars:?}");
+    }
+
+    #[test]
     fn a_lone_photo_of_no_one_gives_up_its_page() {
         let shot = |id: &str, day: u32, of_people: bool, keep: bool| BookPhoto {
             asset_id: id.to_string(),
@@ -3842,7 +3839,6 @@ mod tests {
             (12.0, 12.0),
             (0.0, 0.5, 0.5, 0.49),
             strip,
-            false,
             "Tea",
         );
         assert!(
@@ -3854,20 +3850,9 @@ mod tests {
             (12.0, 12.0),
             (0.0, 0.0, 0.5, 0.49),
             0.0,
-            false,
             "Tea",
         );
         assert!(level.contains("dy: -6.0pt"), "{level}");
-        // A face low in the cell: the caption goes on top instead.
-        let high = cell_caption_typ(
-            (12.0, 12.0),
-            (12.0, 12.0),
-            (0.0, 0.5, 0.5, 0.49),
-            strip,
-            true,
-            "Tea",
-        );
-        assert!(high.contains("#place(top + center, dy: 6.0pt)"), "{high}");
     }
 
     #[test]

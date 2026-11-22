@@ -154,18 +154,18 @@ pub fn borrowed_fixes(assets: &[Asset]) -> HashMap<&str, (f64, f64)> {
         let (Some(t), day, Some(s)) = (a.taken_at, asset_day(a), stream[i]) else {
             continue;
         };
+        // Cheap checks first: the calendar day only for shots close in time.
         let near = assets
             .iter()
             .enumerate()
-            .filter(|(j, b)| {
-                stream[*j] == Some(s)
-                    && b.gps.is_some()
-                    && asset_day(b) == day
-                    && b.taken_at.is_some_and(|u| (u - t).abs() <= BORROW_FIX_SECS)
+            .filter_map(|(j, b)| {
+                let (gps, gap) = (b.gps?, (b.taken_at? - t).abs());
+                (stream[j] == Some(s) && gap <= BORROW_FIX_SECS && asset_day(b) == day)
+                    .then_some((gap, gps))
             })
-            .min_by_key(|(_, b)| b.taken_at.map_or(i64::MAX, |u| (u - t).abs()));
-        if let Some((_, b)) = near {
-            out.insert(a.id.as_str(), b.gps.expect("filtered"));
+            .min_by_key(|&(gap, _)| gap);
+        if let Some((_, fix)) = near {
+            out.insert(a.id.as_str(), fix);
         }
     }
     out
@@ -250,7 +250,7 @@ pub fn photo_places(
             if !sights.contains(p) || poi.as_deref() == Some(p) {
                 return Some(p.to_string());
             }
-            Some(city_of(a).unwrap_or_else(|| p.to_string()))
+            Some(city_of(at).unwrap_or_else(|| p.to_string()))
         };
         if let Some(p) = own.or_else(fallback) {
             out.insert(a.id.clone(), p);

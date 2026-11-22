@@ -15,7 +15,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use triptape_core::itinerary::asset_day;
 use triptape_core::places::Spot;
-use triptape_core::plan::{check_source_integrity, plan_eligibility, trip_day, Integrity};
+use triptape_core::plan::{
+    check_source_integrity, has_caption, plan_eligibility, trip_day, Integrity,
+};
 use triptape_core::types::{distinct_assets, AssetKind, Plan, PlanEntry, Rendition};
 
 #[derive(Debug, Clone)]
@@ -115,7 +117,13 @@ fn resolve_entry(
         entry: entry.clone(),
         still_path,
         motion_path,
-        caption: plan.captions.get(asset_id).cloned(),
+        // A hidden (blank) caption is no caption: the reel falls back to
+        // its place, as the book does.
+        caption: plan
+            .captions
+            .get(asset_id)
+            .filter(|c| has_caption(Some(c)))
+            .cloned(),
         taken_at: a.taken_at,
         tz_offset_secs: a.tz_offset_secs,
         aspect: a.display_aspect(),
@@ -165,7 +173,7 @@ fn book_caption(plan: &Plan, places: &HashMap<String, String>, id: &str) -> Opti
     // A hidden (blank) caption still leaves the photo its place.
     plan.captions
         .get(id)
-        .filter(|c| !c.trim().is_empty())
+        .filter(|c| has_caption(Some(c)))
         .or_else(|| places.get(id))
         .cloned()
 }
@@ -217,7 +225,7 @@ const LONG_HAUL_M: f64 = 7_000_000.0;
 
 /// `route` without its long-haul legs at the start and end (home to the
 /// first stop, the last stop home).
-fn trip_route(route: &[(f64, f64)]) -> Vec<(f64, f64)> {
+fn trip_route(route: &[(f64, f64)]) -> &[(f64, f64)] {
     let far = |a: (f64, f64), b: (f64, f64)| triptape_core::geo::haversine_m(a, b) > LONG_HAUL_M;
     let mut start = 0;
     while start + 1 < route.len() && far(route[start], route[start + 1]) {
@@ -227,7 +235,7 @@ fn trip_route(route: &[(f64, f64)]) -> Vec<(f64, f64)> {
     while end > start + 1 && far(route[end - 2], route[end - 1]) {
         end -= 1;
     }
-    route[start..end].to_vec()
+    &route[start..end]
 }
 
 /// Drop every photo whose `_edited` version is in the book too (Photos
@@ -247,15 +255,11 @@ fn drop_originals_of_edits(photos: &mut Vec<render_book::BookPhoto>) {
         .filter(|(_, _, e)| *e)
         .map(|(d, s, _)| (d.as_path(), s.as_str()))
         .collect();
-    let keep: Vec<bool> = keys
-        .iter()
-        .map(|k| match k {
-            Some((d, s, e)) => *e || !edited.contains(&(d.as_path(), s.as_str())),
-            None => true,
-        })
-        .collect();
-    let mut keep = keep.into_iter();
-    photos.retain(|_| keep.next().unwrap_or(true));
+    let mut keys = keys.iter();
+    photos.retain(|_| match keys.next() {
+        Some(Some((d, s, e))) => *e || !edited.contains(&(d.as_path(), s.as_str())),
+        _ => true,
+    });
 }
 
 /// Whether the book may use this asset. The plan's chapters hold near-dupe
@@ -751,6 +755,9 @@ fn export_inner(
         };
         let trip_start = photo_span.map(|(s, _)| s);
         let mut book_photos: Vec<BookPhoto> = vec![];
+        // Where `photo_places` stood a shot without GPS: the same borrowed
+        // fix, so its spot (aboard, ashore) agrees with its place.
+        let borrowed = triptape_core::places::borrowed_fixes(assets);
         for a in assets
             .iter()
             .filter(|a| a.kind != AssetKind::Video && in_book_flow(&chapter_of, &a.id))
@@ -782,7 +789,17 @@ fn export_inner(
             let day = asset_day(a).zip(trip_start).map(|(d, s)| trip_day(d, s));
             let place = places.get(&a.id).cloned();
             let itin = opts.itinerary.as_ref();
-            let spot = triptape_core::places::spot(itin, a);
+            let located;
+            let spot = match (a.gps, borrowed.get(a.id.as_str())) {
+                (None, Some(&fix)) => {
+                    located = triptape_core::types::Asset {
+                        gps: Some(fix),
+                        ..a.clone()
+                    };
+                    triptape_core::places::spot(itin, &located)
+                }
+                _ => triptape_core::places::spot(itin, a),
+            };
             book_photos.push(BookPhoto {
                 asset_id: a.id.clone(),
                 path: a.path.clone(),
@@ -803,15 +820,12 @@ fn export_inner(
                 score: a.score.as_ref().map_or(render_book::NEUTRAL_SCORE, |s| {
                     s.tech_quality() + s.bonus + panorama_bonus(a, s.tech_quality())
                 }),
-                // Captioned or pinned by the owner: always placed.
                 // Captioned, pinned into the book, or pinned to the cover by
                 // the owner: always placed (the page cap never drops it).
                 keep: plan.book.contains(&a.id)
                     || plan.cover.contains_key(&a.id)
-                    || plan
-                        .captions
-                        .get(&a.id)
-                        .is_some_and(|c| !c.trim().is_empty()),
+                    || has_caption(plan.captions.get(&a.id).map(String::as_str)),
+                pinned: plan.book.contains(&a.id) || plan.cover.contains_key(&a.id),
                 taken_at: a.taken_at,
                 phash: a.phash,
                 people_sig: a.people_sig,
@@ -831,17 +845,17 @@ fn export_inner(
                     .map(|&(x, y)| (f32::from(x) / 100.0, f32::from(y) / 100.0)),
             });
         }
+        // A photo and the owner's `_edited` version of it are one photo:
+        // the edit stays.
+        drop_originals_of_edits(&mut book_photos);
         // A cover pin outside the book's photos can't show: say so.
         for id in plan.cover.keys() {
             if !book_photos.iter().any(|p| &p.asset_id == id) {
                 report.fallbacks.push(format!(
-                    "cover: pinned {id} is not among the book's photos (a near-duplicate or an excluded shot); pin a photo the book uses"
+                    "cover: pinned {id} is not among the book's photos (a near-duplicate, an excluded shot or an original whose _edited version is in); pin a photo the book uses"
                 ));
             }
         }
-        // A photo and the owner's `_edited` version of it are one photo:
-        // the edit stays.
-        drop_originals_of_edits(&mut book_photos);
         // The film's story order (stable, so ties keep db order).
         let story_pos = book_story_positions(plan, assets);
         book_photos.sort_by_key(|p| {
@@ -862,17 +876,23 @@ fn export_inner(
         // the long-haul flights from and to home, which would stretch it
         // across an ocean and shrink the trip to a corner.
         let book_route = trip_route(&plan.map_polyline);
-        let book_map = (book_route.len() >= 2)
-            .then(|| work.join("route_card_book.png"))
-            .filter(|card| {
-                crate::map::save_route_card(&book_route, &[], 1800, 1800, card)
-                    .map_err(|e| report.fallbacks.push(format!("book map failed: {e}")))
-                    .is_ok()
-            });
+        // The owner's back cover is the trip's map: no second, plainer
+        // route map before it.
+        let book_map = if book_route.len() >= 2 && opts.back_cover.is_none() {
+            let card = work.join("route_card_book.png");
+            match crate::map::save_route_card(book_route, &[], 1800, 1800, &card) {
+                Ok(_) => Some(card),
+                Err(e) => {
+                    report.fallbacks.push(format!("book map failed: {e}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         match render_book::render_book(
             &book_photos,
-            // The owner's back cover is the trip's map: no second, plainer
-            // route map before it.
+            // Nor the film's card in its place.
             book_map
                 .as_deref()
                 .or(map_card.as_deref())
