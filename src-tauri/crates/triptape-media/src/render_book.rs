@@ -2105,7 +2105,13 @@ fn fit_photo_focused(
         None if !faces.is_empty() => face_window_clear(sw, sh, tw_f, th_f, &faces, reserve),
         None => (focus_window(sw, sh, tw_f, th_f, (0.5, 0.5)), false),
     };
-    if cut && whole_if_cut {
+    // Shown whole only when that still fills most of the cell: a 4:3 photo
+    // pillarboxed in a wide strip leaves black voids worse than a crop.
+    let fills = {
+        let (sa, ca) = (sw / sh, tw_f / th_f);
+        (sa / ca).min(ca / sa)
+    };
+    if cut && whole_if_cut && fills >= WHOLE_MIN_FILL {
         // No crop of this cell keeps every face: show the whole photo in it
         // on the page's dark ground rather than slice someone in half.
         fb.push(format!(
@@ -2372,9 +2378,13 @@ const NARROW_CELL: f64 = 0.55;
 /// What a grid layout pays for a sliver that guts its photo.
 const NARROW_CELL_COST: f64 = 1.5;
 
+/// Share of a cell a photo shown whole must still fill (else it is
+/// cropped, keeping the biggest faces).
+const WHOLE_MIN_FILL: f64 = 0.75;
+
 /// What a grid layout pays for a cell that cuts a detected face: more
 /// than any amount of ordinary cropping.
-const FACE_CUT_COST: f64 = 3.0;
+const FACE_CUT_COST: f64 = 6.0;
 
 /// Width / height from which a photo is a panorama: alone on a grid row
 /// it spans the page at its own height.
