@@ -755,11 +755,16 @@ pub struct BookOutput {
     pub fallbacks: Vec<String>,
 }
 
+/// Largest-face size (of the shorter side) the closing photo needs: the
+/// family close enough to read on the last page, not a statue with them
+/// at its foot.
+const CLOSING_FACE: f32 = 0.12;
+
 /// Photos at the end of the book the closing page never repeats.
 const CLOSING_SKIPS_LAST: usize = 12;
 
 /// How many of a section's first photos may back its title page.
-const DIVIDER_WINDOW: usize = 4;
+const DIVIDER_WINDOW: usize = 8;
 
 /// How many photos after the hero may supply the opening spread.
 const SPREAD_WINDOW: usize = 11;
@@ -1259,9 +1264,13 @@ pub fn render_book(
         viable
             .iter()
             .filter(|p| {
+                // Big, sharp faces that print well on a full page.
+                let (w, h) = slot_inches(opts.preset, PageKind::Closing, 1);
                 !placed.contains(p.asset_id.as_str())
                     && cover_rank(p) == 2
                     && p.tagged_people >= 2
+                    && p.face_size >= CLOSING_FACE
+                    && dpi_verdict(p.width, p.height, w, h) == DpiVerdict::Ok
                     && p.day.zip(last_day).is_some_and(|(d, l)| d + 2 >= l)
             })
             .max_by(|a, b| a.score.total_cmp(&b.score))
@@ -2097,10 +2106,13 @@ fn fit_photo_focused(
         None => (focus_window(sw, sh, tw_f, th_f, (0.5, 0.5)), false),
     };
     if cut {
+        // No crop of this cell keeps every face: show the whole photo in it
+        // on the page's dark ground rather than slice someone in half.
         fb.push(format!(
-            "crop: {} cannot keep every face in its cell; the biggest stay",
+            "crop: {} cannot keep every face in its cell; shown whole",
             p.display_name()
         ));
+        return contain_on_page(&src, tw, th, 0);
     }
     crop_window(&src, window, tw, th)
 }
