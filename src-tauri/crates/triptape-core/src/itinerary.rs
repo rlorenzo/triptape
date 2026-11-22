@@ -551,7 +551,7 @@ impl Itinerary {
             .find(|s| {
                 let far = fixes
                     .iter()
-                    .filter(|&&p| crate::geo::haversine_m(p, (s.lat, s.lon)) > STOP_NEAR_M)
+                    .filter(|&&p| haversine_m(p, s.pos()) > STOP_NEAR_M)
                     .count();
                 s.kind != StopKind::Home && far * 5 < fixes.len().max(1)
             })

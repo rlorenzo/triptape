@@ -222,16 +222,19 @@ fn face_signals_at(r: &Row, first: usize) -> rusqlite::Result<Option<FaceSignals
     }))
 }
 
+/// Whether `table` has a column named `column` (false when no such table).
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name=?2",
+        [table, column],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .map_err(|e| e.to_string())
+}
+
 fn add_column_if_missing(conn: &Connection, column: &str, ddl: &str) -> Result<(), String> {
-    let present = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name=?1",
-            [column],
-            |r| r.get::<_, i64>(0),
-        )
-        .map_err(|e| e.to_string())?
-        > 0;
-    if !present {
+    if !has_column(conn, "assets", column)? {
         conn.execute(&format!("ALTER TABLE assets ADD COLUMN {column} {ddl}"), [])
             .map_err(|e| e.to_string())?;
     }
@@ -258,15 +261,7 @@ impl Db {
         // Early builds kept each known face's person name; names are
         // personal data and never stored, so that table goes (its regions
         // come back with the next `triptape faces`).
-        let named_faces = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('known_faces') WHERE name='name'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(|e| e.to_string())?
-            > 0;
-        if named_faces {
+        if has_column(&conn, "known_faces", "name")? {
             conn.execute("DROP TABLE known_faces", [])
                 .map_err(|e| e.to_string())?;
         }
@@ -849,6 +844,14 @@ impl Db {
         let mut deleted = 0usize;
         for chunk in stale.chunks(500) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            // Their face regions go too: a later scan may hand a deleted id
+            // to a different photo, which must not inherit these boxes.
+            self.conn
+                .execute(
+                    &format!("DELETE FROM known_faces WHERE asset_id IN ({placeholders})"),
+                    rusqlite::params_from_iter(chunk.iter()),
+                )
+                .map_err(|e| e.to_string())?;
             let sql = format!("DELETE FROM assets WHERE id IN ({placeholders})");
             let mut st = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
             deleted += st
@@ -1850,6 +1853,24 @@ mod tests {
         assert_eq!(db.latest_project().unwrap().unwrap().id, b.id);
         db.set_project_folder(&b.id, "/b2").unwrap();
         assert_eq!(db.project_for_folder("/b2").unwrap().unwrap().id, b.id);
+    }
+
+    #[test]
+    fn opening_drops_a_known_faces_table_that_kept_names() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE known_faces (asset_id TEXT, name TEXT, x REAL, y REAL, w REAL, h REAL);
+             INSERT INTO known_faces VALUES ('a', 'Lana', 0.1, 0.1, 0.1, 0.1);",
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        assert!(!has_column(&db.conn, "known_faces", "name").unwrap());
+        assert!(has_column(&db.conn, "known_faces", "body").unwrap());
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM known_faces", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "the names went with the old table");
     }
 
     #[test]

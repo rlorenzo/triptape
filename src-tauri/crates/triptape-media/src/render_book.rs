@@ -399,16 +399,21 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
         };
         // A tagged family face beats a stranger's elbow behind a plate.
         let window = &run[..run.len().min(DIVIDER_WINDOW)];
+        let tier = |pos: usize| {
+            let p = &photos[order[pos]];
+            if p.family.iter().any(|k| !k.body) {
+                0
+            } else if p.is_of_people() {
+                1
+            } else {
+                2
+            }
+        };
         if let Some(pos) = window
             .iter()
             .copied()
-            .find(|&pos| printable(pos) && photos[order[pos]].family.iter().any(|k| !k.body))
-            .or_else(|| {
-                window
-                    .iter()
-                    .copied()
-                    .find(|&pos| printable(pos) && photos[order[pos]].is_of_people())
-            })
+            .filter(|&pos| printable(pos) && tier(pos) < 2)
+            .min_by_key(|&pos| tier(pos))
             .or_else(|| run.iter().copied().find(|&pos| printable(pos)))
         {
             order[at..=pos].rotate_right(1);
@@ -946,16 +951,11 @@ fn lone_scenery(photos: &[BookPhoto]) -> Vec<String> {
 /// the one before): it keeps its caption on a shared page rather than
 /// taking a full page of its own.
 fn fold_lone_kept(photos: &mut [BookPhoto]) {
-    let key = |p: &BookPhoto| (p.day, p.area.clone());
-    // Stretches as (start, end) runs of one key.
+    // Stretches as (start, end) runs of one (day, area).
     let mut runs: Vec<(usize, usize)> = vec![];
-    let mut start = 0;
-    while start < photos.len() {
-        let end = (start..photos.len())
-            .find(|&i| key(&photos[i]) != key(&photos[start]))
-            .unwrap_or(photos.len());
-        runs.push((start, end));
-        start = end;
+    for run in photos.chunk_by(|a, b| (a.day, &a.area) == (b.day, &b.area)) {
+        let start = runs.last().map_or(0, |&(_, end)| end);
+        runs.push((start, start + run.len()));
     }
     for (r, &(start, end)) in runs.iter().enumerate() {
         let p = &photos[start];
@@ -963,19 +963,21 @@ fn fold_lone_kept(photos: &mut [BookPhoto]) {
             continue;
         }
         let day = p.day;
-        // The nearest stretch of the day with two or more photos (a lone
-        // one may become the day's divider and leave this one alone
-        // again): later ones first, then earlier ones.
-        let target = runs[r + 1..]
-            .iter()
-            .chain(runs[..r].iter().rev())
-            .find(|&&(a, b)| b - a >= 2 && photos[a].day == day)
-            .or_else(|| {
-                runs[r + 1..]
-                    .iter()
-                    .chain(runs[..r].iter().rev())
-                    .find(|&&(a, _)| photos[a].day == day)
-            })
+        // Only a neighbouring stretch of the same day: pages break on every
+        // change of (day, area) in photo order, so taking the area of a
+        // stretch further off would leave this photo alone all the same.
+        let near = || {
+            runs.get(r + 1)
+                .into_iter()
+                .chain(r.checked_sub(1).map(|i| &runs[i]))
+                .filter(|&&(a, _)| photos[a].day == day)
+        };
+        // The next stretch, else the one before; one with two or more
+        // photos first (a lone one may become the day's divider and leave
+        // this one alone again).
+        let target = near()
+            .find(|&&(a, b)| b - a >= 2)
+            .or_else(|| near().next())
             .map(|&(a, _)| photos[a].area.clone());
         if let Some(area) = target {
             photos[start].area = area;
@@ -1317,20 +1319,16 @@ pub fn render_book(
     // days the pages leave out, so the last page is new, not a repeat.
     // Like every page, it must print sharp enough: a blocked choice gives
     // way to the automatic pick, with a note.
-    let owner_closing = viable.iter().find(|p| p.closing).cloned().filter(|p| {
-        let (w, h) = slot_inches(opts.preset, PageKind::Closing, 1);
-        let ok = dpi_verdict(p.width, p.height, w, h) != DpiVerdict::Block;
-        if !ok {
-            fallbacks.push(format!(
-                "closing: {} is too small to print a full page; another photo closes the book",
-                p.path
-                    .file_name()
-                    .map(|f| f.to_string_lossy())
-                    .unwrap_or_default()
-            ));
-        }
-        ok
-    });
+    let (closing_w, closing_h) = slot_inches(opts.preset, PageKind::Closing, 1);
+    let mut owner_closing = viable.iter().find(|p| p.closing).cloned();
+    if let Some(p) = owner_closing
+        .take_if(|p| dpi_verdict(p.width, p.height, closing_w, closing_h) == DpiVerdict::Block)
+    {
+        fallbacks.push(format!(
+            "closing: {} is too small to print a full page; another photo closes the book",
+            p.display_name()
+        ));
+    }
     if let Some(c) = &owner_closing {
         pruned.retain(|p| p.asset_id != c.asset_id);
     }
@@ -1338,7 +1336,6 @@ pub fn render_book(
     let mut closing_pick: Option<BookPhoto> = owner_closing.or_else(|| {
         let placed: HashSet<&str> = pruned.iter().map(|p| p.asset_id.as_str()).collect();
         let last_day = viable.iter().filter_map(|p| p.day).max();
-        let (w, h) = slot_inches(opts.preset, PageKind::Closing, 1);
         viable
             .iter()
             .filter(|p| {
@@ -1350,7 +1347,7 @@ pub fn render_book(
                     && p.people >= 4
                     && p.face_size >= CLOSING_FACE
                     && p.day.zip(last_day).is_some_and(|(d, l)| d + 1 >= l)
-                    && dpi_verdict(p.width, p.height, w, h) == DpiVerdict::Ok
+                    && dpi_verdict(p.width, p.height, closing_w, closing_h) == DpiVerdict::Ok
                     && cover_rank(p) == 2
             })
             .max_by(|a, b| a.score.total_cmp(&b.score))
@@ -1651,6 +1648,9 @@ pub fn render_book(
                         .map(|&i| photos[i].asset_id.as_str())
                         .collect();
                     let last_day = photos.iter().filter_map(|p| p.day).max();
+                    let printable = |p: &BookPhoto| {
+                        dpi_verdict(p.width, p.height, closing_w, closing_h) != DpiVerdict::Block
+                    };
                     let last = closing_pick
                         .as_ref()
                         .or_else(|| {
@@ -1661,14 +1661,20 @@ pub fn render_book(
                                     // panorama, no group a square would cut.
                                     !recent.contains(&p.asset_id.as_str())
                                         && p.day.zip(last_day).is_some_and(|(d, l)| d + 2 >= l)
+                                        && printable(p)
                                         && cover_rank(p) == 2
                                 })
                                 .max_by(|a, b| a.score.total_cmp(&b.score))
                         })
+                        // Else the last photo sharp enough for a full page: one
+                        // that only cleared a grid cell would fail preflight.
+                        .or_else(|| photos.iter().rev().find(|p| printable(p)))
                         .unwrap_or_else(|| &photos[photos.len() - 1]);
                     shown.push(last);
-                    let (sw, sh) = slot_inches(opts.preset, PageKind::Closing, 1);
-                    placements.push((page_no, dpi_verdict(last.width, last.height, sw, sh)));
+                    placements.push((
+                        page_no,
+                        dpi_verdict(last.width, last.height, closing_w, closing_h),
+                    ));
                     draw_fullbleed(last, (tw, th), 0, &out, &fit, &mut fallbacks)?;
                     captions
                         .entry(page_no)
@@ -3519,8 +3525,17 @@ mod tests {
         ];
         fold_lone_kept(&mut photos);
         assert_eq!(photos[0].area.as_deref(), Some("Mount Faber Peak"));
-        // A lone photo next door (the day's divider-to-be) is skipped for
-        // the stretch after it.
+        // Next door with two or more photos beats a lone one next door.
+        let mut photos = vec![
+            shot("cloud", "Cloud Forest", 3, false),
+            shot("cloud2", "Cloud Forest", 4, false),
+            shot("durian", "food court", 0, true),
+            shot("dome", "Flower Dome", 3, false),
+        ];
+        fold_lone_kept(&mut photos);
+        assert_eq!(photos[2].area.as_deref(), Some("Cloud Forest"));
+        // A stretch past a lone neighbour is never taken: the neighbour
+        // still splits the pages, so the photo would print alone anyway.
         let mut photos = vec![
             shot("durian", "food court", 0, true),
             shot("dome", "Flower Dome", 3, false),
@@ -3528,7 +3543,7 @@ mod tests {
             shot("cloud2", "Cloud Forest", 4, false),
         ];
         fold_lone_kept(&mut photos);
-        assert_eq!(photos[0].area.as_deref(), Some("Cloud Forest"));
+        assert_eq!(photos[0].area.as_deref(), Some("Flower Dome"));
         // A lone people photo keeps its own stretch.
         let mut photos = vec![
             BookPhoto {

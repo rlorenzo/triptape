@@ -494,10 +494,9 @@ fn book_heading_place(
         return None;
     }
     // A place that already names its town ("Kamakura, Japan · Tsurugaoka
-    // Hachimangū", a day trip out of the stop's city) leads with the town
-    // and drops the country: no stop city in front of it.
-    // Only a real country goes: "Flower Dome, Gardens by the Bay" is one
-    // name.
+    // Hachimangū", a day trip out of the stop's city) leads with the town,
+    // without its country, and no stop city in front of it. Only a real
+    // country goes: "Flower Dome, Gardens by the Bay" is one name.
     let (first, rest) = place
         .split_once(" \u{b7} ")
         .map_or((place, None), |(a, b)| (a, Some(b)));
@@ -847,9 +846,8 @@ fn export_inner(
             };
             let chapter = chapter_of.get(a.id.as_str()).copied();
             let day = asset_day(a).zip(trip_start).map(|(d, s)| trip_day(d, s));
-            // "Kamakura, Japan" (the nearest town, off the itinerary)
-            // prints as "Kamakura": the book is all one trip abroad.
             let place = book_places.get(&a.id).cloned();
+            let closing = plan.closing.as_deref() == Some(a.id.as_str());
             let itin = opts.itinerary.as_ref();
             let located;
             let spot = match (a.gps, borrowed.get(a.id.as_str())) {
@@ -871,7 +869,7 @@ fn export_inner(
                 place,
                 aboard: matches!(spot, Spot::Aboard(_)),
                 faces: vec![],
-                closing: plan.closing.as_deref() == Some(a.id.as_str()),
+                closing,
                 family: opts
                     .known_faces
                     .get(&a.id)
@@ -892,7 +890,7 @@ fn export_inner(
                 // the owner: always placed (the page cap never drops it).
                 keep: plan.book.contains(&a.id)
                     || plan.cover.contains_key(&a.id)
-                    || plan.closing.as_deref() == Some(a.id.as_str())
+                    || closing
                     || has_caption(plan.captions.get(&a.id).map(String::as_str)),
                 pinned: plan.book.contains(&a.id) || plan.cover.contains_key(&a.id),
                 taken_at: a.taken_at,
