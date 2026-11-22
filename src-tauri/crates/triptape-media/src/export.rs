@@ -809,6 +809,7 @@ fn export_inner(
                 place,
                 aboard: matches!(spot, Spot::Aboard(_)),
                 faces: vec![],
+                closing: plan.closing.as_deref() == Some(a.id.as_str()),
                 area: match spot {
                     Spot::Named(name) => Some(name.to_string()),
                     _ => None,
@@ -824,6 +825,7 @@ fn export_inner(
                 // the owner: always placed (the page cap never drops it).
                 keep: plan.book.contains(&a.id)
                     || plan.cover.contains_key(&a.id)
+                    || plan.closing.as_deref() == Some(a.id.as_str())
                     || has_caption(plan.captions.get(&a.id).map(String::as_str)),
                 pinned: plan.book.contains(&a.id) || plan.cover.contains_key(&a.id),
                 taken_at: a.taken_at,
@@ -891,10 +893,29 @@ fn export_inner(
                     })?;
                     itin.port_call(day)
                 });
-                match (port, &ch.place) {
-                    (Some(port), Some(place)) => {
+                // A sight names the day; the stop it was in leads, so the
+                // book says where the trip was ("Singapore · Mount Faber
+                // Peak", "Jeju · Jeongbang Waterfall").
+                let stop = opts.itinerary.as_ref().and_then(|itin| {
+                    let place = ch.place.as_deref()?;
+                    if ships.iter().any(|s| place.contains(s.as_str())) {
+                        return None;
+                    }
+                    let day = ch.asset_ids.iter().find_map(|id| {
+                        triptape_core::itinerary::asset_day(by_id.get(id.as_str())?)
+                    })?;
+                    itin.stop_on(day)
+                        .filter(|city| !place.contains(city.as_str()))
+                });
+                match (port, stop, &ch.place) {
+                    (Some(port), _, Some(place)) => {
                         let mut named = ch.clone();
                         named.place = Some(format!("{place} \u{b7} {port}"));
+                        crate::titlecard::chapter_book_title(&named)
+                    }
+                    (None, Some(city), Some(place)) => {
+                        let mut named = ch.clone();
+                        named.place = Some(format!("{city} \u{b7} {place}"));
                         crate::titlecard::chapter_book_title(&named)
                     }
                     _ => crate::titlecard::chapter_book_title(ch),
@@ -1303,6 +1324,7 @@ mod tests {
             cover: Default::default(),
             crop: Default::default(),
             book: Default::default(),
+            closing: Default::default(),
         }
     }
 

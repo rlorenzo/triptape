@@ -5,7 +5,7 @@
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m] [--models DIR]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
-//!                [--solo REF...] [--unsolo REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--book REF...] [--unbook REF...] [--list]
+//!                [--solo REF...] [--unsolo REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
@@ -1054,6 +1054,9 @@ struct EditArgs {
     /// Photos pinned into (or out of) the book.
     book: Vec<String>,
     unbook: Vec<String>,
+    /// The book's closing photo (`--closing REF`); `--no-closing` clears it.
+    closing: Option<String>,
+    no_closing: bool,
 }
 
 const MOVE_USAGE: &str = "--move wants --after REF or --before REF";
@@ -1102,6 +1105,9 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     out.cover.push(parse_cover_pin(&v)?);
                 }
             }
+            "closing" => out.closing = Some(single(values)?),
+            "no-closing" if values.is_empty() => out.no_closing = true,
+            "no-closing" => return Err("--no-closing takes no value".to_string()),
             "crop" => match <[String; 3]>::try_from(values) {
                 Ok([a, x, y]) => {
                     let pct = |v: &str| match v.parse::<u8>() {
@@ -1215,6 +1221,9 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
     println!("joins: {}", collage.joins.len());
     for (a, b) in &collage.joins {
         println!("  {} + {}", show(a), show(b));
+    }
+    if let Some(id) = &edits.closing {
+        println!("closing photo: {}", show(id));
     }
     println!("book pins: {}", edits.book.len());
     for id in &edits.book {
@@ -1352,6 +1361,16 @@ fn edit_cmd(args: &[String]) {
         .map(|(q, x, y)| (resolve_one(q), *x, *y))
         .collect();
     let uncrops = resolve(&a.uncrop);
+    let closing = a.closing.as_deref().map(resolve_one);
+    if let Some(asset) = closing.filter(|x| ep.base.chapter_of(&x.id).is_none()) {
+        die(
+            "edit",
+            format!(
+                "{} is not in any chapter of the plan, so the book can't close on it",
+                asset_label(asset)
+            ),
+        );
+    }
     let books = resolve(&a.book);
     // A pin only places a photo the plan holds (a near-duplicate the scan
     // set aside has no page to go to): refuse it rather than save a no-op.
@@ -1377,11 +1396,13 @@ fn edit_cmd(args: &[String]) {
         || !crops.is_empty()
         || !uncrops.is_empty()
         || !books.is_empty()
-        || !unbooks.is_empty();
+        || !unbooks.is_empty()
+        || closing.is_some()
+        || a.no_closing;
     if !changed && !a.list {
         die(
             "edit",
-            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--book/--unbook or --list",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--book/--unbook/--closing/--no-closing or --list",
         );
     }
     let mut edits = ep.edits.clone();
@@ -1402,6 +1423,14 @@ fn edit_cmd(args: &[String]) {
             (!text.is_empty()).then(|| text.to_string()),
         );
         println!("caption: {} = {text:?}", asset_label(asset));
+    }
+    if a.no_closing {
+        edits.closing = None;
+        println!("closing: cleared");
+    }
+    if let Some(asset) = closing {
+        edits.closing = Some(asset.id.clone());
+        println!("closing: {}", asset_label(asset));
     }
     for asset in &unbooks {
         edits.set_book(asset.id.clone(), false);

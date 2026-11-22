@@ -141,6 +141,8 @@ pub struct BookPhoto {
     /// Detected faces (normalised boxes), when the face models ran: page
     /// layouts avoid cells that would cut them.
     pub faces: Vec<FaceBox>,
+    /// The owner chose this photo for the closing page.
+    pub closing: bool,
 }
 
 impl BookPhoto {
@@ -178,6 +180,7 @@ impl BookPhoto {
             crop_focus: None,
             aboard: false,
             faces: vec![],
+            closing: false,
         }
     }
 
@@ -1258,7 +1261,13 @@ pub fn render_book(
     // The closing page's photo, chosen now from what the pages leave out:
     // a strong people shot of the last days that the book doesn't print
     // elsewhere, so the last page is new, not a repeat.
-    let closing_pick: Option<BookPhoto> = {
+    // The owner's choice first; it then leaves the pages, so it never
+    // prints twice.
+    let owner_closing = viable.iter().find(|p| p.closing).cloned();
+    if let Some(c) = &owner_closing {
+        pruned.retain(|p| p.asset_id != c.asset_id);
+    }
+    let closing_pick: Option<BookPhoto> = owner_closing.or_else(|| {
         let placed: HashSet<&str> = pruned.iter().map(|p| p.asset_id.as_str()).collect();
         let last_day = viable.iter().filter_map(|p| p.day).max();
         viable
@@ -1276,7 +1285,7 @@ pub fn render_book(
             })
             .max_by(|a, b| a.score.total_cmp(&b.score))
             .cloned()
-    };
+    });
     // A photo alone in its stretch (its day or named place) would fill a
     // page by itself: worth it for people or the owner's caption, not for
     // a plate of food or a candy bucket.
@@ -2941,11 +2950,9 @@ fn write_typst_and_compile(
         for (rect, text) in texts.cells.get(&page_no).into_iter().flatten() {
             // Grid cells end above the page strip, so a cell caption needs
             // no lift unless its cell still reaches into the strip's band.
-            let lift = if rect.1 + rect.3 > 1.0 - strip_pt / (ph * 72.0) {
-                strip_pt
-            } else {
-                0.0
-            };
+            // Only by as much as the cell actually runs into the strip.
+            let overlap = rect.1 + rect.3 - (1.0 - strip_pt / (ph * 72.0));
+            let lift = (overlap * ph * 72.0).max(0.0);
             typ.push_str(&cell_caption_typ(
                 (pw, ph),
                 (tw_in, th_in),
@@ -3073,7 +3080,13 @@ fn strip_px(lines: &[String], title: bool, preset: BookPreset, th: u32) -> u32 {
     }
     let (size, inset) = if title { (24, 14) } else { (14, 8) };
     let (w_in, h_in) = preset.trim_inches();
-    let pt = strip_height_pt(&lines.join(" · "), size, inset, w_in);
+    // As the burn draws it: a title on its own line, the rest beneath.
+    let pt = if title && lines.len() > 1 {
+        strip_height_pt(&lines[0], size, inset, w_in)
+            + strip_height_pt(&lines[1..].join(" · "), 14, 0, w_in)
+    } else {
+        strip_height_pt(&lines.join(" · "), size, inset, w_in)
+    };
     (pt / (h_in * 72.0) * f64::from(th)).round() as u32
 }
 

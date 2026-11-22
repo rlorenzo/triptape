@@ -284,6 +284,9 @@ pub struct Plan {
     /// captioned photo.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub book: Vec<String>,
+    /// The owner's photo for the book's closing page, if chosen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closing: Option<String>,
 }
 
 /// How the user regrouped the film's collages, by asset id. Read by

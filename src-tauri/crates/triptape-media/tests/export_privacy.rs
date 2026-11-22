@@ -330,6 +330,7 @@ fn film_from_tagged_sources_is_clean_and_carries_no_rotation() {
         cover: Default::default(),
         crop: Default::default(),
         book: Default::default(),
+        closing: Default::default(),
     };
     let caps = triptape_media::ffmpeg::probe_capabilities(ff(), &tools.ffprobe.bin);
     let film = t.path().join("hero.mp4");
