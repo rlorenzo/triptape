@@ -1168,6 +1168,7 @@ mod tests {
             crop: Default::default(),
             book: Default::default(),
             closing: Default::default(),
+            book_layout: Default::default(),
         };
         let out = apply_itinerary(&plan, &assets, &itin());
         let places: Vec<_> = out

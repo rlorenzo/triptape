@@ -173,6 +173,44 @@ fn book_chapter_of(plan: &Plan) -> HashMap<&str, usize> {
 
 /// A book photo's caption: the user's, else its shared place
 /// ([`triptape_core::places::photo_places`]).
+/// The owner's page groups (`--group`): each group's photos move together
+/// to where its earliest photo stands in story order and become one stretch
+/// of that photo's day, so they share a page.
+fn group_pages(photos: &mut Vec<BookPhoto>, groups: &[Vec<String>]) {
+    for (n, group) in groups.iter().enumerate() {
+        let mut members: Vec<BookPhoto> = vec![];
+        let mut at = None;
+        let mut k = 0;
+        while k < photos.len() {
+            if group.contains(&photos[k].asset_id) {
+                at.get_or_insert(k);
+                members.push(photos.remove(k));
+            } else {
+                k += 1;
+            }
+        }
+        let (Some(at), Some(first)) = (at, members.first()) else {
+            continue;
+        };
+        if members.len() < 2 {
+            photos.splice(at..at, members);
+            continue;
+        }
+        let (day, chapter) = (first.day, first.chapter);
+        let area = Some(format!(
+            "{} \u{b7} page {}",
+            first.area.clone().unwrap_or_default(),
+            n + 1
+        ));
+        for m in &mut members {
+            m.day = day;
+            m.chapter = chapter;
+            m.area = area.clone();
+        }
+        photos.splice(at..at, members);
+    }
+}
+
 fn book_caption(plan: &Plan, places: &HashMap<String, String>, id: &str) -> Option<String> {
     // A hidden (blank) caption still leaves the photo its place.
     plan.captions
@@ -818,9 +856,20 @@ fn export_inner(
                 )
             })
             .collect();
+        let layout = &plan.book_layout;
+        let laid_out = |id: &str| {
+            layout.feature.iter().any(|x| x == id)
+                || layout.whole.iter().any(|x| x == id)
+                || layout.stills.contains_key(id)
+                || layout.groups.iter().flatten().any(|x| x == id)
+        };
         for a in assets
             .iter()
-            .filter(|a| a.kind != AssetKind::Video && in_book_flow(&chapter_of, &a.id))
+            // Videos only as the frame the owner chose (`--still`).
+            .filter(|a| {
+                (a.kind != AssetKind::Video || layout.stills.contains_key(&a.id))
+                    && in_book_flow(&chapter_of, &a.id)
+            })
         {
             if let Err(reason) = verify_source(&asset_snapshot(a), &a.path) {
                 report.fallbacks.push(format!("book: {reason}; skipped"));
@@ -881,10 +930,13 @@ fn export_inner(
                 // Captioned, pinned into the book, or pinned to the cover by
                 // the owner: always placed (the page cap never drops it).
                 keep: plan.book.contains(&a.id)
+                    || laid_out(&a.id)
                     || plan.cover.contains_key(&a.id)
                     || closing
                     || has_caption(plan.captions.get(&a.id).map(String::as_str)),
-                pinned: plan.book.contains(&a.id) || plan.cover.contains_key(&a.id),
+                pinned: plan.book.contains(&a.id)
+                    || laid_out(&a.id)
+                    || plan.cover.contains_key(&a.id),
                 taken_at: a.taken_at,
                 phash: a.phash,
                 people_sig: a.people_sig,
@@ -902,6 +954,9 @@ fn export_inner(
                     .crop
                     .get(&a.id)
                     .map(|&(x, y)| (f32::from(x) / 100.0, f32::from(y) / 100.0)),
+                still_ms: layout.stills.get(&a.id).copied(),
+                feature: layout.feature.contains(&a.id),
+                whole: layout.whole.contains(&a.id),
             });
         }
         // A photo and the owner's `_edited` version of it are one photo:
@@ -923,6 +978,7 @@ fn export_inner(
                 .copied()
                 .unwrap_or(usize::MAX)
         });
+        group_pages(&mut book_photos, &layout.groups);
         let book_dir = out_dir.join("book");
         let staged_book = stage.join("book");
         // Day-marker titles: day once, with the location.
@@ -1237,6 +1293,29 @@ mod tests {
     }
 
     #[test]
+    fn a_page_group_moves_together_to_its_first_photo() {
+        let photo = |id: &str, area: &str| BookPhoto {
+            asset_id: id.into(),
+            day: Some(19),
+            area: Some(area.into()),
+            ..BookPhoto::blank()
+        };
+        let mut photos = vec![
+            photo("pano1", "Palace"),
+            photo("selfie", "Palace"),
+            photo("pano2", "Palace"),
+            photo("street", "Street"),
+            photo("pano3", "Post Office"),
+        ];
+        let groups = vec![vec!["pano1".to_string(), "pano2".into(), "pano3".into()]];
+        group_pages(&mut photos, &groups);
+        let ids: Vec<&str> = photos.iter().map(|p| p.asset_id.as_str()).collect();
+        assert_eq!(ids, ["pano1", "pano2", "pano3", "selfie", "street"]);
+        assert!(photos[..3].iter().all(|p| p.area == photos[0].area));
+        assert_ne!(photos[3].area, photos[0].area, "its own page");
+    }
+
+    #[test]
     fn book_captions_prefer_user_text_then_the_shared_place() {
         let mut plan = empty_plan();
         let places: HashMap<String, String> =
@@ -1430,6 +1509,7 @@ mod tests {
             crop: Default::default(),
             book: Default::default(),
             closing: Default::default(),
+            book_layout: Default::default(),
         }
     }
 

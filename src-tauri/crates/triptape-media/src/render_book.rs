@@ -136,6 +136,12 @@ pub struct BookPhoto {
     /// The owner's crop focus, (x, y) as fractions of the photo: crops
     /// centre there instead of on detected faces.
     pub crop_focus: Option<(f32, f32)>,
+    /// A video shown as one frame, this many milliseconds in.
+    pub still_ms: Option<u32>,
+    /// The owner wants this photo in the biggest cell on its page.
+    pub feature: bool,
+    /// The owner wants this photo never cropped.
+    pub whole: bool,
     /// The itinerary puts the shot on board the ship.
     pub aboard: bool,
     /// Detected faces (normalised boxes), when the face models ran: page
@@ -181,6 +187,9 @@ impl BookPhoto {
             face_size: 0.0,
             cover_focus: None,
             crop_focus: None,
+            still_ms: None,
+            feature: false,
+            whole: false,
             aboard: false,
             faces: vec![],
             closing: false,
@@ -501,6 +510,21 @@ pub fn flow_pages(
     has_map: bool,
     cap: usize,
 ) -> Vec<FlowPage> {
+    flow_pages_marked(chapter_of, day_of, &[], wide_idx, has_map, cap)
+}
+
+/// [`flow_pages`] where a chapter whose first photo is marked in
+/// `no_divider` gets no divider: its heading goes on its first photo page
+/// (a captioned plate of food opens the day in time order, on a shared
+/// page, instead of yielding to a later family photo pulled ahead of it).
+pub fn flow_pages_marked(
+    chapter_of: &[Option<usize>],
+    day_of: &[Option<u32>],
+    no_divider: &[bool],
+    wide_idx: Option<usize>,
+    has_map: bool,
+    cap: usize,
+) -> Vec<FlowPage> {
     let n_photos = chapter_of.len();
     let mut pages = vec![FlowPage {
         kind: PageKind::CoverProxy,
@@ -549,6 +573,10 @@ pub fn flow_pages(
     // use up its photo and lead straight into the next, undivided chapter's
     // pages under the wrong title, so only chapters with photos to spare
     // compete for the limited dividers.
+    let openings: Vec<usize> = openings
+        .into_iter()
+        .filter(|&o| !no_divider.get(rest_idx[o]).copied().unwrap_or(false))
+        .collect();
     let eligible: Vec<usize> = if openings.len() > MAX_DIVIDERS {
         let mut photos_in: HashMap<Option<usize>, usize> = HashMap::new();
         for c in &rest {
@@ -821,7 +849,18 @@ fn book_flow(photos: &[BookPhoto], has_map: bool, cap: usize) -> Vec<FlowPage> {
             Some(stretch)
         })
         .collect();
-    flow_pages(&chapter_of, &stretch_of, wide_index(photos), has_map, cap)
+    // A day opening on the owner's captioned shot with no one in it (a
+    // plate of food) keeps its time order: no divider pulls a later family
+    // photo ahead of it.
+    let no_divider: Vec<bool> = photos.iter().map(|p| p.keep && !p.is_of_people()).collect();
+    flow_pages_marked(
+        &chapter_of,
+        &stretch_of,
+        &no_divider,
+        wide_index(photos),
+        has_map,
+        cap,
+    )
 }
 
 /// The selected photos as the pages print them: the owner's closing photo
@@ -1753,12 +1792,9 @@ pub fn render_book(
 
     let counted = count_pages(&kinds);
     let texts = PageTexts {
+        titles: day_title_pages(&kinds, &bannered, &captions),
         lines: captions,
         cells: cell_captions,
-        // kinds[0] is the uncounted cover-proxy, so kinds[n] is page n.
-        titles: (1..kinds.len())
-            .filter(|&n| kinds[n] == PageKind::Divider || bannered.contains(&n))
-            .collect(),
     };
     opts.progress.check_cancelled()?;
     opts.progress.step("book", "proof and press PDFs", None);
@@ -2004,6 +2040,32 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
     format!("{head} — {}", seen.join(" · "))
 }
 
+/// Pages whose strip prints large: a divider or bannered page whose
+/// heading starts a new day ("Day 21 · …"). A mid-day divider (a new place
+/// on the same day) keeps the caption size, so large type always means a new
+/// day. A book without day headings keeps every divider large.
+fn day_title_pages(
+    kinds: &[PageKind],
+    bannered: &HashSet<usize>,
+    captions: &HashMap<usize, Vec<String>>,
+) -> HashSet<usize> {
+    // kinds[0] is the uncounted cover-proxy, so kinds[n] is page n.
+    let headed: Vec<usize> = (1..kinds.len())
+        .filter(|&n| kinds[n] == PageKind::Divider || bannered.contains(&n))
+        .collect();
+    let is_day = |n: &usize| {
+        captions
+            .get(n)
+            .and_then(|l| l.first())
+            .is_some_and(|h| h.starts_with("Day "))
+    };
+    if headed.iter().any(is_day) {
+        headed.into_iter().filter(is_day).collect()
+    } else {
+        headed.into_iter().collect()
+    }
+}
+
 /// Caption lines for a divider page: its background photo's chapter title
 /// plus that photo's own caption, since the photo is consumed here.
 fn divider_lines(bg: &BookPhoto, chapters: &[String], announced: &mut Announced) -> Vec<String> {
@@ -2166,6 +2228,16 @@ fn caption_of(p: &BookPhoto) -> Vec<String> {
 // -- page painters (photo geometry real; caption text burned in via Typst) -
 
 fn load(photo: &BookPhoto, ffmpeg_bin: &str, fallbacks: &mut Vec<String>) -> RgbImage {
+    if let Some(ms) = photo.still_ms {
+        return video_frame(ffmpeg_bin, &photo.path, ms).unwrap_or_else(|| {
+            fallbacks.push(format!(
+                "{} frame at {:.1}s unreadable; gray placeholder",
+                photo.display_name(),
+                f64::from(ms) / 1000.0
+            ));
+            solid(800, 600, Rgb([90, 90, 95]))
+        });
+    }
     match image::open(&photo.path) {
         // The image crate ignores EXIF orientation (the FFmpeg/sips decode
         // path orients its output), so portrait JPEGs would print sideways
@@ -2196,6 +2268,31 @@ fn load(photo: &BookPhoto, ffmpeg_bin: &str, fallbacks: &mut Vec<String>) -> Rgb
 
 /// Decode a still the `image` crate cannot read (HEIC) through FFmpeg
 /// (with the macOS `sips` fallback for tmap/Dolby Vision items).
+/// One frame of the video at `path`, `ms` milliseconds in, upright (FFmpeg
+/// applies the video's rotation).
+fn video_frame(ffmpeg_bin: &str, path: &std::path::Path, ms: u32) -> Option<RgbImage> {
+    let out = std::env::temp_dir().join(format!("triptape-still-{}-{ms}.png", std::process::id()));
+    let ok = std::process::Command::new(ffmpeg_bin)
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-ss",
+            &format!("{:.3}", f64::from(ms) / 1000.0),
+            "-i",
+        ])
+        .arg(path)
+        .args(["-frames:v", "1"])
+        .arg(&out)
+        .status()
+        .is_ok_and(|s| s.success());
+    let img = ok
+        .then(|| image::open(&out).ok().map(|d| d.to_rgb8()))
+        .flatten();
+    let _ = std::fs::remove_file(&out);
+    img
+}
+
 fn decode_via_ffmpeg(ffmpeg_bin: &str, path: &std::path::Path) -> Option<RgbImage> {
     let png = crate::ffmpeg::decode_still_to_png(ffmpeg_bin, path).ok()?;
     image::open(&png.path).ok().map(|d| d.to_rgb8())
@@ -2228,6 +2325,11 @@ fn fit_photo_focused(
     fb: &mut Vec<String>,
 ) -> RgbImage {
     let src = load(p, fit.ffmpeg, fb);
+    if p.whole {
+        // The owner wants all of it (the glass floor at the bottom edge).
+        let strip_px = (reserve.clamp(0.0, 1.0) * f64::from(th)).round() as u32;
+        return contain_on_page(&src, tw, th, strip_px);
+    }
     let faces = match fit.faces {
         Some(f) => fit
             .found
@@ -2726,6 +2828,14 @@ const NARROW_CELL_COST: f64 = 1.5;
 /// cropped, keeping the biggest faces).
 const WHOLE_MIN_FILL: f64 = 0.75;
 
+/// What a grid layout pays when the owner's featured photo is not in the
+/// page's biggest cell: more than anything else a layout can cost.
+const FEATURE_COST: f64 = 20.0;
+
+/// What a never-cropped photo pays per unit of shape mismatch with its
+/// cell (the bars it leaves).
+const WHOLE_MISMATCH_COST: f64 = 4.0;
+
 /// What a grid layout pays for a cell that cuts a detected face: more
 /// than any amount of ordinary cropping.
 const FACE_CUT_COST: f64 = 6.0;
@@ -2833,16 +2943,31 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
             if frame_cuts(slot[i], cw, row_h[r], 0.0) {
                 cost += FACE_CUT_COST;
             }
-            cost += weight
-                * if c < a {
-                    1.0 - c / a // sides cut
-                } else {
-                    (1.0 - a / c) * if a > 1.0 { 0.6 } else { 1.0 } // top/bottom cut
-                };
+            cost += if slot[i].whole {
+                // Never cropped: a mismatched cell leaves bars, so the
+                // layout gives it a cell of its own shape.
+                WHOLE_MISMATCH_COST * (1.0 - (c / a).min(a / c))
+            } else {
+                weight
+                    * if c < a {
+                        1.0 - c / a // sides cut
+                    } else {
+                        (1.0 - a / c) * if a > 1.0 { 0.6 } else { 1.0 } // top/bottom cut
+                    }
+            };
         }
         // Unequal sizes: shrinking a photo costs as much more as
         // cropping it does, so people photos get the big cells.
         let areas: Vec<f64> = cells.iter().map(|c| c.2 * c.3).collect();
+        // The owner's featured photo takes the biggest cell.
+        let biggest = areas.iter().copied().fold(0.0, f64::max);
+        if slot
+            .iter()
+            .zip(&areas)
+            .any(|(p, &a)| p.feature && a < biggest * 0.98)
+        {
+            cost += FEATURE_COST;
+        }
         let mean = areas.iter().sum::<f64>() / n as f64;
         cost += BALANCE
             * areas
@@ -3617,6 +3742,46 @@ mod tests {
             title_rest_lines(&["Mount Faber", "Singapore"]),
             ["Mount Faber · Singapore"]
         );
+    }
+
+    #[test]
+    fn only_day_headings_print_large() {
+        let kinds = vec![
+            PageKind::CoverProxy,
+            PageKind::Divider,
+            PageKind::Grid,
+            PageKind::Divider,
+        ];
+        let caps: HashMap<usize, Vec<String>> = [
+            (
+                1,
+                vec!["Day 19 · Wed, Oct 21 — Ho Chi Minh City".to_string()],
+            ),
+            (3, vec!["Disney Adventure".to_string()]),
+        ]
+        .into();
+        let titles = day_title_pages(&kinds, &HashSet::new(), &caps);
+        assert_eq!(
+            titles,
+            HashSet::from([1]),
+            "the mid-day divider stays small"
+        );
+    }
+
+    #[test]
+    fn a_chapter_opening_on_a_marked_photo_gets_no_divider() {
+        let chapters: Vec<Option<usize>> = vec![Some(0), Some(0), Some(1), Some(1), Some(1)];
+        let plain = flow_pages(&chapters, &[], None, false, 60);
+        assert!(plain.iter().any(|p| p.kind == PageKind::Divider));
+        let marked = flow_pages_marked(
+            &chapters,
+            &[],
+            &[false, false, true, false, false],
+            None,
+            false,
+            60,
+        );
+        assert!(marked.iter().all(|p| p.kind != PageKind::Divider));
     }
 
     #[test]

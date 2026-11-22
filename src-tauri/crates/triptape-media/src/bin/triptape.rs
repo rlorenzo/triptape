@@ -5,7 +5,7 @@
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m] [--models DIR]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
-//!                [--solo REF...] [--unsolo REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--list]
+//!                [--solo REF...] [--unsolo REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--feature REF...] [--whole REF...] [--still VIDEO SECS] [--group REF REF...] [--unfeature|--unwhole|--unstill|--ungroup REF...] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
@@ -1061,6 +1061,18 @@ struct EditArgs {
     /// The book's closing photo (`--closing REF`); `--no-closing` clears it.
     closing: Option<String>,
     no_closing: bool,
+    /// Book layout: photos that take the biggest cell on their page.
+    feature: Vec<String>,
+    unfeature: Vec<String>,
+    /// Photos never cropped in the book.
+    whole: Vec<String>,
+    unwhole: Vec<String>,
+    /// Videos shown in the book as one frame: (asset, seconds in).
+    still: Vec<(String, f64)>,
+    unstill: Vec<String>,
+    /// Photos that share one book page.
+    group: Vec<Vec<String>>,
+    ungroup: Vec<String>,
 }
 
 const MOVE_USAGE: &str = "--move wants --after REF or --before REF";
@@ -1110,6 +1122,19 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                 }
             }
             "closing" => out.closing = Some(single(values)?),
+            "still" => match <[String; 2]>::try_from(values) {
+                Ok([a, secs]) => match secs.parse::<f64>() {
+                    Ok(t) if t.is_finite() && t >= 0.0 => out.still.push((a, t)),
+                    _ => {
+                        return Err(format!(
+                            "--still wants seconds into the video, got {secs:?}"
+                        ))
+                    }
+                },
+                Err(_) => return Err("--still wants a video and the seconds into it".to_string()),
+            },
+            "group" if values.len() >= 2 => out.group.push(values),
+            "group" => return Err("--group wants two or more photos".to_string()),
             "no-closing" if values.is_empty() => out.no_closing = true,
             "no-closing" => return Err("--no-closing takes no value".to_string()),
             "crop" => match <[String; 3]>::try_from(values) {
@@ -1139,7 +1164,8 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                 out.moves.push((asset, single(values)?, flag == "after"));
             }
             "include" | "exclude" | "uninclude" | "unexclude" | "solo" | "unsolo" | "unjoin"
-            | "unmove" | "uncover" | "hide-caption" | "uncrop" | "book" | "unbook" => {
+            | "unmove" | "uncover" | "hide-caption" | "uncrop" | "book" | "unbook" | "feature"
+            | "unfeature" | "whole" | "unwhole" | "unstill" | "ungroup" => {
                 if values.is_empty() {
                     return Err(format!("--{flag} wants at least one asset"));
                 }
@@ -1156,6 +1182,12 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     "uncrop" => out.uncrop.extend(values),
                     "book" => out.book.extend(values),
                     "unbook" => out.unbook.extend(values),
+                    "feature" => out.feature.extend(values),
+                    "unfeature" => out.unfeature.extend(values),
+                    "whole" => out.whole.extend(values),
+                    "unwhole" => out.unwhole.extend(values),
+                    "unstill" => out.unstill.extend(values),
+                    "ungroup" => out.ungroup.extend(values),
                     _ => out.unjoin.extend(values),
                 }
             }
@@ -1231,6 +1263,31 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
     }
     if let Some(id) = &edits.closing {
         println!("closing photo: {}", show(id));
+    }
+    let layout = &edits.book_layout;
+    if !layout.is_empty() {
+        println!(
+            "book layout: {} featured, {} whole, {} stills, {} groups",
+            layout.feature.len(),
+            layout.whole.len(),
+            layout.stills.len(),
+            layout.groups.len()
+        );
+        for id in &layout.feature {
+            println!("  feature {}", show(id));
+        }
+        for id in &layout.whole {
+            println!("  whole {}", show(id));
+        }
+        for (id, ms) in &layout.stills {
+            println!("  still {} at {:.1}s", show(id), f64::from(*ms) / 1000.0);
+        }
+        for g in &layout.groups {
+            println!(
+                "  group {}",
+                g.iter().map(&show).collect::<Vec<_>>().join(" + ")
+            );
+        }
     }
     println!("book pins: {}", edits.book.len());
     for id in &edits.book {
@@ -1400,6 +1457,41 @@ fn edit_cmd(args: &[String]) {
         );
     }
     let unbooks = resolve(&a.unbook);
+    let features = resolve(&a.feature);
+    let unfeatures = resolve(&a.unfeature);
+    let wholes = resolve(&a.whole);
+    let unwholes = resolve(&a.unwhole);
+    let stills: Vec<(&Asset, f64)> = a.still.iter().map(|(q, t)| (resolve_one(q), *t)).collect();
+    if let Some((asset, _)) = stills.iter().find(|(x, _)| x.kind != AssetKind::Video) {
+        die(
+            "edit",
+            format!(
+                "{} is not a video; --still takes a frame from a video",
+                asset_label(asset)
+            ),
+        );
+    }
+    let unstills = resolve(&a.unstill);
+    let groups: Vec<Vec<&Asset>> = a.group.iter().map(|g| resolve(g)).collect();
+    let ungroups = resolve(&a.ungroup);
+    // Layout choices only reach photos the plan holds.
+    let laid_out = features
+        .iter()
+        .chain(&wholes)
+        .chain(stills.iter().map(|(x, _)| x))
+        .chain(groups.iter().flatten());
+    if let Some(asset) = laid_out
+        .into_iter()
+        .find(|x| ep.base.chapter_of(&x.id).is_none())
+    {
+        die(
+            "edit",
+            format!(
+                "{} is not in any chapter of the plan, so the book can't lay it out",
+                asset_label(asset)
+            ),
+        );
+    }
     let changed = ops.iter().any(|(assets, ..)| !assets.is_empty())
         || !unjoins.is_empty()
         || !joins.is_empty()
@@ -1414,11 +1506,19 @@ fn edit_cmd(args: &[String]) {
         || !books.is_empty()
         || !unbooks.is_empty()
         || closing.is_some()
-        || a.no_closing;
+        || a.no_closing
+        || !features.is_empty()
+        || !unfeatures.is_empty()
+        || !wholes.is_empty()
+        || !unwholes.is_empty()
+        || !stills.is_empty()
+        || !unstills.is_empty()
+        || !groups.is_empty()
+        || !ungroups.is_empty();
     if !changed && !a.list {
         die(
             "edit",
-            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--book/--unbook/--closing/--no-closing or --list",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--book/--unbook/--closing/--no-closing/--feature/--whole/--still/--group (and their un- forms) or --list",
         );
     }
     let mut edits = ep.edits.clone();
@@ -1447,6 +1547,59 @@ fn edit_cmd(args: &[String]) {
     if let Some(asset) = closing {
         edits.closing = Some(asset.id.clone());
         println!("closing: {}", asset_label(asset));
+    }
+    {
+        let layout = &mut edits.book_layout;
+        for asset in &unfeatures {
+            layout.feature.retain(|id| *id != asset.id);
+            println!("unfeature: {}", asset_label(asset));
+        }
+        for asset in &features {
+            layout.feature.retain(|id| *id != asset.id);
+            layout.feature.push(asset.id.clone());
+            println!("feature: {}", asset_label(asset));
+        }
+        for asset in &unwholes {
+            layout.whole.retain(|id| *id != asset.id);
+            println!("unwhole: {}", asset_label(asset));
+        }
+        for asset in &wholes {
+            layout.whole.retain(|id| *id != asset.id);
+            layout.whole.push(asset.id.clone());
+            println!("whole: {}", asset_label(asset));
+        }
+        for asset in &unstills {
+            layout.stills.remove(&asset.id);
+            println!("unstill: {}", asset_label(asset));
+        }
+        for (asset, t) in &stills {
+            layout
+                .stills
+                .insert(asset.id.clone(), (t * 1000.0).round() as u32);
+            println!("still: {} at {t}s", asset_label(asset));
+        }
+        for asset in &ungroups {
+            for g in &mut layout.groups {
+                g.retain(|id| *id != asset.id);
+            }
+            println!("ungroup: {}", asset_label(asset));
+        }
+        for g in &groups {
+            let ids: Vec<String> = g.iter().map(|x| x.id.clone()).collect();
+            // A photo is in at most one group: the newest one.
+            for old in &mut layout.groups {
+                old.retain(|id| !ids.contains(id));
+            }
+            layout.groups.push(ids);
+            println!(
+                "group: {}",
+                g.iter()
+                    .map(|x| asset_label(x))
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            );
+        }
+        layout.groups.retain(|g| g.len() >= 2);
     }
     for asset in &unbooks {
         edits.set_book(asset.id.clone(), false);

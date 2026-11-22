@@ -1238,6 +1238,7 @@ mod tests {
             crop: Default::default(),
             book: Default::default(),
             closing: Default::default(),
+            book_layout: Default::default(),
         };
         assert!(db.get_plan_edits(&p.id).unwrap().is_empty());
         db.save_plan_edits(&p.id, &edits).unwrap();
@@ -1782,6 +1783,7 @@ mod tests {
             crop: Default::default(),
             book: Default::default(),
             closing: Default::default(),
+            book_layout: Default::default(),
         };
         db.insert_plan(&p.id, &plan, "local").unwrap();
         let back = db.latest_plan(Some(&p.id)).unwrap().unwrap();

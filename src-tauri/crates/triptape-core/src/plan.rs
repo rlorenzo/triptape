@@ -1156,6 +1156,9 @@ pub struct PlanEdits {
     /// The book's closing photo (see [`crate::types::Plan::closing`]).
     #[serde(default)]
     pub closing: Option<String>,
+    /// Book layout choices (see [`crate::types::BookLayout`]).
+    #[serde(default)]
+    pub book_layout: crate::types::BookLayout,
 }
 
 impl PlanEdits {
@@ -1171,6 +1174,7 @@ impl PlanEdits {
             && self.crop.is_empty()
             && self.book.is_empty()
             && self.closing.is_none()
+            && self.book_layout.is_empty()
     }
 
     /// Pin a photo into the book, or unpin it.
@@ -1544,6 +1548,9 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
         .closing
         .clone()
         .filter(|id| in_plan.contains(id.as_str()) && !dead.contains(id.as_str()));
+    out.book_layout = edits.book_layout.clone();
+    out.book_layout
+        .retain_assets(|id| in_plan.contains(id) && !dead.contains(id));
     out.collage
         .retain_assets(|id| in_plan.contains(id) && !dead.contains(id));
     out
@@ -1935,6 +1942,7 @@ pub fn build_plan_with_length(
         crop: Default::default(),
         book: Default::default(),
         closing: Default::default(),
+        book_layout: Default::default(),
     }
 }
 
@@ -5088,6 +5096,7 @@ mod tests {
             crop: Default::default(),
             book: Default::default(),
             closing: Default::default(),
+            book_layout: Default::default(),
         };
         // a4 is a panorama: solo. a1 and a3 join across the clip; b1 and
         // b3 across the captioned b2; nothing joins across the chapters.

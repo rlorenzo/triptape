@@ -316,6 +316,47 @@ pub struct Plan {
     /// The owner's photo for the book's closing page, if chosen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closing: Option<String>,
+    /// The owner's book layout choices (see [`BookLayout`]).
+    #[serde(default, skip_serializing_if = "BookLayout::is_empty")]
+    pub book_layout: BookLayout,
+}
+
+/// How the owner wants particular photos laid out in the book.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BookLayout {
+    /// Photos that get the biggest cell on their page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feature: Vec<String>,
+    /// Photos never cropped: shown whole in their cell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub whole: Vec<String>,
+    /// Videos shown in the book as one frame: asset id -> milliseconds in.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stills: BTreeMap<String, u32>,
+    /// Photos that share one page, in the order given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<Vec<String>>,
+}
+
+impl BookLayout {
+    pub fn is_empty(&self) -> bool {
+        self.feature.is_empty()
+            && self.whole.is_empty()
+            && self.stills.is_empty()
+            && self.groups.is_empty()
+    }
+
+    /// Keep only the asset ids `keep` accepts; groups left with fewer
+    /// than two photos go.
+    pub fn retain_assets(&mut self, keep: impl Fn(&str) -> bool) {
+        self.feature.retain(|id| keep(id));
+        self.whole.retain(|id| keep(id));
+        self.stills.retain(|id, _| keep(id));
+        for g in &mut self.groups {
+            g.retain(|id| keep(id));
+        }
+        self.groups.retain(|g| g.len() >= 2);
+    }
 }
 
 /// How the user regrouped the film's collages, by asset id. Read by
