@@ -201,16 +201,16 @@ pub fn x264_aac(preset: &str, crf: u32) -> Vec<String> {
         .map(String::from)
         .to_vec();
     args.push(crf.to_string());
-    args.extend(yuv420p_aac_faststart());
+    args.extend(pix_fmt_aac_faststart("yuv420p"));
     args
 }
 
-/// The encoder-independent tail of [`x264_aac`]: yuv420p, AAC 48 kHz
+/// The encoder-independent tail of [`x264_aac`]: `pix_fmt`, AAC 48 kHz
 /// stereo, faststart.
-fn yuv420p_aac_faststart() -> Vec<String> {
+fn pix_fmt_aac_faststart(pix_fmt: &str) -> Vec<String> {
     [
         "-pix_fmt",
-        "yuv420p",
+        pix_fmt,
         "-c:a",
         "aac",
         "-ar",
@@ -227,8 +227,13 @@ fn yuv420p_aac_faststart() -> Vec<String> {
 /// Peak video bitrate of a 4K film, kbit/s. A Roku (player or TV) on
 /// Ethernet has a 100 Mbit/s port, and Plex direct-plays only what the
 /// link sustains: an uncapped CRF encode peaked near 300 Mbit/s and
-/// buffered. 30 Mbit/s leaves room for Wi-Fi and other traffic.
-pub const FILM_4K_MAX_KBPS: u32 = 30_000;
+/// buffered. 40 Mbit/s leaves more than half the link for Wi-Fi and other
+/// traffic.
+pub const FILM_4K_MAX_KBPS: u32 = 40_000;
+/// x265 quality of the 4K film: visually lossless on a TV for phone
+/// photos and video (about 20-25 Mbit/s average on the Japan to Singapore
+/// trip), with [`FILM_4K_MAX_KBPS`] trimming only the busiest seconds.
+const FILM_4K_CRF: &str = "18";
 /// Peak video bitrate of a 1080p film or a 1080x1920 reel, kbit/s.
 pub const FILM_1080P_MAX_KBPS: u32 = 15_000;
 
@@ -248,9 +253,10 @@ pub fn bitrate_cap_args(kbps: u32) -> Vec<String> {
 /// (`FILM_4K_MAX_KBPS` / `FILM_1080P_MAX_KBPS`, one-second buffer so the
 /// cap holds second by second). 4K is HEVC when this FFmpeg has libx265
 /// (half the bitrate of H.264 for the same picture; every 4K Roku plays
-/// it), tagged `hvc1` for Apple players; otherwise H.264 High 5.1. 1080p
-/// stays H.264, which every player handles. Yuv420p, AAC 48 kHz stereo,
-/// faststart, as [`x264_aac`].
+/// it) at CRF 18, 10-bit (Main10) when this libx265 can, tagged `hvc1`
+/// for Apple players; otherwise H.264 High 5.1. 1080p
+/// stays H.264, which every player handles. `yuv420p10le` for 10-bit HEVC
+/// (else `yuv420p`), AAC 48 kHz stereo, faststart, as [`x264_aac`].
 pub fn film_encode_args(caps: &Capabilities, res: Resolution) -> Vec<String> {
     let max = match res {
         Resolution::Uhd4k => FILM_4K_MAX_KBPS,
@@ -263,7 +269,7 @@ pub fn film_encode_args(caps: &Capabilities, res: Resolution) -> Vec<String> {
             "-preset",
             "fast",
             "-crf",
-            "21",
+            FILM_4K_CRF,
             "-tag:v",
             "hvc1",
             "-x265-params",
@@ -273,7 +279,15 @@ pub fn film_encode_args(caps: &Capabilities, res: Resolution) -> Vec<String> {
         args.push(format!(
             "vbv-maxrate={max}:vbv-bufsize={max}:log-level=error"
         ));
-        args.extend(yuv420p_aac_faststart());
+        if caps.libx265_10bit {
+            // 10-bit HEVC (Main10): smooth skies, sunsets and dark
+            // gradients without banding; every 4K Roku and Apple TV plays
+            // it, and Plex direct-plays it.
+            args.extend(pix_fmt_aac_faststart("yuv420p10le"));
+            args.extend(["-profile:v".into(), "main10".into()]);
+        } else {
+            args.extend(pix_fmt_aac_faststart("yuv420p"));
+        }
         return args;
     }
     let mut args = x264_aac("medium", 19);
@@ -290,6 +304,8 @@ pub struct Capabilities {
     pub libx264: bool,
     /// HEVC encoder, for the streamable 4K film ([`film_encode_args`]).
     pub libx265: bool,
+    /// The HEVC encoder can write 10-bit (Main10) video.
+    pub libx265_10bit: bool,
     pub aac: bool,
     pub xfade: bool,
     pub perspective: bool,
@@ -417,6 +433,16 @@ fn flag_present(output: &str, name: &str) -> bool {
     })
 }
 
+/// Whether libx265's encoder help (`ffmpeg -h encoder=libx265`; `None` when
+/// that call failed) lists a 10-bit pixel format among those it supports.
+fn x265_writes_10bit(help: Option<&str>) -> bool {
+    help.is_some_and(|h| {
+        h.lines()
+            .filter(|l| l.contains("pixel formats"))
+            .any(|l| l.split_whitespace().any(|f| f == "yuv420p10le"))
+    })
+}
+
 /// Probe `ffmpeg_bin` (`-encoders`, `-filters`) for the capabilities above.
 /// Missing binaries or unparseable output yield all-false capabilities
 /// (callers then fail with a clear error instead of misprobing).
@@ -424,11 +450,16 @@ pub fn probe_capabilities(ffmpeg_bin: &str, ffprobe_bin: &str) -> Capabilities {
     let encoders = run_capture(ffmpeg_bin, &["-hide_banner", "-encoders"]).unwrap_or_default();
     let filters = run_capture(ffmpeg_bin, &["-hide_banner", "-filters"]).unwrap_or_default();
     let filter = |name| flag_present(&filters, name);
+    let libx265 = flag_present(&encoders, "libx265");
     Capabilities {
         ffmpeg_bin: ffmpeg_bin.to_string(),
         ffprobe_bin: ffprobe_bin.to_string(),
         libx264: flag_present(&encoders, "libx264"),
-        libx265: flag_present(&encoders, "libx265"),
+        libx265,
+        libx265_10bit: libx265
+            && x265_writes_10bit(
+                run_capture(ffmpeg_bin, &["-hide_banner", "-h", "encoder=libx265"]).as_deref(),
+            ),
         aac: flag_present(&encoders, "aac"),
         xfade: filter("xfade"),
         perspective: filter("perspective"),
@@ -1597,6 +1628,19 @@ mod tests {
     }
 
     #[test]
+    fn ten_bit_hevc_is_read_from_the_encoder_help() {
+        let multi = "Encoder libx265 [libx265 H.265 / HEVC]:\n    Supported pixel formats: yuv420p yuvj420p yuv420p10le yuv422p10le gray10le\n";
+        let eight = "Encoder libx265 [libx265 H.265 / HEVC]:\n    Supported pixel formats: yuv420p yuvj420p yuv422p yuv444p gbrp gray\n";
+        assert!(x265_writes_10bit(Some(multi)));
+        assert!(!x265_writes_10bit(Some(eight)));
+        assert!(!x265_writes_10bit(None), "a failed help call is not 10-bit");
+        // The name elsewhere in the help (an option's text) does not count.
+        assert!(!x265_writes_10bit(Some(
+            "  -x265-params  e.g. yuv420p10le output\n"
+        )));
+    }
+
+    #[test]
     fn the_film_encode_is_capped_to_stream() {
         let at = arg_after;
         let with = Capabilities {
@@ -1607,11 +1651,24 @@ mod tests {
         let hevc = film_encode_args(&with, Resolution::Uhd4k);
         assert_eq!(at(&hevc, "-c:v"), "libx265");
         assert_eq!(at(&hevc, "-tag:v"), "hvc1");
-        assert!(at(&hevc, "-x265-params").contains("vbv-maxrate=30000:vbv-bufsize=30000"));
+        assert!(at(&hevc, "-x265-params").contains("vbv-maxrate=40000:vbv-bufsize=40000"));
+        assert_eq!(at(&hevc, "-crf"), "18");
         assert_eq!(at(&hevc, "-pix_fmt"), "yuv420p");
+        assert!(
+            !hevc.iter().any(|a| a == "-profile:v"),
+            "8-bit without 10-bit support"
+        );
         assert_eq!(at(&hevc, "-c:a"), "aac");
         assert_eq!(at(&hevc, "-movflags"), "+faststart");
         assert_eq!(at(&hevc, "-preset"), "fast");
+        // A libx265 that writes 10-bit: Main10, no banding in gradients.
+        let ten = Capabilities {
+            libx265_10bit: true,
+            ..with.clone()
+        };
+        let main10 = film_encode_args(&ten, Resolution::Uhd4k);
+        assert_eq!(at(&main10, "-pix_fmt"), "yuv420p10le");
+        assert_eq!(at(&main10, "-profile:v"), "main10");
         // No libx265: capped H.264 High 5.1.
         let without = Capabilities {
             libx264: true,
@@ -1622,7 +1679,7 @@ mod tests {
         assert_eq!(at(&avc, "-level:v"), "5.1");
         assert_eq!(
             (at(&avc, "-maxrate"), at(&avc, "-bufsize")),
-            ("30000k", "30000k")
+            ("40000k", "40000k")
         );
         // 1080p stays H.264 at its own cap.
         let hd = film_encode_args(&with, Resolution::Hd1080);
