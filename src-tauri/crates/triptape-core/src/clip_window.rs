@@ -21,8 +21,12 @@ pub const MAX_WINDOW_SECS: f64 = 8.0;
 const _: () = assert!(TARGET_WINDOW_SECS <= MAX_WINDOW_SECS);
 /// Clips at or under this length are kept whole.
 pub const MIN_ANALYZED_SECS: f64 = 2.0;
-/// Opening and closing margin a window never touches (camera raise/lower).
-pub const EDGE_SKIP_SECS: f64 = 0.7;
+/// Opening margin a window never touches (the camera being raised).
+pub const START_SKIP_SECS: f64 = 0.7;
+/// Closing margin a window never touches: lowering the phone takes longer
+/// than raising it, and people often stop recording late (a Jeju clip's last
+/// 1.6 s was the phone dropping to the deck, half of it inside the window).
+pub const END_SKIP_SECS: f64 = 1.6;
 
 /// Clips longer than this are split at scene cuts into several windows.
 pub const MULTI_WINDOW_MIN_SECS: f64 = 20.0;
@@ -238,10 +242,10 @@ pub fn wants_window(duration: f64) -> bool {
 }
 
 /// Pick the max-sum window of `window_len(duration)` over per-sample scores
-/// (sample `i` starts at `i * SAMPLE_SECS`), keeping `EDGE_SKIP_SECS` clear
-/// of both ends. Ties go to the earliest window. Returns `(start, end)` in
-/// seconds, or `None` when the clip should play whole (short, or no
-/// analysis available).
+/// (sample `i` starts at `i * SAMPLE_SECS`), keeping `START_SKIP_SECS` clear
+/// of the start and `END_SKIP_SECS` of the end. Ties go to the earliest
+/// window. Returns `(start, end)` in seconds, or `None` when the clip should
+/// play whole (short, or no analysis available).
 pub fn pick_window(scores: &[f32], duration: f64) -> Option<(f64, f64)> {
     if !wants_window(duration) {
         return None;
@@ -251,8 +255,8 @@ pub fn pick_window(scores: &[f32], duration: f64) -> Option<(f64, f64)> {
     if n == 0 || scores.len() < n {
         return None;
     }
-    let first = (EDGE_SKIP_SECS / SAMPLE_SECS).ceil() as usize;
-    let by_time = ((duration - EDGE_SKIP_SECS - len) / SAMPLE_SECS).floor();
+    let first = (START_SKIP_SECS / SAMPLE_SECS).ceil() as usize;
+    let by_time = ((duration - END_SKIP_SECS - len) / SAMPLE_SECS).floor();
     let last = (by_time.max(0.0) as usize).min(scores.len() - n);
     if by_time < first as f64 || last < first {
         // Too short for margins: centre the window instead.
@@ -346,14 +350,17 @@ pub fn pick_windows(scores: &[f32], cuts: &[usize], duration: f64) -> Vec<ClipSp
         // Stay inside the scene: it starts at the first post-cut sample and
         // ends at the last pre-cut one (the cut falls somewhere after it).
         let lo = if a == 0 {
-            EDGE_SKIP_SECS
+            START_SKIP_SECS
         } else {
             a as f64 * SAMPLE_SECS
         };
+        // Every scene keeps the closing margin clear: a cut inside it would
+        // otherwise let the scene before it run into the lowered phone.
         let hi = match starts.get(i + 1) {
             Some(&b) => (b - 1) as f64 * SAMPLE_SECS,
-            None => duration - EDGE_SKIP_SECS,
-        };
+            None => duration,
+        }
+        .min(duration - END_SKIP_SECS);
         let n = (((hi - lo).min(TARGET_WINDOW_SECS)) / SAMPLE_SECS).floor() as usize;
         if (n as f64) * SAMPLE_SECS < MIN_SCENE_WINDOW_SECS {
             continue;
@@ -517,7 +524,7 @@ mod tests {
 
     #[test]
     fn flat_scores_pick_earliest_valid_window() {
-        // 30 s clip, 6 s window: earliest start honours the 0.7 s edge skip.
+        // 30 s clip, 6 s window: earliest start honours the 0.7 s start skip.
         let w = pick_window(&[0.5; 30], 30.0).unwrap();
         assert_eq!(w, (1.0, 7.0));
     }
@@ -540,12 +547,16 @@ mod tests {
         }
         let (start, end) = pick_window(&s, 30.0).unwrap();
         assert!(
-            start >= EDGE_SKIP_SECS && end <= 30.0 - EDGE_SKIP_SECS,
+            start >= START_SKIP_SECS && end <= 30.0 - END_SKIP_SECS,
             "{start} {end}"
         );
-        // Last valid start: 30 - 0.7 - 6 = 23.3 s -> sample 23 -> 23.0 s.
+        // Last valid start: 30 - 1.6 - 6 = 22.4 s -> sample 22 -> 22.0 s.
         let tail: Vec<f32> = (0..30).map(|i| i as f32).collect();
-        assert_eq!(pick_window(&tail, 30.0), Some((23.0, 29.0)));
+        assert_eq!(pick_window(&tail, 30.0), Some((22.0, 28.0)));
+        // A 19.9 s clip whose best moment is at the very end (the phone
+        // drops from 18.3 s): the window ends by 18 s.
+        let drop: Vec<f32> = (0..20).map(|i| i as f32).collect();
+        assert_eq!(pick_window(&drop, 19.883), Some((12.0, 18.0)));
     }
 
     #[test]
@@ -686,6 +697,26 @@ mod tests {
         for w in pick_windows(&s, &[20], 60.0) {
             assert!(w.end <= 19.0 || w.start >= 20.0, "{w:?}");
         }
+    }
+
+    #[test]
+    fn last_scene_keeps_the_end_skip_clear() {
+        // Scores climb to the very end: the last scene's window still stops
+        // END_SKIP_SECS short of it (60 - 1.6 = 58.4 s -> ends at 58 s).
+        let s: Vec<f32> = (0..60).map(|i| 0.5 + i as f32 / 200.0).collect();
+        let w = pick_windows(&s, &[30], 60.0);
+        let last = w.last().unwrap();
+        assert_eq!((last.start, last.end), (52.0, 58.0));
+    }
+
+    #[test]
+    fn a_cut_inside_the_closing_margin_keeps_it_clear() {
+        // 60.2 s, scores climb to the end, a cut at sample 60 (inside the
+        // last 1.6 s): no window may end after 60.2 - 1.6 = 58.6 s.
+        let s: Vec<f32> = (0..61).map(|i| 0.5 + i as f32 / 200.0).collect();
+        let w = pick_windows(&s, &[30, 60], 60.2);
+        let end = w.iter().map(|w| w.end).fold(0.0, f64::max);
+        assert!(end <= 60.2 - END_SKIP_SECS, "{w:?}");
     }
 
     #[test]
