@@ -117,7 +117,8 @@ pub struct Itinerary {
 /// A place the owner named: a point and the reach that counts as there,
 /// or a local time window (`from`/`until`, `YYYY-MM-DD HH:MM`) for places
 /// GPS cannot tell apart, such as two glasshouses 130 m apart where indoor
-/// fixes drift. A window, when given, decides on its own.
+/// fixes drift. A window without a point decides on its own; with a point,
+/// a shot's GPS (when present) must also fall within `radius_m`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NamedPlace {
     pub name: String,
@@ -152,9 +153,14 @@ impl NamedPlace {
         self.from.zip(self.until)
     }
 
+    /// The place's point, when it has both coordinates.
+    fn point(&self) -> Option<(f64, f64)> {
+        self.lat.zip(self.lon)
+    }
+
     /// Metres from `gps` when the place has a point and `gps` is inside it.
     fn reach(&self, gps: Option<(f64, f64)>) -> Option<f64> {
-        let d = haversine_m(gps?, (self.lat?, self.lon?));
+        let d = haversine_m(gps?, self.point()?);
         (d <= self.radius_m).then_some(d)
     }
 }
@@ -238,17 +244,24 @@ impl Itinerary {
     }
 
     /// The owner-named place a shot was taken in: one whose time window
-    /// holds its local time, else the nearest whose radius reaches its GPS.
+    /// holds its local time (and, for a window with a point, whose radius
+    /// reaches its GPS when it has one), else the nearest whose radius
+    /// reaches its GPS.
     /// A shot without a time zone has no local time to place it by.
     pub fn place_of(&self, a: &Asset) -> Option<&str> {
         let when = a
             .taken_at
             .zip(a.tz_offset_secs)
             .and_then(|(t, tz)| crate::metadata::local_datetime(t, Some(tz)));
+        // On a split day the other party was elsewhere at the same time
+        // (Stanley Market vs Disneyland), so the point must agree too.
         let timed = self.places.iter().find(|pl| {
-            pl.window()
+            let in_time = pl
+                .window()
                 .zip(when)
-                .is_some_and(|((from, until), w)| from <= w && w <= until)
+                .is_some_and(|((from, until), w)| from <= w && w <= until);
+            let in_place = a.gps.is_none() || pl.point().is_none() || pl.reach(a.gps).is_some();
+            in_time && in_place
         });
         timed
             .or_else(|| {
@@ -305,7 +318,7 @@ impl Itinerary {
             if pl.window().is_some_and(|(from, until)| until < from) {
                 return Err(format!("place {:?} has until before from", pl.name));
             }
-            if !timed && (pl.lat.is_none() || pl.lon.is_none()) {
+            if !timed && pl.point().is_none() {
                 return Err(format!(
                     "place {:?} needs lat and lon, or from/until",
                     pl.name
@@ -1309,6 +1322,37 @@ mod tests {
         assert_eq!(
             ch.film_places().collect::<Vec<_>>(),
             ["Kiyosumi Garden", "Tokyo", "Kiyosumi Garden"]
+        );
+    }
+
+    #[test]
+    fn a_window_with_a_point_needs_the_shot_there() {
+        let mut it = itin();
+        it.places = serde_json::from_str(
+            r#"[{ "name": "Stanley Market", "lat": 22.218, "lon": 114.211, "radius_m": 2000,
+                  "from": "2026-10-18 13:15", "until": "2026-10-18 15:00" }]"#,
+        )
+        .unwrap();
+        let at = |gps| {
+            let mut a = photo("p", "2026-10-18", gps);
+            // 14:00 local in Hong Kong.
+            a.taken_at = Some(1_792_303_200);
+            a.tz_offset_secs = Some(8 * 3600);
+            a
+        };
+        assert_eq!(
+            it.place_of(&at(Some((22.2171, 114.2125)))),
+            Some("Stanley Market")
+        );
+        // The other party at Disneyland at the same time.
+        assert_eq!(it.place_of(&at(Some((22.3101, 114.0406)))), None);
+        // No GPS: the time places it.
+        assert_eq!(it.place_of(&at(None)), Some("Stanley Market"));
+        // Half a point (no lon) is no point: the time places it.
+        it.places[0].lon = None;
+        assert_eq!(
+            it.place_of(&at(Some((22.3101, 114.0406)))),
+            Some("Stanley Market")
         );
     }
 
