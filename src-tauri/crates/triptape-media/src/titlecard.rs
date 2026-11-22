@@ -106,7 +106,13 @@ pub fn lower_third_doc(top: &str, bottom: Option<&str>) -> String {
 /// centered, with the trip name and date range as a footer. Gives the
 /// film an ending instead of stopping on the last photo.
 pub fn places_card_doc(trip_name: &str, places: &[String], date_range: Option<&str>) -> String {
-    let list = places.join("  ·  ");
+    // A name never breaks across lines ("Victoria / Peak"): its spaces are
+    // non-breaking, so lines wrap only at the separators.
+    let list = places
+        .iter()
+        .map(|p| p.replace(' ', "\u{a0}"))
+        .collect::<Vec<_>>()
+        .join("  ·  ");
     let footer = match date_range {
         Some(d) => format!("{} · {}", esc(trip_name), esc(d)),
         None => esc(trip_name),
@@ -282,4 +288,22 @@ pub fn save_title_card(
     img.save(out)
         .map_err(|e| crate::MediaError::Io(format!("save title card: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn places_card_never_breaks_a_name() {
+        let doc = places_card_doc(
+            "Trip",
+            &[
+                "Victoria Peak".to_string(),
+                "Hong Kong Disneyland".to_string(),
+            ],
+            None,
+        );
+        assert!(doc.contains("Victoria\u{a0}Peak  ·  Hong\u{a0}Kong\u{a0}Disneyland"));
+    }
 }
