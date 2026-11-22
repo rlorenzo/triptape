@@ -496,13 +496,13 @@ fn book_heading_place(
     // A place that already names its town ("Kamakura, Japan · Tsurugaoka
     // Hachimangū", a day trip out of the stop's city) leads with the town
     // and drops the country: no stop city in front of it.
-    if let Some((town, rest)) = place
+    // Only a real country goes: "Flower Dome, Gardens by the Bay" is one
+    // name.
+    let (first, rest) = place
         .split_once(" \u{b7} ")
-        .map_or((place, None), |(a, b)| (a, Some(b)))
-        .0
-        .split_once(", ")
-        .map(|(t, _)| (t, place.split_once(" \u{b7} ").map(|(_, b)| b)))
-    {
+        .map_or((place, None), |(a, b)| (a, Some(b)));
+    let town = triptape_core::geo::without_country(first);
+    if town != first {
         return Some(match rest {
             Some(r) => format!("{town} \u{b7} {r}"),
             None => town.to_string(),
@@ -1128,6 +1128,11 @@ mod tests {
         assert_eq!(
             heading("asakusa", "Senso-ji").as_deref(),
             Some("Tokyo \u{b7} Senso-ji")
+        );
+        // A comma inside a sight's own name is not a country.
+        assert_eq!(
+            heading("asakusa", "Flower Dome, Gardens by the Bay").as_deref(),
+            Some("Tokyo \u{b7} Flower Dome, Gardens by the Bay")
         );
         // A place naming its own town leads with it, without the country.
         assert_eq!(
