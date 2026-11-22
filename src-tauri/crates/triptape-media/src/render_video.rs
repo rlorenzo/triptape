@@ -14,8 +14,8 @@ use crate::segment_cache::SegmentCache;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{
-    self, collage_hold_secs, is_panorama, pano_coverage, pano_motion, MAX_CLIP_SECS, MAX_COLLAGE,
-    MIN_SEGMENT_SECS,
+    self, caption_read_secs, collage_hold_secs, is_panorama, pano_coverage, pano_motion,
+    places_card_secs, MAX_CLIP_SECS, MAX_COLLAGE, MIN_SEGMENT_SECS,
 };
 use triptape_core::types::{CollageEdits, Plan, PlanEntry, Rendition};
 
@@ -381,8 +381,6 @@ pub struct VideoOutput {
 
 /// Hard ceiling for a short film (PLAN.md: "short" is <=30 s).
 const SHORT_FILM_SECS: f64 = 30.0;
-/// Closing places card hold.
-const CREDITS_SECS: f64 = 4.5;
 /// Closing map recap runs this much longer than the opening map.
 const CLOSING_MAP_EXTRA_SECS: f64 = 1.5;
 
@@ -420,9 +418,13 @@ fn closing_map_len(opts: &VideoOptions) -> f64 {
 }
 
 /// Seconds the closing cards add, reserved up front in short mode.
-fn closing_secs(has_route: bool, closing_map: f64, has_places: bool) -> f64 {
+fn closing_secs(has_route: bool, closing_map: f64, places: usize) -> f64 {
     let map = if has_route { closing_map } else { 0.0 };
-    map + if has_places { CREDITS_SECS } else { 0.0 }
+    map + if places > 0 {
+        places_card_secs(places)
+    } else {
+        0.0
+    }
 }
 
 /// Choose at most `slots` entries for a short film so every chapter is seen,
@@ -675,7 +677,7 @@ pub fn render_hero_video(
         let has_route = map_card.is_some() && !plan.map_polyline.is_empty();
         SHORT_FILM_SECS
             - segs.iter().map(|s| s.2).sum::<f64>()
-            - closing_secs(has_route, closing_map_len(opts), !places.is_empty())
+            - closing_secs(has_route, closing_map_len(opts), places.len())
     } else {
         f64::INFINITY
     };
@@ -1005,18 +1007,12 @@ pub fn render_hero_video(
             &mut fallbacks,
         )?;
         let places_mp4 = work_dir.join("seg_places.mp4");
-        render_hold_segment(
-            caps,
-            &png,
-            CREDITS_SECS,
-            segs.len(),
-            opts.resolution,
-            &places_mp4,
-        )?;
+        let hold = places_card_secs(places.len());
+        render_hold_segment(caps, &png, hold, segs.len(), opts.resolution, &places_mp4)?;
         segs.push((
             card_entry("credits", &png),
             places_mp4,
-            CREDITS_SECS,
+            hold,
             "still".into(),
         ));
     }
@@ -1440,8 +1436,9 @@ fn write_captions_srt(
             }
             n += 1;
             let st = starts[i] + 0.3;
-            // Multi-line (collage) cues get reading time per caption.
-            let read_secs = 3.5 * c.trim().lines().count() as f64;
+            // As long as the shot was held to read it; multi-line
+            // (collage) cues get at least 3.5 s per caption.
+            let read_secs = caption_read_secs(Some(c)).max(3.5 * c.trim().lines().count() as f64);
             let en = (starts[i] + (d - 0.6).min(read_secs)).max(st + 0.5);
             body.push_str(&format!(
                 "{n}\n{} --> {}\n{}\n\n",
@@ -1469,10 +1466,11 @@ fn srt_ts(t: f64) -> String {
     )
 }
 
-/// Seconds to freeze-pad a clip to: the minimum hold, limited by what is left
-/// of the short-mode budget. `None` when the clip already reaches that.
-fn clip_pad_target(probed: f64, budget: f64) -> Option<f64> {
-    let target = MIN_SEGMENT_SECS.min(budget);
+/// Seconds to freeze-pad a clip to: the minimum hold (or `hold`, when a
+/// caption needs longer to read), limited by what is left of the
+/// short-mode budget. `None` when the clip already reaches that.
+fn clip_pad_target(probed: f64, budget: f64, hold: f64) -> Option<f64> {
+    let target = MIN_SEGMENT_SECS.max(hold).min(budget);
     (probed < target).then_some(target)
 }
 
@@ -1600,13 +1598,20 @@ fn render_group(
 ) -> Result<GroupOutcome, crate::MediaError> {
     let r = present[0];
     let mut fallbacks = vec![];
+    // Long enough to read what is written on it (a lone entry's caption
+    // is its collage caption, trimmed).
+    // Short mode also keeps it within the group's fair share, so one long
+    // caption neither starves later chapters nor freezes a clip just trimmed.
+    let read_secs = caption_read_secs(collage_caption(present).as_deref())
+        .min(limits.cap)
+        .min(limits.budget);
     let rendered = if present.len() == 1 {
         render_entry_segment(
             caps,
             r,
             idx,
             variant,
-            still_secs,
+            still_secs.max(read_secs),
             limits.cap,
             opts.resolution,
             work_dir,
@@ -1618,7 +1623,9 @@ fn render_group(
             present,
             idx,
             variant,
-            still_secs,
+            // The collage's scaled hold, raised to the reading time (not the
+            // reading time scaled, which would overrun CAPTION_MAX_SECS).
+            still_secs.max(read_secs / collage_hold_secs(present.len(), 1.0)),
             opts.live_collages,
             opts.resolution,
             work_dir,
@@ -1648,7 +1655,7 @@ fn render_group(
         .unwrap_or(dur);
     // Flash frames are unwatchable: a sub-2.5s clip (most Live Photo
     // motions) is freeze-padded on its last frame to a minimum hold.
-    let dur = match clip_pad_target(probed, limits.budget).filter(|_| kind == "clip") {
+    let dur = match clip_pad_target(probed, limits.budget, read_secs).filter(|_| kind == "clip") {
         Some(target) => match pad_segment_freeze(caps, &seg_path, target) {
             Ok(()) => target,
             Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
@@ -1757,8 +1764,13 @@ fn render_entry_segment(
                     .or(r.aspect);
                 let dur = if let Some(aspect) = aspect.filter(|&a| is_panorama(a)) {
                     let motion = pano_motion(aspect);
-                    // A short-mode budget can shorten the pan, never below a still.
-                    let dur = motion.hold_secs.min(max_secs.max(still_secs));
+                    // A caption's reading time (carried in `still_secs`) can
+                    // lengthen the pan; a short-mode budget can shorten it,
+                    // never below a still.
+                    let dur = motion
+                        .hold_secs
+                        .max(still_secs)
+                        .min(max_secs.max(still_secs));
                     // Travel less when shortened so the pan keeps its speed bound.
                     let coverage = pano_coverage(aspect, dur);
                     render_pano_segment(caps, &png.path, dur, aspect, coverage, variant, res, out)?;
@@ -2810,7 +2822,7 @@ fn graph_segment_args(img: &Path, dur: f64, graph: String, out: &Path) -> Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use triptape_core::plan::has_caption;
+    use triptape_core::plan::{CAPTION_MAX_SECS, PLACES_CARD_MAX_SECS};
 
     #[test]
     fn film_graph_chains_cuts_into_one_graph() {
@@ -2992,28 +3004,28 @@ mod tests {
                         opening_map,
                         route_stops: 0,
                         route_secs: None,
-                        places: true,
+                        places: 1,
                     },
                     HeroCards {
                         route: false,
                         opening_map,
                         route_stops: 0,
                         route_secs: None,
-                        places: false,
+                        places: 0,
                     },
                     HeroCards {
                         route: true,
                         opening_map,
                         route_stops: 0,
                         route_secs: None,
-                        places: false,
+                        places: 0,
                     },
                     HeroCards {
                         route: true,
                         opening_map,
                         route_stops: 6,
                         route_secs: None,
-                        places: true,
+                        places: 1,
                     },
                 ]
             }) {
@@ -3072,8 +3084,8 @@ mod tests {
                         "still",
                     ));
                 }
-                if cards.places {
-                    segs.push(("credits".into(), CREDITS_SECS, "still"));
+                if cards.places > 0 {
+                    segs.push(("credits".into(), places_card_secs(cards.places), "still"));
                 }
                 let mut chapter_break = vec![false; segs.len()];
                 for i in 1..segs.len() {
@@ -3104,7 +3116,7 @@ mod tests {
                     &entries,
                     |id| CHAPTER_LABELS[id[1..3].parse::<usize>().unwrap()],
                     |_| None,
-                    |id| has_caption(captions.get(id).map(String::as_str)),
+                    |id| caption_read_secs(captions.get(id).map(String::as_str)),
                     taken_of,
                     cards,
                 );
@@ -4296,10 +4308,13 @@ mod tests {
 
     #[test]
     fn closing_secs_counts_only_cards_that_render() {
-        assert_eq!(closing_secs(true, 4.5, true), 9.0);
-        assert_eq!(closing_secs(true, 4.5, false), 4.5);
-        assert_eq!(closing_secs(false, 4.5, true), CREDITS_SECS);
-        assert_eq!(closing_secs(false, 4.5, false), 0.0);
+        assert_eq!(closing_secs(true, 4.5, 3), 9.0);
+        assert_eq!(closing_secs(true, 4.5, 0), 4.5);
+        assert_eq!(closing_secs(false, 4.5, 3), places_card_secs(3));
+        assert_eq!(closing_secs(false, 4.5, 0), 0.0);
+        // A long list holds long enough to read, within the ceiling.
+        assert!((places_card_secs(28) - 8.6).abs() < 1e-9);
+        assert_eq!(places_card_secs(60), PLACES_CARD_MAX_SECS);
         // Two or more stops: the animated recap's budget replaces the card.
         let stops = |n| {
             let opts = VideoOptions {
@@ -4673,12 +4688,26 @@ mod tests {
 
     #[test]
     fn clip_pad_target_respects_budget() {
-        assert_eq!(clip_pad_target(1.0, f64::INFINITY), Some(MIN_SEGMENT_SECS));
-        assert_eq!(clip_pad_target(1.0, 10.0), Some(MIN_SEGMENT_SECS));
-        assert_eq!(clip_pad_target(0.8, 1.5), Some(1.5));
+        assert_eq!(
+            clip_pad_target(1.0, f64::INFINITY, 0.0),
+            Some(MIN_SEGMENT_SECS)
+        );
+        assert_eq!(clip_pad_target(1.0, 10.0, 0.0), Some(MIN_SEGMENT_SECS));
+        // Reading time grows with the words, within a ceiling.
+        assert_eq!(caption_read_secs(None), 0.0);
+        assert_eq!(caption_read_secs(Some("  ")), 0.0);
+        assert!((caption_read_secs(Some("Very good pork rib soup")) - 3.0).abs() < 1e-9);
+        assert_eq!(
+            caption_read_secs(Some(&"word ".repeat(25))),
+            CAPTION_MAX_SECS
+        );
+        // A caption that needs longer to read holds the clip longer.
+        assert_eq!(clip_pad_target(1.6, 10.0, 6.0), Some(6.0));
+        assert_eq!(clip_pad_target(1.6, 4.0, 6.0), Some(4.0));
+        assert_eq!(clip_pad_target(0.8, 1.5, 0.0), Some(1.5));
         // Already capped to the remaining budget: nothing to pad.
-        assert_eq!(clip_pad_target(0.6, 0.6), None);
-        assert_eq!(clip_pad_target(3.0, 10.0), None);
+        assert_eq!(clip_pad_target(0.6, 0.6, 0.0), None);
+        assert_eq!(clip_pad_target(3.0, 10.0, 0.0), None);
     }
 
     /// Default (4K) hero render end to end: Typst title, caption burn-in

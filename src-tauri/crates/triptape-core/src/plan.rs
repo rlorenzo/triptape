@@ -97,7 +97,39 @@ const EST_TITLE_SECS: f64 = 2.5;
 /// Opening route map hold (only with a GPS route).
 const EST_MAP_SECS: f64 = 3.0;
 /// Closing places card hold (only when a chapter has a named place).
-const EST_PLACES_SECS: f64 = 4.5;
+const PLACES_CARD_MIN_SECS: f64 = 4.5;
+/// Longest the closing places card holds, however many places.
+pub const PLACES_CARD_MAX_SECS: f64 = 9.0;
+/// Places card hold before reading time.
+const PLACES_CARD_BASE_SECS: f64 = 3.0;
+/// Reading time per place name on the closing card.
+const PLACES_CARD_SECS_PER_PLACE: f64 = 0.2;
+
+/// How long the closing places card holds for `places` names: long enough
+/// to read them (28 names were on screen for 4.5 s), within a ceiling.
+/// Shared by the renderer and the planner's estimate.
+pub fn places_card_secs(places: usize) -> f64 {
+    (PLACES_CARD_BASE_SECS + PLACES_CARD_SECS_PER_PLACE * places as f64)
+        .clamp(PLACES_CARD_MIN_SECS, PLACES_CARD_MAX_SECS)
+}
+
+/// Longest a caption may stretch its shot.
+pub const CAPTION_MAX_SECS: f64 = 8.0;
+/// Reading time per caption word, on top of [`CAPTION_BASE_SECS`].
+const CAPTION_SECS_PER_WORD: f64 = 0.3;
+/// Time to notice a caption before reading it.
+const CAPTION_BASE_SECS: f64 = 1.5;
+
+/// Seconds a shot must stay on screen for its caption to be read: a
+/// 25-word caption on a 1.6 s Live Photo could not be. `0.0` without one.
+/// Shared by the renderer and the planner's estimate.
+pub fn caption_read_secs(caption: Option<&str>) -> f64 {
+    let words = caption.map_or(0, |c| c.split_whitespace().count());
+    if words == 0 {
+        return 0.0;
+    }
+    (CAPTION_BASE_SECS + CAPTION_SECS_PER_WORD * words as f64).min(CAPTION_MAX_SECS)
+}
 /// Overlap of the first cut (circleopen) and the last (circleclose).
 const EST_BOOKEND_OVERLAP_SECS: f64 = 0.7;
 /// Overlaps at chapter breaks and other cuts into or out of a card: the
@@ -658,14 +690,14 @@ pub struct HeroCards {
     /// Closing map length when the journey's own schedule sets it (an
     /// itinerary recap); `None` derives it from `route_stops`.
     pub route_secs: Option<f64>,
-    /// Closing places card (some chapter has a named place).
-    pub places: bool,
+    /// Distinct places on the closing card (0: no card).
+    pub places: usize,
 }
 
 /// Screen seconds one entry takes on its own (a still joining a collage
 /// costs less than this; see [`estimate_hero_secs`]).
-fn solo_secs(e: &PlanEntry, pano_secs_of: impl Fn(&str) -> Option<f64>) -> f64 {
-    match e.rendition {
+fn solo_secs(e: &PlanEntry, pano_secs_of: impl Fn(&str) -> Option<f64>, read_secs: f64) -> f64 {
+    let secs = match e.rendition {
         Rendition::Still => pano_secs_of(&e.asset_id).unwrap_or(EST_STILL_SECS),
         Rendition::Motion {
             trim_start,
@@ -675,7 +707,9 @@ fn solo_secs(e: &PlanEntry, pano_secs_of: impl Fn(&str) -> Option<f64>) -> f64 {
             trim_start,
             trim_end,
         } => (trim_end - trim_start).clamp(MIN_SEGMENT_SECS, MAX_CLIP_SECS),
-    }
+    };
+    // A caption holds its shot until it can be read.
+    secs.max(read_secs)
 }
 
 /// What one rendered segment is, for transition overlaps.
@@ -697,7 +731,7 @@ pub fn estimate_hero_secs<'e, 'c>(
     entries: impl IntoIterator<Item = &'e PlanEntry>,
     chapter_of: impl Fn(&str) -> &'c str,
     pano_secs_of: impl Fn(&str) -> Option<f64>,
-    captioned: impl Fn(&str) -> bool,
+    caption_secs: impl Fn(&str) -> f64,
     taken_of: impl Fn(&str) -> Option<i64>,
     cards: HeroCards,
 ) -> f64 {
@@ -705,11 +739,21 @@ pub fn estimate_hero_secs<'e, 'c>(
         entries,
         chapter_of,
         pano_secs_of,
-        captioned,
+        caption_secs,
         taken_of,
         cards,
         &CollageEdits::default(),
     )
+}
+
+/// Distinct place names the closing card lists (the film's own name for a
+/// chapter when it has one).
+fn distinct_places(chapters: &[Chapter]) -> usize {
+    chapters
+        .iter()
+        .filter_map(|c| c.film_place.as_deref().or(c.place.as_deref()))
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 /// Estimated seconds of an (edited) plan's film, with the inputs the
@@ -737,13 +781,13 @@ pub fn estimate_plan_secs(plan: &Plan, assets: &[Asset]) -> f64 {
             &crate::route_stops::chapter_route_stops(&plan.chapters, assets, &plan.map_polyline),
         ),
         route_secs: None,
-        places: plan.chapters.iter().any(|c| c.place.is_some()),
+        places: distinct_places(&plan.chapters),
     };
     estimate_hero_secs_with(
         &plan.hero,
         |id| labels[chapter.get(id).copied().unwrap_or(plan.chapters.len())].as_str(),
         |id| pano.get(id).copied(),
-        |id| has_caption(plan.captions.get(id).map(String::as_str)),
+        |id| caption_read_secs(plan.captions.get(id).map(String::as_str)),
         |id| taken.get(id).copied(),
         cards,
         &plan.collage,
@@ -756,7 +800,7 @@ pub fn estimate_hero_secs_with<'e, 'c>(
     entries: impl IntoIterator<Item = &'e PlanEntry>,
     chapter_of: impl Fn(&str) -> &'c str,
     pano_secs_of: impl Fn(&str) -> Option<f64>,
-    captioned: impl Fn(&str) -> bool,
+    caption_secs: impl Fn(&str) -> f64,
     taken_of: impl Fn(&str) -> Option<i64>,
     cards: HeroCards,
     collage: &CollageEdits,
@@ -775,7 +819,7 @@ pub fn estimate_hero_secs_with<'e, 'c>(
                 collage_eligible(
                     &e.rendition,
                     pano_secs_of(&e.asset_id).is_some(),
-                    captioned(&e.asset_id),
+                    caption_secs(&e.asset_id) > 0.0,
                 ),
                 taken_of(&e.asset_id),
             )
@@ -784,7 +828,11 @@ pub fn estimate_hero_secs_with<'e, 'c>(
     );
     for g in collage_groups(&slots) {
         let secs = match g.len() {
-            1 => solo_secs(entries[g[0]], &pano_secs_of),
+            1 => solo_secs(
+                entries[g[0]],
+                &pano_secs_of,
+                caption_secs(&entries[g[0]].asset_id),
+            ),
             n => collage_hold_secs(n, EST_STILL_SECS),
         };
         segs.push((Seg::Chapter(slots[g[0]].chapter), secs));
@@ -801,8 +849,8 @@ pub fn estimate_hero_secs_with<'e, 'c>(
                 .unwrap_or_else(|| crate::route_stops::closing_map_secs(cards.route_stops)),
         ));
     }
-    if cards.places {
-        segs.push((Seg::Card, EST_PLACES_SECS));
+    if cards.places > 0 {
+        segs.push((Seg::Card, places_card_secs(cards.places)));
     }
     let n = segs.len();
     let mut overlap = 0.0;
@@ -861,7 +909,7 @@ fn select_hero_by_budget<'a>(
     score_of: impl Fn(&PlanEntry) -> f32,
     similar: impl Fn(&str, &str) -> bool,
     pano_secs_of: impl Fn(&str) -> Option<f64> + Copy,
-    captioned: impl Fn(&str) -> bool + Copy,
+    caption_secs: impl Fn(&str) -> f64 + Copy,
     taken_of: impl Fn(&str) -> Option<i64> + Copy,
     budget: HeroBudget,
 ) -> Vec<PlanEntry> {
@@ -917,7 +965,7 @@ fn select_hero_by_budget<'a>(
                 .map(|(e, _)| e),
             chapter_of,
             pano_secs_of,
-            captioned,
+            caption_secs,
             taken_of,
             budget.cards,
         )
@@ -950,7 +998,11 @@ fn select_hero_by_budget<'a>(
         .collect();
     let mut secs: Vec<f64> = taken
         .iter()
-        .map(|t| t.iter().map(|&i| solo_secs(&cands[i], pano_secs_of)).sum())
+        .map(|t| {
+            t.iter()
+                .map(|&i| solo_secs(&cands[i], pano_secs_of, caption_secs(&cands[i].asset_id)))
+                .sum()
+        })
         .collect();
     let mut total = estimate(&picked);
     for allow_similar in [false, true] {
@@ -1734,7 +1786,7 @@ pub fn build_plan_with_length(
                 &crate::route_stops::chapter_route_stops(&chapters, assets, &map_polyline),
             ),
             route_secs: None,
-            places: chapters.iter().any(|c| c.place.is_some()),
+            places: distinct_places(&chapters),
         },
     };
     let by_id: HashMap<&str, &Asset> = ordered.iter().map(|a| (a.id.as_str(), *a)).collect();
@@ -1794,7 +1846,7 @@ pub fn build_plan_with_length(
         entry_score,
         similar,
         pano_secs_of,
-        |id| has_caption(by_id.get(id).and_then(|a| a.user_caption.as_deref())),
+        |id| caption_read_secs(by_id.get(id).and_then(|a| a.user_caption.as_deref())),
         |id| by_id.get(id).and_then(|a| a.taken_at),
         budget,
     );
@@ -3214,14 +3266,14 @@ mod tests {
             &plan.hero,
             |id| clusters.get(id).map_or(UNGROUPED, String::as_str),
             |_| None,
-            |id| has_caption(plan.captions.get(id).map(String::as_str)),
+            |id| caption_read_secs(plan.captions.get(id).map(String::as_str)),
             |_| Some(0),
             HeroCards {
                 route: !plan.map_polyline.is_empty(),
                 opening_map: true,
                 route_stops: 0,
                 route_secs: None,
-                places: plan.chapters.iter().any(|c| c.place.is_some()),
+                places: distinct_places(&plan.chapters),
             },
         )
     }
@@ -3491,11 +3543,10 @@ mod tests {
             opening_map: true,
             route_stops: 0,
             route_secs: None,
-            places: true,
+            places: 1,
         };
         assert!(
-            (estimate_hero_secs(&entries, ch, |_| None, |_| false, |_| Some(0), cards) - 33.18)
-                .abs()
+            (estimate_hero_secs(&entries, ch, |_| None, |_| 0.0, |_| Some(0), cards) - 33.18).abs()
                 < 1e-9
         );
         // Without a route or places only the title card remains.
@@ -3504,13 +3555,12 @@ mod tests {
             opening_map: true,
             route_stops: 0,
             route_secs: None,
-            places: false,
+            places: 0,
         };
         // 2.5 + 7 + 4 + 6 + 2.5 + 4 = 26 s; cuts 0.7 + 0.54 + 0.8 + 0.54 +
         // 0.7 = 3.28 s.
         assert!(
-            (estimate_hero_secs(&entries, ch, |_| None, |_| false, |_| Some(0), bare) - 22.72)
-                .abs()
+            (estimate_hero_secs(&entries, ch, |_| None, |_| 0.0, |_| Some(0), bare) - 22.72).abs()
                 < 1e-9
         );
     }
@@ -3522,7 +3572,7 @@ mod tests {
             opening_map: true,
             route_stops: 0,
             route_secs: None,
-            places: false,
+            places: 0,
         };
         let est = |ids: &[&str], caps: &[(&str, &str)]| {
             let entries: Vec<PlanEntry> = ids.iter().map(|i| still_entry(i)).collect();
@@ -3531,7 +3581,7 @@ mod tests {
                 &entries,
                 |_| "X",
                 |_| None,
-                |id| has_caption(caps.get(id).copied()),
+                |id| caption_read_secs(caps.get(id).copied()),
                 |_| Some(0),
                 bare,
             )
@@ -3629,11 +3679,10 @@ mod tests {
             opening_map: true,
             route_stops: 0,
             route_secs: None,
-            places: false,
+            places: 0,
         };
         assert!(
-            (estimate_hero_secs(&entries, |_| "X", pano, |_| false, |_| Some(0), bare) - 15.1)
-                .abs()
+            (estimate_hero_secs(&entries, |_| "X", pano, |_| 0.0, |_| Some(0), bare) - 15.1).abs()
                 < 1e-9
         );
     }
@@ -3767,7 +3816,7 @@ mod tests {
         opening_map: true,
         route_stops: 0,
         route_secs: None,
-        places: false,
+        places: 0,
     };
 
     fn pick(
@@ -3789,7 +3838,7 @@ mod tests {
             score_of,
             similar,
             |_| None,
-            |_| false,
+            |_| 0.0,
             |_| Some(0),
             HeroBudget {
                 ceiling_secs,
@@ -3820,7 +3869,7 @@ mod tests {
                 score_of,
                 |_, _| false,
                 |_| None,
-                |_| false,
+                |_| 0.0,
                 |_| Some(0),
                 HeroBudget {
                     ceiling_secs: 60.0,
@@ -3862,7 +3911,7 @@ mod tests {
             [&cands[0], &cands[3]],
             letter,
             |_| None,
-            |_| false,
+            |_| 0.0,
             |_| Some(0),
             NO_CARDS,
         );
@@ -3891,7 +3940,7 @@ mod tests {
             [&cands()[0]],
             letter,
             |_| None,
-            |_| false,
+            |_| 0.0,
             |_| Some(0),
             NO_CARDS,
         );
@@ -3913,7 +3962,7 @@ mod tests {
             &cands[..0],
             letter,
             |_| None,
-            |_| false,
+            |_| 0.0,
             |_| Some(0),
             NO_CARDS,
         ) + 20.0 * 2.5;
@@ -4021,7 +4070,7 @@ mod tests {
             [&still_entry("x")],
             |_| UNGROUPED,
             |_| None,
-            |_| false,
+            |_| 0.0,
             |_| Some(0),
             NO_CARDS,
         );
@@ -4322,19 +4371,19 @@ mod tests {
     #[test]
     fn route_and_places_cards_shift_the_estimate() {
         let e = [still_entry("a1")];
-        let bare = estimate_hero_secs(&e, letter, |_| None, |_| false, |_| Some(0), NO_CARDS);
+        let bare = estimate_hero_secs(&e, letter, |_| None, |_| 0.0, |_| Some(0), NO_CARDS);
         let full = estimate_hero_secs(
             &e,
             letter,
             |_| None,
-            |_| false,
+            |_| 0.0,
             |_| Some(0),
             HeroCards {
                 route: true,
                 opening_map: true,
                 route_stops: 0,
                 route_secs: None,
-                places: true,
+                places: 1,
             },
         );
         // title 2.5 + still 4 - 0.7 vs + map 3 + closing map 4.5 + places 4.5.
@@ -4342,7 +4391,7 @@ mod tests {
         assert!((full - bare - 10.0).abs() < 1e-9, "{full}");
         // No entries: nothing but the title, and no overlap to subtract.
         assert_eq!(
-            estimate_hero_secs([], letter, |_| None, |_| false, |_| Some(0), NO_CARDS),
+            estimate_hero_secs([], letter, |_| None, |_| 0.0, |_| Some(0), NO_CARDS),
             EST_TITLE_SECS
         );
     }
@@ -4487,7 +4536,7 @@ mod tests {
                 score_of,
                 |_, _| false,
                 |_| None,
-                |_| false,
+                |_| 0.0,
                 |_| Some(0),
                 budget(ceiling),
             )
@@ -4798,7 +4847,7 @@ mod tests {
                 &entries,
                 letter,
                 |_| None,
-                |_| false,
+                |_| 0.0,
                 |_| Some(0),
                 NO_CARDS,
                 c,
@@ -4814,7 +4863,7 @@ mod tests {
         assert!(solo - auto > 2.0, "{auto} -> {solo}");
         assert_eq!(
             auto,
-            estimate_hero_secs(&entries, letter, |_| None, |_| false, |_| Some(0), NO_CARDS)
+            estimate_hero_secs(&entries, letter, |_| None, |_| 0.0, |_| Some(0), NO_CARDS)
         );
     }
 
@@ -5185,17 +5234,22 @@ mod tests {
             opening_map: true,
             route_stops: 0,
             route_secs: None,
-            places: false,
+            places: 0,
         };
         // Title 2.5, x1+x3 collage 5, clip 6, y1 solo 4 = 17.5 s; cuts
         // opening 0.7, plain 0.54, closing 0.7 = 1.94 s.
-        let est = estimate_hero_secs(&entries, ch, |_| None, |_| false, |_| Some(0), bare);
+        let est = estimate_hero_secs(&entries, ch, |_| None, |_| 0.0, |_| Some(0), bare);
         assert!((est - 15.56).abs() < 1e-9, "{est}");
         // Captioning x3 leaves x1 nobody to pair with: x1 solo 4, clip 6,
         // x3 solo 4, y1 solo 4 + title 2.5 = 20.5 s; cuts 0.7 + 0.54 +
         // 0.54 + 0.7 = 2.48 s.
-        let est = estimate_hero_secs(&entries, ch, |_| None, |id| id == "x3", |_| Some(0), bare);
+        let short = |id: &str| if id == "x3" { 3.0 } else { 0.0 };
+        let est = estimate_hero_secs(&entries, ch, |_| None, short, |_| Some(0), bare);
         assert!((est - 18.02).abs() < 1e-9, "{est}");
+        // A caption that takes 6 s to read holds x3 for 6 s, not 4.
+        let long = |id: &str| if id == "x3" { 6.0 } else { 0.0 };
+        let est = estimate_hero_secs(&entries, ch, |_| None, long, |_| Some(0), bare);
+        assert!((est - 20.02).abs() < 1e-9, "{est}");
     }
 
     fn split_fixture() -> Vec<Asset> {
