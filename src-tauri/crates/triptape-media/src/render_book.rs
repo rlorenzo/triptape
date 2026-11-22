@@ -2780,6 +2780,12 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
             if c < NARROW_CELL && c / a < NARROW_CELL {
                 cost += NARROW_CELL_COST;
             }
+            // Its mirror: a wide strip keeping under half a photo's height
+            // (a group shot or a tall statue squeezed into a ribbon) cuts
+            // heads and feet alike. Panoramas are made for strips.
+            if c > 1.0 / NARROW_CELL && a / c < NARROW_CELL && a < PANORAMA_ASPECT {
+                cost += NARROW_CELL_COST;
+            }
             // A cell that would cut a detected face costs far more than any
             // crop: that layout loses.
             if frame_cuts(slot[i], cw, row_h[r], 0.0) {
