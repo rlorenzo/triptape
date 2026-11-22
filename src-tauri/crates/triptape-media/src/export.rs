@@ -493,13 +493,10 @@ fn book_heading_place(
     if triptape_core::itinerary::is_ship_place(ships, place) {
         return None;
     }
-    // The middle of the day's fixes: a day trip out of the city (Kamakura
-    // from Tokyo) keeps the sight alone.
-    let (mut lats, mut lons): (Vec<f64>, Vec<f64>) = shots.iter().filter_map(|a| a.gps).unzip();
-    lats.sort_by(f64::total_cmp);
-    lons.sort_by(f64::total_cmp);
-    let at = (!lats.is_empty()).then(|| (lats[lats.len() / 2], lons[lons.len() / 2]));
-    itin.stop_on(day, at)
+    // A day trip out of the city (Kamakura from Tokyo) keeps the sight
+    // alone.
+    let fixes: Vec<(f64, f64)> = shots.iter().filter_map(|a| a.gps).collect();
+    itin.stop_on(day, &fixes)
         .filter(|city| !place.contains(city.as_str()))
         .map(|city| format!("{city} \u{b7} {place}"))
 }
