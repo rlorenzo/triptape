@@ -307,6 +307,22 @@ fn plan_chunks(
     }
 }
 
+/// A chapter heading as shown: the day line (`Day 16 · Sun, Oct 18`) on
+/// the day's first heading, then only the place for later moves that day,
+/// so a new place doesn't look like a new day. `last_day` tracks the day
+/// line shown last.
+fn day_once(
+    last_day: &mut Option<String>,
+    (top, bottom): (String, Option<String>),
+) -> (String, Option<String>) {
+    let same_day = last_day.as_deref() == Some(top.as_str());
+    *last_day = Some(top.clone());
+    match bottom {
+        Some(place) if same_day => (place, None),
+        bottom => (top, bottom),
+    }
+}
+
 /// Per-cut overlap for a transition: slow fades get room to breathe,
 /// everything else takes the 0.5 s standard.
 pub fn transition_overlap(t: &Transition) -> f64 {
@@ -1230,6 +1246,9 @@ pub fn render_hero_video(
         // A chapter heading identical to the last one shown (the same day
         // and place, split by a few shots elsewhere) is not repeated.
         let mut last_heading: Option<(String, Option<String>)> = None;
+        // The day line shown last: a later heading the same day names only
+        // its place, so a move within a day doesn't read as a new day.
+        let mut last_day: Option<String> = None;
         for (i, (r, _, _, _)) in segs.iter().enumerate() {
             let id = r.entry.asset_id.as_str();
             if id == "title" || id == "credits" {
@@ -1250,11 +1269,13 @@ pub fn render_hero_video(
                     0 => crate::titlecard::chapter_film_lines(ch),
                     k => crate::titlecard::chapter_lines_at(ch, section_place(ch, k)?),
                 });
-                heading.filter(|lines| {
-                    let repeat = last_heading.as_ref() == Some(lines);
-                    last_heading = Some(lines.clone());
-                    !repeat
-                })
+                heading
+                    .filter(|lines| {
+                        let repeat = last_heading.as_ref() == Some(lines);
+                        last_heading = Some(lines.clone());
+                        !repeat
+                    })
+                    .map(|lines| day_once(&mut last_day, lines))
             };
             let Some((top, bottom)) = lines else { continue };
             todo.push((
@@ -3082,6 +3103,29 @@ fn graph_segment_args(img: &Path, dur: f64, graph: String, out: &Path) -> Vec<St
 mod tests {
     use super::*;
     use triptape_core::plan::{CAPTION_MAX_SECS, PLACES_CARD_MAX_SECS};
+
+    #[test]
+    fn the_day_line_shows_once_a_day() {
+        let mut last = None;
+        let h = |d: &str, p: &str| (d.to_string(), Some(p.to_string()));
+        assert_eq!(
+            day_once(&mut last, h("Day 16 · Sun, Oct 18", "Victoria Peak")),
+            h("Day 16 · Sun, Oct 18", "Victoria Peak")
+        );
+        assert_eq!(
+            day_once(&mut last, h("Day 16 · Sun, Oct 18", "Stanley Market")),
+            ("Stanley Market".to_string(), None)
+        );
+        assert_eq!(
+            day_once(&mut last, h("Day 17 · Mon, Oct 19", "Carnival Luminosa")),
+            h("Day 17 · Mon, Oct 19", "Carnival Luminosa")
+        );
+        // An old plan's title-only heading passes through.
+        assert_eq!(
+            day_once(&mut last, ("Chapter".to_string(), None)),
+            ("Chapter".to_string(), None)
+        );
+    }
 
     #[test]
     fn a_long_film_is_joined_in_chunks_on_the_same_timeline() {

@@ -238,17 +238,26 @@ impl Itinerary {
     }
 
     /// The owner-named place a shot was taken in: one whose time window
-    /// holds its local time, else the nearest whose radius reaches its GPS.
+    /// holds its local time (and, for a window with a point, whose radius
+    /// reaches its GPS when it has one), else the nearest whose radius
+    /// reaches its GPS.
     /// A shot without a time zone has no local time to place it by.
     pub fn place_of(&self, a: &Asset) -> Option<&str> {
         let when = a
             .taken_at
             .zip(a.tz_offset_secs)
             .and_then(|(t, tz)| crate::metadata::local_datetime(t, Some(tz)));
+        // A window with a point too also needs the shot there when its
+        // GPS is known: on a split day the other party was elsewhere at
+        // that time (Stanley Market vs Disneyland). Without GPS, the time
+        // alone places it.
         let timed = self.places.iter().find(|pl| {
-            pl.window()
+            let in_time = pl
+                .window()
                 .zip(when)
-                .is_some_and(|((from, until), w)| from <= w && w <= until)
+                .is_some_and(|((from, until), w)| from <= w && w <= until);
+            let in_place = a.gps.is_none() || pl.lat.is_none() || pl.reach(a.gps).is_some();
+            in_time && in_place
         });
         timed
             .or_else(|| {
@@ -1310,6 +1319,31 @@ mod tests {
             ch.film_places().collect::<Vec<_>>(),
             ["Kiyosumi Garden", "Tokyo", "Kiyosumi Garden"]
         );
+    }
+
+    #[test]
+    fn a_window_with_a_point_needs_the_shot_there() {
+        let mut it = itin();
+        it.places = serde_json::from_str(
+            r#"[{ "name": "Stanley Market", "lat": 22.218, "lon": 114.211, "radius_m": 2000,
+                  "from": "2026-10-18 13:15", "until": "2026-10-18 15:00" }]"#,
+        )
+        .unwrap();
+        let at = |gps| {
+            let mut a = photo("p", "2026-10-18", gps);
+            // 14:00 local in Hong Kong.
+            a.taken_at = Some(1_792_303_200);
+            a.tz_offset_secs = Some(8 * 3600);
+            a
+        };
+        assert_eq!(
+            it.place_of(&at(Some((22.2171, 114.2125)))),
+            Some("Stanley Market")
+        );
+        // The other party at Disneyland at the same time.
+        assert_eq!(it.place_of(&at(Some((22.3101, 114.0406)))), None);
+        // No GPS: the time places it.
+        assert_eq!(it.place_of(&at(None)), Some("Stanley Market"));
     }
 
     #[test]
