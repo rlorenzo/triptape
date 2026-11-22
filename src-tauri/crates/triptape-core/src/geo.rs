@@ -267,6 +267,18 @@ pub fn city_name(gps: (f64, f64)) -> Option<String> {
         .map(|c| format!("{}, {}", c.name, c.country))
 }
 
+/// `Kamakura, Japan` as `Kamakura`: a [`city_name`] without its country.
+/// Any other name (`Flower Dome, Gardens by the Bay`) passes through.
+pub fn without_country(name: &str) -> &str {
+    static COUNTRIES: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    let countries = COUNTRIES.get_or_init(|| gazetteer().iter().map(|c| c.country).collect());
+    match name.rsplit_once(", ") {
+        Some((town, country)) if countries.contains(country) => town,
+        _ => name,
+    }
+}
+
 /// Named attractions (Wikidata, CC0): tourist attractions, parks,
 /// museums, amusement parks, castles, zoos, temples, shrines, churches,
 /// mosques with a notability floor
@@ -601,6 +613,15 @@ mod tests {
         assert_eq!(
             city_name((-16.4332, -179.8)).as_deref(),
             Some("Labasa, Fiji")
+        );
+    }
+
+    #[test]
+    fn without_country_keeps_names_with_commas() {
+        assert_eq!(without_country("Kamakura, Japan"), "Kamakura");
+        assert_eq!(
+            without_country("Flower Dome, Gardens by the Bay"),
+            "Flower Dome, Gardens by the Bay"
         );
     }
 

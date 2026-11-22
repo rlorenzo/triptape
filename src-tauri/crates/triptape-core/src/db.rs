@@ -100,6 +100,15 @@ CREATE TABLE IF NOT EXISTS people (
     display_name TEXT,
     face_count INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS known_faces (
+    asset_id TEXT NOT NULL REFERENCES assets(id),
+    x REAL NOT NULL,
+    y REAL NOT NULL,
+    w REAL NOT NULL,
+    h REAL NOT NULL,
+    body INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_known_faces_asset ON known_faces(asset_id);
 CREATE TABLE IF NOT EXISTS plans (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
@@ -213,16 +222,19 @@ fn face_signals_at(r: &Row, first: usize) -> rusqlite::Result<Option<FaceSignals
     }))
 }
 
+/// Whether `table` has a column named `column` (false when no such table).
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name=?2",
+        [table, column],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .map_err(|e| e.to_string())
+}
+
 fn add_column_if_missing(conn: &Connection, column: &str, ddl: &str) -> Result<(), String> {
-    let present = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name=?1",
-            [column],
-            |r| r.get::<_, i64>(0),
-        )
-        .map_err(|e| e.to_string())?
-        > 0;
-    if !present {
+    if !has_column(conn, "assets", column)? {
         conn.execute(&format!("ALTER TABLE assets ADD COLUMN {column} {ddl}"), [])
             .map_err(|e| e.to_string())?;
     }
@@ -246,6 +258,13 @@ impl Db {
     fn init(conn: Connection) -> Result<Self, String> {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| e.to_string())?;
+        // Early builds kept each known face's person name; names are
+        // personal data and never stored, so that table goes (its regions
+        // come back with the next `triptape faces`).
+        if has_column(&conn, "known_faces", "name")? {
+            conn.execute("DROP TABLE known_faces", [])
+                .map_err(|e| e.to_string())?;
+        }
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         // Migrations for DBs created before capture timezones, embedded
         // user captions, people counts/signatures, library scores, image
@@ -327,6 +346,73 @@ impl Db {
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Replace a project's known faces (named people's regions from the
+    /// photo library) with `faces`; its assets absent from `faces` lose
+    /// theirs (their tags were removed).
+    pub fn replace_known_faces(
+        &self,
+        project_id: &str,
+        faces: &HashMap<String, Vec<crate::types::KnownFace>>,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM known_faces WHERE asset_id IN (SELECT id FROM assets WHERE project_id=?1)",
+            params![project_id],
+        )
+        .map_err(|e| e.to_string())?;
+        {
+            let mut insert = tx
+                .prepare_cached(
+                    "INSERT INTO known_faces (asset_id,x,y,w,h,body) VALUES (?1,?2,?3,?4,?5,?6)",
+                )
+                .map_err(|e| e.to_string())?;
+            for (asset, list) in faces {
+                for f in list {
+                    insert
+                        .execute(params![asset, f.x, f.y, f.w, f.h, i64::from(f.body)])
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Known faces of a project's assets, by asset id.
+    pub fn known_faces(
+        &self,
+        project_id: &str,
+    ) -> Result<HashMap<String, Vec<crate::types::KnownFace>>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT k.asset_id,k.x,k.y,k.w,k.h,k.body FROM known_faces k JOIN assets a ON a.id=k.asset_id WHERE a.project_id=?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map(params![project_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    crate::types::KnownFace {
+                        x: r.get::<_, f64>(1)? as f32,
+                        y: r.get::<_, f64>(2)? as f32,
+                        w: r.get::<_, f64>(3)? as f32,
+                        h: r.get::<_, f64>(4)? as f32,
+                        body: r.get::<_, i64>(5)? != 0,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out: HashMap<String, Vec<crate::types::KnownFace>> = HashMap::new();
+        for row in rows {
+            let (id, f) = row.map_err(|e| e.to_string())?;
+            out.entry(id).or_default().push(f);
+        }
+        Ok(out)
     }
 
     /// Mark a project as just updated, so [`Db::latest_project`] opens it:
@@ -758,6 +844,14 @@ impl Db {
         let mut deleted = 0usize;
         for chunk in stale.chunks(500) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            // Their face regions go too: a later scan may hand a deleted id
+            // to a different photo, which must not inherit these boxes.
+            self.conn
+                .execute(
+                    &format!("DELETE FROM known_faces WHERE asset_id IN ({placeholders})"),
+                    rusqlite::params_from_iter(chunk.iter()),
+                )
+                .map_err(|e| e.to_string())?;
             let sql = format!("DELETE FROM assets WHERE id IN ({placeholders})");
             let mut st = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
             deleted += st
@@ -1143,6 +1237,7 @@ mod tests {
             cover: Default::default(),
             crop: Default::default(),
             book: Default::default(),
+            closing: Default::default(),
         };
         assert!(db.get_plan_edits(&p.id).unwrap().is_empty());
         db.save_plan_edits(&p.id, &edits).unwrap();
@@ -1686,6 +1781,7 @@ mod tests {
             cover: Default::default(),
             crop: Default::default(),
             book: Default::default(),
+            closing: Default::default(),
         };
         db.insert_plan(&p.id, &plan, "local").unwrap();
         let back = db.latest_plan(Some(&p.id)).unwrap().unwrap();
@@ -1757,6 +1853,51 @@ mod tests {
         assert_eq!(db.latest_project().unwrap().unwrap().id, b.id);
         db.set_project_folder(&b.id, "/b2").unwrap();
         assert_eq!(db.project_for_folder("/b2").unwrap().unwrap().id, b.id);
+    }
+
+    #[test]
+    fn opening_drops_a_known_faces_table_that_kept_names() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE known_faces (asset_id TEXT, name TEXT, x REAL, y REAL, w REAL, h REAL);
+             INSERT INTO known_faces VALUES ('a', 'Lana', 0.1, 0.1, 0.1, 0.1);",
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        assert!(!has_column(&db.conn, "known_faces", "name").unwrap());
+        assert!(has_column(&db.conn, "known_faces", "body").unwrap());
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM known_faces", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "the names went with the old table");
+    }
+
+    #[test]
+    fn known_faces_round_trip_per_asset() {
+        let db = mem();
+        let p = db.create_project("t", "/t").unwrap();
+        let a = Asset::new(
+            format!("{}_a00000", p.id),
+            "/t/a.jpg".into(),
+            AssetKind::Photo,
+        );
+        db.upsert_asset(&p.id, &a).unwrap();
+        let face = crate::types::KnownFace {
+            x: 0.1,
+            y: 0.5,
+            w: 0.1,
+            h: 0.13,
+            body: false,
+        };
+        let faces: HashMap<String, Vec<_>> = [(a.id.clone(), vec![face.clone()])].into();
+        db.replace_known_faces(&p.id, &faces).unwrap();
+        db.replace_known_faces(&p.id, &faces).unwrap();
+        let back = db.known_faces(&p.id).unwrap();
+        assert_eq!(back[&a.id], vec![face]);
+        // Tags removed in Photos: a re-import without the asset clears it.
+        db.replace_known_faces(&p.id, &HashMap::new()).unwrap();
+        assert!(db.known_faces(&p.id).unwrap().is_empty());
     }
 
     #[test]

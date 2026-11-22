@@ -66,11 +66,13 @@ fn iou(a: &Face, b: &Face) -> f32 {
     }
 }
 
-/// YuNet input for an RGB image: (BGR 0..255 planar tensor, shape
-/// `[1, 3, h, w]`, scale from thumbnail to tensor pixels).
-pub fn yunet_input(img: &RgbImage) -> (Vec<f32>, [i64; 4], f32) {
+/// YuNet input for an RGB image scaled to `long_edge` (larger finds
+/// smaller faces, a toddler at the back of a group, at more compute):
+/// (BGR 0..255 planar tensor, shape `[1, 3, h, w]`, scale from thumbnail
+/// to tensor pixels).
+pub fn yunet_input(img: &RgbImage, long_edge: u32) -> (Vec<f32>, [i64; 4], f32) {
     let (w, h) = (img.width().max(1) as f32, img.height().max(1) as f32);
-    let sc = YUNET_LONG_EDGE as f32 / w.max(h);
+    let sc = long_edge as f32 / w.max(h);
     let rw = ((w * sc).round() as u32).max(1);
     let rh = ((h * sc).round() as u32).max(1);
     let (pw, ph) = (rw.div_ceil(32) * 32, rh.div_ceil(32) * 32);
@@ -272,7 +274,7 @@ mod tests {
     #[test]
     fn yunet_input_is_bgr_and_padded() {
         let img = RgbImage::from_pixel(320, 200, image::Rgb([10, 20, 30]));
-        let (d, shape, sc) = yunet_input(&img);
+        let (d, shape, sc) = yunet_input(&img, YUNET_LONG_EDGE);
         assert_eq!(shape, [1, 3, 416, 640]);
         assert!((sc - 2.0).abs() < 1e-6);
         let plane = 416 * 640;

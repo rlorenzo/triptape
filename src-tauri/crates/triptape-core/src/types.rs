@@ -99,6 +99,20 @@ pub struct Asset {
     pub faces: Option<FaceSignals>,
 }
 
+/// A named person's region in a photo (never the name itself), from the owner's photo library
+/// (Apple Photos' face tags): who matters in the frame. Normalised to the
+/// upright photo, top-left origin. `body` marks a region known only from
+/// the person's body (no face found), whose top stands in for the head.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct KnownFace {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    #[serde(default)]
+    pub body: bool,
+}
+
 /// What the optional face models found in one photo: only what scoring
 /// needs (no boxes, crops or identities).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -299,6 +313,9 @@ pub struct Plan {
     /// captioned photo.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub book: Vec<String>,
+    /// The owner's photo for the book's closing page, if chosen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closing: Option<String>,
 }
 
 /// How the user regrouped the film's collages, by asset id. Read by

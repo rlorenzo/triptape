@@ -96,6 +96,9 @@ impl ItinLeg {
     }
 }
 
+/// How far from a stop a day's photos may be and still be in its city.
+pub const STOP_NEAR_M: f64 = 30_000.0;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Itinerary {
     pub stops: Vec<ItinStop>,
@@ -463,6 +466,18 @@ impl Itinerary {
             .into_iter()
             .find(|c| c.start <= day && day <= c.end);
         let Some(cruise) = cruise else {
+            // A shot far from every stop active today was on a trip out of
+            // the city (Kamakura from Tokyo): no city is better than the
+            // wrong one.
+            let far = gps.is_some_and(|p| {
+                self.stops
+                    .iter()
+                    .filter(|s| s.active_on(day))
+                    .all(|s| haversine_m(p, s.pos()) > STOP_NEAR_M)
+            });
+            if far {
+                return None;
+            }
             return Some(DayLabel {
                 place: city()?,
                 on_ship: false,
@@ -515,6 +530,40 @@ impl Itinerary {
                 on_ship: true,
             },
         })
+    }
+
+    /// Stops active on `day` whose label the book may name (not hidden).
+    fn labelled_on(&self, day: NaiveDate) -> impl Iterator<Item = &ItinStop> {
+        self.stops
+            .iter()
+            .filter(move |s| !s.hide_label && s.active_on(day))
+    }
+
+    /// The stop the trip is at on `day` (a city or a port call, not home),
+    /// by its label, unless hidden. `fixes` are where the day's photos
+    /// were: when a fifth or more lie beyond [`STOP_NEAR_M`] of a stop, the
+    /// day went out of that city (Kamakura from Tokyo), so it doesn't name
+    /// it. No fixes, no check.
+    pub fn stop_on(&self, day: NaiveDate, fixes: &[(f64, f64)]) -> Option<String> {
+        self.labelled_on(day)
+            // Near the fixes inside the search: a travel day has both the
+            // stop left and the stop reached active.
+            .find(|s| {
+                let far = fixes
+                    .iter()
+                    .filter(|&&p| haversine_m(p, s.pos()) > STOP_NEAR_M)
+                    .count();
+                s.kind != StopKind::Home && far * 5 < fixes.len().max(1)
+            })
+            .map(|s| s.label.clone())
+    }
+
+    /// The port the ship calls at on `day`, by its label, if any (and
+    /// not hidden): the book names it beside the ship on a port day.
+    pub fn port_call(&self, day: NaiveDate) -> Option<String> {
+        self.labelled_on(day)
+            .find(|s| s.kind == StopKind::Port)
+            .map(|s| s.label.clone())
     }
 
     /// `Carnival Luminosa Embarkation` on the first day of a cruise,
@@ -890,6 +939,54 @@ mod tests {
     }
 
     #[test]
+    fn a_shot_far_from_the_city_takes_no_city_label() {
+        let it = itin();
+        let tokyo = it.label_for(day("2026-10-05"), Some((35.7148, 139.7967)));
+        assert_eq!(tokyo.map(|l| l.place).as_deref(), Some("Tokyo"));
+        // Kamakura, ~50 km out: not "Tokyo".
+        assert!(it
+            .label_for(day("2026-10-05"), Some((35.3192, 139.5467)))
+            .is_none());
+    }
+
+    #[test]
+    fn stop_on_and_port_call_name_the_days_stop() {
+        let it = itin();
+        assert_eq!(it.stop_on(day("2026-10-05"), &[]).as_deref(), Some("Tokyo"));
+        // Photos in Asakusa are in Tokyo; Kamakura (~50 km) is a day trip.
+        let asakusa = (35.7148, 139.7967);
+        let kamakura = (35.3192, 139.5467);
+        assert_eq!(
+            it.stop_on(day("2026-10-05"), &[asakusa]).as_deref(),
+            Some("Tokyo")
+        );
+        assert_eq!(it.stop_on(day("2026-10-05"), &[kamakura]), None);
+        // A morning in Tokyo, then the afternoon in Kamakura: still a day
+        // trip once a fifth of the photos are out of the city.
+        let mixed = [asakusa, asakusa, asakusa, kamakura];
+        assert_eq!(it.stop_on(day("2026-10-05"), &mixed), None);
+        // Home is never the trip's stop.
+        assert_eq!(it.stop_on(day("2026-10-03"), &[]), None);
+        // A travel day has the stop left and the stop reached active:
+        // photos in the second city name it, not nothing.
+        let travel = Itinerary::from_json(
+            r#"{ "stops": [
+              { "id": "kyoto", "label": "Kyoto", "lat": 35.01, "lon": 135.77, "arrive": "2026-10-01", "depart": "2026-10-03" },
+              { "id": "tokyo", "label": "Tokyo", "lat": 35.71, "lon": 139.80, "arrive": "2026-10-03", "depart": "2026-10-06" }
+            ], "legs": [ { "from": "kyoto", "to": "tokyo", "mode": "ground" } ] }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            travel.stop_on(day("2026-10-03"), &[asakusa]).as_deref(),
+            Some("Tokyo")
+        );
+        assert_eq!(it.port_call(day("2026-10-11")).as_deref(), Some("Osaka"));
+        // A hidden port, and a day at sea, name nothing.
+        assert_eq!(it.port_call(day("2026-10-09")), None);
+        assert_eq!(it.port_call(day("2026-10-15")), None);
+    }
+
+    #[test]
     fn parses_and_merges_cruises_per_ship() {
         let cruises = itin().cruises();
         assert_eq!(
@@ -1057,6 +1154,7 @@ mod tests {
             cover: Default::default(),
             crop: Default::default(),
             book: Default::default(),
+            closing: Default::default(),
         };
         let out = apply_itinerary(&plan, &assets, &itin());
         let places: Vec<_> = out

@@ -5,7 +5,7 @@
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m] [--models DIR]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
-//!                [--solo REF...] [--unsolo REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--book REF...] [--unbook REF...] [--list]
+//!                [--solo REF...] [--unsolo REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
@@ -770,6 +770,9 @@ fn export_cmd(flags: &HashMap<String, String>) {
         .unwrap_or_else(|| die("plan", "no plan in db (run scan first)"));
     // Rendered maps get the same home fuzzing as `plan` JSON (Sec 14).
     hide_home(flags, &mut plan.map_polyline);
+    let known_faces = db
+        .known_faces(&project_id)
+        .unwrap_or_else(|e| die("known faces", e));
     let trip_name = db
         .get_project(&project_id)
         .unwrap_or_else(|e| die("project", e))
@@ -887,6 +890,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             map_style,
             hop_clips,
             back_cover,
+            known_faces,
         },
     );
     console.finish();
@@ -1054,6 +1058,9 @@ struct EditArgs {
     /// Photos pinned into (or out of) the book.
     book: Vec<String>,
     unbook: Vec<String>,
+    /// The book's closing photo (`--closing REF`); `--no-closing` clears it.
+    closing: Option<String>,
+    no_closing: bool,
 }
 
 const MOVE_USAGE: &str = "--move wants --after REF or --before REF";
@@ -1102,6 +1109,9 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     out.cover.push(parse_cover_pin(&v)?);
                 }
             }
+            "closing" => out.closing = Some(single(values)?),
+            "no-closing" if values.is_empty() => out.no_closing = true,
+            "no-closing" => return Err("--no-closing takes no value".to_string()),
             "crop" => match <[String; 3]>::try_from(values) {
                 Ok([a, x, y]) => {
                     let pct = |v: &str| match v.parse::<u8>() {
@@ -1151,6 +1161,9 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
             }
             other => return Err(format!("unknown flag --{other}")),
         }
+    }
+    if out.closing.is_some() && out.no_closing {
+        return Err("--closing and --no-closing conflict: pass one".to_string());
     }
     if pending_move.is_some() {
         return Err(MOVE_USAGE.to_string());
@@ -1215,6 +1228,9 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
     println!("joins: {}", collage.joins.len());
     for (a, b) in &collage.joins {
         println!("  {} + {}", show(a), show(b));
+    }
+    if let Some(id) = &edits.closing {
+        println!("closing photo: {}", show(id));
     }
     println!("book pins: {}", edits.book.len());
     for id in &edits.book {
@@ -1352,6 +1368,25 @@ fn edit_cmd(args: &[String]) {
         .map(|(q, x, y)| (resolve_one(q), *x, *y))
         .collect();
     let uncrops = resolve(&a.uncrop);
+    let closing = a.closing.as_deref().map(resolve_one);
+    if let Some(asset) = closing.filter(|x| x.kind == AssetKind::Video) {
+        die(
+            "edit",
+            format!(
+                "{} is a video; the book closes on a photo",
+                asset_label(asset)
+            ),
+        );
+    }
+    if let Some(asset) = closing.filter(|x| ep.base.chapter_of(&x.id).is_none()) {
+        die(
+            "edit",
+            format!(
+                "{} is not in any chapter of the plan, so the book can't close on it",
+                asset_label(asset)
+            ),
+        );
+    }
     let books = resolve(&a.book);
     // A pin only places a photo the plan holds (a near-duplicate the scan
     // set aside has no page to go to): refuse it rather than save a no-op.
@@ -1377,11 +1412,13 @@ fn edit_cmd(args: &[String]) {
         || !crops.is_empty()
         || !uncrops.is_empty()
         || !books.is_empty()
-        || !unbooks.is_empty();
+        || !unbooks.is_empty()
+        || closing.is_some()
+        || a.no_closing;
     if !changed && !a.list {
         die(
             "edit",
-            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--book/--unbook or --list",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--book/--unbook/--closing/--no-closing or --list",
         );
     }
     let mut edits = ep.edits.clone();
@@ -1402,6 +1439,14 @@ fn edit_cmd(args: &[String]) {
             (!text.is_empty()).then(|| text.to_string()),
         );
         println!("caption: {} = {text:?}", asset_label(asset));
+    }
+    if a.no_closing {
+        edits.closing = None;
+        println!("closing: cleared");
+    }
+    if let Some(asset) = closing {
+        edits.closing = Some(asset.id.clone());
+        println!("closing: {}", asset_label(asset));
     }
     for asset in &unbooks {
         edits.set_book(asset.id.clone(), false);
@@ -1563,20 +1608,48 @@ fn edit_cmd(args: &[String]) {
     println!("film now has {} shots", hero.len());
 }
 
+/// `triptape faces --db trip.db --osxphotos photos.json [--project ID]`:
+/// import named people's face regions from `osxphotos query --json` output
+/// (Apple Photos' face tags), so the book frames the family first.
+fn faces_cmd(flags: &HashMap<String, String>) {
+    let db_path = need(flags, "db");
+    let json_path = need(flags, "osxphotos");
+    let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
+    let project_id = project_or_latest(&db, flags, "faces");
+    let assets = db
+        .list_assets(&project_id)
+        .unwrap_or_else(|e| die("assets", e));
+    let json = std::fs::read_to_string(&json_path)
+        .unwrap_or_else(|e| die(&format!("read {}", json_path.display()), e));
+    let faces = triptape_core::osxphotos::known_faces_from_osxphotos(&json, &assets)
+        .unwrap_or_else(|e| die("osxphotos json", e));
+    db.replace_known_faces(&project_id, &faces)
+        .unwrap_or_else(|e| die("save faces", e));
+    let regions: usize = faces.values().map(Vec::len).sum();
+    println!("project: {project_id}");
+    println!("known faces: {regions} regions on {} photos", faces.len());
+}
+
+/// `--project ID`, else the latest project in `db` (dying as `cmd` when
+/// there is none).
+fn project_or_latest(db: &Db, flags: &HashMap<String, String>, cmd: &str) -> String {
+    match flags.get("project") {
+        Some(id) => id.clone(),
+        None => {
+            db.latest_project()
+                .unwrap_or_else(|e| die("project", e))
+                .unwrap_or_else(|| die(cmd, "no project in db"))
+                .id
+        }
+    }
+}
+
 /// `learn`: show, reset or apply the story-score weights learned from the
 /// owner's Story-editor edits. Never changes a plan unless `--apply`.
 fn learn_cmd(flags: &HashMap<String, String>) {
     let db_path = need(flags, "db");
     let db = Db::open(&db_path).unwrap_or_else(|e| die("open db", e));
-    let project_id = match flags.get("project") {
-        Some(id) => id.clone(),
-        None => {
-            db.latest_project()
-                .unwrap_or_else(|e| die("project", e))
-                .unwrap_or_else(|| die("learn", "no project in db"))
-                .id
-        }
-    };
+    let project_id = project_or_latest(&db, flags, "learn");
     let on = |k: &str| flags.get(k).is_some_and(|v| v == "true");
     if on("reset") {
         let n = db
@@ -1881,6 +1954,7 @@ fn main() {
         "pick" => pick_cmd(&flags),
         "maps" => maps_cmd(&flags),
         "learn" => learn_cmd(&flags),
+        "faces" => faces_cmd(&flags),
         "cache" => cache_cmd(std::env::args().nth(2).as_deref().unwrap_or(""), &flags),
         "edit" => edit_cmd(&std::env::args().skip(2).collect::<Vec<_>>()),
         _ => {
@@ -1987,6 +2061,17 @@ mod tests {
             ]
         );
         assert!(parse_edit_args(&args("--caption a")).is_err());
+    }
+
+    #[test]
+    fn edit_args_set_and_clear_the_closing_photo() {
+        let a = parse_edit_args(&args("--closing a")).unwrap();
+        assert_eq!((a.closing.as_deref(), a.no_closing), (Some("a"), false));
+        let a = parse_edit_args(&args("--no-closing")).unwrap();
+        assert_eq!((a.closing, a.no_closing), (None, true));
+        assert!(parse_edit_args(&args("--no-closing a")).is_err());
+        assert!(parse_edit_args(&args("--closing")).is_err());
+        assert!(parse_edit_args(&args("--closing a --no-closing")).is_err());
     }
 
     #[test]

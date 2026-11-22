@@ -141,6 +141,11 @@ pub struct BookPhoto {
     /// Detected faces (normalised boxes), when the face models ran: page
     /// layouts avoid cells that would cut them.
     pub faces: Vec<FaceBox>,
+    /// The owner chose this photo for the closing page.
+    pub closing: bool,
+    /// Named people's regions from the photo library: framing keeps them
+    /// first.
+    pub family: Vec<KnownBox>,
 }
 
 impl BookPhoto {
@@ -178,6 +183,8 @@ impl BookPhoto {
             crop_focus: None,
             aboard: false,
             faces: vec![],
+            closing: false,
+            family: vec![],
         }
     }
 
@@ -390,10 +397,23 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
             let p = &photos[order[pos]];
             dpi_verdict(p.width, p.height, w, h) != DpiVerdict::Block
         };
-        if let Some(pos) = run[..run.len().min(DIVIDER_WINDOW)]
+        // A tagged family face beats a stranger's elbow behind a plate.
+        let window = &run[..run.len().min(DIVIDER_WINDOW)];
+        let tier = |pos: usize| {
+            let p = &photos[order[pos]];
+            if p.family.iter().any(|k| !k.body) {
+                0
+            } else if p.is_of_people() {
+                1
+            } else {
+                2
+            }
+        };
+        if let Some(pos) = window
             .iter()
             .copied()
-            .find(|&pos| printable(pos) && photos[order[pos]].is_of_people())
+            .filter(|&pos| printable(pos) && tier(pos) < 2)
+            .min_by_key(|&pos| tier(pos))
             .or_else(|| run.iter().copied().find(|&pos| printable(pos)))
         {
             order[at..=pos].rotate_right(1);
@@ -755,11 +775,16 @@ pub struct BookOutput {
     pub fallbacks: Vec<String>,
 }
 
+/// Largest-face size (of the shorter side) the closing photo needs: the
+/// family close enough to read on the last page, not a statue with them
+/// at its foot.
+const CLOSING_FACE: f32 = 0.12;
+
 /// Photos at the end of the book the closing page never repeats.
 const CLOSING_SKIPS_LAST: usize = 12;
 
 /// How many of a section's first photos may back its title page.
-const DIVIDER_WINDOW: usize = 4;
+const DIVIDER_WINDOW: usize = 8;
 
 /// How many photos after the hero may supply the opening spread.
 const SPREAD_WINDOW: usize = 11;
@@ -919,6 +944,45 @@ fn lone_scenery(photos: &[BookPhoto]) -> Vec<String> {
         start = end;
     }
     out
+}
+
+/// An owner-kept photo with no one in it, alone in its stretch (a plate
+/// of laksa between two sights), joins the next stretch of its day (else
+/// the one before): it keeps its caption on a shared page rather than
+/// taking a full page of its own.
+fn fold_lone_kept(photos: &mut [BookPhoto]) {
+    // Stretches as (start, end) runs of one (day, area).
+    let mut runs: Vec<(usize, usize)> = vec![];
+    for run in photos.chunk_by(|a, b| (a.day, &a.area) == (b.day, &b.area)) {
+        let start = runs.last().map_or(0, |&(_, end)| end);
+        runs.push((start, start + run.len()));
+    }
+    for (r, &(start, end)) in runs.iter().enumerate() {
+        let p = &photos[start];
+        if end - start != 1 || !p.keep || p.is_of_people() || p.day.is_none() {
+            continue;
+        }
+        let day = p.day;
+        // Only a neighbouring stretch of the same day: pages break on every
+        // change of (day, area) in photo order, so taking the area of a
+        // stretch further off would leave this photo alone all the same.
+        let near = || {
+            runs.get(r + 1)
+                .into_iter()
+                .chain(r.checked_sub(1).map(|i| &runs[i]))
+                .filter(|&&(a, _)| photos[a].day == day)
+        };
+        // The next stretch, else the one before; one with two or more
+        // photos first (a lone one may become the day's divider and leave
+        // this one alone again).
+        let target = near()
+            .find(|&&(a, b)| b - a >= 2)
+            .or_else(|| near().next())
+            .map(|&(a, _)| photos[a].area.clone());
+        if let Some(area) = target {
+            photos[start].area = area;
+        }
+    }
 }
 
 /// Same caption text at most this many times in one day: an owner who
@@ -1250,9 +1314,49 @@ pub fn render_book(
             "book: selected {keep} of {of} photos (your captioned photos first, then the best-scored of each chapter) to fit the {cap}-page cap"
         ));
     }
+    // The closing page's photo: the owner's choice (taken off the pages,
+    // so it never prints twice), else a strong people shot of the last
+    // days the pages leave out, so the last page is new, not a repeat.
+    // Like every page, it must print sharp enough: a blocked choice gives
+    // way to the automatic pick, with a note.
+    let (closing_w, closing_h) = slot_inches(opts.preset, PageKind::Closing, 1);
+    let mut owner_closing = viable.iter().find(|p| p.closing).cloned();
+    if let Some(p) = owner_closing
+        .take_if(|p| dpi_verdict(p.width, p.height, closing_w, closing_h) == DpiVerdict::Block)
+    {
+        fallbacks.push(format!(
+            "closing: {} is too small to print a full page; another photo closes the book",
+            p.display_name()
+        ));
+    }
+    if let Some(c) = &owner_closing {
+        pruned.retain(|p| p.asset_id != c.asset_id);
+    }
+    let owner_chose_closing = owner_closing.is_some();
+    let mut closing_pick: Option<BookPhoto> = owner_closing.or_else(|| {
+        let placed: HashSet<&str> = pruned.iter().map(|p| p.asset_id.as_str()).collect();
+        let last_day = viable.iter().filter_map(|p| p.day).max();
+        viable
+            .iter()
+            .filter(|p| {
+                // Big, sharp faces that print well on a full page (the
+                // framing search in `cover_rank` last: it is the costly one;
+                // it sees only tagged faces until the detector runs below).
+                !placed.contains(p.asset_id.as_str())
+                    && p.tagged_people >= 3
+                    && p.people >= 4
+                    && p.face_size >= CLOSING_FACE
+                    && p.day.zip(last_day).is_some_and(|(d, l)| d + 1 >= l)
+                    && dpi_verdict(p.width, p.height, closing_w, closing_h) == DpiVerdict::Ok
+                    && cover_rank(p) == 2
+            })
+            .max_by(|a, b| a.score.total_cmp(&b.score))
+            .cloned()
+    });
     // A photo alone in its stretch (its day or named place) would fill a
     // page by itself: worth it for people or the owner's caption, not for
     // a plate of food or a candy bucket.
+    fold_lone_kept(&mut pruned);
     let lone: HashSet<String> = lone_scenery(&pruned).into_iter().collect();
     for id in &lone {
         fallbacks.push(format!(
@@ -1271,6 +1375,20 @@ pub fn render_book(
             found
                 .borrow_mut()
                 .insert(p.asset_id.clone(), p.faces.clone());
+        }
+        // The closing photo is off the pages: its faces too, so its full
+        // page frames like any other.
+        if let Some(c) = closing_pick.as_mut() {
+            let src = load(c, &opts.ffmpeg_bin, &mut fallbacks);
+            c.faces = (finder.0)(&src);
+            found
+                .borrow_mut()
+                .insert(c.asset_id.clone(), c.faces.clone());
+        }
+        // An automatic pick whose detected faces a full page would cut
+        // gives way to the closing page's in-book pick.
+        if !owner_chose_closing && closing_pick.as_ref().is_some_and(|c| cover_rank(c) != 2) {
+            closing_pick = None;
         }
     }
     let photos: &[BookPhoto] = &pruned;
@@ -1513,7 +1631,9 @@ pub fn render_book(
                 }
             }
             PageKind::Closing => {
-                if photos.is_empty() {
+                // The owner's closing photo is off the pages: it still
+                // prints when it was the only photo.
+                if closing_pick.is_none() && photos.is_empty() {
                     draw_text_placeholder(fp.kind, tw, th, &out)?;
                 } else {
                     // The closing photo repeats one from the book: make it the
@@ -1528,18 +1648,33 @@ pub fn render_book(
                         .map(|&i| photos[i].asset_id.as_str())
                         .collect();
                     let last_day = photos.iter().filter_map(|p| p.day).max();
-                    let last = photos
-                        .iter()
-                        .filter(|p| {
-                            // A people photo that fills a page well: no
-                            // panorama, no group a square would cut.
-                            cover_rank(p) == 2
-                                && !recent.contains(&p.asset_id.as_str())
-                                && p.day.zip(last_day).is_some_and(|(d, l)| d + 2 >= l)
+                    let printable = |p: &BookPhoto| {
+                        dpi_verdict(p.width, p.height, closing_w, closing_h) != DpiVerdict::Block
+                    };
+                    let last = closing_pick
+                        .as_ref()
+                        .or_else(|| {
+                            photos
+                                .iter()
+                                .filter(|p| {
+                                    // A people photo that fills a page well: no
+                                    // panorama, no group a square would cut.
+                                    !recent.contains(&p.asset_id.as_str())
+                                        && p.day.zip(last_day).is_some_and(|(d, l)| d + 2 >= l)
+                                        && printable(p)
+                                        && cover_rank(p) == 2
+                                })
+                                .max_by(|a, b| a.score.total_cmp(&b.score))
                         })
-                        .max_by(|a, b| a.score.total_cmp(&b.score))
-                        .unwrap_or(&photos[photos.len() - 1]);
+                        // Else the last photo sharp enough for a full page: one
+                        // that only cleared a grid cell would fail preflight.
+                        .or_else(|| photos.iter().rev().find(|p| printable(p)))
+                        .unwrap_or_else(|| &photos[photos.len() - 1]);
                     shown.push(last);
+                    placements.push((
+                        page_no,
+                        dpi_verdict(last.width, last.height, closing_w, closing_h),
+                    ));
                     draw_fullbleed(last, (tw, th), 0, &out, &fit, &mut fallbacks)?;
                     captions
                         .entry(page_no)
@@ -1915,13 +2050,28 @@ fn page_caption(slot: &[&BookPhoto], kind: PageKind) -> Vec<String> {
     for p in slot {
         // A captioned photo's place follows the user's words, unless the
         // words already name it ("…treats in Singapore · Singapore").
-        let words = caption_of(p);
+        let mut words = caption_of(p);
         let place = p.place.clone().filter(|pl| {
             p.own_caption()
                 && !words
                     .iter()
                     .any(|w| w.to_lowercase().contains(&pl.to_lowercase()))
         });
+        if place.is_some() {
+            // The owner's sentence ends before its place: "…for 8 years. ·
+            // Paradox Singapore". Place names are capitalised; a sentence
+            // has lowercase words.
+            for w in &mut words {
+                let sentence = w
+                    .split_whitespace()
+                    .filter(|t| t.starts_with(|ch: char| ch.is_lowercase()))
+                    .count()
+                    >= 3;
+                if sentence && !w.ends_with(['.', '!', '?', '\u{2026}', ')', '"', '\u{201d}']) {
+                    w.push('.');
+                }
+            }
+        }
         lines.extend(words.into_iter().chain(place));
     }
     collapse_lines(lines, kind)
@@ -2037,7 +2187,7 @@ fn solid(w: u32, h: u32, c: Rgb<u8>) -> RgbImage {
 /// faces (with room above for the head) in frame. When they cannot all
 /// fit, the biggest stay and the render notes the photo.
 fn fit_photo(p: &BookPhoto, tw: u32, th: u32, fit: &Fit, fb: &mut Vec<String>) -> RgbImage {
-    fit_photo_focused(p, p.crop_focus, tw, th, 0.0, fit, fb)
+    fit_photo_focused(p, p.crop_focus, (tw, th), 0.0, true, fit, fb)
 }
 
 /// [`fit_photo`] centred on `focus` (fractions of the photo) when set,
@@ -2045,9 +2195,9 @@ fn fit_photo(p: &BookPhoto, tw: u32, th: u32, fit: &Fit, fb: &mut Vec<String>) -
 fn fit_photo_focused(
     p: &BookPhoto,
     focus: Option<(f32, f32)>,
-    tw: u32,
-    th: u32,
+    (tw, th): (u32, u32),
     reserve: f64,
+    whole_if_cut: bool,
     fit: &Fit,
     fb: &mut Vec<String>,
 ) -> RgbImage {
@@ -2072,10 +2222,24 @@ fn fit_photo_focused(
             focus_window(sw, sh, tw_f, th_f, (f64::from(fx), f64::from(fy))),
             false,
         ),
-        None if !faces.is_empty() => face_window_clear(sw, sh, tw_f, th_f, &faces, reserve),
-        None => (focus_window(sw, sh, tw_f, th_f, (0.5, 0.5)), false),
+        None => frame_photo(p, (sw, sh), (tw_f, th_f), &faces, reserve),
     };
-    if cut {
+    // Shown whole only when that still fills most of the cell: a 4:3 photo
+    // pillarboxed in a wide strip leaves black voids worse than a crop.
+    let fills = {
+        let (sa, ca) = (sw / sh, tw_f / th_f);
+        (sa / ca).min(ca / sa)
+    };
+    if cut && whole_if_cut && fills >= WHOLE_MIN_FILL {
+        // No crop of this cell keeps every face: show the whole photo in it
+        // on the page's dark ground rather than slice someone in half.
+        fb.push(format!(
+            "crop: {} cannot keep every face in its cell; shown whole",
+            p.display_name()
+        ));
+        let strip_px = (reserve.clamp(0.0, 1.0) * th_f).round() as u32;
+        return contain_on_page(&src, tw, th, strip_px);
+    } else if cut {
         fb.push(format!(
             "crop: {} cannot keep every face in its cell; the biggest stay",
             p.display_name()
@@ -2105,9 +2269,9 @@ fn crop_window(src: &RgbImage, (x, y, w, h): (f64, f64, f64, f64), tw: u32, th: 
 }
 
 /// Share of a crop's spare height left above the faces (the rest goes
-/// below): what towers over people (mascots, statues) matters more than
-/// the floor.
-const ABOVE_SHARE: f64 = 0.6;
+/// below): children in strollers sit below the adults' faces more often
+/// than a mascot towers over them (a mascot gets an owner crop focus).
+const ABOVE_SHARE: f64 = 0.35;
 
 /// Room kept around a face, as fractions of its box: the detector boxes
 /// the face, so the top of the head and hair sit well above it.
@@ -2115,22 +2279,225 @@ const HEAD_ABOVE: f32 = 0.6;
 const FACE_SIDE: f32 = 0.2;
 const FACE_BELOW: f32 = 0.15;
 
-/// The source window (x, y, w, h in pixels) a cover-fit of an `sw`x`sh`
-/// photo into a `tw`x`th` cell keeps: as many faces as fit, biggest
-/// first, each with its head room, centred between them; centred on the
-/// photo when it has none. Also whether a face was left out or cut.
-fn face_window(
+/// A named person's region in a photo (from the photo library's face
+/// tags): a face, or a body whose top stands in for the head.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KnownBox {
+    pub b: FaceBox,
+    pub body: bool,
+}
+
+impl From<&triptape_core::types::KnownFace> for KnownBox {
+    fn from(k: &triptape_core::types::KnownFace) -> Self {
+        KnownBox {
+            b: FaceBox {
+                x: k.x,
+                y: k.y,
+                w: k.w,
+                h: k.h,
+            },
+            body: k.body,
+        }
+    }
+}
+
+/// What framing weighs a family member's face (with head room) at.
+const FAMILY_FACE_WEIGHT: f64 = 10.0;
+/// What framing weighs the head end of a family member's body at.
+const FAMILY_BODY_WEIGHT: f64 = 6.0;
+/// What a detected face no family region covers weighs, on a photo with
+/// family tags: most likely a stranger.
+const STRANGER_WEIGHT: f64 = 0.5;
+/// A target only partly in a window counts this many times against it:
+/// a sliced face is worse than one left out.
+const PARTIAL_PENALTY: f64 = 1.5;
+/// A target's head room (its padded box) fully in the window earns this
+/// share of its weight on top: nice to have, never worth slicing a face.
+const ROOM_BONUS: f64 = 0.3;
+/// Candidate positions tried along each axis.
+const FRAMING_STEPS: usize = 25;
+
+/// A region framing tries to keep: the face itself (`core`), which must
+/// not be sliced, and the face with head room (`room`), a bonus.
+#[derive(Debug, Clone)]
+struct Target {
+    core: FaceBox,
+    room: FaceBox,
+    weight: f64,
+    /// A tagged family member (not a stranger the detector found).
+    family: bool,
+}
+
+/// The regions framing tries to keep, each with its weight: family faces
+/// (with head room), the top quarter of a family body (its head), and the
+/// detected faces no family region covers, lightly (strangers).
+fn framing_targets(p: &BookPhoto, detected: &[FaceBox]) -> Vec<Target> {
+    let pad = |b: FaceBox| FaceBox {
+        x: b.x - FACE_SIDE * b.w,
+        y: b.y - HEAD_ABOVE * b.h,
+        w: b.w * (1.0 + 2.0 * FACE_SIDE),
+        h: b.h * (1.0 + HEAD_ABOVE + FACE_BELOW),
+    };
+    let mut out: Vec<Target> = p
+        .family
+        .iter()
+        .map(|k| {
+            if k.body {
+                let head = FaceBox {
+                    h: k.b.h * 0.25,
+                    ..k.b.clone()
+                };
+                Target {
+                    room: head.clone(),
+                    core: head,
+                    weight: FAMILY_BODY_WEIGHT,
+                    family: true,
+                }
+            } else {
+                Target {
+                    core: k.b.clone(),
+                    room: pad(k.b.clone()),
+                    weight: FAMILY_FACE_WEIGHT,
+                    family: true,
+                }
+            }
+        })
+        .collect();
+    let covered = |d: &FaceBox| {
+        let (cx, cy) = (d.x + d.w / 2.0, d.y + d.h / 2.0);
+        p.family.iter().any(|k| {
+            let b = &k.b;
+            cx >= b.x - b.w * 0.25
+                && cx <= b.x + b.w * 1.25
+                && cy >= b.y - b.h * 0.25
+                && cy <= b.y + b.h * if k.body { 0.5 } else { 1.25 }
+        })
+    };
+    out.extend(detected.iter().filter(|d| !covered(d)).map(|d| Target {
+        core: d.clone(),
+        room: pad(d.clone()),
+        weight: STRANGER_WEIGHT,
+        family: false,
+    }));
+    out
+}
+
+/// The `tw`x`th`-shaped source window of an `sw`x`sh` photo that best
+/// frames `targets` (see [`framing_targets`]): each target fully inside
+/// adds its weight, one only partly inside subtracts
+/// [`PARTIAL_PENALTY`] times it, and nothing counts for one left out. The
+/// bottom `reserve` of the window (a caption strip) counts as outside.
+/// Also whether a family member is cut or left out.
+fn framing_window(
     sw: f64,
     sh: f64,
     tw: f64,
     th: f64,
-    faces: &[FaceBox],
+    targets: &[Target],
+    reserve: f64,
 ) -> ((f64, f64, f64, f64), bool) {
-    face_window_clear(sw, sh, tw, th, faces, 0.0)
+    let scale = (tw / sw).max(th / sh);
+    let (cw, ch) = ((tw / scale).min(sw), (th / scale).min(sh));
+    let usable_h = ch * (1.0 - reserve.clamp(0.0, 0.5));
+    let (slack_x, slack_y) = ((sw - cw).max(0.0), (sh - ch).max(0.0));
+    // Candidate offsets along an axis: evenly across its slack, or the
+    // middle when there is none to speak of.
+    let offsets = |slack: f64| -> Vec<f64> {
+        if slack > 0.5 {
+            (0..FRAMING_STEPS)
+                .map(|i| slack * i as f64 / (FRAMING_STEPS - 1) as f64)
+                .collect()
+        } else {
+            vec![slack / 2.0]
+        }
+    };
+    let fraction_in = |b: &FaceBox, x: f64, y: f64| {
+        let (bx0, by0) = (f64::from(b.x) * sw, f64::from(b.y) * sh);
+        let (bx1, by1) = (bx0 + f64::from(b.w) * sw, by0 + f64::from(b.h) * sh);
+        let (ix0, iy0) = (bx0.max(x).max(0.0), by0.max(y).max(0.0));
+        let (ix1, iy1) = (bx1.min(x + cw).min(sw), by1.min(y + usable_h).min(sh));
+        let inside = (ix1 - ix0).max(0.0) * (iy1 - iy0).max(0.0);
+        // Only the part of the box within the photo can be framed.
+        let area = (bx1.min(sw) - bx0.max(0.0)).max(0.0) * (by1.min(sh) - by0.max(0.0)).max(0.0);
+        if area <= 0.0 {
+            1.0
+        } else {
+            inside / area
+        }
+    };
+    let mut best: Option<(f64, f64, f64, bool)> = None;
+    let ys = offsets(slack_y);
+    for x in offsets(slack_x) {
+        for &y in &ys {
+            let mut score = 0.0;
+            let mut family_cut = false;
+            for t in targets {
+                let w = t.weight;
+                let f = fraction_in(&t.core, x, y);
+                if f >= 0.98 {
+                    score += w;
+                    if fraction_in(&t.room, x, y) >= 0.98 {
+                        score += ROOM_BONUS * w;
+                    }
+                    continue;
+                }
+                if f > 0.02 {
+                    score -= PARTIAL_PENALTY * w;
+                }
+                family_cut |= t.family;
+            }
+            // Ties: the window nearest the middle of the photo.
+            let off = ((x - slack_x / 2.0).abs() + (y - slack_y / 2.0).abs()) / (sw + sh);
+            let score = score - 0.01 * off;
+            if best.is_none_or(|(s, ..)| score > s) {
+                best = Some((score, x, y, family_cut));
+            }
+        }
+    }
+    let (_, x, y, cut) = best.unwrap_or((0.0, slack_x / 2.0, slack_y / 2.0, false));
+    ((x, y, cw, ch), cut)
 }
 
-/// [`face_window`] keeping faces above a band of `reserve` (a fraction of
-/// the cell's height) at its bottom, where the page's caption strip lies.
+/// The window a photo is cropped to in a `tw`x`th` cell, and whether it
+/// cuts someone who matters: by [`framing_window`] when the photo carries
+/// family regions, else by the detected faces alone ([`face_window_clear`]).
+fn frame_photo(
+    p: &BookPhoto,
+    (sw, sh): (f64, f64),
+    (tw, th): (f64, f64),
+    detected: &[FaceBox],
+    reserve: f64,
+) -> ((f64, f64, f64, f64), bool) {
+    if !p.family.is_empty() {
+        framing_window(sw, sh, tw, th, &framing_targets(p, detected), reserve)
+    } else if !detected.is_empty() {
+        face_window_clear(sw, sh, tw, th, detected, reserve)
+    } else {
+        (focus_window(sw, sh, tw, th, (0.5, 0.5)), false)
+    }
+}
+
+/// Whether the photo's own pixel size can be framed into a `tw`x`th` cell
+/// without cutting someone who matters.
+fn frame_cuts(p: &BookPhoto, tw: f64, th: f64, reserve: f64) -> bool {
+    p.width > 0
+        && p.height > 0
+        && frame_photo(
+            p,
+            (f64::from(p.width), f64::from(p.height)),
+            (tw, th),
+            &p.faces,
+            reserve,
+        )
+        .1
+}
+
+/// The source window (x, y, w, h in pixels) a cover-fit of an `sw`x`sh`
+/// photo into a `tw`x`th` cell keeps: as many faces as fit, biggest
+/// first, each with its head room, centred between them; centred on the
+/// photo when it has none. Faces stay above a band of `reserve` (a
+/// fraction of the cell's height) at its bottom, where the page's caption
+/// strip lies. Also whether a face was left out or cut.
 fn face_window_clear(
     sw: f64,
     sh: f64,
@@ -2244,23 +2611,13 @@ fn draw_fullbleed(
     // A wide group photo squared off for a full page would lose the
     // people at its sides: then the whole photo sits on the page instead,
     // above the strip.
-    let cuts_faces = p.crop_focus.is_none()
-        && !p.faces.is_empty()
-        && face_window_clear(
-            f64::from(p.width.max(1)),
-            f64::from(p.height.max(1)),
-            f64::from(tw),
-            f64::from(th),
-            &p.faces,
-            reserve,
-        )
-        .1;
+    let cuts_faces = p.crop_focus.is_none() && frame_cuts(p, f64::from(tw), f64::from(th), reserve);
     if cuts_faces {
         let src = load(p, ff.ffmpeg, fb);
         return save_jpg(&contain_on_page(&src, tw, th, strip_px), out);
     }
     save_jpg(
-        &fit_photo_focused(p, p.crop_focus, tw, th, reserve, ff, fb),
+        &fit_photo_focused(p, p.crop_focus, (tw, th), reserve, true, ff, fb),
         out,
     )
 }
@@ -2295,7 +2652,8 @@ fn draw_half(
     ff: &Fit,
     fb: &mut Vec<String>,
 ) -> Result<(), crate::MediaError> {
-    let full = fit_photo(p, tw * 2, th, ff, fb);
+    // A spread's two halves are one photo: crop it, never letterbox it.
+    let full = fit_photo_focused(p, p.crop_focus, (tw * 2, th), 0.0, false, ff, fb);
     let x = if left { 0 } else { tw };
     save_jpg(
         &image::imageops::crop_imm(&full, x, 0, tw, th).to_image(),
@@ -2330,9 +2688,21 @@ fn row_splits(n: usize) -> Vec<Vec<usize>> {
     out
 }
 
+/// Cell width / height below which a cell is a sliver, and the share of
+/// a photo's width below which a sliver guts it (a 4:3 shot in a third of
+/// the page keeps a quarter of its width; a portrait in half a page keeps
+/// two thirds and is fine).
+const NARROW_CELL: f64 = 0.55;
+/// What a grid layout pays for a sliver that guts its photo.
+const NARROW_CELL_COST: f64 = 1.5;
+
+/// Share of a cell a photo shown whole must still fill (else it is
+/// cropped, keeping the biggest faces).
+const WHOLE_MIN_FILL: f64 = 0.75;
+
 /// What a grid layout pays for a cell that cuts a detected face: more
 /// than any amount of ordinary cropping.
-const FACE_CUT_COST: f64 = 3.0;
+const FACE_CUT_COST: f64 = 6.0;
 
 /// Width / height from which a photo is a panorama: alone on a grid row
 /// it spans the page at its own height.
@@ -2420,20 +2790,22 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
             x += cw + gap;
             let (a, c) = (aspect(slot[i]), cw / row_h[r]);
             let weight = people_weight(slot[i]);
+            // A tall sliver (a third of the page wide, full height) leaves
+            // no room around anyone: such layouts lose unless nothing else
+            // fits.
+            if c < NARROW_CELL && c / a < NARROW_CELL {
+                cost += NARROW_CELL_COST;
+            }
+            // Its mirror: a wide strip keeping under half a photo's height
+            // (a group shot or a tall statue squeezed into a ribbon) cuts
+            // heads and feet alike. Panoramas are made for strips.
+            if c > 1.0 / NARROW_CELL && a / c < NARROW_CELL && a < PANORAMA_ASPECT {
+                cost += NARROW_CELL_COST;
+            }
             // A cell that would cut a detected face costs far more than any
             // crop: that layout loses.
-            let p = slot[i];
-            if !p.faces.is_empty() && p.width > 0 && p.height > 0 {
-                let (_, cut) = face_window(
-                    f64::from(p.width),
-                    f64::from(p.height),
-                    cw,
-                    row_h[r],
-                    &p.faces,
-                );
-                if cut {
-                    cost += FACE_CUT_COST;
-                }
+            if frame_cuts(slot[i], cw, row_h[r], 0.0) {
+                cost += FACE_CUT_COST;
             }
             cost += weight
                 * if c < a {
@@ -2551,7 +2923,7 @@ fn typst_text_png(
     scratch_png: &Path,
 ) -> Option<image::DynamicImage> {
     let doc = format!(
-        "#set page(width: 11in, height: auto, fill: none, margin: 0in)\n#set text(font: \"DejaVu Sans\", fill: white)\n#align(center)[#text(size: 44pt, weight: \"bold\")[{}]]\n#align(center)[#text(size: 20pt)[{}]]\n",
+        "#set page(width: 11in, height: auto, fill: none, margin: 0in)\n#set text(font: {BOOK_FONTS}, fill: white)\n#align(center)[#text(size: 44pt, weight: \"bold\")[{}]]\n#align(center)[#text(size: 20pt, weight: \"medium\")[{}]]\n",
         typ_escape(title),
         typ_escape(sub)
     );
@@ -2560,6 +2932,15 @@ fn typst_text_png(
     let _ = std::fs::remove_file(scratch_png);
     img
 }
+
+/// Typst font list for every caption, title and the cover: the bundled
+/// sans first, then sans faces macOS and Windows ship. Typst's own
+/// fallback serif prints a comma like a full stop ("October 3–30. 2026").
+const BOOK_FONTS: &str = r#"("DejaVu Sans", "Avenir Next", "Helvetica Neue", "Arial")"#;
+
+/// Width / height of a cover tile in the 4×3 mosaic above the title band
+/// (882×981 px on a 12-inch cover): faces are checked against it.
+const COVER_TILE_ASPECT: f64 = 0.9;
 
 /// Photos at the start of the book (hero, spread, the first pages) the
 /// cover never repeats.
@@ -2581,10 +2962,7 @@ fn cover_rank(p: &BookPhoto) -> u8 {
         .is_some_and(|e| e.eq_ignore_ascii_case("png"));
     let panorama = p.height > 0 && f64::from(p.width) / f64::from(p.height) >= PANORAMA_ASPECT;
     // Faces that a squarish tile would cut (a wide group) make a poor tile.
-    let tile_cuts = !p.faces.is_empty()
-        && p.width > 0
-        && p.height > 0
-        && face_window(f64::from(p.width), f64::from(p.height), 1.0, 1.0, &p.faces).1;
+    let tile_cuts = frame_cuts(p, COVER_TILE_ASPECT, 1.0, 0.0);
     if png || panorama || tile_cuts {
         0
     } else if p.is_of_people() {
@@ -2613,11 +2991,12 @@ fn cover_picks(photos: &[BookPhoto], opening: &[usize]) -> Vec<usize> {
     // One tile per day where the trip allows: two tiles of one scene (a
     // pinned waterfall beside another shot of it) waste the cover.
     let mut days: HashSet<u32> = picks.iter().filter_map(|&i| photos[i].day).collect();
+    // Ranked once: each rank runs a framing search.
+    let rank: Vec<u8> = photos.iter().map(cover_rank).collect();
     let better = |a: &usize, b: &usize| {
-        let (a, b) = (&photos[*a], &photos[*b]);
-        cover_rank(a)
-            .cmp(&cover_rank(b))
-            .then(a.score.total_cmp(&b.score))
+        rank[*a]
+            .cmp(&rank[*b])
+            .then(photos[*a].score.total_cmp(&photos[*b].score))
     };
     for k in 0..slots {
         let stretch = &pool[k * pool.len() / slots..(k + 1) * pool.len() / slots];
@@ -2678,7 +3057,9 @@ fn draw_cover_collage(
             .filter(|&fx| fx != 0.5)
             .map(|fx| (fx, p.crop_focus.map_or(0.5, |c| c.1)))
             .or(p.crop_focus);
-        let tile = fit_photo_focused(p, focus, tile_w, tile_h, 0.0, fit, fallbacks);
+        // Cover tiles always fill their cell: letterboxed tiles leave ragged
+        // gaps in the mosaic.
+        let tile = fit_photo_focused(p, focus, (tile_w, tile_h), 0.0, false, fit, fallbacks);
         image::imageops::replace(
             &mut canvas,
             &tile,
@@ -2795,7 +3176,7 @@ fn write_typst_and_compile(
     let pdf_name = if bleed { "press.pdf" } else { "proof.pdf" };
     let typ_name = if bleed { "press.typ" } else { "proof.typ" };
     let mut typ = format!(
-        "#set page(width: {pw}in, height: {ph}in, margin: 0in)\n#set text(font: \"DejaVu Sans\", size: 14pt, fill: white)\n"
+        "#set page(width: {pw}in, height: {ph}in, margin: 0in)\n#set text(font: {BOOK_FONTS}, size: 14pt, fill: white)\n"
     );
     match cover {
         Some(c) => typ.push_str(&format!(
@@ -2833,27 +3214,36 @@ fn write_typst_and_compile(
             } else {
                 (14, 8)
             };
-            // "…for 8 years. · Paradox Singapore": no full stop before a
-            // separator.
-            let text = lines
-                .iter()
-                .map(|l| l.trim_end().trim_end_matches('.'))
-                .collect::<Vec<_>>()
-                .join(" · ");
-            strip_pt = strip_height_pt(&text, size, inset, pw);
-            typ.push_str(&format!(
-                "#place(bottom + center)[#rect(fill: rgb(18, 20, 26).transparentize(20%), inset: {inset}pt)[#text(size: {size}pt)[{}]]]\n",
-                typ_escape(&text)
-            ));
+            // [`page_caption`] already punctuates: "…for 8 years. ·
+            // Paradox Singapore" keeps its full stop.
+            let clean: Vec<&str> = lines.iter().map(|l| l.trim_end()).collect();
+            let title_page = texts.titles.contains(&page_no);
+            if title_page && clean.len() > 1 {
+                // The day heading on its own line; the owner's words and
+                // the places beneath it in caption size, never fused into
+                // one three-line block.
+                let (head, rest) = (clean[0], clean[1..].join(" · "));
+                strip_pt = title_strip_pt(&clean, size, inset, pw);
+                typ.push_str(&format!(
+                    "#place(bottom + center)[#rect(fill: rgb(18, 20, 26).transparentize(20%), inset: {inset}pt)[#align(center)[#text(size: {size}pt)[{}] \\ #text(size: 14pt)[{}]]]]\n",
+                    typ_escape(head),
+                    typ_escape(&rest)
+                ));
+            } else {
+                let text = clean.join(" · ");
+                strip_pt = strip_height_pt(&text, size, inset, pw);
+                typ.push_str(&format!(
+                    "#place(bottom + center)[#rect(fill: rgb(18, 20, 26).transparentize(20%), inset: {inset}pt)[#text(size: {size}pt)[{}]]]\n",
+                    typ_escape(&text)
+                ));
+            }
         }
         for (rect, text) in texts.cells.get(&page_no).into_iter().flatten() {
             // Grid cells end above the page strip, so a cell caption needs
             // no lift unless its cell still reaches into the strip's band.
-            let lift = if rect.1 + rect.3 > 1.0 - strip_pt / (ph * 72.0) {
-                strip_pt
-            } else {
-                0.0
-            };
+            // Only by as much as the cell actually runs into the strip.
+            let overlap = rect.1 + rect.3 - (1.0 - strip_pt / (ph * 72.0));
+            let lift = (overlap * ph * 72.0).max(0.0);
             typ.push_str(&cell_caption_typ(
                 (pw, ph),
                 (tw_in, th_in),
@@ -2981,8 +3371,20 @@ fn strip_px(lines: &[String], title: bool, preset: BookPreset, th: u32) -> u32 {
     }
     let (size, inset) = if title { (24, 14) } else { (14, 8) };
     let (w_in, h_in) = preset.trim_inches();
-    let pt = strip_height_pt(&lines.join(" · "), size, inset, w_in);
+    let pt = if title && lines.len() > 1 {
+        title_strip_pt(lines, size, inset, w_in)
+    } else {
+        strip_height_pt(&lines.join(" · "), size, inset, w_in)
+    };
     (pt / (h_in * 72.0) * f64::from(th)).round() as u32
+}
+
+/// Height (pt) of a title page's strip as the burn draws it: the heading
+/// on its own line at `size`, the rest beneath it at caption size.
+fn title_strip_pt<S: AsRef<str>>(lines: &[S], size: u32, inset: u32, page_w: f64) -> f64 {
+    let rest: Vec<&str> = lines[1..].iter().map(AsRef::as_ref).collect();
+    strip_height_pt(lines[0].as_ref(), size, inset, page_w)
+        + strip_height_pt(&rest.join(" · "), 14, 0, page_w)
 }
 
 /// Height in points of a bottom strip of `text` at `size` pt with `inset`
@@ -3091,6 +3493,67 @@ mod tests {
             journey: None,
             back_cover_image: None,
         }
+    }
+
+    #[test]
+    fn an_owner_sentence_ends_before_its_place() {
+        let mut b = BookPhoto::blank();
+        b.caption = Some("It served us well for 8 years".into());
+        b.place = Some("Paradox Singapore".into());
+        b.keep = true;
+        let caps = page_caption(&[&b], PageKind::PhotoCaption);
+        assert_eq!(
+            caps,
+            ["It served us well for 8 years.", "Paradox Singapore"]
+        );
+    }
+
+    #[test]
+    fn a_lone_captioned_plate_joins_the_next_stretch_of_its_day() {
+        let shot = |id: &str, area: &str, people: u32, keep: bool| BookPhoto {
+            asset_id: id.into(),
+            day: Some(22),
+            area: Some(area.into()),
+            people,
+            keep,
+            ..BookPhoto::blank()
+        };
+        let mut photos = vec![
+            shot("laksa", "food court", 0, true),
+            shot("cable", "Mount Faber Peak", 3, false),
+            shot("peak", "Mount Faber Peak", 4, false),
+        ];
+        fold_lone_kept(&mut photos);
+        assert_eq!(photos[0].area.as_deref(), Some("Mount Faber Peak"));
+        // Next door with two or more photos beats a lone one next door.
+        let mut photos = vec![
+            shot("cloud", "Cloud Forest", 3, false),
+            shot("cloud2", "Cloud Forest", 4, false),
+            shot("durian", "food court", 0, true),
+            shot("dome", "Flower Dome", 3, false),
+        ];
+        fold_lone_kept(&mut photos);
+        assert_eq!(photos[2].area.as_deref(), Some("Cloud Forest"));
+        // A stretch past a lone neighbour is never taken: the neighbour
+        // still splits the pages, so the photo would print alone anyway.
+        let mut photos = vec![
+            shot("durian", "food court", 0, true),
+            shot("dome", "Flower Dome", 3, false),
+            shot("cloud", "Cloud Forest", 3, false),
+            shot("cloud2", "Cloud Forest", 4, false),
+        ];
+        fold_lone_kept(&mut photos);
+        assert_eq!(photos[0].area.as_deref(), Some("Flower Dome"));
+        // A lone people photo keeps its own stretch.
+        let mut photos = vec![
+            BookPhoto {
+                tagged_people: 2,
+                ..shot("selfie", "food court", 2, true)
+            },
+            shot("cable", "Mount Faber Peak", 3, false),
+        ];
+        fold_lone_kept(&mut photos);
+        assert_eq!(photos[0].area.as_deref(), Some("food court"));
     }
 
     #[test]
@@ -3601,6 +4064,103 @@ mod tests {
             shot("menu", 4, false, true),
         ];
         assert_eq!(lone_scenery(&photos), ["food"]);
+    }
+
+    /// [`face_window_clear`] with no caption strip.
+    fn face_window(
+        sw: f64,
+        sh: f64,
+        tw: f64,
+        th: f64,
+        faces: &[FaceBox],
+    ) -> ((f64, f64, f64, f64), bool) {
+        face_window_clear(sw, sh, tw, th, faces, 0.0)
+    }
+
+    #[test]
+    fn framing_trims_head_room_before_it_slices_a_face() {
+        // IMG_6872: three family faces stacked down a 4032x3024 selfie, in
+        // a wide cell that can't hold all of them with head room. Every
+        // face stays whole; only spare room goes.
+        let fb = |x: f32, y: f32, w: f32, h: f32| KnownBox {
+            b: FaceBox { x, y, w, h },
+            body: false,
+        };
+        let p = BookPhoto {
+            width: 4032,
+            height: 3024,
+            family: vec![
+                fb(0.15, 0.37, 0.12, 0.16),
+                fb(0.69, 0.59, 0.19, 0.25),
+                fb(0.31, 0.82, 0.08, 0.10),
+            ],
+            ..BookPhoto::blank()
+        };
+        let ((_, y, _, h), cut) = frame_photo(&p, (4032.0, 3024.0), (2.3, 1.0), &[], 0.0);
+        let (top, bottom) = (y / 3024.0, (y + h) / 3024.0);
+        assert!(
+            top <= 0.37 && bottom >= 0.92,
+            "all three faces: {top:.3}..{bottom:.3}"
+        );
+        assert!(!cut);
+    }
+
+    #[test]
+    fn framing_keeps_the_family_over_strangers() {
+        let fb = |x: f32, y: f32, side: f32| FaceBox {
+            x,
+            y,
+            w: side,
+            h: side * 1.33,
+        };
+        // A wide 4000x3000 photo into a square cell: Lana at the far left,
+        // three strangers at the right.
+        let p = BookPhoto {
+            width: 4000,
+            height: 3000,
+            family: vec![KnownBox {
+                b: fb(0.05, 0.4, 0.08),
+                body: false,
+            }],
+            ..BookPhoto::blank()
+        };
+        let strangers = [
+            fb(0.75, 0.4, 0.06),
+            fb(0.82, 0.4, 0.06),
+            fb(0.89, 0.4, 0.06),
+        ];
+        let ((x, _, w, _), cut) = frame_photo(&p, (4000.0, 3000.0), (1.0, 1.0), &strangers, 0.0);
+        assert!(
+            x <= 0.05 * 4000.0 && x + w >= 0.13 * 4000.0,
+            "Lana in: x={x}"
+        );
+        assert!(!cut);
+        // Two family members too far apart for the cell: one stays whole,
+        // the other is left out rather than sliced, and the cut is noted.
+        let p2 = BookPhoto {
+            family: vec![
+                KnownBox {
+                    b: fb(0.05, 0.4, 0.08),
+                    body: false,
+                },
+                KnownBox {
+                    b: fb(0.85, 0.4, 0.08),
+                    body: false,
+                },
+            ],
+            ..p.clone()
+        };
+        let targets = framing_targets(&p2, &[]);
+        let ((x, _, w, _), cut) = framing_window(4000.0, 3000.0, 1.0, 1.0, &targets, 0.0);
+        let whole = |b: &FaceBox| {
+            let (x0, x1) = (f64::from(b.x) * 4000.0, f64::from(b.x + b.w) * 4000.0);
+            (x0 >= x && x1 <= x + w) || x1 <= x || x0 >= x + w
+        };
+        assert!(
+            targets.iter().all(|t| whole(&t.core)),
+            "nobody sliced: x={x}"
+        );
+        assert!(cut, "someone left out");
     }
 
     #[test]

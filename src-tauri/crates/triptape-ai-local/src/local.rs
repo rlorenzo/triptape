@@ -344,9 +344,10 @@ struct FaceModels {
 }
 
 impl FaceModels {
-    /// Every face YuNet finds in `img`, in its pixels.
-    fn detect(&self, img: &RgbImage) -> Result<Vec<faces::Face>, String> {
-        let (input, shape, scale) = faces::yunet_input(img);
+    /// Every face YuNet finds in `img`, in its pixels, with YuNet run at
+    /// `long_edge` pixels.
+    fn detect(&self, img: &RgbImage, long_edge: u32) -> Result<Vec<faces::Face>, String> {
+        let (input, shape, scale) = faces::yunet_input(img, long_edge);
         let out = self.detector.with(|s| run_f32(s, shape, input))?;
         let data: Vec<Vec<f32>> = out.into_iter().map(|(_, d)| d).collect();
         let (h, w) = (shape[2] as u32, shape[3] as u32);
@@ -354,7 +355,7 @@ impl FaceModels {
     }
 
     fn analyze(&self, img: &RgbImage) -> Result<FaceSignals, String> {
-        let found = self.detect(img)?;
+        let found = self.detect(img, faces::YUNET_LONG_EDGE)?;
         let happy: Vec<Option<f32>> = faces::smile_gated(&found)
             .map(|f| {
                 let input = faces::ferplus_input(img, f);
@@ -374,7 +375,9 @@ impl FaceModels {
 
     /// Plausible faces in `img`, as boxes normalised to its size.
     fn boxes(&self, img: &RgbImage) -> Result<Vec<crate::FaceBox>, String> {
-        let found = self.detect(img)?;
+        // Twice the scan's size: crops must see the small faces too (a
+        // child at the bottom of a group), not just the subject.
+        let found = self.detect(img, 2 * faces::YUNET_LONG_EDGE)?;
         let (iw, ih) = (img.width().max(1) as f32, img.height().max(1) as f32);
         // MIN_FACE_PX is in thumbnail pixels; scale it to `img`.
         let min_px = faces::MIN_FACE_PX * (iw.max(ih) / proxies::THUMB_LONG_EDGE as f32).max(1.0);
