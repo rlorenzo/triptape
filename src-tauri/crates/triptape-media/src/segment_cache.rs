@@ -682,9 +682,18 @@ fn link_or_copy_with(
     link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
     copy: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    link(src, dst)
-        .or_else(|_| copy(src, dst))
-        .or_else(|_| stream_copy(src, dst))
+    link(src, dst).or_else(|_| copy(src, dst)).or_else(|e| {
+        // A full disk or a missing source fails the byte copy too.
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::StorageFull | std::io::ErrorKind::NotFound
+        ) {
+            return Err(e);
+        }
+        // Whatever a failed OS copy left behind would block the retry.
+        let _ = std::fs::remove_file(dst);
+        stream_copy(src, dst)
+    })
 }
 
 /// Copy the bytes of `src` to a fresh `dst`, nothing else.
@@ -1326,6 +1335,15 @@ mod tests {
         };
         link_or_copy_with(&src, &dst, denied, denied).expect("byte copy still works");
         assert_eq!(std::fs::read(&dst).unwrap(), std::fs::read(&src).unwrap());
+
+        // A full disk is not retried as a byte copy.
+        let full = |_: &Path, _: &Path| {
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        };
+        let dst3 = t.path().join("dst3.mp4");
+        let err = link_or_copy_with(&src, &dst3, denied, full).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+        assert!(!dst3.exists());
 
         // A missing source fails cleanly and leaves nothing behind.
         let gone = t.path().join("gone.mp4");
