@@ -77,26 +77,22 @@ pub fn xfade_offsets_var(durations: &[f64], overlaps: &[f64]) -> Vec<f64> {
     offsets
 }
 
-/// The single-encode filter graph for the hero film: segment inputs
-/// `0..n` chained through xfade (and acrossfade when `keep_ambience`),
-/// then the optional caption burn and the audio mix ending in `[aout]`.
-/// `bed_graph` must emit `[mbed]`. Returns the graph and the `-map`
-/// target for the video stream.
-fn film_graph(
+/// Inputs `0..n` chained through xfade (and acrossfade when
+/// `keep_ambience`), each filter ending in `;`. Returns the graph and the
+/// labels of the finished video and audio streams: `[v]`/`[a]`, or the lone
+/// input's `[0:v]`/`[0:a]` when there is no cut.
+fn xfade_chain(
     transitions: &[Option<Transition>],
-    cut_overlaps: &[f64],
+    overlaps: &[f64],
     offsets: &[f64],
     keep_ambience: bool,
-    burn_srt: Option<&str>,
-    bed_graph: &str,
-    norm: &str,
-) -> (String, String) {
+) -> (String, String, String) {
     let n = transitions.len();
     let mut graph = String::new();
     let (mut vl, mut al) = ("[0:v]".to_string(), "[0:a]".to_string());
     for i in 1..n {
         let t = transitions[i].unwrap_or(Transition::Fade);
-        let ov = cut_overlaps[i - 1];
+        let ov = overlaps[i - 1];
         let offset = offsets[i - 1].max(0.0);
         let tag = |p: &str| {
             if i == n - 1 {
@@ -119,6 +115,25 @@ fn film_graph(
             al = na;
         }
     }
+    (graph, vl, al)
+}
+
+/// The single-encode filter graph for the hero film: segment inputs
+/// `0..n` chained through xfade (and acrossfade when `keep_ambience`),
+/// then the optional caption burn and the audio mix ending in `[aout]`.
+/// `bed_graph` must emit `[mbed]`. Returns the graph and the `-map`
+/// target for the video stream.
+fn film_graph(
+    transitions: &[Option<Transition>],
+    cut_overlaps: &[f64],
+    offsets: &[f64],
+    keep_ambience: bool,
+    burn_srt: Option<&str>,
+    bed_graph: &str,
+    norm: &str,
+) -> (String, String) {
+    let (mut graph, vl, al) = xfade_chain(transitions, cut_overlaps, offsets, keep_ambience);
+    let n = transitions.len();
     // `vl`/`al` now name the finished film streams ([v]/[a], or the lone
     // input's [0:v]/[0:a] when there is no cut).
     let video_map = match burn_srt {
@@ -139,6 +154,157 @@ fn film_graph(
         graph.push_str(&format!("{bed_graph};[mbed]{norm}[aout]"));
     }
     (graph, video_map)
+}
+
+/// Most segments joined in one ffmpeg graph. ffmpeg decodes every input
+/// of a graph at once, so memory grows with the count: 159 4K segments
+/// rendered, 226 did not.
+const ASSEMBLY_CHUNK: usize = 40;
+
+/// Quality of a pre-joined chunk (x264, near-lossless): it is decoded once
+/// more by the final encode.
+const CHUNK_CRF: u32 = 12;
+
+/// The film's inputs for the final encode: the segments themselves, or
+/// for a long film the pre-joined chunks, with the cuts between them.
+#[derive(Debug, Clone, PartialEq)]
+struct JoinedInputs {
+    inputs: Vec<PathBuf>,
+    durations: Vec<f64>,
+    /// Transition into each input (`None` for the first), as
+    /// [`assign_transitions`] gives them.
+    transitions: Vec<Option<Transition>>,
+    /// Overlap of each cut, `inputs.len() - 1` of them.
+    overlaps: Vec<f64>,
+}
+
+/// Chunk boundaries: `chunk`-sized runs of `0..n` (`chunk` at least two;
+/// the last run may hold a single segment).
+fn assembly_chunks(n: usize, chunk: usize) -> Vec<std::ops::Range<usize>> {
+    let chunk = chunk.max(2);
+    (0..n)
+        .step_by(chunk)
+        .map(|a| a..(a + chunk).min(n))
+        .collect()
+}
+
+/// Pre-join a long film's segments into chunks (see [`ASSEMBLY_CHUNK`]),
+/// each with its own cuts at their transitions and overlaps; the cuts
+/// between chunks are left for the final graph, so the timeline is the
+/// same as one graph over every segment. A short film passes through.
+#[allow(clippy::too_many_arguments)]
+fn prejoin_chunks(
+    caps: &Capabilities,
+    segs: &[PathBuf],
+    durations: &[f64],
+    transitions: &[Option<Transition>],
+    overlaps: &[f64],
+    keep_ambience: bool,
+    work_dir: &Path,
+    chunk: usize,
+    on_progress: &dyn Fn(f64),
+) -> Result<JoinedInputs, crate::MediaError> {
+    let plan = plan_chunks(durations, transitions, overlaps, chunk);
+    let Some(ranges) = plan.ranges else {
+        return Ok(JoinedInputs {
+            inputs: segs.to_vec(),
+            ..plan.joined
+        });
+    };
+    // Progress over the whole join, weighted by each chunk's length.
+    let total: f64 = plan.joined.durations.iter().sum::<f64>().max(1e-3);
+    let mut done = 0.0;
+    let mut inputs = vec![];
+    for (k, r) in ranges.iter().enumerate() {
+        let secs = plan.joined.durations[k];
+        // A lone trailing segment needs no join.
+        if r.len() == 1 {
+            done += secs;
+            on_progress((done / total).clamp(0.0, 1.0));
+            inputs.push(segs[r.start].clone());
+            continue;
+        }
+        let out = work_dir.join(format!("chunk_{k:02}.mp4"));
+        let local_overlaps = &overlaps[r.start..r.end - 1];
+        let (graph, v, a) = xfade_chain(
+            &transitions[r.clone()],
+            local_overlaps,
+            &xfade_offsets_var(&durations[r.clone()], local_overlaps),
+            keep_ambience,
+        );
+        let mut args: Vec<String> = vec!["-y".into()];
+        for p in &segs[r.clone()] {
+            args.extend(["-i".into(), s(p)]);
+        }
+        let graph = graph.trim_end_matches(';').to_string();
+        args.extend(["-filter_complex".into(), graph, "-map".into(), v]);
+        if keep_ambience {
+            args.extend(["-map".into(), a]);
+        }
+        args.extend(ffmpeg::x264_aac("veryfast", CHUNK_CRF));
+        args.extend(["-r".into(), "30".into(), s(&out)]);
+        let chunk_progress = |f: f64| on_progress(((done + f * secs) / total).clamp(0.0, 1.0));
+        caps.run_progress(&args, &out, secs, &chunk_progress)
+            .map_err(|e| match e {
+                crate::MediaError::Cancelled => e,
+                e => crate::MediaError::Ffmpeg(format!("joining chunk {k}: {e}")),
+            })?;
+        done += secs;
+        on_progress((done / total).clamp(0.0, 1.0));
+        inputs.push(out);
+    }
+    Ok(JoinedInputs {
+        inputs,
+        ..plan.joined
+    })
+}
+
+/// The chunk layout of [`prejoin_chunks`] (pure): the chunk ranges when the
+/// film needs them, and the final graph's durations, transitions and
+/// overlaps (the inputs are filled in by the caller).
+struct ChunkPlan {
+    ranges: Option<Vec<std::ops::Range<usize>>>,
+    joined: JoinedInputs,
+}
+
+fn plan_chunks(
+    durations: &[f64],
+    transitions: &[Option<Transition>],
+    overlaps: &[f64],
+    chunk: usize,
+) -> ChunkPlan {
+    let chunk = chunk.max(2);
+    let n = durations.len();
+    if n <= chunk {
+        return ChunkPlan {
+            ranges: None,
+            joined: JoinedInputs {
+                inputs: vec![],
+                durations: durations.to_vec(),
+                transitions: transitions.to_vec(),
+                overlaps: overlaps.to_vec(),
+            },
+        };
+    }
+    let ranges = assembly_chunks(n, chunk);
+    let chunk_secs = |r: &std::ops::Range<usize>| {
+        durations[r.clone()].iter().sum::<f64>() - overlaps[r.start..r.end - 1].iter().sum::<f64>()
+    };
+    let joined = JoinedInputs {
+        inputs: vec![],
+        durations: ranges.iter().map(chunk_secs).collect(),
+        // The cut into each chunk is the cut into its first segment.
+        transitions: ranges.iter().map(|r| transitions[r.start]).collect(),
+        overlaps: ranges
+            .iter()
+            .skip(1)
+            .map(|r| overlaps[r.start - 1])
+            .collect(),
+    };
+    ChunkPlan {
+        ranges: Some(ranges),
+        joined,
+    }
 }
 
 /// Per-cut overlap for a transition: slow fades get room to breathe,
@@ -1226,19 +1392,37 @@ pub fn render_hero_video(
     progress.check_cancelled()?;
     let label = "assembling film (transitions, music, captions, encode)";
     progress.step("video", label, Some(0.0));
+    // A long film is pre-joined in chunks first: one graph over every
+    // segment buffers frames for all of them at once (a 226-segment 4K film
+    // grew ffmpeg past 80 GB and macOS killed it). The chunks keep every
+    // cut's transition and overlap, so the timeline is unchanged.
+    let seg_paths: Vec<PathBuf> = segs.iter().map(|s| s.1.clone()).collect();
+    let join_label = "joining film chunks";
+    let joined = prejoin_chunks(
+        caps,
+        &seg_paths,
+        &durations,
+        &transitions,
+        &cut_overlaps,
+        opts.keep_ambience,
+        work_dir,
+        ASSEMBLY_CHUNK,
+        &|f| progress.step("video", join_label, Some(f)),
+    )?;
+    progress.step("video", label, Some(0.0));
     let mut args: Vec<String> = vec!["-y".into()];
-    for (_, p, _, _) in &segs {
+    for p in &joined.inputs {
         args.extend(["-i".into(), s(p)]);
     }
     for m in crate::music::bed_inputs(&bed_plan, &playlist) {
         args.extend(["-i".into(), s(m)]);
     }
-    // Segments are inputs 0..n; the bed placements follow.
-    let bed_graph = crate::music::bed_filter(&bed_plan, &playlist, segs.len(), total);
+    // Film inputs are 0..n; the bed placements follow.
+    let bed_graph = crate::music::bed_filter(&bed_plan, &playlist, joined.inputs.len(), total);
     let (graph, video_map) = film_graph(
-        &transitions,
-        &cut_overlaps,
-        &offsets,
+        &joined.transitions,
+        &joined.overlaps,
+        &xfade_offsets_var(&joined.durations, &joined.overlaps),
         opts.keep_ambience,
         burn_srt.as_deref(),
         &bed_graph,
@@ -2900,6 +3084,63 @@ mod tests {
     use triptape_core::plan::{CAPTION_MAX_SECS, PLACES_CARD_MAX_SECS};
 
     #[test]
+    fn a_long_film_is_joined_in_chunks_on_the_same_timeline() {
+        let n = 2 * ASSEMBLY_CHUNK + 5;
+        let durations: Vec<f64> = (0..n).map(|i| 3.0 + (i % 4) as f64).collect();
+        let transitions: Vec<Option<Transition>> = (0..n)
+            .map(|i| {
+                (i > 0).then_some(if i % 7 == 0 {
+                    Transition::FadeBlack
+                } else {
+                    Transition::Fade
+                })
+            })
+            .collect();
+        let overlaps: Vec<f64> = transitions[1..]
+            .iter()
+            .map(|t| transition_overlap(&t.unwrap()))
+            .collect();
+        let plan = plan_chunks(&durations, &transitions, &overlaps, ASSEMBLY_CHUNK);
+        let ranges = plan.ranges.expect("chunked");
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges.last().unwrap().end, n);
+        let j = plan.joined;
+        // Same film length as one graph over every segment.
+        let total = |d: &[f64], o: &[f64]| d.iter().sum::<f64>() - o.iter().sum::<f64>();
+        assert!((total(&j.durations, &j.overlaps) - total(&durations, &overlaps)).abs() < 1e-9);
+        // The cut into each chunk is its first segment's cut.
+        assert_eq!(j.transitions[1], transitions[ASSEMBLY_CHUNK]);
+        assert_eq!(j.overlaps[0], overlaps[ASSEMBLY_CHUNK - 1]);
+        assert_eq!(j.transitions[0], None);
+        // A short film is one graph, as before.
+        let short = plan_chunks(
+            &durations[..5],
+            &transitions[..5],
+            &overlaps[..4],
+            ASSEMBLY_CHUNK,
+        );
+        assert!(short.ranges.is_none());
+        assert_eq!(short.joined.durations, durations[..5]);
+    }
+
+    #[test]
+    fn an_xfade_chain_names_its_finished_streams() {
+        let tr = [None, Some(Transition::Fade), Some(Transition::FadeBlack)];
+        let (g, v, a) = xfade_chain(&tr, &[0.5, 0.8], &[4.5, 8.7], true);
+        assert_eq!(
+            g,
+            "[0:v][1:v]xfade=transition=fade:duration=0.500:offset=4.500[v1];\
+             [0:a][1:a]acrossfade=d=0.500:c1=tri:c2=tri[a1];\
+             [v1][2:v]xfade=transition=fadeblack:duration=0.800:offset=8.700[v];\
+             [a1][2:a]acrossfade=d=0.800:c1=tri:c2=tri[a];"
+        );
+        assert_eq!((v.as_str(), a.as_str()), ("[v]", "[a]"));
+        let (g, v, a) = xfade_chain(&[None], &[], &[], false);
+        assert!(g.is_empty());
+        assert_eq!((v.as_str(), a.as_str()), ("[0:v]", "[0:a]"));
+    }
+
+    #[test]
     fn place_sections_follow_each_chapter_through_the_film() {
         let hero: Vec<serde_json::Value> = ["a1", "a2", "b1", "a3", "a4"]
             .iter()
@@ -3747,6 +3988,103 @@ mod tests {
             tz_offset_secs: None,
             aspect: None,
         }
+    }
+
+    /// Real ffmpeg: five tiny segments joined two to a chunk, then the chunks
+    /// joined by `film_graph`, come out at the length one graph would give.
+    #[test]
+    fn chunked_assembly_keeps_the_film_length() {
+        let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
+        if !caps.libx264 || !caps.xfade {
+            eprintln!("ffmpeg caps insufficient; skipping chunked assembly test");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let durations = [2.0, 1.5, 2.5, 2.0, 1.0];
+        let segs: Vec<PathBuf> = durations
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let p = temp.path().join(format!("s{i}.mp4"));
+                let st = std::process::Command::new(&caps.ffmpeg_bin)
+                    .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+                    .arg(format!("testsrc2=s=160x90:r=30:d={d}"))
+                    .args(["-f", "lavfi", "-i"])
+                    .arg(format!("anullsrc=r=48000:cl=stereo:d={d}"))
+                    .args([
+                        "-shortest",
+                        "-c:v",
+                        "libx264",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-c:a",
+                        "aac",
+                    ])
+                    .arg(&p)
+                    .status()
+                    .unwrap();
+                assert!(st.success());
+                p
+            })
+            .collect();
+        let transitions = [
+            None,
+            Some(Transition::Fade),
+            Some(Transition::FadeBlack),
+            Some(Transition::Fade),
+            Some(Transition::Fade),
+        ];
+        let overlaps = [0.5, 0.8, 0.5, 0.5];
+        let seen = std::cell::RefCell::new(vec![]);
+        let joined = prejoin_chunks(
+            &caps,
+            &segs,
+            &durations,
+            &transitions,
+            &overlaps,
+            false,
+            temp.path(),
+            2,
+            &|f| seen.borrow_mut().push(f),
+        )
+        .unwrap();
+        assert_eq!(joined.inputs.len(), 3);
+        // Progress climbs to done across the chunks.
+        let seen = seen.into_inner();
+        assert!(seen.windows(2).all(|w| w[0] <= w[1] + 1e-9), "{seen:?}");
+        assert!(
+            (seen.last().copied().unwrap() - 1.0).abs() < 1e-9,
+            "{seen:?}"
+        );
+        // The lone trailing segment is used as is, not re-encoded.
+        assert_eq!(joined.inputs[2], segs[4]);
+        let out = temp.path().join("film.mp4");
+        let (graph, map) = film_graph(
+            &joined.transitions,
+            &joined.overlaps,
+            &xfade_offsets_var(&joined.durations, &joined.overlaps),
+            false,
+            None,
+            "anullsrc=r=48000:cl=stereo,atrim=0:20[mbed]",
+            "anull",
+        );
+        let mut args: Vec<String> = vec!["-y".into()];
+        for p in &joined.inputs {
+            args.extend(["-i".into(), s(p)]);
+        }
+        args.extend(["-filter_complex".into(), graph, "-map".into(), map]);
+        args.extend(["-map".into(), "[aout]".into(), "-shortest".into()]);
+        args.extend(ffmpeg::x264_aac("veryfast", 23));
+        args.push(s(&out));
+        caps.run(&args, &out).unwrap();
+        let got = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &out)
+            .unwrap()
+            .duration_secs;
+        let want = durations.iter().sum::<f64>() - overlaps.iter().sum::<f64>();
+        assert!(
+            (got - want).abs() < 0.1,
+            "film {got:.3} s, one graph {want:.3} s"
+        );
     }
 
     /// A landscape-coded stream with a 90 degree display matrix (how iPhones
