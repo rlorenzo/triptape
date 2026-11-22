@@ -433,6 +433,16 @@ fn flag_present(output: &str, name: &str) -> bool {
     })
 }
 
+/// Whether libx265's encoder help (`ffmpeg -h encoder=libx265`; `None` when
+/// that call failed) lists a 10-bit pixel format among those it supports.
+fn x265_writes_10bit(help: Option<&str>) -> bool {
+    help.is_some_and(|h| {
+        h.lines()
+            .filter(|l| l.contains("pixel formats"))
+            .any(|l| l.split_whitespace().any(|f| f == "yuv420p10le"))
+    })
+}
+
 /// Probe `ffmpeg_bin` (`-encoders`, `-filters`) for the capabilities above.
 /// Missing binaries or unparseable output yield all-false capabilities
 /// (callers then fail with a clear error instead of misprobing).
@@ -447,8 +457,9 @@ pub fn probe_capabilities(ffmpeg_bin: &str, ffprobe_bin: &str) -> Capabilities {
         libx264: flag_present(&encoders, "libx264"),
         libx265,
         libx265_10bit: libx265
-            && run_capture(ffmpeg_bin, &["-hide_banner", "-h", "encoder=libx265"])
-                .is_some_and(|h| h.contains("yuv420p10le")),
+            && x265_writes_10bit(
+                run_capture(ffmpeg_bin, &["-hide_banner", "-h", "encoder=libx265"]).as_deref(),
+            ),
         aac: flag_present(&encoders, "aac"),
         xfade: filter("xfade"),
         perspective: filter("perspective"),
@@ -1614,6 +1625,19 @@ mod tests {
         let fb = tonemap_chain(&no_z, "arib-std-b67").unwrap();
         assert!(!fb.contains("zscale"), "fallback must not need zscale");
         assert!(tonemap_chain(&Capabilities::default(), "smpte2084").is_none());
+    }
+
+    #[test]
+    fn ten_bit_hevc_is_read_from_the_encoder_help() {
+        let multi = "Encoder libx265 [libx265 H.265 / HEVC]:\n    Supported pixel formats: yuv420p yuvj420p yuv420p10le yuv422p10le gray10le\n";
+        let eight = "Encoder libx265 [libx265 H.265 / HEVC]:\n    Supported pixel formats: yuv420p yuvj420p yuv422p yuv444p gbrp gray\n";
+        assert!(x265_writes_10bit(Some(multi)));
+        assert!(!x265_writes_10bit(Some(eight)));
+        assert!(!x265_writes_10bit(None), "a failed help call is not 10-bit");
+        // The name elsewhere in the help (an option's text) does not count.
+        assert!(!x265_writes_10bit(Some(
+            "  -x265-params  e.g. yuv420p10le output\n"
+        )));
     }
 
     #[test]
