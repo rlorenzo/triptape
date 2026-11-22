@@ -1099,6 +1099,7 @@ mod tests {
             day_index: None,
             date_label: None,
             film_place: None,
+            film_place_changes: Default::default(),
         };
         let heading = |id, place| book_heading_place(&chapter(id, place), &itin, &ships, &by_id);
         assert_eq!(
