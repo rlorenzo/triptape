@@ -1269,6 +1269,7 @@ pub fn render_book(
                 !placed.contains(p.asset_id.as_str())
                     && cover_rank(p) == 2
                     && p.tagged_people >= 3
+                    && p.people >= 4
                     && p.face_size >= CLOSING_FACE
                     && dpi_verdict(p.width, p.height, w, h) == DpiVerdict::Ok
                     && p.day.zip(last_day).is_some_and(|(d, l)| d + 1 >= l)
@@ -2624,6 +2625,10 @@ fn typst_text_png(
 /// fallback serif prints a comma like a full stop ("October 3–30. 2026").
 const BOOK_FONTS: &str = r#"("DejaVu Sans", "Avenir Next", "Helvetica Neue", "Arial")"#;
 
+/// Width / height of a cover tile in the 4×3 mosaic above the title band
+/// (882×981 px on a 12-inch cover): faces are checked against it.
+const COVER_TILE_ASPECT: f64 = 0.9;
+
 /// Photos at the start of the book (hero, spread, the first pages) the
 /// cover never repeats.
 const COVER_SKIPS_FIRST: usize = 30;
@@ -2647,7 +2652,14 @@ fn cover_rank(p: &BookPhoto) -> u8 {
     let tile_cuts = !p.faces.is_empty()
         && p.width > 0
         && p.height > 0
-        && face_window(f64::from(p.width), f64::from(p.height), 1.0, 1.0, &p.faces).1;
+        && face_window(
+            f64::from(p.width),
+            f64::from(p.height),
+            COVER_TILE_ASPECT,
+            1.0,
+            &p.faces,
+        )
+        .1;
     if png || panorama || tile_cuts {
         0
     } else if p.is_of_people() {
