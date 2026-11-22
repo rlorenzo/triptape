@@ -3222,12 +3222,17 @@ fn write_typst_and_compile(
                 // The day heading on its own line; the owner's words and
                 // the places beneath it in caption size, never fused into
                 // one three-line block.
-                let (head, rest) = (clean[0], clean[1..].join(" · "));
+                let head = clean[0];
+                let rest = title_rest_lines(&clean[1..])
+                    .iter()
+                    .map(|l| format!("#text(size: 14pt)[{}]", typ_escape(l)))
+                    .collect::<Vec<_>>()
+                    .join(" \\ ");
                 strip_pt = title_strip_pt(&clean, size, inset, pw);
                 typ.push_str(&format!(
-                    "#place(bottom + center)[#rect(fill: rgb(18, 20, 26).transparentize(20%), inset: {inset}pt)[#align(center)[#text(size: {size}pt)[{}] \\ #text(size: 14pt)[{}]]]]\n",
+                    "#place(bottom + center)[#rect(fill: rgb(18, 20, 26).transparentize(20%), inset: {inset}pt)[#align(center)[#text(size: {size}pt)[{}] \\ {}]]]\n",
                     typ_escape(head),
-                    typ_escape(&rest)
+                    rest
                 ));
             } else {
                 let text = clean.join(" · ");
@@ -3382,9 +3387,28 @@ fn strip_px(lines: &[String], title: bool, preset: BookPreset, th: u32) -> u32 {
 /// Height (pt) of a title page's strip as the burn draws it: the heading
 /// on its own line at `size`, the rest beneath it at caption size.
 fn title_strip_pt<S: AsRef<str>>(lines: &[S], size: u32, inset: u32, page_w: f64) -> f64 {
-    let rest: Vec<&str> = lines[1..].iter().map(AsRef::as_ref).collect();
     strip_height_pt(lines[0].as_ref(), size, inset, page_w)
-        + strip_height_pt(&rest.join(" · "), 14, 0, page_w)
+        + title_rest_lines(&lines[1..])
+            .iter()
+            .map(|l| strip_height_pt(l, 14, 0, page_w))
+            .sum::<f64>()
+}
+
+/// The lines under a title page's heading: the owner's sentence on a line
+/// of its own, then the places joined with " · " ("…for 8 years." and
+/// "Paradox Singapore" below it, not run together).
+fn title_rest_lines<S: AsRef<str>>(rest: &[S]) -> Vec<String> {
+    let mut out: Vec<Vec<&str>> = vec![];
+    let mut new_line = true;
+    for l in rest {
+        let l = l.as_ref();
+        if new_line {
+            out.push(vec![]);
+        }
+        out.last_mut().expect("pushed above").push(l);
+        new_line = l.ends_with(['.', '!', '?', '\u{2026}']);
+    }
+    out.iter().map(|g| g.join(" · ")).collect()
 }
 
 /// Height in points of a bottom strip of `text` at `size` pt with `inset`
@@ -3554,6 +3578,19 @@ mod tests {
         ];
         fold_lone_kept(&mut photos);
         assert_eq!(photos[0].area.as_deref(), Some("food court"));
+    }
+
+    #[test]
+    fn a_title_page_puts_the_owners_sentence_above_its_place() {
+        let rest = ["It served us well for 8 years.", "Paradox Singapore"];
+        assert_eq!(
+            title_rest_lines(&rest),
+            ["It served us well for 8 years.", "Paradox Singapore"]
+        );
+        assert_eq!(
+            title_rest_lines(&["Mount Faber", "Singapore"]),
+            ["Mount Faber · Singapore"]
+        );
     }
 
     #[test]
