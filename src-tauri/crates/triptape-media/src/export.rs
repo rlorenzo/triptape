@@ -65,6 +65,20 @@ pub struct ExportOptions {
     /// Folder for the film's scratch files (segments, chunks) instead of
     /// `<out>/.work`: see [`scratch_dir`]. `None` keeps them in `<out>/.work`.
     pub work_dir: Option<PathBuf>,
+    /// Render the hero film as a draft for reviewing edits (see
+    /// [`VideoOptions::draft`]): `hero-draft.mp4` and its sidecars, beside
+    /// any keepsake `hero.mp4`, which is left alone.
+    pub draft: bool,
+}
+
+/// File stem of the hero film and its sidecars: a draft never takes the
+/// keepsake's name, so it can neither replace nor be mistaken for it.
+pub fn film_stem(draft: bool) -> &'static str {
+    if draft {
+        "hero-draft"
+    } else {
+        "hero"
+    }
 }
 
 /// Where the hero film's intermediates (segments, pre-joined chunks) go.
@@ -114,6 +128,9 @@ pub struct Skipped {
 pub struct ExportReport {
     pub trip_name: String,
     pub video: Option<String>,
+    /// The film is a draft for review (`hero-draft.mp4`), not the keepsake.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub draft: bool,
     pub reels: Vec<String>,
     pub book_pages: usize,
     pub skipped: Vec<Skipped>,
@@ -607,6 +624,7 @@ fn export_inner(
     let mut report = ExportReport {
         trip_name: opts.trip_name.clone(),
         video: None,
+        draft: false,
         reels: vec![],
         book_pages: 0,
         skipped: vec![],
@@ -656,14 +674,16 @@ fn export_inner(
             .collect();
         let staged_video = stage.join("video");
         std::fs::create_dir_all(&staged_video).map_err(|e| crate::MediaError::Io(e.to_string()))?;
-        let out_mp4 = out_dir.join("hero.mp4");
+        let stem = film_stem(opts.draft);
+        let film_name = format!("{stem}.mp4");
+        let out_mp4 = out_dir.join(&film_name);
         match render_video::render_hero_video(
             caps,
             plan,
             &resolved,
             map_card.as_deref(),
             &scratch.join("video"),
-            &staged_video.join("hero.mp4"),
+            &staged_video.join(&film_name),
             &VideoOptions {
                 trip_name: opts.trip_name.clone(),
                 short_mode: elig.video == "short",
@@ -672,6 +692,7 @@ fn export_inner(
                 live_collages: opts.live_collages,
                 opening_map: opts.opening_map,
                 typst_bin: opts.typst_bin.clone(),
+                draft: opts.draft,
                 resolution: opts.resolution,
                 jobs: opts.jobs,
                 map_style: opts.map_style,
@@ -694,16 +715,18 @@ fn export_inner(
                 opts.progress.check_cancelled()?;
                 // Sidecars first, film last. A film with no captions must
                 // not keep the previous film's.
-                for name in ["hero.srt", "hero.edl.json"] {
-                    let staged = staged_video.join(name);
+                for ext in ["srt", "edl.json"] {
+                    let name = format!("{stem}.{ext}");
+                    let staged = staged_video.join(&name);
                     if staged.exists() {
-                        promote_file(&staged, &out_dir.join(name))?;
+                        promote_file(&staged, &out_dir.join(&name))?;
                     } else {
-                        let _ = std::fs::remove_file(out_dir.join(name));
+                        let _ = std::fs::remove_file(out_dir.join(&name));
                     }
                 }
-                promote_file(&staged_video.join("hero.mp4"), &out_mp4)?;
+                promote_file(&staged_video.join(&film_name), &out_mp4)?;
                 report.video = Some(out_mp4.to_string_lossy().into_owned());
+                report.draft = opts.draft;
                 report.fallbacks.extend(v.fallbacks);
             }
             Err(e) => {
@@ -1436,6 +1459,7 @@ mod tests {
                 hop_clips: vec![],
                 back_cover: None,
                 work_dir: None,
+                draft: false,
             },
         );
         assert!(matches!(err, Err(crate::MediaError::Cancelled)), "{err:?}");
@@ -1497,6 +1521,7 @@ mod tests {
             hop_clips: vec![],
             back_cover: None,
             work_dir: None,
+            draft: false,
         };
         let report = export_all(&Default::default(), &empty_plan(), &[], &out, &opts).unwrap();
         assert!(!out.join(".work").exists(), "{:?}", report.fallbacks);
@@ -1518,6 +1543,9 @@ mod tests {
         assert!(!out.join(".work").exists());
         assert!(local.join("mine.txt").exists());
         assert_eq!(scratch_dir(&out, None), out.join(".work"));
+        // A draft never takes the keepsake's file names.
+        assert_eq!(film_stem(false), "hero");
+        assert_eq!(film_stem(true), "hero-draft");
     }
 
     #[test]

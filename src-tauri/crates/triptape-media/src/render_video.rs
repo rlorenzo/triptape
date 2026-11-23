@@ -82,16 +82,28 @@ pub fn xfade_offsets_var(durations: &[f64], overlaps: &[f64]) -> Vec<f64> {
 /// Inputs `0..n` chained through xfade (and acrossfade when
 /// `keep_ambience`), each filter ending in `;`. Returns the graph and the
 /// labels of the finished video and audio streams: `[v]`/`[a]`, or the lone
-/// input's `[0:v]`/`[0:a]` when there is no cut.
+/// input's `[0:v]`/`[0:a]` when there is no cut. With `scale` (a draft's
+/// frame size) every input is scaled to it before its cut, as `[s0]`,
+/// `[s1]`..., so the cuts and all after them run on the small frame.
 fn xfade_chain(
     transitions: &[Option<Transition>],
     overlaps: &[f64],
     offsets: &[f64],
     keep_ambience: bool,
+    scale: Option<(u32, u32)>,
 ) -> (String, String, String) {
     let n = transitions.len();
     let mut graph = String::new();
-    let (mut vl, mut al) = ("[0:v]".to_string(), "[0:a]".to_string());
+    let vin = |i: usize| match scale {
+        Some(_) => format!("[s{i}]"),
+        None => format!("[{i}:v]"),
+    };
+    if let Some((w, h)) = scale {
+        for i in 0..n {
+            graph.push_str(&format!("[{i}:v]{}{};", ffmpeg::draft_scale(w, h), vin(i)));
+        }
+    }
+    let (mut vl, mut al) = (vin(0), "[0:a]".to_string());
     for i in 1..n {
         let t = transitions[i].unwrap_or(Transition::Fade);
         let ov = overlaps[i - 1];
@@ -105,7 +117,8 @@ fn xfade_chain(
         };
         let nv = tag("v");
         graph.push_str(&format!(
-            "{vl}[{i}:v]xfade=transition={}:duration={ov:.3}:offset={offset:.3}{nv};",
+            "{vl}{}xfade=transition={}:duration={ov:.3}:offset={offset:.3}{nv};",
+            vin(i),
             t.xfade_name(),
         ));
         vl = nv;
@@ -123,8 +136,10 @@ fn xfade_chain(
 /// The single-encode filter graph for the hero film: segment inputs
 /// `0..n` chained through xfade (and acrossfade when `keep_ambience`),
 /// then the optional caption burn and the audio mix ending in `[aout]`.
-/// `bed_graph` must emit `[mbed]`. Returns the graph and the `-map`
-/// target for the video stream.
+/// `bed_graph` must emit `[mbed]`. `scale` as in [`xfade_chain`]: a
+/// draft's captions are burned on the small frame. Returns the graph and
+/// the `-map` target for the video stream.
+#[allow(clippy::too_many_arguments)]
 fn film_graph(
     transitions: &[Option<Transition>],
     cut_overlaps: &[f64],
@@ -133,9 +148,9 @@ fn film_graph(
     burn_srt: Option<&str>,
     bed_graph: &str,
     norm: &str,
+    scale: Option<(u32, u32)>,
 ) -> (String, String) {
-    let (mut graph, vl, al) = xfade_chain(transitions, cut_overlaps, offsets, keep_ambience);
-    let n = transitions.len();
+    let (mut graph, vl, al) = xfade_chain(transitions, cut_overlaps, offsets, keep_ambience, scale);
     // `vl`/`al` now name the finished film streams ([v]/[a], or the lone
     // input's [0:v]/[0:a] when there is no cut).
     let video_map = match burn_srt {
@@ -143,9 +158,9 @@ fn film_graph(
             graph.push_str(&format!("{vl}{sub}[vsub];"));
             "[vsub]".to_string()
         }
-        // A filter-output label maps as-is; a raw input stream is `0:v`.
-        None if n > 1 => vl,
-        None => "0:v".to_string(),
+        // A raw input stream is `0:v`; a filter-output label maps as-is.
+        None if vl == "[0:v]" => "0:v".to_string(),
+        None => vl,
     };
     if keep_ambience {
         graph.push_str(&format!(
@@ -166,6 +181,49 @@ const ASSEMBLY_CHUNK: usize = 40;
 /// Quality of a pre-joined chunk (x264, near-lossless): it is decoded once
 /// more by the final encode.
 const CHUNK_CRF: u32 = 12;
+
+/// How the film is joined and encoded: the keepsake, or a draft for
+/// reviewing an edit. Both use the same segments, cuts, captions and
+/// music, so a draft shows the keepsake's timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recipe {
+    /// Full size, near-lossless chunks, [`ffmpeg::film_encode_args`].
+    Keepsake,
+    /// Scaled to [`ffmpeg::DRAFT_RESOLUTION`] where the segments are
+    /// joined, and encoded fast ([`ffmpeg::draft_encode_args`]).
+    Draft(ffmpeg::DraftEncoder),
+}
+
+impl Recipe {
+    /// The frame the joins scale every input to (`None`: left as it is).
+    fn scale(self) -> Option<(u32, u32)> {
+        match self {
+            Self::Keepsake => None,
+            Self::Draft(_) => Some(ffmpeg::DRAFT_RESOLUTION.dims()),
+        }
+    }
+
+    /// Encode arguments of a pre-joined chunk.
+    fn chunk_encode_args(self) -> Vec<String> {
+        match self {
+            Self::Keepsake => ffmpeg::x264_aac("veryfast", CHUNK_CRF),
+            Self::Draft(e) => ffmpeg::draft_encode_args(e, ffmpeg::DRAFT_CHUNK_KBPS),
+        }
+    }
+
+    /// Encode arguments of the finished film.
+    fn film_encode_args(self, caps: &Capabilities, res: Resolution) -> Vec<String> {
+        match self {
+            Self::Keepsake => ffmpeg::film_encode_args(caps, res),
+            Self::Draft(e) => ffmpeg::draft_encode_args(e, ffmpeg::DRAFT_FILM_KBPS),
+        }
+    }
+
+    /// Frame size of the finished film.
+    fn dims(self, res: Resolution) -> (u32, u32) {
+        self.scale().unwrap_or(res.dims())
+    }
+}
 
 /// The film's inputs for the final encode: the segments themselves, or
 /// for a long film the pre-joined chunks, with the cuts between them.
@@ -204,6 +262,7 @@ fn prejoin_chunks(
     keep_ambience: bool,
     work_dir: &Path,
     chunk: usize,
+    recipe: Recipe,
     on_progress: &dyn Fn(f64),
 ) -> Result<JoinedInputs, crate::MediaError> {
     let plan = plan_chunks(durations, transitions, overlaps, chunk);
@@ -233,6 +292,7 @@ fn prejoin_chunks(
             local_overlaps,
             &xfade_offsets_var(&durations[r.clone()], local_overlaps),
             keep_ambience,
+            recipe.scale(),
         );
         let mut args: Vec<String> = vec!["-y".into()];
         for p in &segs[r.clone()] {
@@ -243,7 +303,7 @@ fn prejoin_chunks(
         if keep_ambience {
             args.extend(["-map".into(), a]);
         }
-        args.extend(ffmpeg::x264_aac("veryfast", CHUNK_CRF));
+        args.extend(recipe.chunk_encode_args());
         args.extend(["-r".into(), "30".into(), s(&out)]);
         let chunk_progress = |f: f64| on_progress(((done + f * secs) / total).clamp(0.0, 1.0));
         caps.run_progress(&args, &out, secs, &chunk_progress)
@@ -541,6 +601,11 @@ pub struct VideoOptions {
     /// place of the drawn ones (one per [`triptape_core::journey::Hop`]).
     /// The film then has no closing route map.
     pub hop_clips: Vec<PathBuf>,
+    /// A draft for reviewing an edit, not the keepsake: the same segments
+    /// (at `resolution`, so the segment cache serves both), cuts, captions
+    /// and music, joined at [`ffmpeg::DRAFT_RESOLUTION`] with the fastest
+    /// encoder this machine has ([`ffmpeg::draft_encoder`]).
+    pub draft: bool,
 }
 
 impl Default for VideoOptions {
@@ -563,6 +628,7 @@ impl Default for VideoOptions {
             journey: None,
             map_style: MapStyle::default(),
             hop_clips: vec![],
+            draft: false,
         }
     }
 }
@@ -583,6 +649,9 @@ pub struct EdlSegment {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Edl {
     pub version: u32,
+    /// The film is a draft (see [`VideoOptions::draft`]), not the keepsake.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub draft: bool,
     pub trip_name: String,
     pub overlap_secs: f64,
     /// Per-cut overlap actually used (len = segments - 1).
@@ -799,6 +868,17 @@ pub fn render_hero_video(
     if !caps.can_burn_captions() {
         fallbacks.push("libass absent: captions as sidecar SRT, not burned in".into());
     }
+    let recipe = if opts.draft {
+        let encoder = ffmpeg::draft_encoder(caps);
+        let (w, h) = ffmpeg::DRAFT_RESOLUTION.dims();
+        fallbacks.push(format!(
+            "draft film ({w}x{h}, {}): for reviewing edits, not the keepsake",
+            encoder.name()
+        ));
+        Recipe::Draft(encoder)
+    } else {
+        Recipe::Keepsake
+    };
     let typst_ok = crate::titlecard::typst_available(&opts.typst_bin);
     if !typst_ok {
         fallbacks.push(format!(
@@ -1501,6 +1581,7 @@ pub fn render_hero_video(
         opts.keep_ambience,
         work_dir,
         ASSEMBLY_CHUNK,
+        recipe,
         &|f| progress.step("video", join_label, Some(f)),
     )?;
     progress.step("video", label, Some(0.0));
@@ -1521,6 +1602,7 @@ pub fn render_hero_video(
         burn_srt.as_deref(),
         &bed_graph,
         norm,
+        recipe.scale(),
     );
     args.extend([
         "-filter_complex".into(),
@@ -1531,8 +1613,8 @@ pub fn render_hero_video(
         "[aout]".into(),
     ]);
     // Streamable on a home network (Plex to a Roku): capped bitrate, HEVC
-    // at 4K when available.
-    args.extend(ffmpeg::film_encode_args(caps, opts.resolution));
+    // at 4K when available. A draft takes the fastest encode instead.
+    args.extend(recipe.film_encode_args(caps, opts.resolution));
     // Nothing from a source file's tags reaches the shared film (Sec 14).
     args.extend(triptape_core::privacy::exif_strip_args());
     args.extend(["-r".into(), "30".into(), s(out_mp4)]);
@@ -1546,10 +1628,11 @@ pub fn render_hero_video(
         })?;
 
     // 6. Verify + EDL + sidecar SRT.
-    let (out_w, out_h) = opts.resolution.dims();
+    let (out_w, out_h) = recipe.dims(opts.resolution);
     let probed = ffmpeg::verify_video(&caps.ffprobe_bin, out_mp4, out_w, out_h)?;
     let edl = Edl {
         version: 1,
+        draft: opts.draft,
         trip_name: opts.trip_name.clone(),
         overlap_secs: opts.overlap_secs,
         cut_overlaps_secs: cut_overlaps
@@ -3428,7 +3511,7 @@ mod tests {
     #[test]
     fn an_xfade_chain_names_its_finished_streams() {
         let tr = [None, Some(Transition::Fade), Some(Transition::FadeBlack)];
-        let (g, v, a) = xfade_chain(&tr, &[0.5, 0.8], &[4.5, 8.7], true);
+        let (g, v, a) = xfade_chain(&tr, &[0.5, 0.8], &[4.5, 8.7], true, None);
         assert_eq!(
             g,
             "[0:v][1:v]xfade=transition=fade:duration=0.500:offset=4.500[v1];\
@@ -3437,9 +3520,86 @@ mod tests {
              [a1][2:a]acrossfade=d=0.800:c1=tri:c2=tri[a];"
         );
         assert_eq!((v.as_str(), a.as_str()), ("[v]", "[a]"));
-        let (g, v, a) = xfade_chain(&[None], &[], &[], false);
+        let (g, v, a) = xfade_chain(&[None], &[], &[], false, None);
         assert!(g.is_empty());
         assert_eq!((v.as_str(), a.as_str()), ("[0:v]", "[0:a]"));
+    }
+
+    /// A draft scales every input to its frame first, so the cuts, the
+    /// caption burn and the encode all run at 1080p on the same timeline.
+    #[test]
+    fn a_draft_graph_scales_each_input_before_its_cut() {
+        let tr = [None, Some(Transition::Fade), Some(Transition::FadeBlack)];
+        let scale = Recipe::Draft(ffmpeg::DraftEncoder::X264Ultrafast).scale();
+        assert_eq!(scale, Some((1920, 1080)));
+        assert_eq!(Recipe::Keepsake.scale(), None);
+        let (g, v, _) = xfade_chain(&tr, &[0.5, 0.8], &[4.5, 8.7], false, scale);
+        assert_eq!(
+            g,
+            "[0:v]scale=1920:1080:flags=bilinear,setsar=1[s0];\
+             [1:v]scale=1920:1080:flags=bilinear,setsar=1[s1];\
+             [2:v]scale=1920:1080:flags=bilinear,setsar=1[s2];\
+             [s0][s1]xfade=transition=fade:duration=0.500:offset=4.500[v1];\
+             [v1][s2]xfade=transition=fadeblack:duration=0.800:offset=8.700[v];"
+        );
+        assert_eq!(v, "[v]");
+        // The same cuts as the keepsake's graph: only the inputs differ.
+        let (full, ..) = xfade_chain(&tr, &[0.5, 0.8], &[4.5, 8.7], false, None);
+        assert!(g.ends_with(&full.replace("[1:v]", "[s1]").replace("[2:v]", "[s2]")[5..]));
+        // Captions are burned after the scale; a lone input is scaled too.
+        let (g, map) = film_graph(
+            &tr,
+            &[0.5, 0.8],
+            &[4.5, 8.7],
+            false,
+            Some("SUB"),
+            "BED",
+            "NORM",
+            scale,
+        );
+        assert!(g.contains("[v]SUB[vsub];"), "{g}");
+        assert_eq!(map, "[vsub]");
+        let (g, map) = film_graph(&[None], &[], &[], false, None, "BED", "NORM", scale);
+        assert!(
+            g.starts_with("[0:v]scale=1920:1080:flags=bilinear,setsar=1[s0];BED;"),
+            "{g}"
+        );
+        assert_eq!(map, "[s0]");
+    }
+
+    #[test]
+    fn a_draft_recipe_swaps_the_encodes_and_the_frame_only() {
+        let caps = Capabilities {
+            libx264: true,
+            libx265: true,
+            libx265_10bit: true,
+            ..Default::default()
+        };
+        let at = ffmpeg::arg_after;
+        let res = Resolution::Uhd4k;
+        let keep = Recipe::Keepsake;
+        assert_eq!(
+            keep.film_encode_args(&caps, res),
+            ffmpeg::film_encode_args(&caps, res)
+        );
+        assert_eq!(
+            keep.chunk_encode_args(),
+            ffmpeg::x264_aac("veryfast", CHUNK_CRF)
+        );
+        assert_eq!(keep.dims(res), (3840, 2160));
+        let draft = Recipe::Draft(ffmpeg::DraftEncoder::HevcVideotoolbox);
+        let film = draft.film_encode_args(&caps, res);
+        assert_eq!(at(&film, "-c:v"), "hevc_videotoolbox");
+        assert_eq!(at(&film, "-b:v"), "10000k");
+        assert_eq!(at(&draft.chunk_encode_args(), "-b:v"), "20000k");
+        assert_eq!(draft.dims(res), (1920, 1080));
+        // No hardware encoder: libx264 at its fastest, still 1080p.
+        let soft = Recipe::Draft(ffmpeg::DraftEncoder::X264Ultrafast);
+        assert_eq!(
+            at(&soft.film_encode_args(&caps, res), "-preset"),
+            "ultrafast"
+        );
+        assert_eq!(soft.dims(res), (1920, 1080));
     }
 
     #[test]
@@ -3492,7 +3652,16 @@ mod tests {
     #[test]
     fn film_graph_chains_cuts_into_one_graph() {
         let tr = [None, Some(Transition::Fade), Some(Transition::FadeBlack)];
-        let (g, map) = film_graph(&tr, &[0.5, 0.8], &[4.5, 8.7], false, None, "BED", "NORM");
+        let (g, map) = film_graph(
+            &tr,
+            &[0.5, 0.8],
+            &[4.5, 8.7],
+            false,
+            None,
+            "BED",
+            "NORM",
+            None,
+        );
         assert!(
             g.starts_with("[0:v][1:v]xfade=transition=fade:duration=0.500:offset=4.500[v1];"),
             "{g}"
@@ -3518,6 +3687,7 @@ mod tests {
             Some("subtitles=x.srt"),
             "BED",
             "NORM",
+            None,
         );
         assert!(
             g.contains("[0:a][1:a]acrossfade=d=0.500:c1=tri:c2=tri[a];"),
@@ -3531,11 +3701,11 @@ mod tests {
 
     #[test]
     fn film_graph_single_segment_passes_input_through() {
-        let (g, map) = film_graph(&[None], &[], &[], true, None, "BED", "NORM");
+        let (g, map) = film_graph(&[None], &[], &[], true, None, "BED", "NORM", None);
         assert!(!g.contains("xfade"), "{g}");
         assert!(g.starts_with("[0:a]volume=0.12"), "{g}");
         assert_eq!(map, "0:v");
-        let (g, map) = film_graph(&[None], &[], &[], false, Some("SUB"), "BED", "NORM");
+        let (g, map) = film_graph(&[None], &[], &[], false, Some("SUB"), "BED", "NORM", None);
         assert!(g.starts_with("[0:v]SUB[vsub];BED;"), "{g}");
         assert_eq!(map, "[vsub]");
     }
@@ -4400,6 +4570,7 @@ mod tests {
             false,
             temp.path(),
             2,
+            Recipe::Keepsake,
             &|f| seen.borrow_mut().push(f),
         )
         .unwrap();
@@ -4422,6 +4593,7 @@ mod tests {
             None,
             "anullsrc=r=48000:cl=stereo,atrim=0:20[mbed]",
             "anull",
+            None,
         );
         let mut args: Vec<String> = vec!["-y".into()];
         for p in &joined.inputs {
@@ -6006,6 +6178,60 @@ mod tests {
             .unwrap();
         let (third, _, _) = run("c", &entries);
         assert_eq!((third.hits, third.misses), (3, 1), "{third:?}");
+    }
+
+    /// A draft of a 4K film is a 1080p film on the keepsake's timeline,
+    /// made from the same 4K segments: a second draft reuses them all.
+    #[test]
+    fn a_draft_renders_at_1080p_from_the_film_4k_segments() {
+        use crate::segment_cache::{SegmentCache, SegmentCacheConfig};
+        let Some(caps) = parallel_caps() else {
+            eprintln!("ffmpeg caps insufficient; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (plan, entries) = parallel_fixture(dir.path());
+        let cfg = SegmentCacheConfig::roomy(dir.path().join("cache"));
+        let opts = VideoOptions {
+            resolution: Resolution::Uhd4k,
+            draft: true,
+            ..parallel_opts(2)
+        };
+        let run = |name: &str| {
+            let work = dir.path().join(name).join(".work");
+            let cache = SegmentCache::open(&cfg, "ffmpeg test".into(), &work).unwrap();
+            let caps = Capabilities {
+                segment_cache: Some(cache.clone()),
+                ..caps.clone()
+            };
+            let out = dir.path().join(name).join("hero-draft.mp4");
+            let v =
+                render_hero_video(&caps, &plan, &entries, None, &work, &out, &opts).expect("draft");
+            // The segments stay 4K: they are the keepsake's own.
+            let seg = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &work.join("seg_000.mp4")).unwrap();
+            assert_eq!((seg.width, seg.height), (3840, 2160));
+            (cache.stats(), v)
+        };
+        let (first, v) = run("a");
+        assert_eq!((first.hits, first.misses), (0, 4), "{first:?}");
+        let film = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &v.path).unwrap();
+        assert_eq!((film.width, film.height), (1920, 1080));
+        assert!(film.has_audio);
+        assert!(
+            v.fallbacks
+                .iter()
+                .any(|f| f.starts_with("draft film (1920x1080, ")),
+            "{:?}",
+            v.fallbacks
+        );
+        let edl: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&v.edl_path).unwrap()).unwrap();
+        assert_eq!(edl["draft"], true);
+        // The timeline is the plan's, not the frame size's.
+        assert!((film.duration_secs - edl["total_secs"].as_f64().unwrap()).abs() < 0.2);
+        assert_eq!(v.srt_path.unwrap().file_name().unwrap(), "hero-draft.srt");
+        let (second, _) = run("b");
+        assert_eq!((second.hits, second.misses), (4, 0), "{second:?}");
     }
 
     /// A collage the user split ("Show on its own") is a new grouping: the

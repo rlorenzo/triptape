@@ -1274,6 +1274,7 @@ fn export_blocking(
         hop_clips: vec![],
         back_cover: None,
         work_dir: None,
+        draft: false,
         // The same dir the CLI uses, so `triptape cache` sees the app's
         // segments: macOS ~/Library/Caches/app.triptape.desktop/segments.
         segment_cache: triptape_media::segment_cache::default_dir().map(|dir| {

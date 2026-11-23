@@ -8,7 +8,7 @@
 //!                [--solo REF...] [--unsolo REF...] [--live REF...] [--unlive REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--frame REF X Y W H]... [--unframe REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--resolution 4k|1080p] [--jobs N] [--quiet]
-//!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE] [--work-dir DIR]
+//!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE] [--work-dir DIR] [--draft]
 //! triptape cache stats|clear [--segment-cache DIR]
 //! triptape pick --db trip.db --out /path/to/new-folder [--count 800] [--project ID] [--stills-only]
 //! triptape maps --itinerary itinerary.json --out /path/to/out [--db trip.db] [--title TEXT] [--resolution 4k|1080p] [--page WxH] [--stills-only]
@@ -26,6 +26,15 @@
 //! clone. With either on a network share (SMB has no hard links) every
 //! reused segment is copied in full, about 14 GB for a 16-minute 4K film
 //! on each export.
+//!
+//! `export --draft` renders the film for reviewing an edit, in minutes:
+//! `hero-draft.mp4` (with `hero-draft.srt` and `hero-draft.edl.json`),
+//! beside any `hero.mp4`, which it leaves alone. A draft is the same film
+//! (the same cached 4K segments, cuts, burned captions and music, so the
+//! timing is the keepsake's) joined at 1080p with Apple's hardware encoder
+//! (`hevc_videotoolbox`, else `h264_videotoolbox`, else libx264
+//! ultrafast). It is for review only: the hardware encoder has no strict
+//! bitrate cap, so render without `--draft` for the film to keep.
 //!
 //! `scan` and `export` take `--ffmpeg`, `--ffprobe` (and `export` `--typst`)
 //! paths; without them each tool comes from `TRIPTAPE_FFMPEG` and friends,
@@ -872,6 +881,8 @@ fn export_cmd(flags: &HashMap<String, String>) {
         die("back-cover", format!("not found: {}", p.display()));
     }
     let segment_cache = segment_cache_config(flags);
+    // A draft of the film for reviewing an edit: 1080p, fastest encoder.
+    let draft = flags.get("draft").is_some_and(|v| v != "false");
     // The film's scratch files go beside the output unless moved (to a
     // local disk, when the output is on a network share).
     let work_dir = flags.get("work-dir").map(|v| {
@@ -912,6 +923,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             hop_clips,
             back_cover,
             work_dir,
+            draft,
             known_faces,
         },
     );
@@ -919,7 +931,11 @@ fn export_cmd(flags: &HashMap<String, String>) {
     let report = exported.unwrap_or_else(|e| die("export", e));
 
     if let Some(v) = &report.video {
-        println!("video: {v}");
+        if report.draft {
+            println!("video (draft, for review only): {v}");
+        } else {
+            println!("video: {v}");
+        }
     }
     if let Some(c) = &report.segment_cache {
         println!(
