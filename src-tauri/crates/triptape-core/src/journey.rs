@@ -34,6 +34,8 @@ pub struct JourneyNode {
     /// City label shown at the stop; `None` for waypoints (an embarkation
     /// terminal, a loop's return).
     pub label: Option<String>,
+    /// The stop's itinerary name, even when its map label is hidden.
+    pub name: String,
     pub pin: bool,
     /// The day the owner arrives here, when the itinerary says.
     pub arrive: Option<jiff::civil::Date>,
@@ -117,9 +119,14 @@ fn wrapped(p: (f64, f64)) -> (f64, f64) {
 /// arrival airport is rarely the house (LAX to Ontario is 50 km).
 pub const HOME_REACH_M: f64 = 150_000.0;
 
+/// Whether `gps` is within [`HOME_REACH_M`] of the home stop at `home`.
+fn within_home_reach(gps: (f64, f64), home: (f64, f64)) -> bool {
+    crate::geo::haversine_m(gps, home) <= HOME_REACH_M
+}
+
 /// Whether a shot at `gps` was taken back home, at `hop`'s destination.
 fn at_home(hop: &Hop, gps: Option<(f64, f64)>) -> bool {
-    gps.is_some_and(|g| crate::geo::haversine_m(g, hop.pos) <= HOME_REACH_M)
+    gps.is_some_and(|g| within_home_reach(g, hop.pos))
 }
 
 /// Where each hop plays in a film whose shots were taken at `shots` (unix
@@ -247,6 +254,24 @@ impl Journey {
         self.schedule().total_secs
     }
 
+    /// Whether `gps` is back home: within [`HOME_REACH_M`] of a stop the
+    /// trip starts or ends at.
+    pub fn near_home(&self, gps: (f64, f64)) -> bool {
+        self.nodes
+            .iter()
+            .filter(|n| n.home)
+            .any(|n| within_home_reach(gps, wrapped(n.pos)))
+    }
+
+    /// The names of the stops the trip starts or ends at (`Los Angeles`),
+    /// including a home stop whose map label is hidden.
+    pub fn home_labels(&self) -> impl Iterator<Item = &str> {
+        self.nodes
+            .iter()
+            .filter(|n| n.home)
+            .map(|n| n.name.as_str())
+    }
+
     /// The journey as hops between named stops, for a film that shows each
     /// one where the trip reaches it. A waypoint (an embarkation terminal)
     /// joins the hop that leaves it.
@@ -335,6 +360,7 @@ impl Journey {
         let node = |stop: &ItinStop, label: Option<String>| JourneyNode {
             pos: stop.pos(),
             label,
+            name: stop.label.clone(),
             pin: false,
             // A stop with only a departure is there that day (the same
             // reading as the itinerary's own stop window).
@@ -777,6 +803,11 @@ mod tests {
         assert_eq!(hops[8].day, Some(jiff::civil::date(2026, 10, 26)));
         assert!(hops[9].home && !hops[0].home);
         assert_eq!(
+            j.home_labels().collect::<Vec<_>>(),
+            ["Los Angeles", "Los Angeles"],
+            "the arrival home counts even with its map label hidden"
+        );
+        assert_eq!(
             date_span(
                 jiff::civil::date(2026, 10, 30),
                 jiff::civil::date(2026, 11, 2)
@@ -828,6 +859,8 @@ mod tests {
         gps[9] = Some((34.06, -117.6));
         let home_cuts = hop_cuts(&hops, &shots, &gps);
         assert_eq!(home_cuts[9], 9, "home before the shot taken at home");
+        assert!(j.near_home((34.06, -117.6)), "Ontario is home");
+        assert!(!j.near_home((1.36, 103.99)), "Changi is not");
         // The departure shot at the home airport predates the hop home, so
         // it does not pull the hop home to the start.
         gps[0] = Some((33.94, -118.41));
