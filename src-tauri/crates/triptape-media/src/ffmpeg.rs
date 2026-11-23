@@ -312,6 +312,99 @@ pub fn film_encode_args(caps: &Capabilities, res: Resolution) -> Vec<String> {
     args
 }
 
+/// Frame size of a draft film, whatever the film's own: the 4K segments
+/// are scaled down where they are joined.
+pub const DRAFT_RESOLUTION: Resolution = Resolution::Hd1080;
+/// Video bitrate of a draft film, kbit/s.
+pub const DRAFT_FILM_KBPS: u32 = 10_000;
+/// Video bitrate of a draft's pre-joined chunks, kbit/s: higher than the
+/// film's, since the final pass encodes them once more.
+pub const DRAFT_CHUNK_KBPS: u32 = 20_000;
+
+/// The encoder of a draft film ([`draft_encode_args`]), fastest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftEncoder {
+    /// Apple's hardware HEVC encoder.
+    HevcVideotoolbox,
+    /// Apple's hardware H.264 encoder.
+    H264Videotoolbox,
+    /// Software H.264 at its fastest preset: any FFmpeg with libx264.
+    X264Ultrafast,
+}
+
+impl DraftEncoder {
+    /// FFmpeg's name for the encoder.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::HevcVideotoolbox => "hevc_videotoolbox",
+            Self::H264Videotoolbox => "h264_videotoolbox",
+            Self::X264Ultrafast => "libx264",
+        }
+    }
+}
+
+/// The encoder a draft uses on this machine: a VideoToolbox one this
+/// FFmpeg lists and that really encodes here, HEVC before H.264, else
+/// libx264 ultrafast.
+pub fn draft_encoder(caps: &Capabilities) -> DraftEncoder {
+    pick_draft_encoder(caps, |name| encoder_works(&caps.ffmpeg_bin, name))
+}
+
+/// [`draft_encoder`] with the trial encode swappable. `works` is asked
+/// only about encoders the capability probe found listed.
+fn pick_draft_encoder(caps: &Capabilities, works: impl Fn(&str) -> bool) -> DraftEncoder {
+    let usable = |listed: bool, e: DraftEncoder| listed && works(e.name());
+    if usable(caps.hevc_videotoolbox, DraftEncoder::HevcVideotoolbox) {
+        DraftEncoder::HevcVideotoolbox
+    } else if usable(caps.h264_videotoolbox, DraftEncoder::H264Videotoolbox) {
+        DraftEncoder::H264Videotoolbox
+    } else {
+        DraftEncoder::X264Ultrafast
+    }
+}
+
+/// Whether `encoder` encodes a few 1080p frames here. A hardware encoder
+/// can be compiled in and still fail: a virtual machine or a CI runner
+/// has no encoder hardware behind it.
+fn encoder_works(ffmpeg_bin: &str, encoder: &str) -> bool {
+    let (w, h) = DRAFT_RESOLUTION.dims();
+    let src = format!("color=c=black:s={w}x{h}:r=30:d=0.2");
+    let args = ["-v", "error", "-f", "lavfi", "-i", &src, "-c:v", encoder];
+    Command::new(ffmpeg_bin)
+        .args(args)
+        .args(["-b:v", "4000k", "-f", "null", "-"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Encode of a draft film or of one of its chunks (video and audio), for
+/// reviewing an edit within minutes: fast, at `kbps` on average, 8-bit.
+/// None of this is the keepsake's recipe ([`film_encode_args`]): a
+/// VideoToolbox encoder has no strict second-by-second rate cap, so its
+/// peaks can outrun a Roku's link, and there is no 10-bit and no x265.
+/// HEVC is tagged `hvc1` for Apple players. Audio and faststart as
+/// [`x264_aac`]; libx264 runs at a constant quality instead of `kbps`.
+pub fn draft_encode_args(encoder: DraftEncoder, kbps: u32) -> Vec<String> {
+    let hardware = |tag: &[&str]| {
+        let mut args: Vec<String> = vec!["-c:v".into(), encoder.name().into()];
+        args.extend(["-b:v".into(), format!("{kbps}k")]);
+        args.extend(tag.iter().map(|t| t.to_string()));
+        args.extend(pix_fmt_aac_faststart("yuv420p"));
+        args
+    };
+    match encoder {
+        DraftEncoder::HevcVideotoolbox => hardware(&["-tag:v", "hvc1"]),
+        DraftEncoder::H264Videotoolbox => hardware(&[]),
+        DraftEncoder::X264Ultrafast => x264_aac("ultrafast", 20),
+    }
+}
+
+/// Filter scaling a stream to the `w`x`h` draft frame (square pixels).
+pub fn draft_scale(w: u32, h: u32) -> String {
+    format!("scale={w}:{h}:flags=bilinear,setsar=1")
+}
+
 /// Encoder/filter capabilities relevant to the three renderers.
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
@@ -322,6 +415,10 @@ pub struct Capabilities {
     pub libx265: bool,
     /// The HEVC encoder can write 10-bit (Main10) video.
     pub libx265_10bit: bool,
+    /// This FFmpeg lists Apple's hardware HEVC / H.264 encoder. Listed is
+    /// not yet working: [`draft_encoder`] tries it before a draft uses it.
+    pub hevc_videotoolbox: bool,
+    pub h264_videotoolbox: bool,
     pub aac: bool,
     pub xfade: bool,
     pub perspective: bool,
@@ -344,6 +441,9 @@ pub struct Capabilities {
     pub progress: crate::progress::Progress,
     /// Hero-segment render cache for the running export (`None`: off).
     pub segment_cache: Option<std::sync::Arc<crate::segment_cache::SegmentCache>>,
+    /// Cache of the film's pre-joined chunks (`None`: every chunk is
+    /// joined afresh).
+    pub chunk_cache: Option<std::sync::Arc<crate::segment_cache::SegmentCache>>,
 }
 
 impl Capabilities {
@@ -476,6 +576,8 @@ pub fn probe_capabilities(ffmpeg_bin: &str, ffprobe_bin: &str) -> Capabilities {
             && x265_writes_10bit(
                 run_capture(ffmpeg_bin, &["-hide_banner", "-h", "encoder=libx265"]).as_deref(),
             ),
+        hevc_videotoolbox: flag_present(&encoders, "hevc_videotoolbox"),
+        h264_videotoolbox: flag_present(&encoders, "h264_videotoolbox"),
         aac: flag_present(&encoders, "aac"),
         xfade: filter("xfade"),
         perspective: filter("perspective"),
@@ -1701,6 +1803,84 @@ mod tests {
         let hd = film_encode_args(&with, Resolution::Hd1080);
         assert_eq!(at(&hd, "-c:v"), "libx264");
         assert_eq!(at(&hd, "-maxrate"), "15000k");
+    }
+
+    #[test]
+    fn a_draft_encodes_fast_and_never_with_the_keepsake_recipe() {
+        let at = arg_after;
+        let hevc = draft_encode_args(DraftEncoder::HevcVideotoolbox, DRAFT_FILM_KBPS);
+        assert_eq!(at(&hevc, "-c:v"), "hevc_videotoolbox");
+        assert_eq!(at(&hevc, "-b:v"), "10000k");
+        assert_eq!(at(&hevc, "-tag:v"), "hvc1");
+        assert_eq!(at(&hevc, "-pix_fmt"), "yuv420p");
+        assert_eq!((at(&hevc, "-c:a"), at(&hevc, "-ar")), ("aac", "48000"));
+        assert_eq!(at(&hevc, "-movflags"), "+faststart");
+        let avc = draft_encode_args(DraftEncoder::H264Videotoolbox, DRAFT_CHUNK_KBPS);
+        assert_eq!(at(&avc, "-c:v"), "h264_videotoolbox");
+        assert_eq!(at(&avc, "-b:v"), "20000k");
+        assert!(!avc.iter().any(|a| a == "-tag:v"), "hvc1 is for HEVC only");
+        let soft = draft_encode_args(DraftEncoder::X264Ultrafast, DRAFT_FILM_KBPS);
+        assert_eq!(at(&soft, "-c:v"), "libx264");
+        assert_eq!(at(&soft, "-preset"), "ultrafast");
+        // No Main10, no rate cap, no x265 in any of them.
+        for args in [&hevc, &avc, &soft] {
+            for keepsake_only in ["-profile:v", "-x265-params", "-maxrate", "-bufsize"] {
+                assert!(!args.iter().any(|a| a == keepsake_only), "{args:?}");
+            }
+            assert!(!args.iter().any(|a| a == "libx265" || a == "yuv420p10le"));
+        }
+        assert_eq!(DRAFT_RESOLUTION.dims(), (1920, 1080));
+        assert_eq!(
+            draft_scale(1920, 1080),
+            "scale=1920:1080:flags=bilinear,setsar=1"
+        );
+    }
+
+    #[test]
+    fn a_draft_uses_videotoolbox_only_where_it_is_listed_and_works() {
+        let caps = |hevc, h264| Capabilities {
+            libx264: true,
+            hevc_videotoolbox: hevc,
+            h264_videotoolbox: h264,
+            ..Default::default()
+        };
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        let pick = |c: &Capabilities, working: &[&str]| {
+            asked.borrow_mut().clear();
+            pick_draft_encoder(c, |name| {
+                asked.borrow_mut().push(name.to_string());
+                working.contains(&name)
+            })
+        };
+        let both = ["hevc_videotoolbox", "h264_videotoolbox"];
+        // HEVC first when it works.
+        assert_eq!(
+            pick(&caps(true, true), &both),
+            DraftEncoder::HevcVideotoolbox
+        );
+        assert_eq!(*asked.borrow(), ["hevc_videotoolbox"]);
+        // Listed but failing (no hardware): the next one down.
+        assert_eq!(
+            pick(&caps(true, true), &["h264_videotoolbox"]),
+            DraftEncoder::H264Videotoolbox
+        );
+        assert_eq!(
+            pick(&caps(false, true), &both),
+            DraftEncoder::H264Videotoolbox
+        );
+        assert_eq!(pick(&caps(true, true), &[]), DraftEncoder::X264Ultrafast);
+        // Not listed: never tried, whatever the machine could do.
+        assert_eq!(
+            pick(&caps(false, false), &both),
+            DraftEncoder::X264Ultrafast
+        );
+        assert!(asked.borrow().is_empty());
+        // The probe reads the listing by whole encoder names.
+        let listing = " V....D hevc_videotoolbox    VideoToolbox H.265 Encoder (codec hevc)\n";
+        assert!(flag_present(listing, "hevc_videotoolbox"));
+        assert!(!flag_present(listing, "h264_videotoolbox"));
+        // A binary that cannot start never counts as working.
+        assert!(!encoder_works("/nonexistent/ffmpeg", "hevc_videotoolbox"));
     }
 
     #[test]

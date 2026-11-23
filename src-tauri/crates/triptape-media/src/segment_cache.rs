@@ -12,7 +12,16 @@
 //! <dir>/<kk>/<key>.json     sidecar: size, planned seconds
 //! <dir>/leases/<id>.lease   one per running export (pid + start time)
 //! <dir>/.tmp-*              in-flight writes; never read
+//! <dir>/chunks/             the chunk cache: the same layout once more
 //! ```
+//!
+//! # Chunks
+//!
+//! A long film's segments are pre-joined in chunks before the final encode
+//! (see `render_video`). A joined chunk is cached too, in a cache of its own
+//! under `chunks/` ([`SegmentCacheConfig::chunks`]) with its own size limit:
+//! chunks are several times the size of a segment, and sharing one limit
+//! they would push the segments they were made from out of the cache.
 //!
 //! # Atomic writes
 //!
@@ -61,6 +70,16 @@ pub const SEGMENT_CACHE_VERSION: u32 = 2;
 
 /// Default size limit of the cache.
 pub const DEFAULT_CAP_BYTES: u64 = 20 << 30;
+/// Default size limit of the chunk cache: room for a long 4K film's
+/// keepsake chunks (near-lossless, about 10 GB) and its draft ones.
+pub const DEFAULT_CHUNK_CAP_BYTES: u64 = 16 << 30;
+/// The chunk cache's folder inside the segment cache's.
+const CHUNKS_DIR: &str = "chunks";
+
+/// Where the chunk cache of the segment cache at `dir` lives.
+pub fn chunk_dir(dir: &Path) -> PathBuf {
+    dir.join(CHUNKS_DIR)
+}
 /// Default free-space floor: the smaller of this and
 /// [`FLOOR_FRACTION_PCT`] percent of the volume.
 pub const DEFAULT_MIN_FREE_BYTES: u64 = 10 << 30;
@@ -90,6 +109,8 @@ pub struct SegmentCacheConfig {
     pub dir: PathBuf,
     /// Size limit. `None`: [`DEFAULT_CAP_BYTES`].
     pub max_bytes: Option<u64>,
+    /// Size limit of the chunk cache. `None`: [`DEFAULT_CHUNK_CAP_BYTES`].
+    pub chunk_max_bytes: Option<u64>,
     /// Free-space floor. `None`: min([`DEFAULT_MIN_FREE_BYTES`], 5% of the
     /// volume's total size).
     pub min_free_bytes: Option<u64>,
@@ -105,9 +126,20 @@ impl SegmentCacheConfig {
         Self {
             dir,
             max_bytes: None,
+            chunk_max_bytes: None,
             min_free_bytes: None,
             #[cfg(test)]
             fake_disk: None,
+        }
+    }
+
+    /// The chunk cache that goes with this segment cache: its own folder
+    /// and size limit, the same free-space floor.
+    pub fn chunks(&self) -> Self {
+        Self {
+            dir: chunk_dir(&self.dir),
+            max_bytes: Some(self.chunk_max_bytes.unwrap_or(DEFAULT_CHUNK_CAP_BYTES)),
+            ..self.clone()
         }
     }
 
@@ -366,6 +398,8 @@ pub struct SegmentCache {
     /// Key of the entry each work-dir path was filled from or stored as, so a
     /// later stage (the overlay) can key itself on the base segment.
     keys_by_path: Mutex<std::collections::HashMap<PathBuf, String>>,
+    /// Key of the overlay baked onto each work-dir path, if any.
+    overlays_by_path: Mutex<std::collections::HashMap<PathBuf, String>>,
 }
 
 impl std::fmt::Debug for SegmentCache {
@@ -398,6 +432,7 @@ impl SegmentCache {
             lease_path: Mutex::new(None),
             stats: Mutex::new(UseStats::default()),
             keys_by_path: Mutex::new(Default::default()),
+            overlays_by_path: Mutex::new(Default::default()),
         };
         let lease = Lease {
             pid: std::process::id(),
@@ -492,12 +527,36 @@ impl SegmentCache {
                 s.overlay_misses += 1
             }
         });
+        if hit {
+            self.note_overlay(dest, key);
+        }
         hit
     }
 
     /// [`store`](Self::store) for a lower-third overlay.
     pub fn store_overlay(&self, key: &str, produced: &Path, secs: f64) -> bool {
+        self.note_overlay(produced, key);
         self.store_entry(key, produced, secs).0
+    }
+
+    /// Key naming what is at `path` now: its overlay's key once a
+    /// lower-third was baked onto it, else [`key_of`](Self::key_of). A chunk
+    /// is keyed on these, so a changed heading re-joins its chunk.
+    pub fn content_key_of(&self, path: &Path) -> Option<String> {
+        let overlaid = self
+            .overlays_by_path
+            .lock()
+            .expect("keys lock")
+            .get(path)
+            .cloned();
+        overlaid.or_else(|| self.key_of(path))
+    }
+
+    fn note_overlay(&self, path: &Path, key: &str) {
+        self.overlays_by_path
+            .lock()
+            .expect("keys lock")
+            .insert(path.to_path_buf(), key.to_string());
     }
 
     /// Key the segment at `path` was fetched or offered to the cache under,
@@ -1098,8 +1157,68 @@ mod tests {
         let s = c.stats();
         assert_eq!((s.overlay_hits, s.overlay_misses), (1, 1), "{s:?}");
         assert_eq!((s.hits, s.misses, s.stored), (0, 0, 1), "{s:?}");
-        // An overlay fetch does not rebind the path to the overlay key.
+        // An overlay fetch does not rebind the path to the overlay key,
+        // but the path's content is known by it.
         assert_eq!(c.key_of(&dest), None);
+        assert_eq!(c.content_key_of(&dest).as_deref(), Some(ov_key.as_str()));
+        assert_eq!(c.content_key_of(&seg).as_deref(), Some(ov_key.as_str()));
+        assert_eq!(c.key_of(&seg).as_deref(), Some(seg_key.as_str()));
+        let plain = produce(&work, "seg_002.mp4", 10);
+        assert!(c.store(&seg_key, &plain, 4.0));
+        assert_eq!(c.content_key_of(&plain).as_deref(), Some(seg_key.as_str()));
+    }
+
+    /// Chunks live inside the segment cache's folder under their own limit:
+    /// filling the chunk cache evicts chunks, never segments, and neither
+    /// cache counts or clears the other's entries.
+    #[test]
+    fn the_chunk_cache_has_its_own_budget() {
+        let t = tempfile::tempdir().unwrap();
+        let (dir, work) = (t.path().join("cache"), t.path().join("work"));
+        std::fs::create_dir_all(&work).unwrap();
+        let seg_cfg = SegmentCacheConfig {
+            chunk_max_bytes: Some(250),
+            ..cfg(&dir, Some(1000))
+        };
+        let chunk_cfg = seg_cfg.chunks();
+        assert_eq!(chunk_cfg.dir, chunk_dir(&dir));
+        assert_eq!(chunk_cfg.max_bytes, Some(250));
+        assert_eq!(
+            SegmentCacheConfig::new(dir.clone()).chunks().max_bytes,
+            Some(DEFAULT_CHUNK_CAP_BYTES)
+        );
+        let key = |c: &SegmentCache, name: &str| {
+            let mut k = c.key("test");
+            k.part("name", name);
+            k.finish()
+        };
+        let segs = SegmentCache::open(&seg_cfg, "v".into(), &work).unwrap();
+        let chunks = SegmentCache::open(&chunk_cfg, "v".into(), &work).unwrap();
+        for name in ["s1", "s2", "s3"] {
+            assert!(segs.store(&key(&segs, name), &produce(&work, name, 100), 1.0));
+        }
+        for (i, name) in ["c1", "c2", "c3", "c4"].into_iter().enumerate() {
+            let k = key(&chunks, name);
+            assert!(chunks.store(&k, &produce(&work, name, 100), 1.0));
+            set_age(
+                &entry_path(&chunk_cfg.dir, &k, "mp4"),
+                4000 - 100 * i as u64,
+            );
+        }
+        assert_eq!(disk_stats(&dir).entries, 3, "segments only");
+        assert_eq!(disk_stats(&chunk_cfg.dir).entries, 4);
+        // The chunk cache trims itself to its own limit, oldest first.
+        let evicted = chunks.finish();
+        assert_eq!((evicted.removed, evicted.freed), (2, 200));
+        assert!(read_valid(&chunk_cfg.dir, &key(&chunks, "c1")).is_none());
+        assert!(read_valid(&chunk_cfg.dir, &key(&chunks, "c4")).is_some());
+        // Every segment is still there, and clearing the segments leaves
+        // the chunks.
+        assert_eq!(segs.finish().removed, 0);
+        assert_eq!(disk_stats(&dir).entries, 3);
+        assert_eq!(clear(&dir).removed, 3);
+        assert_eq!(disk_stats(&chunk_cfg.dir).entries, 2);
+        assert!(chunk_cfg.dir.join("leases").is_dir());
     }
 
     /// A fetch whose entry vanished mid-way must not take the existing

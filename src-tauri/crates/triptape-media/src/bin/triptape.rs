@@ -8,8 +8,8 @@
 //!                [--solo REF...] [--unsolo REF...] [--live REF...] [--unlive REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--frame REF X Y W H]... [--unframe REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--resolution 4k|1080p] [--jobs N] [--quiet]
-//!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
-//! triptape cache stats|clear [--segment-cache DIR]
+//!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE] [--chunk-cache-max SIZE] [--work-dir DIR] [--draft]
+//! triptape cache stats|clear [--segment-cache DIR] [--chunk-cache-max SIZE]
 //! triptape pick --db trip.db --out /path/to/new-folder [--count 800] [--project ID] [--stills-only]
 //! triptape maps --itinerary itinerary.json --out /path/to/out [--db trip.db] [--title TEXT] [--resolution 4k|1080p] [--page WxH] [--stills-only]
 //! ```
@@ -17,6 +17,32 @@
 //! Without `--home` or `--segment-cache-max`, `plan`, `export` and `cache`
 //! use the home and limit saved in the app's Settings (`TRIPTAPE_SETTINGS`
 //! names another settings file).
+//!
+//! `export` keeps the film's scratch files in `<out>/.work` unless
+//! `--work-dir DIR` names another folder for them (the finished keepsakes
+//! still land in `--out`). Keep the work dir and the segment cache
+//! (`--segment-cache DIR`, by default the platform cache dir) on the same
+//! local disk: a cached segment is then reused by a hard link or an APFS
+//! clone. With either on a network share (SMB has no hard links) every
+//! reused segment is copied in full, about 14 GB for a 16-minute 4K film
+//! on each export.
+//!
+//! A long film (over 40 segments) is joined in chunks, cut at chapter
+//! starts, before its final encode. The joined chunks are cached too, in
+//! `chunks/` inside the segment cache folder, under their own limit
+//! (`--chunk-cache-max SIZE`, 16 GB by default; a 16-minute 4K film's
+//! chunks take about 10 GB, its draft's about 2 GB). After an edit only
+//! the chunk holding the edited shots is joined again; `cache stats` and
+//! `cache clear` cover both caches.
+//!
+//! `export --draft` renders the film for reviewing an edit, in minutes:
+//! `hero-draft.mp4` (with `hero-draft.srt` and `hero-draft.edl.json`),
+//! beside any `hero.mp4`, which it leaves alone. A draft is the same film
+//! (the same cached 4K segments, cuts, burned captions and music, so the
+//! timing is the keepsake's) joined at 1080p with Apple's hardware encoder
+//! (`hevc_videotoolbox`, else `h264_videotoolbox`, else libx264
+//! ultrafast). It is for review only: the hardware encoder has no strict
+//! bitrate cap, so render without `--draft` for the film to keep.
 //!
 //! `scan` and `export` take `--ffmpeg`, `--ffprobe` (and `export` `--typst`)
 //! paths; without them each tool comes from `TRIPTAPE_FFMPEG` and friends,
@@ -863,6 +889,19 @@ fn export_cmd(flags: &HashMap<String, String>) {
         die("back-cover", format!("not found: {}", p.display()));
     }
     let segment_cache = segment_cache_config(flags);
+    // A draft of the film for reviewing an edit: 1080p, fastest encoder.
+    let draft = flags.get("draft").is_some_and(|v| v != "false");
+    // The film's scratch files go beside the output unless moved (to a
+    // local disk, when the output is on a network share).
+    let work_dir = flags.get("work-dir").map(|v| {
+        let dir = PathBuf::from(v);
+        if v == "true" || v.is_empty() {
+            die("work-dir", "want a folder");
+        }
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| die("work-dir", format!("{}: {e}", dir.display())));
+        dir
+    });
     // Only the book crops around faces; skip loading the models otherwise.
     let faces = matches!(only.as_str(), "all" | "book")
         .then(|| book_faces(flags))
@@ -891,6 +930,8 @@ fn export_cmd(flags: &HashMap<String, String>) {
             map_style,
             hop_clips,
             back_cover,
+            work_dir,
+            draft,
             known_faces,
         },
     );
@@ -898,12 +939,22 @@ fn export_cmd(flags: &HashMap<String, String>) {
     let report = exported.unwrap_or_else(|e| die("export", e));
 
     if let Some(v) = &report.video {
-        println!("video: {v}");
+        if report.draft {
+            println!("video (draft, for review only): {v}");
+        } else {
+            println!("video: {v}");
+        }
     }
     if let Some(c) = &report.segment_cache {
         println!(
             "video: segments reused {}/{} from cache, overlays {}/{} ({} new, {} evicted; {})",
             c.reused, c.total, c.overlays_reused, c.overlays_total, c.stored, c.evicted, c.dir
+        );
+    }
+    if let Some(c) = &report.chunk_cache {
+        println!(
+            "video: chunks reused {}/{} from cache ({} new, {} evicted; {})",
+            c.reused, c.total, c.stored, c.evicted, c.dir
         );
     }
     for r in &report.reels {
@@ -941,8 +992,10 @@ fn segment_cache_config(flags: &HashMap<String, String>) -> Option<SegmentCacheC
         eprintln!("segment cache off: no cache directory on this platform");
     }
     let min_free_bytes = cache_min_free_flag(flags);
+    let chunk_max_bytes = chunk_max_flag(flags);
     dir.map(|dir| SegmentCacheConfig {
         max_bytes,
+        chunk_max_bytes,
         min_free_bytes,
         ..SegmentCacheConfig::new(dir)
     })
@@ -962,6 +1015,13 @@ fn cache_max_flag(flags: &HashMap<String, String>) -> Option<u64> {
         .get("segment-cache-max")
         .map(|v| segment_cache::parse_size(v).unwrap_or_else(|e| die("segment-cache-max", e)))
         .or_else(|| saved_settings().segment_cache_max_bytes)
+}
+
+/// `--chunk-cache-max SIZE`, when given.
+fn chunk_max_flag(flags: &HashMap<String, String>) -> Option<u64> {
+    flags
+        .get("chunk-cache-max")
+        .map(|v| segment_cache::parse_size(v).unwrap_or_else(|e| die("chunk-cache-max", e)))
 }
 
 /// `--segment-cache-min-free SIZE`, when given.
@@ -1003,9 +1063,20 @@ fn cache_cmd(sub: &str, flags: &HashMap<String, String>) {
                 free.map_or_else(|| "unknown".into(), size),
                 size(policy.headroom(st.bytes, free))
             );
+            let chunks = segment_cache::disk_stats(&segment_cache::chunk_dir(&dir));
+            println!(
+                "chunks: {}  size: {}  limit: {}",
+                chunks.entries,
+                size(chunks.bytes),
+                size(chunk_max_flag(flags).unwrap_or(segment_cache::DEFAULT_CHUNK_CAP_BYTES))
+            );
         }
         "clear" => {
-            let r = segment_cache::clear(&dir);
+            let mut r = segment_cache::clear(&dir);
+            let chunks = segment_cache::clear(&segment_cache::chunk_dir(&dir));
+            r.removed += chunks.removed;
+            r.freed += chunks.freed;
+            r.protected += chunks.protected;
             println!(
                 "removed {} entries ({})",
                 r.removed,

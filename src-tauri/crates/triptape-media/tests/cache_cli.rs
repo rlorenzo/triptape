@@ -51,6 +51,33 @@ fn stats_then_clear_empties_the_cache() {
     assert!(out.contains("entries: 0"), "{out}");
 }
 
+/// The film's joined chunks are cached in `chunks/` inside the segment
+/// cache folder: counted apart, under their own limit, cleared with it.
+#[test]
+fn stats_and_clear_cover_the_chunk_cache() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().to_str().unwrap();
+    entry(t.path(), "aa11", 2048);
+    entry(&t.path().join("chunks"), "dd44", 4096);
+
+    let stats = ["cache", "stats", "--segment-cache", dir];
+    let (ok, out) = triptape(&[&stats[..], &["--chunk-cache-max", "2GB"]].concat());
+    assert!(ok);
+    assert!(out.contains("entries: 1 "), "{out}");
+    assert!(
+        out.contains("chunks: 1  size: 4.0 KB  limit: 2.0 GB"),
+        "{out}"
+    );
+    let (_, out) = triptape(&stats);
+    assert!(out.contains("limit: 16.0 GB"), "{out}");
+
+    let (ok, out) = triptape(&["cache", "clear", "--segment-cache", dir]);
+    assert!(ok);
+    assert!(out.contains("removed 2 entries"), "{out}");
+    let (_, out) = triptape(&stats);
+    assert!(out.contains("chunks: 0 "), "{out}");
+}
+
 #[test]
 fn clear_keeps_entries_a_running_export_uses() {
     let t = tempfile::tempdir().unwrap();
