@@ -144,6 +144,8 @@ pub struct BookPhoto {
     pub whole: bool,
     /// In one of the owner's page groups: its stretch prints on one page.
     pub page_group: bool,
+    /// The photo's place is a city the trip stopped in (not a sight).
+    pub place_is_city: bool,
     /// The itinerary puts the shot on board the ship.
     pub aboard: bool,
     /// Detected faces (normalised boxes), when the face models ran: page
@@ -193,6 +195,7 @@ impl BookPhoto {
             feature: false,
             whole: false,
             page_group: false,
+            place_is_city: false,
             aboard: false,
             faces: vec![],
             closing: false,
@@ -2114,6 +2117,20 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
     let Some((head, place)) = title.split_once(" — ") else {
         return title.to_string();
     };
+    // The ship first, then the cities, then the sights, each in the order
+    // visited: "Carnival Luminosa · Fukuoka · Nanzoin Temple", "Singapore ·
+    // Jewel Changi Airport".
+    let rank = |pl: &str| {
+        let shots = || slot.iter().filter(|p| p.place.as_deref() == Some(pl));
+        if shots().any(|p| p.aboard) {
+            0
+        } else if shots().any(|p| p.place_is_city) {
+            1
+        } else {
+            2
+        }
+    };
+
     let mut seen: Vec<&str> = vec![];
     // On board, the ship alone: no deck or lounge ("Lido Deck") after it.
     let mut aboard_named = false;
@@ -2147,11 +2164,14 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
             // The page shows other places than the day's: the heading names
             // what the page shows (a mall, not the restaurant). A page with
             // no placed photo keeps the day's place.
+            // No placed photo: the day and date alone, never a place the
+            // page does not show.
             if seen.is_empty() {
-                return title.to_string();
+                return head.to_string();
             }
             let listed = seen.clone();
             seen.retain(|p| !listed.iter().any(|q| q != p && q.contains(p)));
+            seen.sort_by_key(|pl| rank(pl));
             seen.truncate(MAX_HEADING_PLACES);
             return format!("{head} — {}", seen.join(" \u{b7} "));
         }
@@ -2172,6 +2192,7 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
     // twice: a place already inside another listed place goes.
     let listed = seen.clone();
     seen.retain(|p| !listed.iter().any(|q| q != p && q.contains(p)));
+    seen.sort_by_key(|pl| rank(pl));
     seen.truncate(MAX_HEADING_PLACES);
     format!("{head} — {}", seen.join(" · "))
 }
@@ -3134,10 +3155,19 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
             })
             .collect();
         let biggest = shown.iter().copied().fold(0.0, f64::max);
-        if slot
-            .iter()
-            .zip(&shown)
-            .any(|(p, &a)| p.feature && a < biggest * 0.98)
+        // Clearly the biggest: every other photo at most 90% of it.
+        let featured_small = slot.iter().zip(&shown).any(|(p, &a)| {
+            p.feature
+                && slot
+                    .iter()
+                    .zip(&shown)
+                    .any(|(q, &b)| !std::ptr::eq(*p, *q) && !q.feature && b > a * 0.9)
+        });
+        if featured_small
+            || slot
+                .iter()
+                .zip(&shown)
+                .any(|(p, &a)| p.feature && a < biggest * 0.98)
         {
             cost += FEATURE_COST;
         }
@@ -4588,7 +4618,10 @@ mod tests {
             places_in_time_order(title, &[&tokyo]),
             "Day 5 · Wed, Oct 7 — Tokyo"
         );
-        assert_eq!(places_in_time_order(title, &[&BookPhoto::blank()]), title);
+        assert_eq!(
+            places_in_time_order(title, &[&BookPhoto::blank()]),
+            "Day 5 · Wed, Oct 7"
+        );
         let boarding = at("Carnival Luminosa Embarkation");
         let mut ship = at("Carnival Luminosa");
         ship.aboard = true;
@@ -4615,6 +4648,14 @@ mod tests {
             "Day 6 · Thu, Oct 8 — Tokyo · Tsukiji Outer Market · Togoshi Ginza"
         );
         assert_eq!(places_in_time_order("Day 5", &[&tokyo]), "Day 5");
+        // A city leads its sights, whatever order the photos came in.
+        let jewel = at("Jewel Changi Airport");
+        let mut singapore = at("Singapore");
+        singapore.place_is_city = true;
+        assert_eq!(
+            places_in_time_order("Day 28 — Jewel Changi Airport", &[&jewel, &singapore]),
+            "Day 28 — Singapore · Jewel Changi Airport"
+        );
         // A placeless photo does not shift where the port goes, and a spot
         // on board (a deck) is not listed after the ship.
         let mut deck = at("Lido Deck");

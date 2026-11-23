@@ -868,6 +868,12 @@ fn export_inner(
                 )
             })
             .collect();
+        // The trip's stop cities, to tell a city from a sight in headings.
+        let cities: HashSet<String> = opts
+            .itinerary
+            .as_ref()
+            .map(|i| i.stops.iter().map(|s| s.label.clone()).collect())
+            .unwrap_or_default();
         let layout = &plan.book_layout;
         for a in assets
             .iter()
@@ -967,6 +973,9 @@ fn export_inner(
                 feature: layout.feature.contains(&a.id),
                 whole: layout.whole.contains(&a.id),
                 page_group: false,
+                place_is_city: book_places
+                    .get(&a.id)
+                    .is_some_and(|pl| cities.contains(pl.as_str())),
             });
         }
         // A photo and the owner's `_edited` version of it are one photo:
