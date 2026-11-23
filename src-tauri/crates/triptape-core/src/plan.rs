@@ -11,8 +11,8 @@ use crate::cluster::{day_of, gps_outliers_in, same_day, story_positions, story_t
 use crate::embedding::{same_scene, Embedding};
 use crate::party::Track;
 use crate::types::{
-    distinct_assets, Asset, AssetKind, Chapter, CollageEdits, MusicPick, Plan, PlanEntry,
-    Rendition, Score,
+    distinct_assets, valid_frame, Asset, AssetKind, Chapter, CollageEdits, Frame, MusicPick, Plan,
+    PlanEntry, Rendition, Score,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -472,7 +472,11 @@ impl HeroGrouping {
         let by_id: HashMap<&str, &Asset> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
         Self::new(
             plan,
-            |id| by_id.get(id).and_then(|a| a.display_aspect()),
+            |id| {
+                by_id
+                    .get(id)
+                    .and_then(|a| a.framed_aspect(plan.frame.get(id).copied()))
+            },
             |id| by_id.get(id).and_then(|a| a.taken_at),
             |id| by_id.get(id).is_some_and(|a| a.path.exists()),
         )
@@ -843,7 +847,9 @@ pub fn estimate_plan_secs(plan: &Plan, assets: &[Asset]) -> f64 {
     let pano: HashMap<&str, f64> = assets
         .iter()
         .filter_map(|a| {
-            let asp = a.display_aspect().filter(|&x| is_panorama(x))?;
+            let asp = a
+                .framed_aspect(plan.frame.get(a.id.as_str()).copied())
+                .filter(|&x| is_panorama(x))?;
             Some((a.id.as_str(), pano_motion(asp).hold_secs))
         })
         .collect();
@@ -1221,6 +1227,11 @@ pub struct PlanEdits {
     /// [`apply_edits`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub motion: Vec<String>,
+    /// Photos the user set to play as a still ("Play as a still"), oldest
+    /// first: a Live Photo the planner chose for motion plays its still
+    /// instead, in a collage cell too. Mutually exclusive with `motion`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub still: Vec<String>,
     /// Film photos the user set to play on their own ("Show on its own")
     /// or joined into one collage ("Join with next"), oldest first. Stored
     /// flat (`solo`, `joins`) beside the other edits. See [`collage_slots`].
@@ -1233,6 +1244,9 @@ pub struct PlanEdits {
     /// Per-photo crop focus (see [`crate::types::Plan::crop`]).
     #[serde(default)]
     pub crop: BTreeMap<String, (u8, u8)>,
+    /// Per-photo film framing rectangle (see [`crate::types::Plan::frame`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub frame: BTreeMap<String, Frame>,
     /// Photos pinned into the book (see [`crate::types::Plan::book`]).
     #[serde(default)]
     pub book: Vec<String>,
@@ -1250,9 +1264,11 @@ impl PlanEdits {
             && self.caption_overrides.is_empty()
             && self.moves.is_empty()
             && self.motion.is_empty()
+            && self.still.is_empty()
             && self.collage.is_empty()
             && self.cover.is_empty()
             && self.crop.is_empty()
+            && self.frame.is_empty()
             && self.book.is_empty()
             && self.closing.is_none()
     }
@@ -1262,8 +1278,25 @@ impl PlanEdits {
     pub fn set_motion(&mut self, asset: String, on: bool) {
         self.motion.retain(|id| *id != asset);
         if on {
+            self.still.retain(|id| *id != asset);
             self.motion.push(asset);
         }
+    }
+
+    /// Force a photo to play as a still in the film (even a Live Photo the
+    /// planner chose for motion), or put it back to the planner's choice.
+    pub fn set_still(&mut self, asset: String, on: bool) {
+        self.still.retain(|id| *id != asset);
+        if on {
+            self.motion.retain(|id| *id != asset);
+            self.still.push(asset);
+        }
+    }
+
+    /// Set (or clear, `None`) the film framing rectangle of a photo or
+    /// clip. An invalid rectangle (see [`valid_frame`]) clears it.
+    pub fn set_frame(&mut self, asset: String, frame: Option<Frame>) {
+        set_pin(&mut self.frame, asset, frame.filter(|f| valid_frame(*f)));
     }
 
     /// Pin a photo into the book, or unpin it.
@@ -1610,6 +1643,14 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
         }
     }
 
+    // Photos the user set to play as a still, even one the planner chose
+    // for motion.
+    for e in &mut out.hero {
+        if edits.still.contains(&e.asset_id) && matches!(e.rendition, Rendition::Motion { .. }) {
+            e.rendition = Rendition::Still;
+        }
+    }
+
     // Exclusions: out of every pick and out of the book flow.
     out.hero.retain(|e| !dead.contains(e.asset_id.as_str()));
     out.reel_selects
@@ -1637,6 +1678,18 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
         .map(|(id, f)| (id.clone(), *f))
         .collect();
     out.crop = edits.crop.clone();
+    out.frame = edits
+        .frame
+        .iter()
+        .filter(|(id, f)| in_plan.contains(id.as_str()) && valid_frame(**f))
+        .map(|(id, f)| (id.clone(), *f))
+        .collect();
+    out.still = edits
+        .still
+        .iter()
+        .filter(|id| in_plan.contains(id.as_str()))
+        .cloned()
+        .collect();
     out.book = edits
         .book
         .iter()
@@ -2036,6 +2089,8 @@ pub fn build_plan_with_length(
         },
         cover: Default::default(),
         crop: Default::default(),
+        frame: Default::default(),
+        still: Default::default(),
         book: Default::default(),
         closing: Default::default(),
     }
@@ -5315,6 +5370,8 @@ mod tests {
             },
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
         };
@@ -5368,6 +5425,8 @@ mod tests {
             },
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
         };
@@ -5416,6 +5475,139 @@ mod tests {
     }
 
     #[test]
+    fn play_as_a_still_overrides_a_planned_motion_pick() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let assets = vec![
+            live_asset("lp", Some(2.0), true),
+            asset("ph", T0, AssetKind::Photo),
+        ];
+        let motion = Rendition::Motion {
+            trim_start: 0.0,
+            trim_end: 2.0,
+        };
+        let mut planned = still_entry("lp");
+        planned.rendition = motion.clone();
+        let plan = Plan {
+            plan_version: PLAN_VERSION,
+            schema_version: Plan::SCHEMA_VERSION,
+            hero: vec![planned, still_entry("ph")],
+            reel_selects: vec![],
+            chapters: vec![Chapter {
+                asset_ids: ids(&["lp", "ph"]),
+                ..Default::default()
+            }],
+            captions: Default::default(),
+            collage: Default::default(),
+            map_polyline: vec![],
+            music: MusicPick {
+                track: "t".into(),
+                rationale: "r".into(),
+            },
+            cover: Default::default(),
+            crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
+            book: Default::default(),
+            closing: Default::default(),
+        };
+        let rendition = |p: &Plan, id: &str| {
+            p.hero
+                .iter()
+                .find(|e| e.asset_id == id)
+                .map(|e| e.rendition.clone())
+        };
+        let mut edits = PlanEdits::default();
+        assert_eq!(
+            rendition(&apply_edits(&plan, &assets, &edits), "lp"),
+            Some(motion.clone())
+        );
+        edits.set_still("lp".into(), true);
+        edits.set_still("ph".into(), true);
+        let out = apply_edits(&plan, &assets, &edits);
+        assert_eq!(rendition(&out, "lp"), Some(Rendition::Still));
+        assert_eq!(rendition(&out, "ph"), Some(Rendition::Still));
+        // The renderer hears of it, so a collage cell stays a still too.
+        assert_eq!(out.still, ids(&["lp", "ph"]));
+        // --live and --unlive toggle cleanly.
+        edits.set_motion("lp".into(), true);
+        assert!(edits.motion == ids(&["lp"]) && edits.still == ids(&["ph"]));
+        let out = apply_edits(&plan, &assets, &edits);
+        assert_eq!(rendition(&out, "lp"), Some(motion));
+        edits.set_still("lp".into(), true);
+        assert!(edits.motion.is_empty() && edits.still == ids(&["ph", "lp"]));
+        edits.set_still("lp".into(), false);
+        edits.set_still("ph".into(), false);
+        assert!(edits.is_empty());
+        // Old edits load; an empty list is not stored; a set one counts.
+        let old: PlanEdits = serde_json::from_str(r#"{"excluded":["x"]}"#).unwrap();
+        assert!(old.still.is_empty() && old.frame.is_empty());
+        let json = serde_json::to_value(PlanEdits::default()).unwrap();
+        assert!(json.get("still").is_none() && json.get("frame").is_none());
+        assert!(!PlanEdits {
+            still: vec!["lp".into()],
+            ..Default::default()
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn a_film_frame_rides_onto_the_plan_and_changes_the_aspect() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let assets = vec![asset("a", T0, AssetKind::Photo)];
+        let plan = Plan {
+            plan_version: PLAN_VERSION,
+            schema_version: Plan::SCHEMA_VERSION,
+            hero: vec![still_entry("a")],
+            reel_selects: vec![],
+            chapters: vec![Chapter {
+                asset_ids: ids(&["a"]),
+                ..Default::default()
+            }],
+            captions: Default::default(),
+            collage: Default::default(),
+            map_polyline: vec![],
+            music: MusicPick {
+                track: "t".into(),
+                rationale: "r".into(),
+            },
+            cover: Default::default(),
+            crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
+            book: Default::default(),
+            closing: Default::default(),
+        };
+        let mut edits = PlanEdits::default();
+        edits.set_frame("a".into(), Some((10, 20, 50, 40)));
+        edits.set_frame("gone".into(), Some((0, 0, 50, 50)));
+        // A rectangle outside the photo is refused.
+        edits.set_frame("bad".into(), Some((60, 0, 50, 50)));
+        assert!(!edits.frame.contains_key("bad"));
+        assert!(!edits.is_empty());
+        let out = apply_edits(&plan, &assets, &edits);
+        assert_eq!(out.frame.get("a"), Some(&(10, 20, 50, 40)));
+        assert!(!out.frame.contains_key("gone"));
+        // The framed aspect is the source's times W / H.
+        assert!((crate::types::frame_aspect(1.5, (0, 0, 50, 100)) - 0.75).abs() < 1e-9);
+        let a = asset("a", T0, AssetKind::Photo);
+        if let Some(raw) = a.display_aspect() {
+            let framed = a.framed_aspect(Some((10, 20, 50, 40))).unwrap();
+            assert!((framed - raw * 50.0 / 40.0).abs() < 1e-9);
+        }
+        assert!(crate::types::valid_frame((0, 0, 100, 100)));
+        assert!(
+            !crate::types::valid_frame((0, 0, 0, 10)) && !crate::types::valid_frame((0, 0, 10, 0))
+        );
+        assert!(
+            !crate::types::valid_frame((91, 0, 10, 10))
+                && !crate::types::valid_frame((0, 91, 10, 10))
+        );
+        edits.set_frame("a".into(), None);
+        edits.set_frame("gone".into(), None);
+        assert!(edits.is_empty());
+    }
+
+    #[test]
     fn hero_grouping_reads_chapters_captions_aspect_and_presence() {
         let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let plan = Plan {
@@ -5454,6 +5646,8 @@ mod tests {
             },
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
         };

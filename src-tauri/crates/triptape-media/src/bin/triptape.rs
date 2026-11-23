@@ -5,7 +5,7 @@
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m] [--models DIR]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
-//!                [--solo REF...] [--unsolo REF...] [--live REF...] [--unlive REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--list]
+//!                [--solo REF...] [--unsolo REF...] [--live REF...] [--unlive REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--frame REF X Y W H]... [--unframe REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
@@ -27,6 +27,7 @@ use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use triptape_ai_local::local::{LocalModels, ModelPaths};
 use triptape_core::plan::{MoveRejection, PlanEdits};
+use triptape_core::types::{valid_frame, Frame};
 use triptape_core::{
     asset_ref, cluster,
     db::{Db, EditedPlan},
@@ -1040,8 +1041,8 @@ struct EditArgs {
     unexclude: Vec<String>,
     solo: Vec<String>,
     unsolo: Vec<String>,
-    /// Live Photos to play their motion in the film (`--live`), or back
-    /// to the planner's choice (`--unlive`).
+    /// Live Photos to play their motion in the film (`--live`), or to play
+    /// as a still, in a collage cell too (`--unlive`).
     live: Vec<String>,
     unlive: Vec<String>,
     join: Vec<(String, String)>,
@@ -1059,6 +1060,9 @@ struct EditArgs {
     /// Crop focus: (asset, x percent, y percent).
     crop: Vec<(String, u8, u8)>,
     uncrop: Vec<String>,
+    /// Film framing: (asset, x, y, w, h) in percent of the source.
+    frame: Vec<(String, Frame)>,
+    unframe: Vec<String>,
     /// Photos pinned into (or out of) the book.
     book: Vec<String>,
     unbook: Vec<String>,
@@ -1130,6 +1134,27 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     )
                 }
             },
+            "frame" => match <[String; 5]>::try_from(values) {
+                Ok([a, x, y, w, h]) => {
+                    let pct = |v: &str| {
+                        v.parse::<u8>()
+                            .ok()
+                            .filter(|p| *p <= 100)
+                            .ok_or_else(|| format!("--frame values must be 0-100, got {v:?}"))
+                    };
+                    let f = (pct(&x)?, pct(&y)?, pct(&w)?, pct(&h)?);
+                    if !valid_frame(f) {
+                        return Err(format!(
+                            "--frame W and H must be above 0, with X+W and Y+H at most 100 (got {x} {y} {w} {h})"
+                        ));
+                    }
+                    out.frame.push((a, f));
+                }
+                Err(_) => return Err(
+                    "--frame wants an asset and its rectangle X Y W H in percent (0 0 top left)"
+                        .into(),
+                ),
+            },
             "move" => {
                 if pending_move.is_some() {
                     return Err(MOVE_USAGE.to_string());
@@ -1143,8 +1168,8 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                 out.moves.push((asset, single(values)?, flag == "after"));
             }
             "include" | "exclude" | "uninclude" | "unexclude" | "solo" | "unsolo" | "live"
-            | "unlive" | "unjoin" | "unmove" | "uncover" | "hide-caption" | "uncrop" | "book"
-            | "unbook" => {
+            | "unlive" | "unjoin" | "unmove" | "uncover" | "hide-caption" | "uncrop"
+            | "unframe" | "book" | "unbook" => {
                 if values.is_empty() {
                     return Err(format!("--{flag} wants at least one asset"));
                 }
@@ -1161,6 +1186,7 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     "uncover" => out.uncover.extend(values),
                     "hide-caption" => out.hide_caption.extend(values),
                     "uncrop" => out.uncrop.extend(values),
+                    "unframe" => out.unframe.extend(values),
                     "book" => out.book.extend(values),
                     "unbook" => out.unbook.extend(values),
                     _ => out.unjoin.extend(values),
@@ -1236,6 +1262,10 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
     for id in &edits.motion {
         println!("  {}", show(id));
     }
+    println!("plays as a still: {}", edits.still.len());
+    for id in &edits.still {
+        println!("  {}", show(id));
+    }
     println!("joins: {}", collage.joins.len());
     for (a, b) in &collage.joins {
         println!("  {} + {}", show(a), show(b));
@@ -1250,6 +1280,10 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
     println!("crop focus: {}", edits.crop.len());
     for (id, (x, y)) in &edits.crop {
         println!("  {} at {x}%, {y}%", show(id));
+    }
+    println!("film framing: {}", edits.frame.len());
+    for (id, (x, y, w, h)) in &edits.frame {
+        println!("  {} uses {w}% x {h}% from {x}%, {y}%", show(id));
     }
     println!("cover pins: {}", edits.cover.len());
     for (id, focus) in &edits.cover {
@@ -1329,6 +1363,7 @@ fn edit_cmd(args: &[String]) {
     let set_solo: Setter = |e, id, on| e.collage.set_solo(id, on);
     let solos = resolve(&a.solo);
     let set_live: Setter = PlanEdits::set_motion;
+    let set_still: Setter = PlanEdits::set_still;
     let lives = resolve(&a.live);
     if let Some(asset) = lives.iter().find(|x| !x.has_live_motion()) {
         die(
@@ -1364,7 +1399,7 @@ fn edit_cmd(args: &[String]) {
         (resolve(&a.unsolo), "unsolo", set_solo, false),
         (solos.clone(), "solo", set_solo, true),
         // Motion after the pins, which it may apply to.
-        (resolve(&a.unlive), "unlive", set_live, false),
+        (resolve(&a.unlive), "unlive", set_still, true),
         (lives.clone(), "live", set_live, true),
     ];
     let unjoins = resolve(&a.unjoin);
@@ -1393,6 +1428,8 @@ fn edit_cmd(args: &[String]) {
         .map(|(q, x, y)| (resolve_one(q), *x, *y))
         .collect();
     let uncrops = resolve(&a.uncrop);
+    let frames: Vec<(&Asset, Frame)> = a.frame.iter().map(|(q, f)| (resolve_one(q), *f)).collect();
+    let unframes = resolve(&a.unframe);
     let closing = a.closing.as_deref().map(resolve_one);
     if let Some(asset) = closing.filter(|x| x.kind == AssetKind::Video) {
         die(
@@ -1436,6 +1473,8 @@ fn edit_cmd(args: &[String]) {
         || !hidden.is_empty()
         || !crops.is_empty()
         || !uncrops.is_empty()
+        || !frames.is_empty()
+        || !unframes.is_empty()
         || !books.is_empty()
         || !unbooks.is_empty()
         || closing.is_some()
@@ -1443,7 +1482,7 @@ fn edit_cmd(args: &[String]) {
     if !changed && !a.list {
         die(
             "edit",
-            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--live/--unlive/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--book/--unbook/--closing/--no-closing or --list",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--live/--unlive/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--frame/--unframe/--book/--unbook/--closing/--no-closing or --list",
         );
     }
     let mut edits = ep.edits.clone();
@@ -1493,6 +1532,17 @@ fn edit_cmd(args: &[String]) {
         edits.set_crop(asset.id.clone(), Some((*x, *y)));
         println!(
             "crop: {} centred at {x}% across, {y}% down",
+            asset_label(asset)
+        );
+    }
+    for asset in &unframes {
+        edits.set_frame(asset.id.clone(), None);
+        println!("unframe: {}", asset_label(asset));
+    }
+    for (asset, (x, y, w, h)) in &frames {
+        edits.set_frame(asset.id.clone(), Some((*x, *y, *w, *h)));
+        println!(
+            "frame: {} uses {w}% x {h}% of the photo from {x}% across, {y}% down",
             asset_label(asset)
         );
     }
@@ -2173,6 +2223,28 @@ mod tests {
         assert_eq!(a.unsolo, ["c"]);
         assert_eq!(a.join, [("d".into(), "e".into()), ("f".into(), "g".into())]);
         assert_eq!(a.unjoin, ["h"]);
+    }
+
+    #[test]
+    fn edit_args_take_frame_and_unframe() {
+        let a = parse_edit_args(&args("--frame a 10 20 50 60 --unframe b c")).unwrap();
+        assert_eq!(a.frame, [("a".to_string(), (10, 20, 50, 60))]);
+        assert_eq!(a.unframe, ["b", "c"]);
+        for bad in [
+            "--frame a 10 20 50",
+            "--frame a 10 20 50 60 70",
+            "--frame a 10 20 0 60",
+            "--frame a 10 20 50 0",
+            "--frame a 60 0 50 50",
+            "--frame a 0 60 50 50",
+            "--frame a 0 0 101 50",
+            "--frame a x 0 50 50",
+            "--frame a -1 0 50 50",
+            "--unframe",
+        ] {
+            assert!(parse_edit_args(&args(bad)).is_err(), "{bad}");
+        }
+        assert!(parse_edit_args(&args("--frame a 0 0 100 100")).is_ok());
     }
 
     #[test]

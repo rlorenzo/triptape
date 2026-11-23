@@ -114,6 +114,7 @@ fn resolve_entry(
         AssetKind::Video => (a.path.clone(), Some(a.path.clone())),
         AssetKind::LivePhoto => (a.path.clone(), a.companion_path.clone()),
     };
+    let frame = plan.frame.get(asset_id).copied();
     Some(ResolvedEntry {
         // The caller's entry, not a lookup by asset id: sibling windows of
         // one clip share the id but not the trim.
@@ -129,8 +130,10 @@ fn resolve_entry(
             .cloned(),
         taken_at: a.taken_at,
         tz_offset_secs: a.tz_offset_secs,
-        aspect: a.display_aspect(),
+        aspect: a.framed_aspect(frame),
         gps: a.gps,
+        frame,
+        still: plan.still.iter().any(|id| id == asset_id),
     })
 }
 
@@ -1428,6 +1431,8 @@ mod tests {
             },
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
         }
@@ -1508,6 +1513,8 @@ mod tests {
             tz_offset_secs: None,
             aspect: None,
             gps: None,
+            frame: None,
+            still: false,
         };
         // Both selected stills are reserved up front, as export_all does.
         let mut used: HashSet<PathBuf> = [&by_id["p1"].path, &by_id["p3"].path]

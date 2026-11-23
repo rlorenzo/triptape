@@ -12,12 +12,21 @@ use std::process::Command;
 use std::sync::{Mutex, PoisonError};
 use triptape_core::process;
 use triptape_core::proxies;
-use triptape_core::types::AssetKind;
+use triptape_core::types::{AssetKind, Frame};
 
 use crate::resolution::Resolution;
 
 /// Single-pass EBU R128 loudness target shared by every renderer.
 pub const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
+
+/// The `crop` filter that cuts a source to the owner's framing rectangle
+/// (percent of the displayed source from its top left). Placed right after
+/// the input, before any scale, fit or blur, so the rest of the graph sees
+/// a source that was framed to begin with.
+pub fn frame_crop(f: Frame) -> String {
+    let (x, y, w, h) = f;
+    format!("crop=iw*{w}/100:ih*{h}/100:iw*{x}/100:ih*{y}/100")
+}
 
 /// Filter-graph fragment showing the full `input` photo fitted over its own
 /// blurred fill at `w`x`h` (no crop of the subject, no aspect distortion).
