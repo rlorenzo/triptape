@@ -969,7 +969,7 @@ fn drop_lone_scenery(photos: &mut Vec<BookPhoto>) -> HashSet<String> {
 fn fitting_count(pool: &[BookPhoto], has_map: bool, cap: usize, closing_id: Option<&str>) -> usize {
     // Scenes depend only on the pool: link them once for every probe.
     let scene = scenes(pool);
-    let fits = |n: usize| {
+    let pages = |n: usize| {
         let picked: Vec<BookPhoto> = select_in_scenes(pool, &scene, n)
             .0
             .into_iter()
@@ -984,8 +984,9 @@ fn fitting_count(pool: &[BookPhoto], has_map: bool, cap: usize, closing_id: Opti
                 .iter()
                 .map(|p| p.kind)
                 .collect::<Vec<_>>(),
-        ) <= cap
+        )
     };
+    let fits = |n: usize| pages(n) <= cap;
     if fits(pool.len()) {
         return pool.len();
     }
@@ -998,16 +999,20 @@ fn fitting_count(pool: &[BookPhoto], has_map: bool, cap: usize, closing_id: Opti
             hi = mid - 1;
         }
     }
-    // Fit is not monotonic (one more photo can drop a lone page or fold a
-    // stretch), so the search can stop short of the cap: look a little
-    // further up and keep the largest selection that still fits.
-    (lo + 1..=(lo + FIT_LOOKAHEAD).min(pool.len()))
-        .rev()
-        .find(|&n| fits(n))
-        .unwrap_or(lo)
+    // Fit is not monotonic: one more photo can respace the picks across the
+    // chapters and add a divider or two (264 photos made 109 pages, 265
+    // made 112). Look a little either side and keep the selection that
+    // fills the most pages within the cap, the larger on a tie.
+    (lo.saturating_sub(FIT_LOOKAHEAD)..=(lo + FIT_LOOKAHEAD).min(pool.len()))
+        .filter_map(|n| {
+            let p = pages(n);
+            (p <= cap).then_some((p, n))
+        })
+        .max()
+        .map_or(lo, |(_, n)| n)
 }
 
-/// How many larger selections [`fitting_count`] tries past its search.
+/// How many selection sizes either side of its search [`fitting_count`] tries.
 const FIT_LOOKAHEAD: usize = 24;
 
 /// Evenly spaced indices into `total`, always including the first item,
