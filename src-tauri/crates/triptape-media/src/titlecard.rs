@@ -61,7 +61,7 @@ pub(crate) fn esc(s: &str) -> String {
 }
 
 /// Serif stack for the parchment map title, matching the map's own labels.
-pub const MAP_FONT_STACK: &str = r#"("Georgia", "DejaVu Serif")"#;
+const MAP_FONT_STACK: &str = r#"("Georgia", "DejaVu Serif")"#;
 
 /// Full-frame 1920x1080 title card: trip name, accent rule, date range.
 /// With `map` (an image file name beside the `.typ`, e.g. the first frame

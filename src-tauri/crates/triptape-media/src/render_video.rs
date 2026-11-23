@@ -1090,25 +1090,25 @@ pub fn render_hero_video(
             .filter_map(|r| r.taken_at.map(|t| (t, r.tz_offset_secs)))
             .collect::<Vec<_>>(),
     );
-    let title_dates = opts.title_dates.clone().or_else(|| date_range.clone());
+    // The owner's date line wins; a blank one means no date line at all.
+    let title_dates = match opts.title_dates.as_deref().map(str::trim) {
+        Some(d) => Some(d.to_string()).filter(|d| !d.is_empty()),
+        None => date_range.clone(),
+    };
     const TITLE_MAP: &str = "title-map.png";
-    let title_map = match opts
+    let title_map_png = work_dir.join(TITLE_MAP);
+    let mut title_map = None;
+    if let Some(clip) = opts
         .hop_clips
         .first()
         .filter(|_| typst_ok && hop_clips_adopted(opts))
     {
-        Some(clip) => match caps.run(
-            &first_frame_args(clip, &work_dir.join(TITLE_MAP)),
-            &work_dir.join(TITLE_MAP),
-        ) {
-            Ok(()) => Some(TITLE_MAP),
-            Err(e) => {
-                fallbacks.push(format!("title map frame failed ({e}); plain title card"));
-                None
-            }
-        },
-        None => None,
-    };
+        match caps.run(&first_frame_args(clip, &title_map_png), &title_map_png) {
+            Ok(()) => title_map = Some(TITLE_MAP),
+            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
+            Err(e) => fallbacks.push(format!("title map frame failed ({e}); plain title card")),
+        }
+    }
     let title_is_text = render_card_png(
         opts,
         typst_ok,
@@ -1406,7 +1406,7 @@ pub fn render_hero_video(
             .collect();
         let gps: Vec<Option<(f64, f64)>> = segs[first_shot..].iter().map(|s| s.0.gps).collect();
         let cuts = triptape_core::journey::hop_cuts(&hops, &shots, &gps);
-        let adopt = own_clips && !hops.is_empty() && opts.hop_clips.len() == hops.len();
+        let adopt = hop_clips_adopted(opts);
         if own_clips && !adopt && !hops.is_empty() {
             fallbacks.push(format!(
                 "{} hop clips for {} hops: the maps are drawn instead",
@@ -5915,6 +5915,31 @@ mod tests {
         assert_eq!(MapStyle::from_flag("Night").unwrap(), MapStyle::Night);
         assert!(MapStyle::from_flag("sepia").is_err());
         assert!(is_card("hop-03") && is_card("route") && !is_card("a1b2"));
+        // The owner's clips are adopted only with one per hop, in full
+        // parchment mode; then they close the film themselves.
+        let clips = |n: usize, short_mode| VideoOptions {
+            journey: Some(journey.clone()),
+            hop_clips: (0..n)
+                .map(|i| PathBuf::from(format!("hop{i}.mp4")))
+                .collect(),
+            short_mode,
+            ..Default::default()
+        };
+        let hops = journey.hops().len();
+        assert!(hop_clips_adopted(&clips(hops, false)));
+        assert_eq!(closing_map_len(&clips(hops, false)), 0.0);
+        assert!(!hop_clips_adopted(&clips(hops, true)));
+        assert!(!hop_clips_adopted(&clips(hops + 1, false)));
+        assert!(!hop_clips_adopted(&clips(0, false)));
+        assert!(!hop_clips_adopted(&VideoOptions {
+            map_style: MapStyle::Night,
+            ..clips(hops, false)
+        }));
+        let args = first_frame_args(Path::new("hop0.mp4"), Path::new("title-map.png"));
+        assert_eq!(
+            args,
+            ["-y", "-i", "hop0.mp4", "-frames:v", "1", "title-map.png"]
+        );
     }
 
     #[test]
