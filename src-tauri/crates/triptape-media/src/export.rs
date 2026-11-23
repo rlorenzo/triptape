@@ -358,6 +358,27 @@ fn resolve_verified(
 /// default 60 pages), so a raised cap raises the estimate with it.
 fn estimate_export_bytes(plan: &Plan, photos: usize, book_cap: usize, only: &str) -> u64 {
     const PER_FILM_ENTRY: u64 = 30_000_000;
+    estimate_with(plan, photos, book_cap, only, PER_FILM_ENTRY)
+}
+
+/// Scratch the film needs on the work volume: each entry's cached segment
+/// plus its share of the joined chunks, sized for the frame (4K segments
+/// run ~50 Mbit/s and chunks ~66 Mbit/s, about 6 s an entry).
+fn estimate_work_bytes(plan: &Plan, res: Resolution) -> u64 {
+    let per_entry = match res {
+        Resolution::Uhd4k => 120_000_000,
+        Resolution::Hd1080 => 35_000_000,
+    };
+    estimate_with(plan, 0, 0, "video", per_entry)
+}
+
+fn estimate_with(
+    plan: &Plan,
+    photos: usize,
+    book_cap: usize,
+    only: &str,
+    per_film_entry: u64,
+) -> u64 {
     const PER_REEL: u64 = 60_000_000;
     const PER_BOOK_PHOTO: u64 = 10_000_000;
     const BOOK_PHOTOS_PER_PAGE: u64 = 2;
@@ -365,7 +386,7 @@ fn estimate_export_bytes(plan: &Plan, photos: usize, book_cap: usize, only: &str
     let wanted = |keepsake: &str| only == "all" || only == keepsake;
     let mut bytes = 0;
     if wanted("video") {
-        bytes += PER_FILM_ENTRY * plan.hero.len() as u64;
+        bytes += per_film_entry * plan.hero.len() as u64;
     }
     if wanted("reels") {
         bytes += PER_REEL * plan.reel_selects.len().min(5) as u64;
@@ -654,7 +675,7 @@ fn export_inner(
             std::fs::create_dir_all(work_root).map_err(|e| crate::MediaError::Io(e.to_string()))?;
             triptape_core::jobs::free_space_precheck(
                 work_root,
-                estimate_export_bytes(plan, 0, 0, "video"),
+                estimate_work_bytes(plan, opts.resolution),
             )
             .map_err(crate::MediaError::NoSpace)?;
         }
@@ -1275,6 +1296,24 @@ mod tests {
         std::fs::write(dst.join("keep.mp4"), "old").unwrap();
         assert!(promote_dir(&d.path().join("never-rendered"), &dst, &old).is_err());
         assert!(dst.join("keep.mp4").exists());
+    }
+
+    #[test]
+    fn the_work_estimate_scales_with_the_frame() {
+        let mut plan = empty_plan();
+        let entry = PlanEntry {
+            asset_id: "a".into(),
+            window: 0,
+            content_hash: None,
+            size_bytes: 0,
+            mtime: 0,
+            rendition: Rendition::Still,
+        };
+        plan.hero = vec![entry; 100];
+        let uhd = estimate_work_bytes(&plan, Resolution::Uhd4k);
+        let hd = estimate_work_bytes(&plan, Resolution::Hd1080);
+        assert!(uhd >= 10_000_000_000, "{uhd}");
+        assert!(hd < uhd);
     }
 
     #[test]

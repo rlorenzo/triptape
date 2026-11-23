@@ -263,9 +263,14 @@ fn assembly_chunks(chapter_break: &[bool], chunk: usize) -> Vec<Range<usize>> {
     if n <= chunk {
         return vec![Range { start: 0, end: n }];
     }
-    let min = (chunk / CHUNK_MIN_SHARE)
-        .max(n.div_ceil(chunk))
-        .clamp(1, chunk);
+    // The minimum doubles in wide bands of film length (8 up to 320
+    // segments, 16 up to 640, ...) rather than growing with every 40, so
+    // an edit moves chunk boundaries only when it crosses a band edge.
+    let mut min = (chunk / CHUNK_MIN_SHARE).max(1);
+    while min < chunk && n > chunk * min {
+        min *= 2;
+    }
+    let min = min.min(chunk);
     let mut ranges = vec![];
     let mut start = 0;
     for (i, at_chapter) in chapter_break.iter().enumerate().skip(1) {
@@ -4779,7 +4784,21 @@ mod tests {
         // A very long film raises the minimum, so its final graph never
         // joins more chunks than a chunk has segments.
         let soup = vec![true; 1200];
-        assert!(assembly_chunks(&soup, ASSEMBLY_CHUNK).len() <= ASSEMBLY_CHUNK);
+        assert!(assembly_chunks(&soup, ASSEMBLY_CHUNK).len() <= ASSEMBLY_CHUNK + 1);
+        // One more shot in a long film of short chapters leaves the other
+        // chunks' boundaries where they were (within a length band).
+        let eights = |n: usize| (0..n).map(|i| i > 0 && i % 8 == 0).collect::<Vec<_>>();
+        for n in [216, 300, 330] {
+            let before = assembly_chunks(&eights(n), ASSEMBLY_CHUNK);
+            let mut grown = eights(n);
+            grown.insert(100, false);
+            let after = assembly_chunks(&grown, ASSEMBLY_CHUNK);
+            let unchanged = before
+                .iter()
+                .filter(|r| r.end <= 96)
+                .all(|r| after.contains(r));
+            assert!(unchanged, "n={n}: {before:?} -> {after:?}");
+        }
     }
 
     /// Transitions start over at each chunk: the cuts of a chunk are the
