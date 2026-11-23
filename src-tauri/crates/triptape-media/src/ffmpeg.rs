@@ -26,7 +26,12 @@ pub const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
 /// framed to begin with.
 pub fn frame_crop(frame: Option<Frame>) -> String {
     frame.map_or(String::new(), |(x, y, w, h)| {
-        format!("crop=iw*{w}/100:ih*{h}/100:iw*{x}/100:ih*{y}/100,")
+        // At least 2 pixels each way, kept inside the source, so a tiny
+        // frame on a small source still crops to something ffmpeg accepts.
+        format!(
+            "crop=w='max(2,iw*{w}/100)':h='max(2,ih*{h}/100)':\
+             x='min(iw*{x}/100,iw-ow)':y='min(ih*{y}/100,ih-oh)',"
+        )
     })
 }
 

@@ -6127,13 +6127,18 @@ mod tests {
             ..Default::default()
         };
         let f: Frame = (10, 20, 50, 40);
-        let crop = "crop=iw*50/100:ih*40/100:iw*10/100:ih*20/100";
-        assert_eq!(ffmpeg::frame_crop(Some(f)), format!("{crop},"));
+        let framed = ffmpeg::frame_crop(Some(f));
+        let crop = framed.trim_end_matches(',');
+        assert!(
+            crop.contains("iw*50/100") && crop.contains("ih*20/100"),
+            "{crop}"
+        );
+        assert!(crop.contains("max(2,"), "never under 2 pixels: {crop}");
         assert_eq!(ffmpeg::frame_crop(None), "");
         // Hold: right after the input, ahead of the blur fit.
         let hold = hold_graph(&caps, 0, 120, Resolution::Hd1080, Some(f));
         assert!(hold.starts_with(&format!("[0:v]{crop},split")), "{hold}");
-        assert!(hold.find("crop=iw*50").unwrap() < hold.find("overlay").unwrap());
+        assert!(hold.find(crop).unwrap() < hold.find("overlay").unwrap());
         assert!(!hold_graph(&caps, 0, 120, Resolution::Hd1080, None).contains("iw*"));
         // The hold arguments (and so the cache key) carry it.
         let args = |frame| {
@@ -6305,7 +6310,10 @@ mod tests {
         assert_eq!(framed.frame, Some((0, 25, 100, 50)));
         let g = live_collage_graph(&caps, &cells, 150, 0, Resolution::Hd1080);
         assert!(
-            g.contains("crop=iw*100/100:ih*50/100:iw*0/100:ih*25/100,fps=30"),
+            g.contains(&format!(
+                "{}fps=30",
+                ffmpeg::frame_crop(Some((0, 25, 100, 50)))
+            )),
             "{g}"
         );
     }
