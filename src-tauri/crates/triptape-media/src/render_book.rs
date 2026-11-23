@@ -995,8 +995,17 @@ fn fitting_count(pool: &[BookPhoto], has_map: bool, cap: usize, closing_id: Opti
             hi = mid - 1;
         }
     }
-    lo
+    // Fit is not monotonic (one more photo can drop a lone page or fold a
+    // stretch), so the search can stop short of the cap: look a little
+    // further up and keep the largest selection that still fits.
+    (lo + 1..=(lo + FIT_LOOKAHEAD).min(pool.len()))
+        .rev()
+        .find(|&n| fits(n))
+        .unwrap_or(lo)
 }
+
+/// How many larger selections [`fitting_count`] tries past its search.
+const FIT_LOOKAHEAD: usize = 24;
 
 /// Evenly spaced indices into `total`, always including the first item,
 /// so a trimmed book still spans the whole trip in story order.
