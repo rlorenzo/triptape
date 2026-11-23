@@ -12,6 +12,7 @@ use crate::ffmpeg::{self, path_arg as s, Capabilities};
 use crate::resolution::Resolution;
 use crate::segment_cache::SegmentCache;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{
     self, caption_read_secs, collage_hold_secs, is_panorama, pano_coverage, pano_motion,
@@ -178,6 +179,10 @@ fn film_graph(
 /// rendered, 226 did not.
 const ASSEMBLY_CHUNK: usize = 40;
 
+/// A chunk may end at a chapter start once it holds this share of
+/// [`ASSEMBLY_CHUNK`] (a fifth: eight segments).
+const CHUNK_MIN_SHARE: usize = 5;
+
 /// Quality of a pre-joined chunk (x264, near-lossless): it is decoded once
 /// more by the final encode.
 const CHUNK_CRF: u32 = 12;
@@ -238,20 +243,131 @@ struct JoinedInputs {
     overlaps: Vec<f64>,
 }
 
-/// Chunk boundaries: `chunk`-sized runs of `0..n` (`chunk` at least two;
-/// the last run may hold a single segment).
-fn assembly_chunks(n: usize, chunk: usize) -> Vec<std::ops::Range<usize>> {
+/// Chunk boundaries of a film of `chapter_break.len()` segments
+/// (`chapter_break[i]`: the cut into segment `i` starts a chapter). A film
+/// of at most `chunk` segments (`chunk` at least two) is one run. A longer
+/// one is cut where the story is: a chunk ends at the first chapter start
+/// once it holds a fifth of `chunk` (more in a very long film, so the
+/// final graph never joins more chunks than a chunk has segments), and at
+/// `chunk` segments whatever the story. The last run may hold a single
+/// segment.
+///
+/// Boundaries follow chapters instead of counting from the film's start, so
+/// adding or removing a shot changes its own chunk and leaves the others'
+/// segments as they were (at worst the next chunk's too, when its own
+/// falls under the minimum or sits in a chapter longer than `chunk`). An
+/// unchanged chunk is then reused from the chunk cache.
+fn assembly_chunks(chapter_break: &[bool], chunk: usize) -> Vec<Range<usize>> {
+    let n = chapter_break.len();
     let chunk = chunk.max(2);
-    (0..n)
-        .step_by(chunk)
-        .map(|a| a..(a + chunk).min(n))
-        .collect()
+    if n <= chunk {
+        return vec![Range { start: 0, end: n }];
+    }
+    let min = (chunk / CHUNK_MIN_SHARE)
+        .max(n.div_ceil(chunk))
+        .clamp(1, chunk);
+    let mut ranges = vec![];
+    let mut start = 0;
+    for (i, at_chapter) in chapter_break.iter().enumerate().skip(1) {
+        let len = i - start;
+        if len == chunk || (len >= min && *at_chapter) {
+            ranges.push(start..i);
+            start = i;
+        }
+    }
+    ranges.push(start..n);
+    ranges
 }
 
-/// Pre-join a long film's segments into chunks (see [`ASSEMBLY_CHUNK`]),
-/// each with its own cuts at their transitions and overlaps; the cuts
-/// between chunks are left for the final graph, so the timeline is the
-/// same as one graph over every segment. A short film passes through.
+/// ffmpeg arguments joining one chunk's segments (`inputs`, with their
+/// `durations`, the `transitions` into each and the `overlaps` of the cuts
+/// between them) into `out`.
+fn chunk_join_args(
+    inputs: &[PathBuf],
+    durations: &[f64],
+    transitions: &[Option<Transition>],
+    overlaps: &[f64],
+    keep_ambience: bool,
+    recipe: Recipe,
+    out: &Path,
+) -> Vec<String> {
+    let (graph, v, a) = xfade_chain(
+        transitions,
+        overlaps,
+        &xfade_offsets_var(durations, overlaps),
+        keep_ambience,
+        recipe.scale(),
+    );
+    let mut args: Vec<String> = vec!["-y".into()];
+    for p in inputs {
+        args.extend(["-i".into(), s(p)]);
+    }
+    let graph = graph.trim_end_matches(';').to_string();
+    args.extend(["-filter_complex".into(), graph, "-map".into(), v]);
+    if keep_ambience {
+        args.extend(["-map".into(), a]);
+    }
+    args.extend(recipe.chunk_encode_args());
+    args.extend(["-r".into(), "30".into(), s(out)]);
+    args
+}
+
+/// Cache key of a joined chunk: what each member segment holds
+/// ([`segment_identity`], which carries the segment's resolution and
+/// heading), and the join itself, as its ffmpeg arguments: every cut's
+/// transition, overlap and offset, and the recipe's scale and encode
+/// (a draft and the keepsake never share a chunk). Nothing in it counts
+/// from the film's start, so a chunk keeps its key when another changes.
+fn chunk_key(
+    cache: &SegmentCache,
+    members: &[String],
+    durations: &[f64],
+    transitions: &[Option<Transition>],
+    overlaps: &[f64],
+    keep_ambience: bool,
+    recipe: Recipe,
+) -> String {
+    let mut k = cache.key("chunk");
+    for m in members {
+        k.part("member", m);
+    }
+    // Stand-in input names: a segment's file name carries its index.
+    let inputs = vec![PathBuf::from(KEY_IN); members.len()];
+    k.args(&chunk_join_args(
+        &inputs,
+        durations,
+        transitions,
+        overlaps,
+        keep_ambience,
+        recipe,
+        Path::new(KEY_OUT),
+    ));
+    k.finish()
+}
+
+/// What the segment file `seg` holds, for its chunk's key: the segment
+/// cache key it was rendered or overlaid under, else (cards, hop clips,
+/// a film rendered without the segment cache) a hash of the file itself.
+/// `None` when it cannot be read: its chunk is then joined uncached.
+fn segment_identity(caps: &Capabilities, seg: &Path) -> Option<String> {
+    let keyed = caps
+        .segment_cache
+        .as_deref()
+        .and_then(|c| c.content_key_of(seg));
+    if let Some(k) = keyed {
+        return Some(format!("key:{k}"));
+    }
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut std::fs::File::open(seg).ok()?, &mut hasher).ok()?;
+    Some(format!("file:{}", hasher.finalize().to_hex()))
+}
+
+/// Pre-join a long film's segments into chunks (`ranges`, from
+/// [`assembly_chunks`]), each with its own cuts at their transitions and
+/// overlaps; the cuts between chunks are left for the final graph, so the
+/// timeline is the same as one graph over every segment. A chunk the chunk
+/// cache holds (see [`chunk_key`]) is taken from it instead of being joined
+/// again. A film of one run passes through.
 #[allow(clippy::too_many_arguments)]
 fn prejoin_chunks(
     caps: &Capabilities,
@@ -261,11 +377,11 @@ fn prejoin_chunks(
     overlaps: &[f64],
     keep_ambience: bool,
     work_dir: &Path,
-    chunk: usize,
+    ranges: &[Range<usize>],
     recipe: Recipe,
     on_progress: &dyn Fn(f64),
 ) -> Result<JoinedInputs, crate::MediaError> {
-    let plan = plan_chunks(durations, transitions, overlaps, chunk);
+    let plan = plan_chunks(durations, transitions, overlaps, ranges);
     let Some(ranges) = plan.ranges else {
         return Ok(JoinedInputs {
             inputs: segs.to_vec(),
@@ -278,7 +394,7 @@ fn prejoin_chunks(
     let mut inputs = vec![];
     for (k, r) in ranges.iter().enumerate() {
         let secs = plan.joined.durations[k];
-        // A lone trailing segment needs no join.
+        // A lone segment needs no join.
         if r.len() == 1 {
             done += secs;
             on_progress((done / total).clamp(0.0, 1.0));
@@ -286,31 +402,38 @@ fn prejoin_chunks(
             continue;
         }
         let out = work_dir.join(format!("chunk_{k:02}.mp4"));
+        let members = &segs[r.clone()];
+        let (durs, trans) = (&durations[r.clone()], &transitions[r.clone()]);
         let local_overlaps = &overlaps[r.start..r.end - 1];
-        let (graph, v, a) = xfade_chain(
-            &transitions[r.clone()],
-            local_overlaps,
-            &xfade_offsets_var(&durations[r.clone()], local_overlaps),
-            keep_ambience,
-            recipe.scale(),
-        );
-        let mut args: Vec<String> = vec!["-y".into()];
-        for p in &segs[r.clone()] {
-            args.extend(["-i".into(), s(p)]);
+        let cached = caps.chunk_cache.as_deref().and_then(|c| {
+            let ids: Option<Vec<String>> =
+                members.iter().map(|p| segment_identity(caps, p)).collect();
+            let key = chunk_key(c, &ids?, durs, trans, local_overlaps, keep_ambience, recipe);
+            Some((c, key))
+        });
+        let hit = cached
+            .as_ref()
+            .is_some_and(|(c, key)| c.fetch(key, &out).is_some());
+        if !hit {
+            let args = chunk_join_args(
+                members,
+                durs,
+                trans,
+                local_overlaps,
+                keep_ambience,
+                recipe,
+                &out,
+            );
+            let chunk_progress = |f: f64| on_progress(((done + f * secs) / total).clamp(0.0, 1.0));
+            caps.run_progress(&args, &out, secs, &chunk_progress)
+                .map_err(|e| match e {
+                    crate::MediaError::Cancelled => e,
+                    e => crate::MediaError::Ffmpeg(format!("joining chunk {k}: {e}")),
+                })?;
+            if let Some((c, key)) = &cached {
+                c.store(key, &out, secs);
+            }
         }
-        let graph = graph.trim_end_matches(';').to_string();
-        args.extend(["-filter_complex".into(), graph, "-map".into(), v]);
-        if keep_ambience {
-            args.extend(["-map".into(), a]);
-        }
-        args.extend(recipe.chunk_encode_args());
-        args.extend(["-r".into(), "30".into(), s(&out)]);
-        let chunk_progress = |f: f64| on_progress(((done + f * secs) / total).clamp(0.0, 1.0));
-        caps.run_progress(&args, &out, secs, &chunk_progress)
-            .map_err(|e| match e {
-                crate::MediaError::Cancelled => e,
-                e => crate::MediaError::Ffmpeg(format!("joining chunk {k}: {e}")),
-            })?;
         done += secs;
         on_progress((done / total).clamp(0.0, 1.0));
         inputs.push(out);
@@ -325,7 +448,7 @@ fn prejoin_chunks(
 /// film needs them, and the final graph's durations, transitions and
 /// overlaps (the inputs are filled in by the caller).
 struct ChunkPlan {
-    ranges: Option<Vec<std::ops::Range<usize>>>,
+    ranges: Option<Vec<Range<usize>>>,
     joined: JoinedInputs,
 }
 
@@ -333,11 +456,9 @@ fn plan_chunks(
     durations: &[f64],
     transitions: &[Option<Transition>],
     overlaps: &[f64],
-    chunk: usize,
+    ranges: &[Range<usize>],
 ) -> ChunkPlan {
-    let chunk = chunk.max(2);
-    let n = durations.len();
-    if n <= chunk {
+    if ranges.len() <= 1 {
         return ChunkPlan {
             ranges: None,
             joined: JoinedInputs {
@@ -348,8 +469,7 @@ fn plan_chunks(
             },
         };
     }
-    let ranges = assembly_chunks(n, chunk);
-    let chunk_secs = |r: &std::ops::Range<usize>| {
+    let chunk_secs = |r: &Range<usize>| {
         durations[r.clone()].iter().sum::<f64>() - overlaps[r.start..r.end - 1].iter().sum::<f64>()
     };
     let joined = JoinedInputs {
@@ -364,7 +484,7 @@ fn plan_chunks(
             .collect(),
     };
     ChunkPlan {
-        ranges: Some(ranges),
+        ranges: Some(ranges.to_vec()),
         joined,
     }
 }
@@ -421,6 +541,28 @@ pub fn assign_transitions(
     chapter_break: &[bool],
     kinds: &[SegKind],
 ) -> Vec<Option<Transition>> {
+    let whole = Range {
+        start: 0,
+        end: n_segments,
+    };
+    assign_transitions_by_chunk(n_segments, chapter_break, kinds, &[whole])
+}
+
+/// [`assign_transitions`] for a film joined in chunks (`ranges`, from
+/// [`assembly_chunks`]): the rules start over at each chunk, with the cut
+/// into the chunk as their first. Every count they keep (the chapter-break
+/// cycle, the rotation, the signature's every-fourth cut, no filter twice
+/// in a row) then depends on the chunk's own segments alone, so adding or
+/// removing a shot changes the transitions of its own chunk and no other.
+/// A chunk gets one signature blur-dissolve (a film of one run: three);
+/// the only cut not looked at across chunks is the pair around a chunk's
+/// start, which may share a filter.
+fn assign_transitions_by_chunk(
+    n_segments: usize,
+    chapter_break: &[bool],
+    kinds: &[SegKind],
+    ranges: &[Range<usize>],
+) -> Vec<Option<Transition>> {
     const ROT: [Transition; 5] = [
         Transition::Fade,
         Transition::Dissolve,
@@ -432,10 +574,7 @@ pub fn assign_transitions(
     if n_segments <= 1 {
         return out;
     }
-    let mut prev: Option<&'static str> = None;
-    let mut sig_used = 0u32;
-    let mut break_n = 0u32;
-    let mut rot = 0usize;
+    let sig_cap = if ranges.len() > 1 { 1 } else { 3 };
     // Next rotation pick whose filter differs from `prev`.
     let next_rot = |prev: Option<&str>, rot: &mut usize| -> Transition {
         for _ in 0..ROT.len() {
@@ -447,36 +586,42 @@ pub fn assign_transitions(
         }
         Transition::Fade
     };
-    for (i, slot) in out.iter_mut().enumerate().skip(1) {
-        // Special pick for this story position; `None` means "rotate".
-        let special = if i == 1 {
-            Some(Transition::CircleOpen)
-        } else if i == n_segments - 1 && n_segments > 2 {
-            Some(Transition::CircleClose)
-        } else if chapter_break.get(i).copied().unwrap_or(false) {
-            break_n += 1;
-            Some(if break_n % 3 == 1 {
-                Transition::FadeBlack
+    for r in ranges {
+        let mut prev: Option<&'static str> = None;
+        let mut sig_used = 0u32;
+        let mut break_n = 0u32;
+        let mut rot = 0usize;
+        for i in r.clone().filter(|i| (1..n_segments).contains(i)) {
+            // Special pick for this story position; `None` means "rotate".
+            let special = if i == 1 {
+                Some(Transition::CircleOpen)
+            } else if i == n_segments - 1 && n_segments > 2 {
+                Some(Transition::CircleClose)
+            } else if chapter_break.get(i).copied().unwrap_or(false) {
+                break_n += 1;
+                Some(if break_n % 3 == 1 {
+                    Transition::FadeBlack
+                } else {
+                    Transition::SmoothLeft
+                })
+            } else if kinds.get(i) != kinds.get(i - 1) {
+                Some(Transition::Dissolve)
+            } else if sig_used < sig_cap && (i - r.start) % 4 == 2 {
+                Some(Transition::BlurDissolve)
             } else {
-                Transition::SmoothLeft
-            })
-        } else if kinds.get(i) != kinds.get(i - 1) {
-            Some(Transition::Dissolve)
-        } else if sig_used < 3 && i % 4 == 2 {
-            Some(Transition::BlurDissolve)
-        } else {
-            None
-        };
-        // A special pick that would repeat the previous filter rotates too.
-        let t = match special {
-            Some(c) if Some(c.xfade_name()) != prev => c,
-            _ => next_rot(prev, &mut rot),
-        };
-        if t == Transition::BlurDissolve {
-            sig_used += 1;
+                None
+            };
+            // A special pick that would repeat the previous filter rotates too.
+            let t = match special {
+                Some(c) if Some(c.xfade_name()) != prev => c,
+                _ => next_rot(prev, &mut rot),
+            };
+            if t == Transition::BlurDissolve {
+                sig_used += 1;
+            }
+            out[i] = Some(t);
+            prev = Some(t.xfade_name());
         }
-        *slot = Some(t);
-        prev = Some(t.xfade_name());
     }
     out
 }
@@ -1492,7 +1637,12 @@ pub fn render_hero_video(
             _ => SegKind::Still,
         })
         .collect();
-    let transitions = assign_transitions(segs.len(), &chapter_break, &kinds);
+    // A long film is joined in chunks cut at chapter starts, and its
+    // transitions are assigned chunk by chunk: an edit then changes one
+    // chunk, and the others come back from the chunk cache.
+    let chunk_ranges = assembly_chunks(&chapter_break, ASSEMBLY_CHUNK);
+    let transitions =
+        assign_transitions_by_chunk(segs.len(), &chapter_break, &kinds, &chunk_ranges);
     let durations: Vec<f64> = segs.iter().map(|s| s.2).collect();
     let cut_overlaps: Vec<f64> = transitions
         .iter()
@@ -1580,7 +1730,7 @@ pub fn render_hero_video(
         &cut_overlaps,
         opts.keep_ambience,
         work_dir,
-        ASSEMBLY_CHUNK,
+        &chunk_ranges,
         recipe,
         &|f| progress.step("video", join_label, Some(f)),
     )?;
@@ -3485,7 +3635,8 @@ mod tests {
             .iter()
             .map(|t| transition_overlap(&t.unwrap()))
             .collect();
-        let plan = plan_chunks(&durations, &transitions, &overlaps, ASSEMBLY_CHUNK);
+        let ranges = assembly_chunks(&vec![false; n], ASSEMBLY_CHUNK);
+        let plan = plan_chunks(&durations, &transitions, &overlaps, &ranges);
         let ranges = plan.ranges.expect("chunked");
         assert_eq!(ranges.len(), 3);
         assert_eq!(ranges.last().unwrap().end, n);
@@ -3502,7 +3653,7 @@ mod tests {
             &durations[..5],
             &transitions[..5],
             &overlaps[..4],
-            ASSEMBLY_CHUNK,
+            &assembly_chunks(&[false; 5], ASSEMBLY_CHUNK),
         );
         assert!(short.ranges.is_none());
         assert_eq!(short.joined.durations, durations[..5]);
@@ -4515,6 +4666,324 @@ mod tests {
         }
     }
 
+    /// A 160x90 segment of `secs` seconds showing the lavfi `source`.
+    fn tiny_segment(caps: &Capabilities, p: &Path, source: &str, secs: f64) -> PathBuf {
+        let st = std::process::Command::new(&caps.ffmpeg_bin)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!("{source}=s=160x90:r=30:d={secs}"))
+            .args(["-f", "lavfi", "-i"])
+            .arg(format!("anullsrc=r=48000:cl=stereo:d={secs}"))
+            .args([
+                "-shortest",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+            ])
+            .arg(p)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        p.to_path_buf()
+    }
+
+    /// The chunk plan of a film as the renderer makes it.
+    struct FilmChunks {
+        ranges: Vec<Range<usize>>,
+        /// The transition into every segment.
+        cuts: Vec<Option<Transition>>,
+        /// Each joined chunk's cache key (`None` for a lone segment, which
+        /// is not joined).
+        keys: Vec<Option<String>>,
+    }
+
+    fn film_chunk_keys(
+        cache: &SegmentCache,
+        members: &[String],
+        breaks: &[bool],
+        recipe: Recipe,
+        keep_ambience: bool,
+    ) -> FilmChunks {
+        let n = members.len();
+        let kinds = vec![SegKind::Still; n];
+        let durations: Vec<f64> = (0..n).map(|_| 4.0).collect();
+        let ranges = assembly_chunks(breaks, ASSEMBLY_CHUNK);
+        let transitions = assign_transitions_by_chunk(n, breaks, &kinds, &ranges);
+        let overlaps: Vec<f64> = transitions[1..]
+            .iter()
+            .map(|t| transition_overlap(&t.unwrap()))
+            .collect();
+        let keys = ranges
+            .iter()
+            .map(|r| {
+                (r.len() > 1).then(|| {
+                    chunk_key(
+                        cache,
+                        &members[r.clone()],
+                        &durations[r.clone()],
+                        &transitions[r.clone()],
+                        &overlaps[r.start..r.end - 1],
+                        keep_ambience,
+                        recipe,
+                    )
+                })
+            })
+            .collect();
+        FilmChunks {
+            ranges,
+            cuts: transitions,
+            keys,
+        }
+    }
+
+    #[test]
+    fn chunk_boundaries_follow_chapters() {
+        // 100 segments in chapters of six: a chunk ends at the first
+        // chapter start once it holds eight segments, so every chunk is two
+        // whole chapters and starts where a chapter does.
+        let n = 100;
+        let breaks: Vec<bool> = (0..n).map(|i| i > 0 && i % 6 == 0).collect();
+        let ranges = assembly_chunks(&breaks, ASSEMBLY_CHUNK);
+        assert_eq!(ranges[0], 0..12);
+        assert_eq!(ranges[1], 12..24);
+        assert_eq!(ranges.last().unwrap(), &(96..100));
+        for w in ranges.windows(2) {
+            assert_eq!(w[0].end, w[1].start, "chunks tile the film");
+            assert!(breaks[w[1].start], "{:?} starts mid-chapter", w[1]);
+        }
+        assert!(ranges.iter().all(|r| r.len() <= ASSEMBLY_CHUNK));
+        assert!(
+            ranges.len() <= ASSEMBLY_CHUNK,
+            "the final graph stays small"
+        );
+        // A chapter longer than a chunk is cut at the cap, then the story
+        // takes over again at the next chapter start.
+        let mut long = vec![false; 130];
+        long[100] = true;
+        long[115] = true;
+        assert_eq!(
+            assembly_chunks(&long, ASSEMBLY_CHUNK),
+            [0..40, 40..80, 80..100, 100..115, 115..130]
+        );
+        // A chapter start too soon after the last cut is not a boundary.
+        let mut soon = vec![false; 60];
+        (soon[3], soon[20]) = (true, true);
+        assert_eq!(assembly_chunks(&soon, ASSEMBLY_CHUNK), [0..20, 20..60]);
+        // A film that fits one graph is one run, whatever its chapters.
+        let short: Vec<bool> = (0..ASSEMBLY_CHUNK).map(|i| i % 5 == 0).collect();
+        let one = assembly_chunks(&short, ASSEMBLY_CHUNK);
+        assert_eq!((one.len(), one[0].clone()), (1, 0..ASSEMBLY_CHUNK));
+        let none = assembly_chunks(&[], ASSEMBLY_CHUNK);
+        assert_eq!((none.len(), none[0].clone()), (1, 0..0));
+        // A very long film raises the minimum, so its final graph never
+        // joins more chunks than a chunk has segments.
+        let soup = vec![true; 1200];
+        assert!(assembly_chunks(&soup, ASSEMBLY_CHUNK).len() <= ASSEMBLY_CHUNK);
+    }
+
+    /// Transitions start over at each chunk: the cuts of a chunk are the
+    /// same wherever the chunk sits in the film.
+    #[test]
+    fn transitions_restart_at_each_chunk() {
+        use SegKind::*;
+        let n = 100;
+        let breaks: Vec<bool> = (0..n).map(|i| i > 0 && i % 10 == 0).collect();
+        let kinds = vec![Still; n];
+        let ranges = assembly_chunks(&breaks, ASSEMBLY_CHUNK);
+        assert_eq!(ranges.len(), 10);
+        let t = assign_transitions_by_chunk(n, &breaks, &kinds, &ranges);
+        assert_eq!(t[0], None);
+        assert_eq!(t[1], Some(Transition::CircleOpen));
+        assert_eq!(t[n - 1], Some(Transition::CircleClose));
+        // Every middle chunk is cut alike, opening on the chapter's fade.
+        for r in &ranges[1..9] {
+            assert_eq!(t[r.clone()], t[ranges[1].clone()], "{r:?}");
+            assert_eq!(t[r.start], Some(Transition::FadeBlack));
+            let sig = t[r.clone()]
+                .iter()
+                .filter(|x| **x == Some(Transition::BlurDissolve));
+            assert_eq!(sig.count(), 1, "one signature dissolve a chunk");
+            let names: Vec<&str> = t[r.clone()]
+                .iter()
+                .map(|x| x.unwrap().xfade_name())
+                .collect();
+            assert!(names.windows(2).all(|w| w[0] != w[1]), "{names:?}");
+        }
+        // One run is the old film-wide assignment.
+        let whole = assembly_chunks(&breaks[..30], ASSEMBLY_CHUNK);
+        assert_eq!(
+            assign_transitions_by_chunk(30, &breaks[..30], &kinds[..30], &whole),
+            assign_transitions(30, &breaks[..30], &kinds[..30])
+        );
+    }
+
+    /// Removing a shot re-joins its own chunk only: every other chunk
+    /// keeps its segments, its cuts and so its cache key, and the cuts
+    /// between the chunks stay as they were.
+    #[test]
+    fn removing_a_shot_changes_only_its_own_chunk_key() {
+        use crate::segment_cache::SegmentCacheConfig;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = SegmentCacheConfig::roomy(dir.path().join("chunks"));
+        let cache = SegmentCache::open(&cfg, "ffmpeg test".into(), dir.path()).unwrap();
+        let n = 120;
+        let members: Vec<String> = (0..n).map(|i| format!("key:{i:03}")).collect();
+        let breaks: Vec<bool> = (0..n).map(|i| i > 0 && i % 10 == 0).collect();
+        let keep = Recipe::Keepsake;
+        let FilmChunks { ranges, cuts, keys } =
+            film_chunk_keys(&cache, &members, &breaks, keep, false);
+        assert_eq!(ranges.len(), 12);
+        assert!(keys.iter().all(Option::is_some));
+        let distinct: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(distinct.len(), 12, "every chunk has its own key");
+        // Stable from run to run.
+        assert_eq!(
+            film_chunk_keys(&cache, &members, &breaks, keep, false).keys,
+            keys
+        );
+
+        // Drop shot 25, in the third chunk (20..30).
+        let without = |v: &[String]| [&v[..25], &v[26..]].concat();
+        let breaks2 = [&breaks[..25], &breaks[26..]].concat();
+        let FilmChunks {
+            ranges: ranges2,
+            cuts: cuts2,
+            keys: keys2,
+        } = film_chunk_keys(&cache, &without(&members), &breaks2, keep, false);
+        assert_eq!(ranges2.len(), 12);
+        assert_eq!(ranges2[2], 20..29);
+        for k in 0..12 {
+            if k == 2 {
+                assert_ne!(keys2[k], keys[k], "the edited chunk is joined again");
+            } else {
+                assert_eq!(keys2[k], keys[k], "chunk {k} is reused");
+            }
+            // The final graph's cut into each chunk is unchanged too.
+            assert_eq!(
+                cuts2[ranges2[k].start], cuts[ranges[k].start],
+                "cut into {k}"
+            );
+        }
+        // Counting from the film's start, as before, the same removal
+        // moved every later chunk's segments and changed later cuts.
+        let kinds = vec![SegKind::Still; n];
+        let old = assign_transitions(n, &breaks, &kinds);
+        let old2 = assign_transitions(n - 1, &breaks2, &kinds[1..]);
+        assert_ne!(old[41..60], old2[40..59]);
+
+        // Replacing a shot's picture, or its heading (the overlay key is
+        // its identity), changes that chunk alone as well.
+        let mut edited = members.clone();
+        edited[57] = "key:new".into();
+        let keys3 = film_chunk_keys(&cache, &edited, &breaks, keep, false).keys;
+        let changed: Vec<usize> = (0..12).filter(|k| keys3[*k] != keys[*k]).collect();
+        assert_eq!(changed, [5]);
+
+        // A draft and the keepsake never share a chunk, nor do two draft
+        // encoders, nor films with and without their own sound.
+        let draft = Recipe::Draft(ffmpeg::DraftEncoder::HevcVideotoolbox);
+        let soft = Recipe::Draft(ffmpeg::DraftEncoder::X264Ultrafast);
+        let draft_keys = film_chunk_keys(&cache, &members, &breaks, draft, false).keys;
+        let soft_keys = film_chunk_keys(&cache, &members, &breaks, soft, false).keys;
+        let sound_keys = film_chunk_keys(&cache, &members, &breaks, keep, true).keys;
+        for k in 0..12 {
+            assert_ne!(draft_keys[k], keys[k]);
+            assert_ne!(draft_keys[k], soft_keys[k]);
+            assert_ne!(sound_keys[k], keys[k]);
+        }
+    }
+
+    /// Real ffmpeg: a second join of the same segments takes every chunk
+    /// from the chunk cache and runs no encode; a changed segment re-joins
+    /// its own chunk only; a draft joins its own chunks.
+    #[test]
+    fn a_cached_chunk_is_not_joined_again() {
+        use crate::segment_cache::SegmentCacheConfig;
+        let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
+        if !caps.libx264 || !caps.xfade {
+            eprintln!("ffmpeg caps insufficient; skipping chunk cache test");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        // No two chunks alike: equal chunks would share one cache entry.
+        let durations = [1.5, 1.0, 1.25, 1.0, 1.0];
+        let segs: Vec<PathBuf> = (0..5)
+            .map(|i| {
+                tiny_segment(
+                    &caps,
+                    &temp.path().join(format!("s{i}.mp4")),
+                    "testsrc2",
+                    durations[i],
+                )
+            })
+            .collect();
+        let transitions = [
+            None,
+            Some(Transition::Fade),
+            Some(Transition::FadeBlack),
+            Some(Transition::Fade),
+            Some(Transition::Fade),
+        ];
+        let overlaps = [0.5, 0.8, 0.5, 0.5];
+        let ranges = assembly_chunks(&[false; 5], 2);
+        let cfg = SegmentCacheConfig::roomy(temp.path().join("cache")).chunks();
+        // Each join is its own export: a new work dir and cache handle.
+        let join = |name: &str, ffmpeg_bin: &str, recipe: Recipe| {
+            let work = temp.path().join(name);
+            std::fs::create_dir_all(&work).unwrap();
+            let cache = SegmentCache::open(&cfg, "ffmpeg test".into(), &work).unwrap();
+            let caps = Capabilities {
+                ffmpeg_bin: ffmpeg_bin.into(),
+                chunk_cache: Some(cache.clone()),
+                ..caps.clone()
+            };
+            let joined = prejoin_chunks(
+                &caps,
+                &segs,
+                &durations,
+                &transitions,
+                &overlaps,
+                false,
+                &work,
+                &ranges,
+                recipe,
+                &|_| {},
+            );
+            let stats = cache.stats();
+            (joined, (stats.hits, stats.misses, stats.stored))
+        };
+        let real = caps.ffmpeg_bin.clone();
+        let (first, stats) = join("a", &real, Recipe::Keepsake);
+        // Two joined chunks; the lone last segment is neither joined nor cached.
+        assert_eq!(stats, (0, 2, 2));
+        let first = first.unwrap();
+        assert_eq!(first.inputs[2], segs[4]);
+        // No ffmpeg to run: the join only succeeds without encoding.
+        let (second, stats) = join("b", "/nonexistent/ffmpeg", Recipe::Keepsake);
+        assert_eq!(stats, (2, 0, 0));
+        let second = second.expect("every chunk came from the cache");
+        assert_eq!(second.durations, first.durations);
+        for (a, b) in first.inputs[..2].iter().zip(&second.inputs[..2]) {
+            assert_ne!(a, b, "materialized in the new work dir");
+            assert_eq!(std::fs::read(a).unwrap(), std::fs::read(b).unwrap());
+        }
+        // A draft's chunks are its own: nothing to reuse, so it must encode.
+        let draft = Recipe::Draft(ffmpeg::DraftEncoder::X264Ultrafast);
+        let (failed, stats) = join("c", "/nonexistent/ffmpeg", draft);
+        assert!(failed.is_err());
+        assert_eq!((stats.0, stats.2), (0, 0));
+        let (drafted, stats) = join("d", &real, draft);
+        assert_eq!(stats, (0, 2, 2));
+        let chunk = ffmpeg::ffprobe_file(&caps.ffprobe_bin, &drafted.unwrap().inputs[0]).unwrap();
+        assert_eq!((chunk.width, chunk.height), (1920, 1080));
+        // Another picture in the first chunk: that chunk alone is joined.
+        tiny_segment(&caps, &segs[1], "smptebars", durations[1]);
+        let (_, stats) = join("e", &real, Recipe::Keepsake);
+        assert_eq!(stats, (1, 1, 1));
+    }
+
     /// Real ffmpeg: five tiny segments joined two to a chunk, then the chunks
     /// joined by `film_graph`, come out at the length one graph would give.
     #[test]
@@ -4530,26 +4999,12 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, d)| {
-                let p = temp.path().join(format!("s{i}.mp4"));
-                let st = std::process::Command::new(&caps.ffmpeg_bin)
-                    .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
-                    .arg(format!("testsrc2=s=160x90:r=30:d={d}"))
-                    .args(["-f", "lavfi", "-i"])
-                    .arg(format!("anullsrc=r=48000:cl=stereo:d={d}"))
-                    .args([
-                        "-shortest",
-                        "-c:v",
-                        "libx264",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-c:a",
-                        "aac",
-                    ])
-                    .arg(&p)
-                    .status()
-                    .unwrap();
-                assert!(st.success());
-                p
+                tiny_segment(
+                    &caps,
+                    &temp.path().join(format!("s{i}.mp4")),
+                    "testsrc2",
+                    *d,
+                )
             })
             .collect();
         let transitions = [
@@ -4569,7 +5024,7 @@ mod tests {
             &overlaps,
             false,
             temp.path(),
-            2,
+            &assembly_chunks(&[false; 5], 2),
             Recipe::Keepsake,
             &|f| seen.borrow_mut().push(f),
         )

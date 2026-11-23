@@ -138,6 +138,10 @@ pub struct ExportReport {
     pub attribution: Vec<String>,
     /// Present when a segment cache was in use.
     pub segment_cache: Option<SegmentCacheReport>,
+    /// How the chunk cache served the film's pre-joined chunks (`reused`
+    /// of `total`), when the film was long enough to be joined in chunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_cache: Option<SegmentCacheReport>,
 }
 
 /// Resolve a plan entry to files from the asset map.
@@ -450,6 +454,23 @@ pub fn export_all(
         }
     };
     caps.segment_cache = cache.clone();
+    // The film's joined chunks are cached beside its segments, under their
+    // own size limit. Only the film uses them.
+    let (chunk_cache, chunk_note) = match &opts.segment_cache {
+        Some(cfg) if cache.is_some() && matches!(opts.only.as_str(), "all" | "video") => {
+            let cfg = cfg.chunks();
+            let version = crate::segment_cache::ffmpeg_version(&caps.ffmpeg_bin);
+            match SegmentCache::open(&cfg, version, &scratch) {
+                Ok(c) => (Some(c), None),
+                Err(e) => (
+                    None,
+                    Some(format!("chunk cache off ({}): {e}", cfg.dir.display())),
+                ),
+            }
+        }
+        _ => (None, None),
+    };
+    caps.chunk_cache = chunk_cache.clone();
     // Installed for this thread so FFmpeg and Typst children started outside
     // the progress-aware runners die on cancel too (see `triptape_core::process`).
     let mut out = triptape_core::process::with_cancel(&opts.progress.cancel_flag(), || {
@@ -475,16 +496,26 @@ pub fn export_all(
             }
         }
     }
+    // Chunks first: when the volume is under its free-space floor, the
+    // chunks give the space back before any segment has to.
+    if let Some(chunks) = chunk_cache {
+        let evicted = chunks.finish();
+        if let Ok(report) = out.as_mut() {
+            report.chunk_cache = cache_use(&chunks, evicted.removed, "chunk", report);
+        }
+    }
     if let Some(cache) = cache {
         // Eviction runs only now: the lease is released first, so nothing
         // this export used is protected any longer than it is needed.
         let evicted = cache.finish();
         if let Ok(report) = out.as_mut() {
-            record_cache_use(&cache, evicted.removed, report);
+            report.segment_cache = cache_use(&cache, evicted.removed, "segment", report);
         }
     }
-    if let (Ok(report), Some(note)) = (out.as_mut(), cache_note) {
-        report.fallbacks.push(note);
+    for note in [cache_note, chunk_note].into_iter().flatten() {
+        if let Ok(report) = out.as_mut() {
+            report.fallbacks.push(note);
+        }
     }
     // Written last so the durable record includes the cache diagnostics.
     if let Ok(report) = &out {
@@ -496,29 +527,33 @@ pub fn export_all(
     out
 }
 
-/// Add how `cache` served this export to `report`: the reuse summary and,
-/// when the volume ran low, a fallback note.
-fn record_cache_use(cache: &SegmentCache, evicted: usize, report: &mut ExportReport) {
+/// How `cache` (the "segment" or the "chunk" cache: `what`) served this
+/// export: the reuse summary, when it was asked for anything, and, when the
+/// volume ran low, a fallback note added to `report`.
+fn cache_use(
+    cache: &SegmentCache,
+    evicted: usize,
+    what: &str,
+    report: &mut ExportReport,
+) -> Option<SegmentCacheReport> {
     let stats = cache.stats();
     let total = stats.hits + stats.misses;
-    if total > 0 {
-        report.segment_cache = Some(SegmentCacheReport {
-            dir: cache.dir().to_string_lossy().into_owned(),
-            reused: stats.hits,
-            total,
-            stored: stats.stored,
-            overlays_reused: stats.overlay_hits,
-            overlays_total: stats.overlay_hits + stats.overlay_misses,
-            skipped_low_disk: stats.skipped_low_disk,
-            evicted,
-        });
-    }
     if stats.skipped_low_disk > 0 {
         report.fallbacks.push(format!(
-            "segment cache: {} segments not cached (storing them would drop free space below the floor)",
+            "{what} cache: {} {what}s not cached (storing them would drop free space below the floor)",
             stats.skipped_low_disk
         ));
     }
+    (total > 0).then(|| SegmentCacheReport {
+        dir: cache.dir().to_string_lossy().into_owned(),
+        reused: stats.hits,
+        total,
+        stored: stats.stored,
+        overlays_reused: stats.overlay_hits,
+        overlays_total: stats.overlay_hits + stats.overlay_misses,
+        skipped_low_disk: stats.skipped_low_disk,
+        evicted,
+    })
 }
 
 /// The place a chapter's book heading names, when the itinerary adds to
@@ -631,6 +666,7 @@ fn export_inner(
         fallbacks: vec![],
         attribution: vec![crate::map::MAP_ATTRIBUTION.to_string()],
         segment_cache: None,
+        chunk_cache: None,
     };
 
     // Map card once, shared by the hero film and the book map page.

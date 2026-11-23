@@ -441,6 +441,9 @@ pub struct Capabilities {
     pub progress: crate::progress::Progress,
     /// Hero-segment render cache for the running export (`None`: off).
     pub segment_cache: Option<std::sync::Arc<crate::segment_cache::SegmentCache>>,
+    /// Cache of the film's pre-joined chunks (`None`: every chunk is
+    /// joined afresh).
+    pub chunk_cache: Option<std::sync::Arc<crate::segment_cache::SegmentCache>>,
 }
 
 impl Capabilities {
