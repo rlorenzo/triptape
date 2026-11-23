@@ -3571,7 +3571,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut a = card_entry("a", Path::new("a.png"));
         a.caption = Some("Onto cruise #2! Disney Adventure".into());
-        let b = card_entry("b", Path::new("b.png"));
+        let mut b = card_entry("b", Path::new("b.png"));
+        b.caption = Some("Castaway Cay".into());
         // A 3 s shot whose cut into the next (a dip to black) starts at 2.2 s.
         let segs = vec![
             (a, PathBuf::from("a.mp4"), 3.0, "still".to_string()),
@@ -3580,10 +3581,12 @@ mod tests {
         let out = dir.path().join("c.srt");
         assert_eq!(
             write_captions_srt(&segs, &[0.0, 2.2], &[false, false], &out).unwrap(),
-            1
+            2
         );
         let srt = std::fs::read_to_string(&out).unwrap();
         assert!(srt.contains("00:00:00,300 --> 00:00:02,200"), "{srt}");
+        // The last shot has no cut after it, so only its own length bounds it.
+        assert!(srt.contains("00:00:02,500 --> 00:00:04,600"), "{srt}");
     }
 
     #[test]
