@@ -8,7 +8,7 @@
 //!                [--solo REF...] [--unsolo REF...] [--live REF...] [--unlive REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--frame REF X Y W H]... [--unframe REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--resolution 4k|1080p] [--jobs N] [--quiet]
-//!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
+//!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE] [--work-dir DIR]
 //! triptape cache stats|clear [--segment-cache DIR]
 //! triptape pick --db trip.db --out /path/to/new-folder [--count 800] [--project ID] [--stills-only]
 //! triptape maps --itinerary itinerary.json --out /path/to/out [--db trip.db] [--title TEXT] [--resolution 4k|1080p] [--page WxH] [--stills-only]
@@ -17,6 +17,15 @@
 //! Without `--home` or `--segment-cache-max`, `plan`, `export` and `cache`
 //! use the home and limit saved in the app's Settings (`TRIPTAPE_SETTINGS`
 //! names another settings file).
+//!
+//! `export` keeps the film's scratch files in `<out>/.work` unless
+//! `--work-dir DIR` names another folder for them (the finished keepsakes
+//! still land in `--out`). Keep the work dir and the segment cache
+//! (`--segment-cache DIR`, by default the platform cache dir) on the same
+//! local disk: a cached segment is then reused by a hard link or an APFS
+//! clone. With either on a network share (SMB has no hard links) every
+//! reused segment is copied in full, about 14 GB for a 16-minute 4K film
+//! on each export.
 //!
 //! `scan` and `export` take `--ffmpeg`, `--ffprobe` (and `export` `--typst`)
 //! paths; without them each tool comes from `TRIPTAPE_FFMPEG` and friends,
@@ -863,6 +872,17 @@ fn export_cmd(flags: &HashMap<String, String>) {
         die("back-cover", format!("not found: {}", p.display()));
     }
     let segment_cache = segment_cache_config(flags);
+    // The film's scratch files go beside the output unless moved (to a
+    // local disk, when the output is on a network share).
+    let work_dir = flags.get("work-dir").map(|v| {
+        let dir = PathBuf::from(v);
+        if v == "true" || v.is_empty() {
+            die("work-dir", "want a folder");
+        }
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| die("work-dir", format!("{}: {e}", dir.display())));
+        dir
+    });
     // Only the book crops around faces; skip loading the models otherwise.
     let faces = matches!(only.as_str(), "all" | "book")
         .then(|| book_faces(flags))
@@ -891,6 +911,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             map_style,
             hop_clips,
             back_cover,
+            work_dir,
             known_faces,
         },
     );

@@ -62,6 +62,28 @@ pub struct ExportOptions {
     pub hop_clips: Vec<PathBuf>,
     /// The owner's own picture for the book's back cover.
     pub back_cover: Option<PathBuf>,
+    /// Folder for the film's scratch files (segments, chunks) instead of
+    /// `<out>/.work`: see [`scratch_dir`]. `None` keeps them in `<out>/.work`.
+    pub work_dir: Option<PathBuf>,
+}
+
+/// Where the hero film's intermediates (segments, pre-joined chunks) go.
+/// By default `<out>/.work`. With [`ExportOptions::work_dir`] they go to a
+/// folder of their own inside it, named after the output folder so two
+/// exports sharing a work dir never share files. On the segment cache's
+/// volume a cache hit is then a hard link or an APFS clone, where an output
+/// folder on a network share costs a full copy of every segment per export.
+/// Finished keepsakes are still staged in `<out>/.work/stage`, beside where
+/// they end up, so they move into place with a rename.
+pub fn scratch_dir(out_dir: &Path, work_dir: Option<&Path>) -> PathBuf {
+    match work_dir {
+        None => out_dir.join(".work"),
+        Some(d) => {
+            let out = std::path::absolute(out_dir).unwrap_or_else(|_| out_dir.to_path_buf());
+            let id = blake3::hash(out.to_string_lossy().as_bytes()).to_hex();
+            d.join(format!("triptape-work-{}", &id[..12]))
+        }
+    }
 }
 
 /// How the segment cache served one export.
@@ -395,11 +417,13 @@ pub fn export_all(
     // The cache takes its lease before any segment is used and gives it back
     // however the export ends (the handle also releases on drop).
     let work = out_dir.join(".work");
+    // The film's intermediates: `work` itself unless a work dir moved them.
+    let scratch = scratch_dir(out_dir, opts.work_dir.as_deref());
     let (cache, cache_note) = match &opts.segment_cache {
         None => (None, None),
         Some(cfg) => {
             let version = crate::segment_cache::ffmpeg_version(&caps.ffmpeg_bin);
-            match SegmentCache::open(cfg, version, &work) {
+            match SegmentCache::open(cfg, version, &scratch) {
                 Ok(c) => (Some(c), None),
                 Err(e) => (
                     None,
@@ -418,13 +442,19 @@ pub fn export_all(
     // staged in here, so a failed or cancelled one never reaches `out_dir`. This must
     // precede `cache.finish()`: `.work` holds hard links to cache entries, so
     // while it exists eviction and `cache clear` cannot reclaim their bytes.
-    if let Err(e) = std::fs::remove_dir_all(&work) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            if let Ok(report) = out.as_mut() {
-                report.fallbacks.push(format!(
-                    "could not remove intermediates ({}): {e}; cached segments they share stay allocated",
-                    work.display()
-                ));
+    let mut dirs = vec![&work];
+    if scratch != work {
+        dirs.push(&scratch);
+    }
+    for dir in dirs {
+        if let Err(e) = std::fs::remove_dir_all(dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                if let Ok(report) = out.as_mut() {
+                    report.fallbacks.push(format!(
+                        "could not remove intermediates ({}): {e}; cached segments they share stay allocated",
+                        dir.display()
+                    ));
+                }
             }
         }
     }
@@ -568,6 +598,7 @@ fn export_inner(
     )
     .map_err(crate::MediaError::NoSpace)?;
     let work = out_dir.join(".work");
+    let scratch = scratch_dir(out_dir, opts.work_dir.as_deref());
     let stage = work.join("stage");
     // A crashed run may have left a half-finished keepsake here.
     let _ = std::fs::remove_dir_all(&stage);
@@ -631,7 +662,7 @@ fn export_inner(
             plan,
             &resolved,
             map_card.as_deref(),
-            &work.join("video"),
+            &scratch.join("video"),
             &staged_video.join("hero.mp4"),
             &VideoOptions {
                 trip_name: opts.trip_name.clone(),
@@ -1404,6 +1435,7 @@ mod tests {
                 map_style: Default::default(),
                 hop_clips: vec![],
                 back_cover: None,
+                work_dir: None,
             },
         );
         assert!(matches!(err, Err(crate::MediaError::Cancelled)), "{err:?}");
@@ -1464,10 +1496,28 @@ mod tests {
             map_style: Default::default(),
             hop_clips: vec![],
             back_cover: None,
+            work_dir: None,
         };
         let report = export_all(&Default::default(), &empty_plan(), &[], &out, &opts).unwrap();
         assert!(!out.join(".work").exists(), "{:?}", report.fallbacks);
         assert!(out.join("export.json").exists());
+        // A work dir elsewhere holds the film's scratch files in a folder
+        // of its own, removed with the export; the folder given stays.
+        let local = t.path().join("local");
+        let scratch = scratch_dir(&out, Some(&local));
+        assert_eq!(scratch.parent(), Some(local.as_path()));
+        assert_ne!(scratch, scratch_dir(&t.path().join("other"), Some(&local)));
+        std::fs::create_dir_all(scratch.join("video")).unwrap();
+        std::fs::write(local.join("mine.txt"), "kept").unwrap();
+        let opts = ExportOptions {
+            work_dir: Some(local.clone()),
+            ..opts
+        };
+        let report = export_all(&Default::default(), &empty_plan(), &[], &out, &opts).unwrap();
+        assert!(!scratch.exists(), "{:?}", report.fallbacks);
+        assert!(!out.join(".work").exists());
+        assert!(local.join("mine.txt").exists());
+        assert_eq!(scratch_dir(&out, None), out.join(".work"));
     }
 
     #[test]
