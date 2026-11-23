@@ -1318,7 +1318,8 @@ mod tests {
         let draft = estimate_work_bytes(&plan, Resolution::Uhd4k, true);
         assert!(hd < draft && draft < uhd, "{hd} {draft} {uhd}");
         assert!(uhd >= 10_000_000_000, "{uhd}");
-        assert!(hd < uhd);
+        // A 1080p film's chunks are already small: a draft saves nothing.
+        assert_eq!(estimate_work_bytes(&plan, Resolution::Hd1080, true), hd);
     }
 
     #[test]
