@@ -14,9 +14,12 @@ pub fn valid_frame(f: Frame) -> bool {
     w > 0 && h > 0 && u16::from(x) + u16::from(w) <= 100 && u16::from(y) + u16::from(h) <= 100
 }
 
-/// Aspect (width / height) of a source of aspect `aspect` once cut to `f`.
-pub fn frame_aspect(aspect: f64, f: Frame) -> f64 {
-    aspect * f64::from(f.2) / f64::from(f.3.max(1))
+/// Aspect (width / height) of a source of aspect `aspect` once cut to
+/// `frame`; unchanged without one.
+pub fn frame_aspect(aspect: f64, frame: Option<Frame>) -> f64 {
+    frame.map_or(aspect, |(_, _, w, h)| {
+        aspect * f64::from(w) / f64::from(h.max(1))
+    })
 }
 
 /// What kind of media an asset is.
@@ -151,8 +154,7 @@ impl Asset {
 
     /// [`Self::display_aspect`] after the owner's framing, if any.
     pub fn framed_aspect(&self, frame: Option<Frame>) -> Option<f64> {
-        let a = self.display_aspect()?;
-        Some(frame.map_or(a, |f| frame_aspect(a, f)))
+        Some(frame_aspect(self.display_aspect()?, frame))
     }
 
     /// Width / height as displayed (EXIF rotation applied); `None` when

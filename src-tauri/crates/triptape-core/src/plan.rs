@@ -1645,8 +1645,9 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
 
     // Photos the user set to play as a still, even one the planner chose
     // for motion.
+    let still: HashSet<&str> = edits.still.iter().map(String::as_str).collect();
     for e in &mut out.hero {
-        if edits.still.contains(&e.asset_id) && matches!(e.rendition, Rendition::Motion { .. }) {
+        if still.contains(e.asset_id.as_str()) && matches!(e.rendition, Rendition::Motion { .. }) {
             e.rendition = Rendition::Still;
         }
     }
@@ -5588,12 +5589,14 @@ mod tests {
         assert_eq!(out.frame.get("a"), Some(&(10, 20, 50, 40)));
         assert!(!out.frame.contains_key("gone"));
         // The framed aspect is the source's times W / H.
-        assert!((crate::types::frame_aspect(1.5, (0, 0, 50, 100)) - 0.75).abs() < 1e-9);
-        let a = asset("a", T0, AssetKind::Photo);
-        if let Some(raw) = a.display_aspect() {
-            let framed = a.framed_aspect(Some((10, 20, 50, 40))).unwrap();
-            assert!((framed - raw * 50.0 / 40.0).abs() < 1e-9);
-        }
+        assert!((crate::types::frame_aspect(1.5, Some((0, 0, 50, 100))) - 0.75).abs() < 1e-9);
+        assert_eq!(crate::types::frame_aspect(1.5, None), 1.5);
+        let mut a = asset("a", T0, AssetKind::Photo);
+        assert_eq!(a.framed_aspect(Some((10, 20, 50, 40))), None);
+        (a.width, a.height) = (Some(4000), Some(3000));
+        let framed = a.framed_aspect(Some((10, 20, 50, 40))).unwrap();
+        assert!((framed - 4.0 / 3.0 * 50.0 / 40.0).abs() < 1e-9);
+        assert_eq!(a.framed_aspect(None), a.display_aspect());
         assert!(crate::types::valid_frame((0, 0, 100, 100)));
         assert!(
             !crate::types::valid_frame((0, 0, 0, 10)) && !crate::types::valid_frame((0, 0, 10, 0))

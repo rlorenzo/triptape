@@ -2082,10 +2082,7 @@ fn render_entry_segment(
                 let aspect = image::image_dimensions(&png.path)
                     .ok()
                     .filter(|&(w, h)| w > 0 && h > 0)
-                    .map(|(w, h)| {
-                        let a = f64::from(w) / f64::from(h);
-                        r.frame.map_or(a, |f| frame_aspect(a, f))
-                    })
+                    .map(|(w, h)| frame_aspect(f64::from(w) / f64::from(h), r.frame))
                     .or(r.aspect);
                 let dur = if let Some(aspect) = aspect.filter(|&a| is_panorama(a)) {
                     let motion = pano_motion(aspect);
@@ -2239,7 +2236,7 @@ fn clip_filter(
     frames: u32,
     res: Resolution,
 ) -> String {
-    let mut vf = frame.map_or(String::new(), |f| format!("{},", ffmpeg::frame_crop(f)));
+    let mut vf = ffmpeg::frame_crop(frame);
     vf.push_str("fps=30,");
     match framing {
         ClipFraming::Cover => {
@@ -2334,9 +2331,7 @@ fn hold_graph(
     // blur radius is in canvas pixels, so it scales with the resolution.
     let (sw, sh) = res.supersample();
     let (w, h) = res.dims();
-    let input = frame.map_or("[0:v]".to_string(), |f| {
-        format!("[0:v]{},", ffmpeg::frame_crop(f))
-    });
+    let input = format!("[0:v]{}", ffmpeg::frame_crop(frame));
     let composite = ffmpeg::fit_over_blur(caps, &input, sw, sh, "", 40 * res.scale());
     let hold = ffmpeg::hold_still(frames);
     let glide = ffmpeg::glide(caps, frames, w, h, variant);
@@ -2530,6 +2525,15 @@ const CROP_FOCUS_Y: f64 = 0.35;
 /// Focal height for a framed photo's cover crop: the owner placed the
 /// rectangle, so any remaining cut is taken evenly from both sides.
 const FRAMED_FOCUS_Y: f64 = 0.5;
+
+/// Focal height of a cell's cover crop, still or motion alike.
+fn cover_focus_y(framed: bool) -> f64 {
+    if framed {
+        FRAMED_FOCUS_Y
+    } else {
+        CROP_FOCUS_Y
+    }
+}
 /// Weight of fill that [`fill_cell`] contains rather than covers, against
 /// one that crops the same amount: shown whole beats cut off, but blur
 /// still wastes the cell.
@@ -2795,10 +2799,8 @@ fn photo_rect(sa: f64, cover: bool, x: u32, y: u32, cw: u32, ch: u32) -> (u32, u
 fn fill_cell(img: &image::RgbImage, cw: u32, ch: u32, framed: bool) -> image::RgbImage {
     let sa = f64::from(img.width().max(1)) / f64::from(img.height().max(1));
     let ca = f64::from(cw) / f64::from(ch.max(1));
-    if framed {
-        cover_fit_focus(img, cw, ch, FRAMED_FOCUS_Y)
-    } else if crop_loss(sa, ca) <= MAX_CELL_CROP {
-        cover_fit_focus(img, cw, ch, CROP_FOCUS_Y)
+    if framed || crop_loss(sa, ca) <= MAX_CELL_CROP {
+        cover_fit_focus(img, cw, ch, cover_focus_y(framed))
     } else {
         contain_over_blur(img, cw, ch)
     }
@@ -3003,8 +3005,7 @@ fn live_cells(
             let probe = ffmpeg::ffprobe_file(&caps.ffprobe_bin, src).ok()?;
             let (dw, dh) = probe.display_dims();
             let frame = members[c.member].frame;
-            let sa = f64::from(dw.max(1)) / f64::from(dh.max(1));
-            let sa = frame.map_or(sa, |f| frame_aspect(sa, f));
+            let sa = frame_aspect(f64::from(dw.max(1)) / f64::from(dh.max(1)), frame);
             let ca = f64::from(c.w.max(1)) / f64::from(c.h.max(1));
             // As long as it looks good: up to where the phone drops.
             let steady = crate::clip_analysis::live_steady_secs(&caps.ffmpeg_bin, src)
@@ -3077,14 +3078,8 @@ fn live_collage_graph(
             end = c.start + c.secs,
             cw = c.w,
             ch = c.h,
-            fy = if c.frame.is_some() {
-                FRAMED_FOCUS_Y
-            } else {
-                CROP_FOCUS_Y
-            },
-            crop = c
-                .frame
-                .map_or(String::new(), |f| format!("{},", ffmpeg::frame_crop(f))),
+            fy = cover_focus_y(c.frame.is_some()),
+            crop = ffmpeg::frame_crop(c.frame),
             x = c.x,
             y = c.y,
         ));
@@ -3142,9 +3137,9 @@ fn pano_graph(
     frame: Option<Frame>,
 ) -> String {
     let frames = (dur * 30.0).round() as u32;
-    let crop = frame.map_or(String::new(), |f| format!("{},", ffmpeg::frame_crop(f)));
     format!(
-        "[0:v]{crop}{},format=yuv420p[v]",
+        "[0:v]{}{},format=yuv420p[v]",
+        ffmpeg::frame_crop(frame),
         ffmpeg::pano_pan(
             frames,
             res.width(),
@@ -6133,7 +6128,8 @@ mod tests {
         };
         let f: Frame = (10, 20, 50, 40);
         let crop = "crop=iw*50/100:ih*40/100:iw*10/100:ih*20/100";
-        assert_eq!(ffmpeg::frame_crop(f), crop);
+        assert_eq!(ffmpeg::frame_crop(Some(f)), format!("{crop},"));
+        assert_eq!(ffmpeg::frame_crop(None), "");
         // Hold: right after the input, ahead of the blur fit.
         let hold = hold_graph(&caps, 0, 120, Resolution::Hd1080, Some(f));
         assert!(hold.starts_with(&format!("[0:v]{crop},split")), "{hold}");

@@ -1073,6 +1073,14 @@ struct EditArgs {
 
 const MOVE_USAGE: &str = "--move wants --after REF or --before REF";
 
+/// A whole percent, 0-100; `what` names the value in the error.
+fn parse_pct(what: &str, v: &str) -> Result<u8, String> {
+    match v.parse::<u8>() {
+        Ok(p) if p <= 100 => Ok(p),
+        _ => Err(format!("{what} must be 0-100, got {v:?}")),
+    }
+}
+
 fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
     let mut out = EditArgs::default();
     let mut pending_move: Option<String> = None;
@@ -1122,10 +1130,7 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
             "no-closing" => return Err("--no-closing takes no value".to_string()),
             "crop" => match <[String; 3]>::try_from(values) {
                 Ok([a, x, y]) => {
-                    let pct = |v: &str| match v.parse::<u8>() {
-                        Ok(p) if p <= 100 => Ok(p),
-                        _ => Err(format!("--crop focus must be 0-100, got {v:?}")),
-                    };
+                    let pct = |v: &str| parse_pct("--crop focus", v);
                     out.crop.push((a, pct(&x)?, pct(&y)?));
                 }
                 Err(_) => {
@@ -1136,12 +1141,7 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
             },
             "frame" => match <[String; 5]>::try_from(values) {
                 Ok([a, x, y, w, h]) => {
-                    let pct = |v: &str| {
-                        v.parse::<u8>()
-                            .ok()
-                            .filter(|p| *p <= 100)
-                            .ok_or_else(|| format!("--frame values must be 0-100, got {v:?}"))
-                    };
+                    let pct = |v: &str| parse_pct("--frame values", v);
                     let f = (pct(&x)?, pct(&y)?, pct(&w)?, pct(&h)?);
                     if !valid_frame(f) {
                         return Err(format!(
@@ -1539,8 +1539,9 @@ fn edit_cmd(args: &[String]) {
         edits.set_frame(asset.id.clone(), None);
         println!("unframe: {}", asset_label(asset));
     }
-    for (asset, (x, y, w, h)) in &frames {
-        edits.set_frame(asset.id.clone(), Some((*x, *y, *w, *h)));
+    for &(asset, f) in &frames {
+        let (x, y, w, h) = f;
+        edits.set_frame(asset.id.clone(), Some(f));
         println!(
             "frame: {} uses {w}% x {h}% of the photo from {x}% across, {y}% down",
             asset_label(asset)

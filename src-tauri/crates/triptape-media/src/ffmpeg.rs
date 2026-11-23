@@ -19,13 +19,15 @@ use crate::resolution::Resolution;
 /// Single-pass EBU R128 loudness target shared by every renderer.
 pub const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
 
-/// The `crop` filter that cuts a source to the owner's framing rectangle
-/// (percent of the displayed source from its top left). Placed right after
-/// the input, before any scale, fit or blur, so the rest of the graph sees
-/// a source that was framed to begin with.
-pub fn frame_crop(f: Frame) -> String {
-    let (x, y, w, h) = f;
-    format!("crop=iw*{w}/100:ih*{h}/100:iw*{x}/100:ih*{y}/100")
+/// The `crop` filter (with its trailing comma) that cuts a source to the
+/// owner's framing rectangle (percent of the displayed source from its top
+/// left), or nothing without one. Placed right after the input, before any
+/// scale, fit or blur, so the rest of the graph sees a source that was
+/// framed to begin with.
+pub fn frame_crop(frame: Option<Frame>) -> String {
+    frame.map_or(String::new(), |(x, y, w, h)| {
+        format!("crop=iw*{w}/100:ih*{h}/100:iw*{x}/100:ih*{y}/100,")
+    })
 }
 
 /// Filter-graph fragment showing the full `input` photo fitted over its own
