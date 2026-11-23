@@ -410,7 +410,20 @@ fn consumption_order(photos: &[BookPhoto], flow: &[FlowPage], preset: BookPreset
             dpi_verdict(p.width, p.height, w, h) != DpiVerdict::Block
         };
         // A tagged family face beats a stranger's elbow behind a plate.
-        let window = &run[..run.len().min(DIVIDER_WINDOW)];
+        // Only photos from the chapter's first moments: a divider must not
+        // pull a shot from later in the visit ahead of the arrival.
+        let first_at = photos[order[run[0]]].taken_at;
+        let window: Vec<usize> = run[..run.len().min(DIVIDER_WINDOW)]
+            .iter()
+            .copied()
+            .filter(|&pos| {
+                photos[order[pos]]
+                    .taken_at
+                    .zip(first_at)
+                    .is_none_or(|(t, f)| t - f <= DIVIDER_SECS)
+            })
+            .collect();
+        let window = &window[..];
         let tier = |pos: usize| {
             let p = &photos[order[pos]];
             if p.family.iter().any(|k| !k.body) {
@@ -2930,6 +2943,10 @@ const NARROW_CELL_COST: f64 = 1.5;
 /// Share of a cell a photo shown whole must still fill (else it is
 /// cropped, keeping the biggest faces).
 const WHOLE_MIN_FILL: f64 = 0.75;
+
+/// How long after a chapter's first photo its divider may reach for a
+/// background.
+const DIVIDER_SECS: i64 = 20 * 60;
 
 /// What a grid layout pays when the owner's featured photo is not in the
 /// page's biggest cell: more than anything else a layout can cost.
