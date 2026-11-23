@@ -758,6 +758,9 @@ pub struct VideoOptions {
     /// and music, joined at [`ffmpeg::DRAFT_RESOLUTION`] with the fastest
     /// encoder this machine has ([`ffmpeg::draft_encoder`]).
     pub draft: bool,
+    /// The owner's own date line for the title card (`October 3rd – 30th`)
+    /// in place of the one worked out from the photos.
+    pub title_dates: Option<String>,
 }
 
 impl Default for VideoOptions {
@@ -781,6 +784,7 @@ impl Default for VideoOptions {
             map_style: MapStyle::default(),
             hop_clips: vec![],
             draft: false,
+            title_dates: None,
         }
     }
 }
@@ -839,16 +843,36 @@ fn closing_map_secs(route_stops: usize, map_secs: f64) -> f64 {
     }
 }
 
+/// The owner's hop clips play in the film: full mode, parchment style, and
+/// one clip per hop of the journey.
+fn hop_clips_adopted(opts: &VideoOptions) -> bool {
+    opts.journey.as_ref().is_some_and(|j| {
+        opts.map_style == MapStyle::Parchment
+            && !opts.short_mode
+            && !opts.hop_clips.is_empty()
+            && opts.hop_clips.len() == j.hops().len()
+    })
+}
+
+/// FFmpeg args writing the first frame of `clip` to `out` (a PNG).
+fn first_frame_args(clip: &Path, out: &Path) -> Vec<String> {
+    vec![
+        "-y".into(),
+        "-i".into(),
+        s(clip),
+        "-frames:v".into(),
+        "1".into(),
+        s(out),
+    ]
+}
+
 /// Seconds the closing map segment will run for these options.
 fn closing_map_len(opts: &VideoOptions) -> f64 {
     match &opts.journey {
         // The owner's hop clips close the film themselves when they are
         // adopted (one per hop, full mode only); otherwise a route map does.
-        Some(j) if opts.map_style == MapStyle::Parchment => {
-            if !opts.short_mode
-                && !opts.hop_clips.is_empty()
-                && opts.hop_clips.len() == j.hops().len()
-            {
+        Some(_) if opts.map_style == MapStyle::Parchment => {
+            if hop_clips_adopted(opts) {
                 0.0
             } else {
                 triptape_core::journey::HOP_OVERVIEW_SECS
@@ -1056,7 +1080,9 @@ pub fn render_hero_video(
     };
     let mut segs: Vec<(ResolvedEntry, PathBuf, f64, String)> = vec![];
     // Title card first: Typst full-frame card (trip name + date range)
-    // when available, else the styled solid.
+    // when available, else the styled solid. With the owner's hop clips,
+    // the title sits on the opening hop's first frame: the map before the
+    // journey is drawn, which the first hop then sets off across.
     let title_png = work_dir.join("title.png");
     let date_range = crate::titlecard::format_date_range(
         &resolved
@@ -1064,18 +1090,42 @@ pub fn render_hero_video(
             .filter_map(|r| r.taken_at.map(|t| (t, r.tz_offset_secs)))
             .collect::<Vec<_>>(),
     );
+    let title_dates = opts.title_dates.clone().or_else(|| date_range.clone());
+    const TITLE_MAP: &str = "title-map.png";
+    let title_map = match opts
+        .hop_clips
+        .first()
+        .filter(|_| typst_ok && hop_clips_adopted(opts))
+    {
+        Some(clip) => match caps.run(
+            &first_frame_args(clip, &work_dir.join(TITLE_MAP)),
+            &work_dir.join(TITLE_MAP),
+        ) {
+            Ok(()) => Some(TITLE_MAP),
+            Err(e) => {
+                fallbacks.push(format!("title map frame failed ({e}); plain title card"));
+                None
+            }
+        },
+        None => None,
+    };
     let title_is_text = render_card_png(
         opts,
         typst_ok,
-        &crate::titlecard::title_card_doc(&opts.trip_name, date_range.as_deref()),
+        &crate::titlecard::title_card_doc(&opts.trip_name, title_dates.as_deref(), title_map),
         &title_png,
         "title",
         &mut fallbacks,
     )?;
     if title_is_text {
         fallbacks.push(format!(
-            "title card shows trip name{}",
-            date_range
+            "title card shows trip name{}{}",
+            if title_map.is_some() {
+                " over the opening map"
+            } else {
+                ""
+            },
+            title_dates
                 .as_deref()
                 .map_or(String::new(), |d| format!(" + {d}"))
         ));

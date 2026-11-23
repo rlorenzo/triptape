@@ -7,7 +7,7 @@
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
 //!                [--solo REF...] [--unsolo REF...] [--live REF...] [--unlive REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--frame REF X Y W H]... [--unframe REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
-//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--resolution 4k|1080p] [--jobs N] [--quiet]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--title TEXT] [--title-dates TEXT] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE] [--chunk-cache-max SIZE] [--work-dir DIR] [--draft]
 //! triptape cache stats|clear [--segment-cache DIR] [--chunk-cache-max SIZE]
 //! triptape pick --db trip.db --out /path/to/new-folder [--count 800] [--project ID] [--stills-only]
@@ -800,11 +800,16 @@ fn export_cmd(flags: &HashMap<String, String>) {
     let known_faces = db
         .known_faces(&project_id)
         .unwrap_or_else(|e| die("known faces", e));
-    let trip_name = db
-        .get_project(&project_id)
-        .unwrap_or_else(|e| die("project", e))
-        .map(|p| p.name.clone())
-        .unwrap_or_else(|| "trip".to_string());
+    // The owner's own title for the keepsakes, else the project's name.
+    let trip_name = match flags.get("title") {
+        Some(t) => t.clone(),
+        None => db
+            .get_project(&project_id)
+            .unwrap_or_else(|e| die("project", e))
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "trip".to_string()),
+    };
+    let title_dates = flags.get("title-dates").cloned();
 
     let caps = ffmpeg::probe_capabilities(&ffmpeg_bin, &ffprobe_bin);
     println!(
@@ -915,6 +920,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             preset,
             book_max_pages,
             trip_name,
+            title_dates,
             typst_bin,
             music_paths: music,
             keep_ambience,
