@@ -3018,7 +3018,7 @@ const FEATURE_COST: f64 = 20.0;
 
 /// How close in time a featured photo must be to its page's first photo to
 /// lead the page.
-const FEATURE_LEAD_SECS: i64 = 600;
+const FEATURE_LEAD_SECS: i64 = 30 * 60;
 
 /// What a never-cropped photo pays per unit of shape mismatch with its
 /// cell (the bars it leaves).
@@ -3570,15 +3570,14 @@ fn draw_sights_mosaic(
     for (k, &pi) in picks.iter().take(n).enumerate() {
         let (cx, cy) = ((k as u32) % cols, (k as u32) / cols);
         let p = &photos[pi];
-        let tile = fit_photo_focused(
-            p,
-            p.crop_focus,
-            (tile_w, tile_h),
-            0.0,
-            false,
-            fit,
-            fallbacks,
-        );
+        // The owner's cover focus (`--cover REF@PCT`) places the tile, as
+        // on the photo cover.
+        let focus = p
+            .cover_focus
+            .filter(|&fx| fx != 0.5)
+            .map(|fx| (fx, p.crop_focus.map_or(0.5, |c| c.1)))
+            .or(p.crop_focus);
+        let tile = fit_photo_focused(p, focus, (tile_w, tile_h), 0.0, false, fit, fallbacks);
         image::imageops::replace(
             &mut canvas,
             &tile,
