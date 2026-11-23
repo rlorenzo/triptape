@@ -34,6 +34,8 @@ pub struct JourneyNode {
     /// City label shown at the stop; `None` for waypoints (an embarkation
     /// terminal, a loop's return).
     pub label: Option<String>,
+    /// The stop's itinerary name, even when its map label is hidden.
+    pub name: String,
     pub pin: bool,
     /// The day the owner arrives here, when the itinerary says.
     pub arrive: Option<jiff::civil::Date>,
@@ -261,12 +263,13 @@ impl Journey {
             .any(|n| within_home_reach(gps, wrapped(n.pos)))
     }
 
-    /// The labels of the stops the trip starts or ends at (`Los Angeles`).
+    /// The names of the stops the trip starts or ends at (`Los Angeles`),
+    /// including a home stop whose map label is hidden.
     pub fn home_labels(&self) -> impl Iterator<Item = &str> {
         self.nodes
             .iter()
             .filter(|n| n.home)
-            .filter_map(|n| n.label.as_deref())
+            .map(|n| n.name.as_str())
     }
 
     /// The journey as hops between named stops, for a film that shows each
@@ -357,6 +360,7 @@ impl Journey {
         let node = |stop: &ItinStop, label: Option<String>| JourneyNode {
             pos: stop.pos(),
             label,
+            name: stop.label.clone(),
             pin: false,
             // A stop with only a departure is there that day (the same
             // reading as the itinerary's own stop window).
@@ -800,8 +804,8 @@ mod tests {
         assert!(hops[9].home && !hops[0].home);
         assert_eq!(
             j.home_labels().collect::<Vec<_>>(),
-            ["Los Angeles"],
-            "the unnamed arrival home adds no label"
+            ["Los Angeles", "Los Angeles"],
+            "the arrival home counts even with its map label hidden"
         );
         assert_eq!(
             date_span(
