@@ -2144,7 +2144,16 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
     }
     if !seen.contains(&place) {
         if !slot.first().is_some_and(|p| p.aboard) {
-            return title.to_string();
+            // The page shows other places than the day's: the heading names
+            // what the page shows (a mall, not the restaurant). A page with
+            // no placed photo keeps the day's place.
+            if seen.is_empty() {
+                return title.to_string();
+            }
+            let listed = seen.clone();
+            seen.retain(|p| !listed.iter().any(|q| q != p && q.contains(p)));
+            seen.truncate(MAX_HEADING_PLACES);
+            return format!("{head} — {}", seen.join(" \u{b7} "));
         }
         // After the places seen before the first placed photo ashore
         // (first when the page never goes ashore).
@@ -4573,8 +4582,13 @@ mod tests {
             places_in_time_order(title, &[&tokyo, &shrine, &shrine]),
             "Day 5 · Wed, Oct 7 — Tokyo · Tsurugaoka Hachimangū"
         );
-        // The title's place not on the page: unchanged.
-        assert_eq!(places_in_time_order(title, &[&tokyo]), title);
+        // The title's place not on the page: the page's own place instead,
+        // and a page with no placed photo keeps the title.
+        assert_eq!(
+            places_in_time_order(title, &[&tokyo]),
+            "Day 5 · Wed, Oct 7 — Tokyo"
+        );
+        assert_eq!(places_in_time_order(title, &[&BookPhoto::blank()]), title);
         let boarding = at("Carnival Luminosa Embarkation");
         let mut ship = at("Carnival Luminosa");
         ship.aboard = true;
@@ -5386,10 +5400,10 @@ mod tests {
         let titles = ["Day 11 — Fukuoka".to_string()];
         assert_eq!(
             divider_lines(&bg, &titles, &mut Announced::default()),
+            // The heading names the page's place; the caption keeps its words.
             [
-                "Day 11 — Fukuoka",
+                "Day 11 — Canal City Ramen Stadium",
                 "Best ramen of the trip.",
-                "Canal City Ramen Stadium"
             ]
         );
     }
