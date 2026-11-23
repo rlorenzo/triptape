@@ -60,8 +60,18 @@ pub(crate) fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Serif stack for the parchment map title, matching the map's own labels.
+const MAP_FONT_STACK: &str = r#"("Georgia", "DejaVu Serif")"#;
+
 /// Full-frame 1920x1080 title card: trip name, accent rule, date range.
-pub fn title_card_doc(trip_name: &str, date_range: Option<&str>) -> String {
+/// With `map` (an image file name beside the `.typ`, e.g. the first frame
+/// of the opening hop clip), the map fills the frame and the title sits on a
+/// parchment banner styled like the map's place labels; otherwise the title
+/// is white on the dark card.
+pub fn title_card_doc(trip_name: &str, date_range: Option<&str>, map: Option<&str>) -> String {
+    if let Some(map) = map {
+        return map_title_card_doc(trip_name, date_range, map);
+    }
     let date_block = match date_range {
         Some(d) => format!(
             "\n  line(length: 340pt, stroke: 6pt + rgb(\"#f5b242\")),\n  text(size: 46pt, fill: rgb(\"#c8cfdb\"), \"{}\"),",
@@ -76,6 +86,30 @@ pub fn title_card_doc(trip_name: &str, date_range: Option<&str>) -> String {
   text(size: 96pt, weight: "bold", "{name}"),{dates}
 ))"#,
         fonts = FONT_STACK,
+        name = esc(trip_name),
+        dates = date_block,
+    )
+}
+
+/// [`title_card_doc`] over a parchment map: dark-brown italic serif on a
+/// cream banner with a red rule, the colours of the map's labels and route.
+fn map_title_card_doc(trip_name: &str, date_range: Option<&str>, map: &str) -> String {
+    let date_block = match date_range {
+        Some(d) => format!(
+            "\n    align(center, line(length: 340pt, stroke: 5pt + rgb(\"#b3261e\"))),\n    align(center, text(size: 50pt, style: \"italic\", \"{}\")),",
+            esc(d)
+        ),
+        None => String::new(),
+    };
+    format!(
+        r##"#set page(width: 1920pt, height: 1080pt, margin: 0pt, background: image("{map}", width: 100%, height: 100%))
+#set text(font: {fonts}, fill: rgb("#3b2410"))
+#place(center + horizon, box(fill: rgb(245, 236, 214, 235), stroke: 4pt + rgb("#3b2410"), radius: 6pt, inset: (x: 80pt, y: 48pt),
+  stack(dir: ttb, spacing: 26pt,
+    align(center, text(size: 100pt, weight: "bold", style: "italic", "{name}")),{dates}
+  )))"##,
+        map = esc(map),
+        fonts = MAP_FONT_STACK,
         name = esc(trip_name),
         dates = date_block,
     )
@@ -300,6 +334,23 @@ pub fn save_title_card(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_card_over_a_map_puts_the_title_on_a_banner() {
+        let doc = title_card_doc(
+            "Our Asia Adventure 2026",
+            Some("October 3rd – 30th"),
+            Some("title-map.png"),
+        );
+        assert!(doc.contains(r#"background: image("title-map.png""#));
+        assert!(doc.contains("box(fill: rgb(245, 236, 214"));
+        assert!(doc.contains(r#""Our Asia Adventure 2026""#));
+        assert!(doc.contains(r#""October 3rd – 30th""#));
+        assert!(doc.contains(MAP_FONT_STACK));
+        let plain = title_card_doc("Trip", None, None);
+        assert!(!plain.contains("image("));
+        assert!(plain.contains("fill: rgb(13, 20, 32)"));
+    }
 
     #[test]
     fn places_card_never_breaks_a_name() {

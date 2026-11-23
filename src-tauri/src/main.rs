@@ -1256,6 +1256,7 @@ fn export_blocking(
         preset: choices.book_preset,
         book_max_pages: choices.book_pages,
         trip_name,
+        title_dates: None,
         typst_bin: tools().typst.bin.clone(),
         music_paths: Vec::new(),
         keep_ambience: false,

@@ -26,6 +26,9 @@ pub struct ExportOptions {
     /// Book page cap; `None` keeps the preset's default max.
     pub book_max_pages: Option<usize>,
     pub trip_name: String,
+    /// The owner's date line for the film's title card; `None` works it
+    /// out from the photos.
+    pub title_dates: Option<String>,
     pub typst_bin: String,
     /// Music playlist in order (crossfaded); empty uses the bundled theme.
     pub music_paths: Vec<PathBuf>,
@@ -763,6 +766,7 @@ fn export_inner(
                 opening_map: opts.opening_map,
                 typst_bin: opts.typst_bin.clone(),
                 draft: opts.draft,
+                title_dates: opts.title_dates.clone(),
                 resolution: opts.resolution,
                 jobs: opts.jobs,
                 map_style: opts.map_style,
@@ -1533,6 +1537,7 @@ mod tests {
                 preset: render_book::BookPreset::P1,
                 book_max_pages: None,
                 trip_name: "Trip".into(),
+                title_dates: None,
                 typst_bin: "typst".into(),
                 music_paths: vec![],
                 keep_ambience: false,
@@ -1595,6 +1600,7 @@ mod tests {
             preset: render_book::BookPreset::P1,
             book_max_pages: None,
             trip_name: "t".into(),
+            title_dates: None,
             typst_bin: "typst".into(),
             music_paths: Vec::new(),
             keep_ambience: false,

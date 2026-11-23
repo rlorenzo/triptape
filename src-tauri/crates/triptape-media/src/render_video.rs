@@ -758,6 +758,9 @@ pub struct VideoOptions {
     /// and music, joined at [`ffmpeg::DRAFT_RESOLUTION`] with the fastest
     /// encoder this machine has ([`ffmpeg::draft_encoder`]).
     pub draft: bool,
+    /// The owner's own date line for the title card (`October 3rd – 30th`)
+    /// in place of the one worked out from the photos.
+    pub title_dates: Option<String>,
 }
 
 impl Default for VideoOptions {
@@ -781,6 +784,7 @@ impl Default for VideoOptions {
             map_style: MapStyle::default(),
             hop_clips: vec![],
             draft: false,
+            title_dates: None,
         }
     }
 }
@@ -839,16 +843,46 @@ fn closing_map_secs(route_stops: usize, map_secs: f64) -> f64 {
     }
 }
 
+/// The owner's hop clips play in the film: full mode, parchment style, and
+/// one clip per hop of the journey.
+fn hop_clips_adopted(opts: &VideoOptions) -> bool {
+    opts.journey.as_ref().is_some_and(|j| {
+        opts.map_style == MapStyle::Parchment
+            && !opts.short_mode
+            && !opts.hop_clips.is_empty()
+            && opts.hop_clips.len() == j.hops().len()
+    })
+}
+
+/// FFmpeg args writing the first frame of `clip` to `out` (a PNG).
+fn first_frame_args(clip: &Path, out: &Path) -> Vec<String> {
+    vec![
+        "-y".into(),
+        "-i".into(),
+        s(clip),
+        "-frames:v".into(),
+        "1".into(),
+        s(out),
+    ]
+}
+
+/// The title card's date line: the owner's own wins (a blank one means no
+/// date line at all), else the range worked out from the photos.
+fn title_date_line(owner: Option<&str>, photos: Option<&str>) -> Option<String> {
+    owner
+        .map(str::trim)
+        .or(photos)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+}
+
 /// Seconds the closing map segment will run for these options.
 fn closing_map_len(opts: &VideoOptions) -> f64 {
     match &opts.journey {
         // The owner's hop clips close the film themselves when they are
         // adopted (one per hop, full mode only); otherwise a route map does.
-        Some(j) if opts.map_style == MapStyle::Parchment => {
-            if !opts.short_mode
-                && !opts.hop_clips.is_empty()
-                && opts.hop_clips.len() == j.hops().len()
-            {
+        Some(_) if opts.map_style == MapStyle::Parchment => {
+            if hop_clips_adopted(opts) {
                 0.0
             } else {
                 triptape_core::journey::HOP_OVERVIEW_SECS
@@ -1056,7 +1090,9 @@ pub fn render_hero_video(
     };
     let mut segs: Vec<(ResolvedEntry, PathBuf, f64, String)> = vec![];
     // Title card first: Typst full-frame card (trip name + date range)
-    // when available, else the styled solid.
+    // when available, else the styled solid. With the owner's hop clips,
+    // the title sits on the opening hop's first frame: the map before the
+    // journey is drawn, which the first hop then sets off across.
     let title_png = work_dir.join("title.png");
     let date_range = crate::titlecard::format_date_range(
         &resolved
@@ -1064,18 +1100,34 @@ pub fn render_hero_video(
             .filter_map(|r| r.taken_at.map(|t| (t, r.tz_offset_secs)))
             .collect::<Vec<_>>(),
     );
+    let title_dates = title_date_line(opts.title_dates.as_deref(), date_range.as_deref());
+    const TITLE_MAP: &str = "title-map.png";
+    let title_map_png = work_dir.join(TITLE_MAP);
+    let mut title_map = None;
+    if let Some(clip) = opts
+        .hop_clips
+        .first()
+        .filter(|_| typst_ok && hop_clips_adopted(opts))
+    {
+        match caps.run(&first_frame_args(clip, &title_map_png), &title_map_png) {
+            Ok(()) => title_map = Some(TITLE_MAP),
+            Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
+            Err(e) => fallbacks.push(format!("title map frame failed ({e}); plain title card")),
+        }
+    }
     let title_is_text = render_card_png(
         opts,
         typst_ok,
-        &crate::titlecard::title_card_doc(&opts.trip_name, date_range.as_deref()),
+        &crate::titlecard::title_card_doc(&opts.trip_name, title_dates.as_deref(), title_map),
         &title_png,
         "title",
         &mut fallbacks,
     )?;
     if title_is_text {
         fallbacks.push(format!(
-            "title card shows trip name{}",
-            date_range
+            "title card shows trip name{}{}",
+            title_map.map_or("", |_| " over the opening map"),
+            title_dates
                 .as_deref()
                 .map_or(String::new(), |d| format!(" + {d}"))
         ));
@@ -1356,7 +1408,7 @@ pub fn render_hero_video(
             .collect();
         let gps: Vec<Option<(f64, f64)>> = segs[first_shot..].iter().map(|s| s.0.gps).collect();
         let cuts = triptape_core::journey::hop_cuts(&hops, &shots, &gps);
-        let adopt = own_clips && !hops.is_empty() && opts.hop_clips.len() == hops.len();
+        let adopt = hop_clips_adopted(opts);
         if own_clips && !adopt && !hops.is_empty() {
             fallbacks.push(format!(
                 "{} hop clips for {} hops: the maps are drawn instead",
@@ -5865,6 +5917,42 @@ mod tests {
         assert_eq!(MapStyle::from_flag("Night").unwrap(), MapStyle::Night);
         assert!(MapStyle::from_flag("sepia").is_err());
         assert!(is_card("hop-03") && is_card("route") && !is_card("a1b2"));
+        // The owner's clips are adopted only with one per hop, in full
+        // parchment mode; then they close the film themselves.
+        let clips = |n: usize, short_mode| VideoOptions {
+            journey: Some(journey.clone()),
+            hop_clips: (0..n)
+                .map(|i| PathBuf::from(format!("hop{i}.mp4")))
+                .collect(),
+            short_mode,
+            ..Default::default()
+        };
+        let hops = journey.hops().len();
+        assert!(hop_clips_adopted(&clips(hops, false)));
+        assert_eq!(closing_map_len(&clips(hops, false)), 0.0);
+        assert!(!hop_clips_adopted(&clips(hops, true)));
+        assert!(!hop_clips_adopted(&clips(hops + 1, false)));
+        assert!(!hop_clips_adopted(&clips(0, false)));
+        assert!(!hop_clips_adopted(&VideoOptions {
+            map_style: MapStyle::Night,
+            ..clips(hops, false)
+        }));
+        // The owner's date line wins over the photos'; a blank one hides it.
+        assert_eq!(
+            title_date_line(Some(" Oct 3rd – 30th "), Some("Oct 4–29")).as_deref(),
+            Some("Oct 3rd – 30th")
+        );
+        assert_eq!(title_date_line(Some("  "), Some("Oct 4–29")), None);
+        assert_eq!(
+            title_date_line(None, Some("Oct 4–29")).as_deref(),
+            Some("Oct 4–29")
+        );
+        assert_eq!(title_date_line(None, None), None);
+        let args = first_frame_args(Path::new("hop0.mp4"), Path::new("title-map.png"));
+        assert_eq!(
+            args,
+            ["-y", "-i", "hop0.mp4", "-frames:v", "1", "title-map.png"]
+        );
     }
 
     #[test]
