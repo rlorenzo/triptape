@@ -1420,9 +1420,13 @@ pub fn render_book(
     let mut cap_note: Option<(usize, usize)>;
     let mut cap_dropped: Vec<String>;
     let mut pruned: Vec<BookPhoto> = loop {
+        // With the owner's front cover, the pinned sights belong to the back
+        // cover alone: the pages never print them too.
+        let back_cover_only =
+            |p: &BookPhoto| opts.front_cover_image.is_some() && p.cover_focus.is_some();
         let pool: Vec<BookPhoto> = viable
             .iter()
-            .filter(|p| !excluded.contains(&p.asset_id))
+            .filter(|p| !excluded.contains(&p.asset_id) && !back_cover_only(p))
             .cloned()
             .collect();
         // Cap math runs on the survivors: dropping the only wide photo
@@ -1570,10 +1574,12 @@ pub fn render_book(
         // themselves, without the family: shots the pages do not print.
         Some(front) => {
             let cover = image_cover(front, (tw, th), &out_dir.join("cover.jpg"), &mut fallbacks);
+            // The owner's cover pins first (chosen sights, printed or not),
+            // then automatic picks from shots the pages do not print.
             let printed: HashSet<&str> = photos.iter().map(|p| p.asset_id.as_str()).collect();
             let unprinted: Vec<BookPhoto> = viable
                 .iter()
-                .filter(|p| !printed.contains(p.asset_id.as_str()))
+                .filter(|p| p.cover_focus.is_some() || !printed.contains(p.asset_id.as_str()))
                 .cloned()
                 .collect();
             let sights = sight_picks(&unprinted);
@@ -3445,11 +3451,21 @@ fn image_cover(
 /// Most tiles the sights mosaic holds (four by four).
 const SIGHT_TILES: usize = 16;
 
-/// Close-ups of the trip's sights for the back cover: photos with no one in
+/// Close-ups of the trip's sights for the back cover: the owner's cover
+/// pins when there are any (in trip order), else photos with no one in
 /// them (no tagged person, no face), not panoramas or screenshots, one per
 /// place, best-scored first, then in trip order. A place is the owner's
 /// named place, else the photo's place label.
 fn sight_picks(photos: &[BookPhoto]) -> Vec<usize> {
+    // The owner's chosen sights (cover pins) fill the mosaic first.
+    let mut pinned: Vec<usize> = (0..photos.len())
+        .filter(|&i| photos[i].cover_focus.is_some())
+        .collect();
+    if !pinned.is_empty() {
+        pinned.sort_by_key(|&i| photos[i].taken_at);
+        pinned.truncate(SIGHT_TILES);
+        return pinned;
+    }
     let nobody = |p: &BookPhoto| {
         p.tagged_people == 0 && p.people == 0 && p.family.is_empty() && p.face_size < 0.01
     };

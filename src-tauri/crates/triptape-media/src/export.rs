@@ -908,7 +908,9 @@ fn export_inner(
             // layout choice.
             let pinned = plan.book.contains(&a.id)
                 || plan.book_layout.mentions(&a.id)
-                || plan.cover.contains_key(&a.id);
+                // A back-cover sight (front cover is the owner's picture) is
+                // not also forced onto the pages: the covers don't repeat them.
+                || (opts.front_cover.is_none() && plan.cover.contains_key(&a.id));
             let itin = opts.itinerary.as_ref();
             let spot =
                 triptape_core::places::spot_with_fix(itin, a, borrowed.get(a.id.as_str()).copied());
