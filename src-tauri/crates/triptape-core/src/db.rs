@@ -1237,6 +1237,8 @@ mod tests {
             motion: vec!["a2".into()],
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
         };
@@ -1781,6 +1783,8 @@ mod tests {
             },
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
         };

@@ -17,7 +17,9 @@ use triptape_core::plan::{
     self, caption_read_secs, collage_hold_secs, is_panorama, pano_coverage, pano_motion,
     places_card_secs, MAX_CLIP_SECS, MAX_COLLAGE, MIN_SEGMENT_SECS,
 };
-use triptape_core::types::{Chapter, CollageEdits, Plan, PlanEntry, Rendition};
+use triptape_core::types::{
+    frame_aspect, Chapter, CollageEdits, Frame, Plan, PlanEntry, Rendition,
+};
 
 /// Crossfade applied at the cut *into* a segment (PLAN.md Sec 9, 6-pack).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -467,6 +469,12 @@ pub struct ResolvedEntry {
     /// Where it was taken, when known: places the travel map home before
     /// the first shot back home.
     pub gps: Option<(f64, f64)>,
+    /// The owner's framing rectangle: the film uses only this part of the
+    /// source (`aspect` is already the framed aspect).
+    pub frame: Option<Frame>,
+    /// The owner set it to play as a still: no Live Photo motion, even in
+    /// a collage cell.
+    pub still: bool,
 }
 
 /// How an itinerary's travel is shown in the film.
@@ -732,6 +740,8 @@ fn card_entry(id: &str, path: &Path) -> ResolvedEntry {
         taken_at: None,
         tz_offset_secs: None,
         aspect: None,
+        frame: None,
+        still: false,
         gps: None,
     }
 }
@@ -845,6 +855,7 @@ pub fn render_hero_video(
         opts.title_secs,
         0,
         opts.resolution,
+        None,
         &title_mp4,
     )?;
     segs.push((
@@ -2071,7 +2082,7 @@ fn render_entry_segment(
                 let aspect = image::image_dimensions(&png.path)
                     .ok()
                     .filter(|&(w, h)| w > 0 && h > 0)
-                    .map(|(w, h)| f64::from(w) / f64::from(h))
+                    .map(|(w, h)| frame_aspect(f64::from(w) / f64::from(h), r.frame))
                     .or(r.aspect);
                 let dur = if let Some(aspect) = aspect.filter(|&a| is_panorama(a)) {
                     let motion = pano_motion(aspect);
@@ -2084,10 +2095,12 @@ fn render_entry_segment(
                         .min(max_secs.max(still_secs));
                     // Travel less when shortened so the pan keeps its speed bound.
                     let coverage = pano_coverage(aspect, dur);
-                    render_pano_segment(caps, &png.path, dur, aspect, coverage, variant, res, out)?;
+                    render_pano_segment(
+                        caps, &png.path, dur, aspect, coverage, variant, res, r.frame, out,
+                    )?;
                     dur
                 } else {
-                    render_hold_segment(caps, &png.path, still_secs, variant, res, out)?;
+                    render_hold_segment(caps, &png.path, still_secs, variant, res, r.frame, out)?;
                     still_secs
                 };
                 Ok(dur)
@@ -2115,7 +2128,18 @@ fn render_entry_segment(
             // Upscaled first so the push-in samples, not smears.
             let (pw, ph) = res.clip_prescale();
             // Framing follows the displayed (autorotated) aspect.
-            let display = probe.as_ref().map(ffmpeg::ProbeInfo::display_dims);
+            // The framed part of the source is what gets fitted.
+            let display = probe
+                .as_ref()
+                .map(ffmpeg::ProbeInfo::display_dims)
+                .map(|(w, h)| {
+                    r.frame.map_or((w, h), |(_, _, fw, fh)| {
+                        (
+                            (u64::from(w) * u64::from(fw) / 100).max(1) as u32,
+                            (u64::from(h) * u64::from(fh) / 100).max(1) as u32,
+                        )
+                    })
+                });
             let framing = display.map_or(ClipFraming::Cover, |(w, h)| {
                 clip_framing(f64::from(w) / f64::from(h.max(1)))
             });
@@ -2134,43 +2158,17 @@ fn render_entry_segment(
                 ));
                 Some(chain)
             });
-            // Normalized to 30 fps before any per-frame work: 60 fps
-            // sources would otherwise composite twice the frames, and the
-            // glide's progress counts frames.
-            let mut vf = String::from("fps=30,");
-            match framing {
-                ClipFraming::Cover => {
-                    let flags = if upscaling { ":flags=lanczos" } else { "" };
-                    vf.push_str(&format!(
-                        "scale={pw}:{ph}:force_original_aspect_ratio=increase{flags},crop={pw}:{ph},setsar=1"
-                    ));
-                    if let Some(chain) = &tonemap {
-                        vf.push(',');
-                        vf.push_str(chain);
-                    }
-                }
-                ClipFraming::Contain => vf.push_str(&ffmpeg::video_contain_over_blur(
-                    caps,
-                    pw,
-                    ph,
-                    upscaling,
-                    tonemap.as_deref(),
-                )),
-            }
-            // Slow glide push-in on clips (1.0 -> 1.05, gentler when the
-            // clip is shown whole), matching the stills' Ken Burns drift
-            // so cuts don't sit static.
             let frames = (len * 30.0).round().max(1.0) as u32;
-            vf.push(',');
-            vf.push_str(&ffmpeg::glide_depth(
+            let vf = clip_filter(
                 caps,
+                r.frame,
+                framing,
+                (pw, ph),
+                upscaling,
+                tonemap.as_deref(),
                 frames,
-                res.width(),
-                res.height(),
-                0,
-                framing.glide_depth(),
-            ));
-            vf.push_str(",format=yuv420p");
+                res,
+            );
             let mut args: Vec<String> = vec![
                 "-y".into(),
                 "-ss".into(),
@@ -2218,6 +2216,54 @@ fn render_entry_segment(
             })
         }
     }
+}
+
+/// Video filter chain of a clip or Live Photo motion: the owner's framing
+/// cuts the source first, then it is normalized to 30 fps (60 fps sources
+/// would otherwise composite twice the frames, and the glide's progress
+/// counts frames), covered or fitted over blur into the `pw`x`ph`
+/// pre-scale (upscaled first so the push-in samples, not smears), and
+/// given a slow glide push-in (1.0 -> 1.05, gentler when the clip is shown
+/// whole), matching the stills' Ken Burns drift so cuts don't sit static.
+#[allow(clippy::too_many_arguments)]
+fn clip_filter(
+    caps: &Capabilities,
+    frame: Option<Frame>,
+    framing: ClipFraming,
+    (pw, ph): (u32, u32),
+    upscaling: bool,
+    tonemap: Option<&str>,
+    frames: u32,
+    res: Resolution,
+) -> String {
+    let mut vf = ffmpeg::frame_crop(frame);
+    vf.push_str("fps=30,");
+    match framing {
+        ClipFraming::Cover => {
+            let flags = if upscaling { ":flags=lanczos" } else { "" };
+            vf.push_str(&format!(
+                "scale={pw}:{ph}:force_original_aspect_ratio=increase{flags},crop={pw}:{ph},setsar=1"
+            ));
+            if let Some(chain) = tonemap {
+                vf.push(',');
+                vf.push_str(chain);
+            }
+        }
+        ClipFraming::Contain => vf.push_str(&ffmpeg::video_contain_over_blur(
+            caps, pw, ph, upscaling, tonemap,
+        )),
+    }
+    vf.push(',');
+    vf.push_str(&ffmpeg::glide_depth(
+        caps,
+        frames,
+        res.width(),
+        res.height(),
+        0,
+        framing.glide_depth(),
+    ));
+    vf.push_str(",format=yuv420p");
+    vf
 }
 
 /// Most of a clip's area a 16:9 cover crop may cut away before the clip is
@@ -2273,12 +2319,20 @@ pub(crate) fn silent_input(secs: f64) -> Vec<String> {
 /// blurred fill at 16:9, then a gentle Ken Burns move (≤1.05×) on the
 /// finished composite, varied by index. Zooming the raw photo instead
 /// both crops the subject and distorts non-16:9 sources.
-fn hold_graph(caps: &Capabilities, variant: usize, frames: u32, res: Resolution) -> String {
+/// The owner's framing, if any, cuts the photo first.
+fn hold_graph(
+    caps: &Capabilities,
+    variant: usize,
+    frames: u32,
+    res: Resolution,
+    frame: Option<Frame>,
+) -> String {
     // Supersample the composite once, hold it, then glide over it. The fill
     // blur radius is in canvas pixels, so it scales with the resolution.
     let (sw, sh) = res.supersample();
     let (w, h) = res.dims();
-    let composite = ffmpeg::fit_over_blur(caps, "[0:v]", sw, sh, "", 40 * res.scale());
+    let input = format!("[0:v]{}", ffmpeg::frame_crop(frame));
+    let composite = ffmpeg::fit_over_blur(caps, &input, sw, sh, "", 40 * res.scale());
     let hold = ffmpeg::hold_still(frames);
     let glide = ffmpeg::glide(caps, frames, w, h, variant);
     format!("{composite},{hold},{glide},format=yuv420p[v]")
@@ -2309,6 +2363,8 @@ fn render_collage_segment(
         let mut k = c.key("collage");
         for (i, m) in members.iter().enumerate() {
             k.file(&format!("member{i}"), &m.still_path);
+            // The owner's framing changes the pixels, not the arguments.
+            k.part(&format!("frame{i}"), &format!("{:?}", m.frame));
         }
         k.part("res", &format!("{:?}", res.dims()));
         k.args(&hold_args(
@@ -2317,6 +2373,7 @@ fn render_collage_segment(
             dur,
             variant,
             res,
+            None,
             Path::new(KEY_OUT),
         ));
         // Layout and crop rules are pixel logic the arguments do not
@@ -2346,14 +2403,14 @@ fn render_collage_segment(
             vec![]
         };
         if moving.is_empty() {
-            render_hold_segment(caps, &canvas, dur, variant, res, out)?;
+            render_hold_segment(caps, &canvas, dur, variant, res, None, out)?;
         } else {
             let args = live_collage_args(caps, &canvas, &moving, dur, variant, res, out);
             match caps.run(&args, out) {
                 // A motion file that will not decode must not cost the
                 // collage its stills.
                 Err(e) if !matches!(e, crate::MediaError::Cancelled) => {
-                    render_hold_segment(caps, &canvas, dur, variant, res, out)?;
+                    render_hold_segment(caps, &canvas, dur, variant, res, None, out)?;
                 }
                 done => done?,
             }
@@ -2465,6 +2522,18 @@ const MAX_CELL_CROP: f64 = 0.45;
 /// Focal height for cover crops that must cut height: people sit in the
 /// upper part of a portrait, so keep the top (0 = top, 0.5 = centre).
 const CROP_FOCUS_Y: f64 = 0.35;
+/// Focal height for a framed photo's cover crop: the owner placed the
+/// rectangle, so any remaining cut is taken evenly from both sides.
+const FRAMED_FOCUS_Y: f64 = 0.5;
+
+/// Focal height of a cell's cover crop, still or motion alike.
+fn cover_focus_y(framed: bool) -> f64 {
+    if framed {
+        FRAMED_FOCUS_Y
+    } else {
+        CROP_FOCUS_Y
+    }
+}
 /// Weight of fill that [`fill_cell`] contains rather than covers, against
 /// one that crops the same amount: shown whole beats cut off, but blur
 /// still wastes the cell.
@@ -2515,10 +2584,11 @@ fn permutations(n: usize) -> Vec<Vec<usize>> {
 
 /// Badness of showing a `sa`-aspect photo in a `ca`-aspect cell: the share
 /// cropped away while it still covers, then a discounted rate for the
-/// share of the cell wasted on blur once it is shown whole.
-fn cell_penalty(sa: f64, ca: f64) -> f64 {
+/// share of the cell wasted on blur once it is shown whole. A framed photo
+/// (`cover`) always fills its cell, so only the share cropped counts.
+fn cell_penalty(sa: f64, ca: f64, cover: bool) -> f64 {
     let loss = crop_loss(sa, ca);
-    if loss <= MAX_CELL_CROP {
+    if cover || loss <= MAX_CELL_CROP {
         loss
     } else {
         MAX_CELL_CROP + CONTAIN_PENALTY * (loss - MAX_CELL_CROP)
@@ -2597,7 +2667,9 @@ fn ideal_column_widths(
 /// preference for capture order. Portraits never go in a stacked (short)
 /// cell, so selfies get tall columns and landscapes share the rest.
 /// Cells tile the canvas exactly.
-fn collage_layout(aspects: &[f64], w: u32, h: u32) -> Vec<CollageCell> {
+/// `covers[i]` marks a member the owner framed: it always covers its cell
+/// (missing entries are `false`).
+fn collage_layout(aspects: &[f64], covers: &[bool], w: u32, h: u32) -> Vec<CollageCell> {
     let n = aspects.len().min(MAX_COLLAGE);
     let total_area = f64::from(w) * f64::from(h);
     let fit = |cells: &[CollageCell]| -> f64 {
@@ -2605,7 +2677,13 @@ fn collage_layout(aspects: &[f64], w: u32, h: u32) -> Vec<CollageCell> {
             .iter()
             .map(|c| {
                 let ca = f64::from(c.w) / f64::from(c.h);
-                cell_penalty(aspects[c.member], ca) * f64::from(c.w) * f64::from(c.h) / total_area
+                cell_penalty(
+                    aspects[c.member],
+                    ca,
+                    covers.get(c.member).copied().unwrap_or(false),
+                ) * f64::from(c.w)
+                    * f64::from(c.h)
+                    / total_area
             })
             .sum()
     };
@@ -2704,9 +2782,9 @@ fn contain_size(sa: f64, tw: u32, th: u32) -> (u32, u32) {
 /// Where [`fill_cell`] puts the photo itself inside a `cw`x`ch` tile at
 /// (`x`, `y`): the whole tile when it cover-crops, the centred fitted
 /// rectangle when the photo is shown whole over its blur.
-fn photo_rect(sa: f64, x: u32, y: u32, cw: u32, ch: u32) -> (u32, u32, u32, u32) {
+fn photo_rect(sa: f64, cover: bool, x: u32, y: u32, cw: u32, ch: u32) -> (u32, u32, u32, u32) {
     let ca = f64::from(cw) / f64::from(ch.max(1));
-    if crop_loss(sa, ca) <= MAX_CELL_CROP {
+    if cover || crop_loss(sa, ca) <= MAX_CELL_CROP {
         (x, y, cw, ch)
     } else {
         let (fw, fh) = contain_size(sa, cw, ch);
@@ -2716,11 +2794,13 @@ fn photo_rect(sa: f64, x: u32, y: u32, cw: u32, ch: u32) -> (u32, u32, u32, u32)
 
 /// Fill a cell: cover-crop (top-biased) when little is lost, else the
 /// whole photo over its own blur so faces and subjects are never cut off.
-fn fill_cell(img: &image::RgbImage, cw: u32, ch: u32) -> image::RgbImage {
+/// A photo the owner framed (`framed`) always covers, cut around its
+/// centre: the owner chose that rectangle so nobody's head is lost.
+fn fill_cell(img: &image::RgbImage, cw: u32, ch: u32, framed: bool) -> image::RgbImage {
     let sa = f64::from(img.width().max(1)) / f64::from(img.height().max(1));
     let ca = f64::from(cw) / f64::from(ch.max(1));
-    if crop_loss(sa, ca) <= MAX_CELL_CROP {
-        cover_fit_focus(img, cw, ch, CROP_FOCUS_Y)
+    if framed || crop_loss(sa, ca) <= MAX_CELL_CROP {
+        cover_fit_focus(img, cw, ch, cover_focus_y(framed))
     } else {
         contain_over_blur(img, cw, ch)
     }
@@ -2751,7 +2831,11 @@ fn compose_collage(
                     })?;
                     let img = image::open(&png.path)
                         .map_err(|e| crate::MediaError::Io(format!("collage open: {e}")))?;
-                    Ok(img.to_rgb8())
+                    let img = img.to_rgb8();
+                    Ok(match m.frame {
+                        Some(f) => crop_to_frame(&img, f),
+                        None => img,
+                    })
                 })
             })
             .collect();
@@ -2764,13 +2848,15 @@ fn compose_collage(
         .iter()
         .map(|i| f64::from(i.width().max(1)) / f64::from(i.height().max(1)))
         .collect();
-    let cells = collage_layout(&aspects, w_px, h_px);
+    let covers: Vec<bool> = members.iter().map(|m| m.frame.is_some()).collect();
+    let cells = collage_layout(&aspects, &covers, w_px, h_px);
     let tiles: Vec<image::RgbImage> = std::thread::scope(|scope| {
         let workers: Vec<_> = cells
             .iter()
             .map(|c| {
                 let img = &images[c.member];
-                scope.spawn(move || fill_cell(img, c.w - gap, c.h - gap))
+                let framed = covers[c.member];
+                scope.spawn(move || fill_cell(img, c.w - gap, c.h - gap, framed))
             })
             .collect();
         workers
@@ -2796,6 +2882,7 @@ fn compose_collage(
         .map(|c| {
             let (x, y, w, h) = photo_rect(
                 aspects[c.member],
+                covers[c.member],
                 c.x + gap / 2,
                 c.y + gap / 2,
                 c.w - gap,
@@ -2812,6 +2899,18 @@ fn compose_collage(
         .collect())
 }
 
+/// The part of `img` inside the owner's framing rectangle (percent of the
+/// image from its top left), at least one pixel each way.
+fn crop_to_frame(img: &image::RgbImage, f: Frame) -> image::RgbImage {
+    let (iw, ih) = (img.width().max(1), img.height().max(1));
+    let at = |len: u32, pct: u8| ((u64::from(len) * u64::from(pct) + 50) / 100) as u32;
+    let x = at(iw, f.0).min(iw - 1);
+    let y = at(ih, f.1).min(ih - 1);
+    let w = at(iw, f.2).clamp(1, iw - x);
+    let h = at(ih, f.3).clamp(1, ih - y);
+    image::imageops::crop_imm(img, x, y, w, h).to_image()
+}
+
 /// Dark gap between collage cells, in supersample-canvas pixels.
 fn collage_gap(res: Resolution) -> u32 {
     18 * res.scale()
@@ -2819,6 +2918,9 @@ fn collage_gap(res: Resolution) -> u32 {
 
 /// The Live Photo motion file of a collage member, when it has one.
 fn live_motion(m: &ResolvedEntry) -> Option<&Path> {
+    if m.still {
+        return None;
+    }
     m.motion_path
         .as_deref()
         .filter(|p| *p != m.still_path.as_path() && p.exists())
@@ -2877,6 +2979,8 @@ struct LiveCell {
     h: u32,
     secs: f64,
     tonemap: Option<String>,
+    /// The member's framing, applied to the motion as to its still.
+    frame: Option<Frame>,
 }
 
 /// Motion cells of a composed collage, from the rectangle each member's
@@ -2900,13 +3004,16 @@ fn live_cells(
             let src = live_motion(members[c.member])?;
             let probe = ffmpeg::ffprobe_file(&caps.ffprobe_bin, src).ok()?;
             let (dw, dh) = probe.display_dims();
-            let sa = f64::from(dw.max(1)) / f64::from(dh.max(1));
+            let frame = members[c.member].frame;
+            let sa = frame_aspect(f64::from(dw.max(1)) / f64::from(dh.max(1)), frame);
             let ca = f64::from(c.w.max(1)) / f64::from(c.h.max(1));
             // As long as it looks good: up to where the phone drops.
             let steady = crate::clip_analysis::live_steady_secs(&caps.ffmpeg_bin, src)
                 .unwrap_or(probe.duration_secs - LIVE_TAIL_TRIM);
             let secs = steady.min(probe.duration_secs).min(dur);
-            if !probe.has_video || crop_loss(sa, ca) > MAX_CELL_CROP || secs < LIVE_MIN_SECS {
+            // A framed cell covers its still, so its motion covers too.
+            let poor_fit = frame.is_none() && crop_loss(sa, ca) > MAX_CELL_CROP;
+            if !probe.has_video || poor_fit || secs < LIVE_MIN_SECS {
                 return None;
             }
             Some(LiveCell {
@@ -2918,6 +3025,7 @@ fn live_cells(
                 h: c.h,
                 secs,
                 tonemap: ffmpeg::tonemap_chain(caps, &probe.color_transfer),
+                frame,
             })
         })
         .collect();
@@ -2963,14 +3071,15 @@ fn live_collage_graph(
         let fade_in = LIVE_FADE_IN.min(c.secs / 4.0);
         let fade_out = LIVE_FADE_OUT.min(c.secs / 4.0);
         g.push_str(&format!(
-            "[{n}:v]fps=30,trim=duration={secs:.3},setpts=PTS-STARTPTS,{tone}format=rgb24,scale={cw}:{ch}:force_original_aspect_ratio=increase:flags=lanczos,crop={cw}:{ch}:(iw-{cw})/2:(ih-{ch})*{fy}:exact=1,setsar=1,format=rgba,fade=t=in:st=0:d={fade_in:.3}:alpha=1,fade=t=out:st={out_st:.3}:d={fade_out:.3}:alpha=1,setpts=PTS+{start:.3}/TB[m{n}];[c{i}][m{n}]overlay={x}:{y}:eof_action=pass:enable='between(t,{start:.3},{end:.3})'[c{n}];",
+            "[{n}:v]{crop}fps=30,trim=duration={secs:.3},setpts=PTS-STARTPTS,{tone}format=rgb24,scale={cw}:{ch}:force_original_aspect_ratio=increase:flags=lanczos,crop={cw}:{ch}:(iw-{cw})/2:(ih-{ch})*{fy}:exact=1,setsar=1,format=rgba,fade=t=in:st=0:d={fade_in:.3}:alpha=1,fade=t=out:st={out_st:.3}:d={fade_out:.3}:alpha=1,setpts=PTS+{start:.3}/TB[m{n}];[c{i}][m{n}]overlay={x}:{y}:eof_action=pass:enable='between(t,{start:.3},{end:.3})'[c{n}];",
             secs = c.secs,
             out_st = c.secs - fade_out,
             start = c.start,
             end = c.start + c.secs,
             cw = c.w,
             ch = c.h,
-            fy = CROP_FOCUS_Y,
+            fy = cover_focus_y(c.frame.is_some()),
+            crop = ffmpeg::frame_crop(c.frame),
             x = c.x,
             y = c.y,
         ));
@@ -3019,10 +3128,18 @@ fn live_collage_args(
 }
 
 /// Filter graph of a panorama pan.
-fn pano_graph(dur: f64, aspect: f64, coverage: f64, variant: usize, res: Resolution) -> String {
+fn pano_graph(
+    dur: f64,
+    aspect: f64,
+    coverage: f64,
+    variant: usize,
+    res: Resolution,
+    frame: Option<Frame>,
+) -> String {
     let frames = (dur * 30.0).round() as u32;
     format!(
-        "[0:v]{},format=yuv420p[v]",
+        "[0:v]{}{},format=yuv420p[v]",
+        ffmpeg::frame_crop(frame),
         ffmpeg::pano_pan(
             frames,
             res.width(),
@@ -3045,9 +3162,10 @@ fn render_pano_segment(
     coverage: f64,
     variant: usize,
     res: Resolution,
+    frame: Option<Frame>,
     out: &Path,
 ) -> Result<(), crate::MediaError> {
-    let graph = pano_graph(dur, aspect, coverage, variant, res);
+    let graph = pano_graph(dur, aspect, coverage, variant, res, frame);
     render_graph_segment(caps, img, dur, graph, out)
 }
 
@@ -3058,10 +3176,11 @@ fn hold_args(
     dur: f64,
     variant: usize,
     res: Resolution,
+    frame: Option<Frame>,
     out: &Path,
 ) -> Vec<String> {
     let frames = (dur * 30.0).round() as u32;
-    graph_segment_args(img, dur, hold_graph(caps, variant, frames, res), out)
+    graph_segment_args(img, dur, hold_graph(caps, variant, frames, res, frame), out)
 }
 
 /// Stand-ins for the input and output paths when a segment's ffmpeg
@@ -3089,13 +3208,15 @@ fn still_key(
         .part("res", &format!("{:?}", res.dims()))
         .num("still_secs", still_secs)
         .num("max_secs", max_secs)
-        .part("aspect", &format!("{:?}", r.aspect));
+        .part("aspect", &format!("{:?}", r.aspect))
+        .part("frame", &format!("{:?}", r.frame));
     k.args(&hold_args(
         caps,
         Path::new(KEY_IN),
         still_secs,
         variant,
         res,
+        r.frame,
         Path::new(KEY_OUT),
     ));
     // Any panorama aspect will do: its pan arguments fingerprint the pan code.
@@ -3104,7 +3225,14 @@ fn still_key(
     k.args(&graph_segment_args(
         Path::new(KEY_IN),
         dur,
-        pano_graph(dur, reference, pano_coverage(reference, dur), variant, res),
+        pano_graph(
+            dur,
+            reference,
+            pano_coverage(reference, dur),
+            variant,
+            res,
+            r.frame,
+        ),
         Path::new(KEY_OUT),
     ));
     k.finish()
@@ -3117,9 +3245,10 @@ fn render_hold_segment(
     dur: f64,
     variant: usize,
     res: Resolution,
+    frame: Option<Frame>,
     out: &Path,
 ) -> Result<(), crate::MediaError> {
-    caps.run(&hold_args(caps, img, dur, variant, res, out), out)
+    caps.run(&hold_args(caps, img, dur, variant, res, frame, out), out)
 }
 
 /// Encode a text card that holds perfectly still for `dur` seconds, at the
@@ -3419,7 +3548,7 @@ mod tests {
             ..Default::default()
         };
         for idx in 0..4 {
-            let g = hold_graph(&caps, idx, 120, Resolution::Hd1080);
+            let g = hold_graph(&caps, idx, 120, Resolution::Hd1080, None);
             // Full photo over blurred fill, motion on the composite only,
             // never past 1.05x (window floor is 20/21 of the frame).
             assert!(g.contains("[bg][fg]overlay"), "{g}");
@@ -3442,7 +3571,7 @@ mod tests {
             ..Default::default()
         };
         for idx in 0..4 {
-            let g = hold_graph(&caps, idx, 120, Resolution::Hd1080);
+            let g = hold_graph(&caps, idx, 120, Resolution::Hd1080, None);
             assert!(!g.contains("zoompan"), "no zoompan jitter: {g}");
             assert!(
                 g.find("overlay").unwrap() < g.find("loop=loop=119").unwrap(),
@@ -3691,18 +3820,18 @@ mod tests {
             vec![P, P, L, L],
             vec![P, P, P, P],
         ] {
-            assert_tiles(&collage_layout(&aspects, 2880, 1620), aspects.len());
+            assert_tiles(&collage_layout(&aspects, &[], 2880, 1620), aspects.len());
         }
     }
 
     #[test]
     fn two_portraits_sit_side_by_side_at_full_height() {
-        let cells = collage_layout(&[0.75, 0.75], 2880, 1620);
+        let cells = collage_layout(&[0.75, 0.75], &[], 2880, 1620);
         assert!(cells.iter().all(|c| c.h == 1620 && c.y == 0));
         assert_eq!((cells[0].w, cells[1].w), (1440, 1440));
         // A portrait + landscape pair: full-height columns, the landscape
         // wider, each cell near its photo's shape.
-        let mixed = collage_layout(&[1.5, 0.75], 2880, 1620);
+        let mixed = collage_layout(&[1.5, 0.75], &[], 2880, 1620);
         assert!(mixed.iter().all(|c| c.h == 1620));
         assert!(mixed[0].w > mixed[1].w);
         let pa = f64::from(mixed[1].w) / f64::from(mixed[1].h);
@@ -3716,7 +3845,7 @@ mod tests {
         // The reviewed case: one landscape + two portrait selfies. Every
         // portrait owns a full-height column that crops it by <= the cap.
         for aspects in [[L, P, P], [P, L, P], [P, P, L]] {
-            let cells = collage_layout(&aspects, 3840, 2160);
+            let cells = collage_layout(&aspects, &[], 3840, 2160);
             for c in &cells {
                 if aspects[c.member] < PORTRAIT_BELOW {
                     assert_eq!(c.h, 2160, "portrait in a short cell: {c:?}");
@@ -3727,21 +3856,21 @@ mod tests {
         }
         // Mixed fours keep portraits tall too, with landscapes stacked.
         let mixed = [L, P, P, L];
-        let cells = collage_layout(&mixed, 3840, 2160);
+        let cells = collage_layout(&mixed, &[], 3840, 2160);
         assert!(cells
             .iter()
             .filter(|c| mixed[c.member] == P)
             .all(|c| c.h == 2160));
         assert!(cells.iter().any(|c| c.h == 1080));
         // Three portraits: three equal columns.
-        let cols = collage_layout(&[0.7, 0.75, 0.8], 2880, 1620);
+        let cols = collage_layout(&[0.7, 0.75, 0.8], &[], 2880, 1620);
         assert!(cols.iter().all(|c| c.h == 1620 && c.w == 960));
     }
 
     #[test]
     fn degenerate_collages_fill_the_canvas() {
-        assert!(collage_layout(&[], 2880, 1620).is_empty());
-        let one = collage_layout(&[0.75], 2880, 1620);
+        assert!(collage_layout(&[], &[], 2880, 1620).is_empty());
+        let one = collage_layout(&[0.75], &[], 2880, 1620);
         assert_eq!(
             one,
             vec![CollageCell {
@@ -3757,21 +3886,21 @@ mod tests {
     #[test]
     fn landscapes_stack_beside_a_lone_portrait_or_share_a_big_cell() {
         // Lone portrait: tall column; landscapes stack opposite it.
-        let cells = collage_layout(&[1.5, 0.75, 1.5], 2880, 1620);
+        let cells = collage_layout(&[1.5, 0.75, 1.5], &[], 2880, 1620);
         let tall = cells.iter().find(|c| c.member == 1).unwrap();
         assert_eq!(tall.h, 1620);
         assert!(cells.iter().filter(|c| c.member != 1).all(|c| c.h == 810));
         // All landscape: one big cell beside two stacked.
-        let cells = collage_layout(&[1.5, 1.5, 1.5], 2880, 1620);
+        let cells = collage_layout(&[1.5, 1.5, 1.5], &[], 2880, 1620);
         assert_eq!(cells.iter().filter(|c| c.h == 1620).count(), 1);
         assert_eq!(cells.iter().filter(|c| c.h == 810).count(), 2);
     }
 
     #[test]
     fn four_photos_grid_unless_mostly_portrait() {
-        let grid = collage_layout(&[1.5, 1.5, 1.5, 1.5], 2880, 1620);
+        let grid = collage_layout(&[1.5, 1.5, 1.5, 1.5], &[], 2880, 1620);
         assert!(grid.iter().all(|c| c.w == 1440 && c.h == 810));
-        let cols = collage_layout(&[0.75; 4], 2880, 1620);
+        let cols = collage_layout(&[0.75; 4], &[], 2880, 1620);
         assert!(cols.iter().all(|c| c.h == 1620 && c.w == 720));
     }
 
@@ -3847,14 +3976,14 @@ mod tests {
                 land.put_pixel(x, y, image::Rgb([30, 200, 30]));
             }
         }
-        let cell = fill_cell(&land, 144, 162);
+        let cell = fill_cell(&land, 144, 162, false);
         assert_eq!((cell.width(), cell.height()), (144, 162));
         // Whole photo is 144x72 at y 45..117.
         assert_eq!(cell.get_pixel(2, 47), &image::Rgb([30, 200, 30]));
         assert_eq!(cell.get_pixel(100, 81), &image::Rgb([200, 30, 30]));
         // Near-matching portrait covers the cell edge to edge.
         let port = image::RgbImage::from_pixel(300, 400, image::Rgb([30, 30, 200]));
-        let cell = fill_cell(&port, 144, 162);
+        let cell = fill_cell(&port, 144, 162, false);
         assert_eq!(cell.get_pixel(0, 0), &image::Rgb([30, 30, 200]));
         assert_eq!(cell.get_pixel(143, 161), &image::Rgb([30, 30, 200]));
     }
@@ -3944,13 +4073,13 @@ mod tests {
             perspective: true,
             ..Default::default()
         };
-        let hd = hold_graph(&caps, 0, 120, Resolution::Hd1080);
+        let hd = hold_graph(&caps, 0, 120, Resolution::Hd1080, None);
         assert!(
             hd.contains("scale=2880:1620") && hd.contains("scale=1920:1080"),
             "{hd}"
         );
         assert!(hd.contains("gblur=sigma=40"), "{hd}");
-        let uhd = hold_graph(&caps, 0, 120, Resolution::Uhd4k);
+        let uhd = hold_graph(&caps, 0, 120, Resolution::Uhd4k, None);
         assert!(
             uhd.contains("scale=5760:3240") && uhd.contains("scale=3840:2160"),
             "{uhd}"
@@ -4211,6 +4340,8 @@ mod tests {
             tz_offset_secs: None,
             aspect: None,
             gps: None,
+            frame: None,
+            still: false,
         }
     }
 
@@ -4452,6 +4583,7 @@ mod tests {
             h: 1602,
             secs,
             tonemap: None,
+            frame: None,
         }
     }
 
@@ -4526,15 +4658,18 @@ mod tests {
     #[test]
     fn photo_rect_matches_cover_and_contain_fills() {
         // 4:3 photo in a 16:9 tile loses 25%: it covers the whole tile.
-        assert_eq!(photo_rect(4.0 / 3.0, 9, 9, 1600, 900), (9, 9, 1600, 900));
+        assert_eq!(
+            photo_rect(4.0 / 3.0, false, 9, 9, 1600, 900),
+            (9, 9, 1600, 900)
+        );
         // 3:4 photo in a tall 4:9 tile loses 41%: still fills the tile
         // (four portraits side by side fill their columns).
-        assert_eq!(photo_rect(0.75, 9, 9, 400, 900), (9, 9, 400, 900));
+        assert_eq!(photo_rect(0.75, false, 9, 9, 400, 900), (9, 9, 400, 900));
         // Square photo in the same tile would lose over half: shown
         // whole, full width, centred vertically.
-        assert_eq!(photo_rect(1.0, 9, 9, 400, 900), (9, 259, 400, 400));
+        assert_eq!(photo_rect(1.0, false, 9, 9, 400, 900), (9, 259, 400, 400));
         // Wide photo in a tall tile: same, and never larger than the tile.
-        let (x, y, w, h) = photo_rect(16.0 / 9.0, 0, 0, 400, 900);
+        let (x, y, w, h) = photo_rect(16.0 / 9.0, false, 0, 0, 400, 900);
         assert_eq!((x, w), (0, 400));
         assert_eq!((y, h), ((900 - 225) / 2, 225));
         // The fitted rectangle is where `contain_over_blur` draws it.
@@ -4881,6 +5016,8 @@ mod tests {
                 tz_offset_secs: None,
                 aspect: None,
                 gps: None,
+                frame: None,
+                still: false,
             });
         }
         let mut captions = HashMap::new();
@@ -4911,6 +5048,8 @@ mod tests {
             },
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
         };
@@ -5079,6 +5218,8 @@ mod tests {
                 tz_offset_secs: None,
                 aspect: None,
                 gps: None,
+                frame: None,
+                still: false,
             })
             .collect();
         let refs: Vec<&ResolvedEntry> = entries.iter().collect();
@@ -5149,6 +5290,8 @@ mod tests {
                 tz_offset_secs: None,
                 aspect: None,
                 gps: None,
+                frame: None,
+                still: false,
             })
             .collect();
         let plan = Plan {
@@ -5171,6 +5314,8 @@ mod tests {
             },
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
         };
@@ -5290,6 +5435,8 @@ mod tests {
                 tz_offset_secs: None,
                 aspect: None,
                 gps: None,
+                frame: None,
+                still: false,
             },
             ResolvedEntry {
                 entry: PlanEntry {
@@ -5307,6 +5454,8 @@ mod tests {
                 tz_offset_secs: None,
                 aspect: None,
                 gps: None,
+                frame: None,
+                still: false,
             },
         ];
         let plan = Plan {
@@ -5328,6 +5477,8 @@ mod tests {
             },
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
         };
@@ -5439,6 +5590,8 @@ mod tests {
             },
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
         };
@@ -5566,6 +5719,8 @@ mod tests {
             },
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
         };
@@ -5706,6 +5861,8 @@ mod tests {
                 tz_offset_secs: None,
                 aspect: Some(f64::from(320 + 16 * i as u32) / 240.0),
                 gps: None,
+                frame: None,
+                still: false,
             });
         }
         let plan = Plan {
@@ -5723,6 +5880,8 @@ mod tests {
             },
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
         };
@@ -5958,6 +6117,205 @@ mod tests {
                 assert_eq!(pos, k + 1, "only the shot after the insert may change");
             }
         }
+    }
+
+    #[test]
+    fn the_film_frame_crops_stills_clips_and_pans_before_any_fit() {
+        let caps = Capabilities {
+            gblur: true,
+            perspective: true,
+            ..Default::default()
+        };
+        let f: Frame = (10, 20, 50, 40);
+        let framed = ffmpeg::frame_crop(Some(f));
+        let crop = framed.trim_end_matches(',');
+        assert!(
+            crop.contains("iw*50/100") && crop.contains("ih*20/100"),
+            "{crop}"
+        );
+        assert!(crop.contains("max(2,"), "never under 2 pixels: {crop}");
+        assert_eq!(ffmpeg::frame_crop(None), "");
+        // Hold: right after the input, ahead of the blur fit.
+        let hold = hold_graph(&caps, 0, 120, Resolution::Hd1080, Some(f));
+        assert!(hold.starts_with(&format!("[0:v]{crop},split")), "{hold}");
+        assert!(hold.find(crop).unwrap() < hold.find("overlay").unwrap());
+        assert!(!hold_graph(&caps, 0, 120, Resolution::Hd1080, None).contains("iw*"));
+        // The hold arguments (and so the cache key) carry it.
+        let args = |frame| {
+            hold_args(
+                &caps,
+                Path::new("i.png"),
+                4.0,
+                0,
+                Resolution::Hd1080,
+                frame,
+                Path::new("o.mp4"),
+            )
+        };
+        assert_ne!(args(Some(f)), args(None));
+        // Pan: cropped before the strip is scaled.
+        let pano = pano_graph(5.0, 3.0, 0.5, 0, Resolution::Hd1080, Some(f));
+        assert!(pano.starts_with(&format!("[0:v]{crop},scale=")), "{pano}");
+        // Clip and Live Photo motion: first in the chain, before scale.
+        let clip = clip_filter(
+            &caps,
+            Some(f),
+            ClipFraming::Contain,
+            (3840, 2160),
+            false,
+            None,
+            90,
+            Resolution::Hd1080,
+        );
+        assert!(clip.starts_with(&format!("{crop},fps=30,scale=")), "{clip}");
+        let clip = clip_filter(
+            &caps,
+            Some(f),
+            ClipFraming::Cover,
+            (3840, 2160),
+            false,
+            None,
+            90,
+            Resolution::Hd1080,
+        );
+        assert!(clip.starts_with(&format!("{crop},fps=30,scale=")), "{clip}");
+        let plain = clip_filter(
+            &caps,
+            None,
+            ClipFraming::Cover,
+            (3840, 2160),
+            false,
+            None,
+            90,
+            Resolution::Hd1080,
+        );
+        assert!(plain.starts_with("fps=30,"), "{plain}");
+    }
+
+    #[test]
+    fn the_film_frame_changes_still_cache_keys() {
+        use crate::segment_cache::{SegmentCache, SegmentCacheConfig};
+        let caps = Capabilities {
+            gblur: true,
+            perspective: true,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = SegmentCacheConfig::roomy(dir.path().join("c"));
+        let cache = SegmentCache::open(&cfg, "ffmpeg test".into(), &dir.path().join("w")).unwrap();
+        let p = dir.path().join("a.png");
+        std::fs::write(&p, "a").unwrap();
+        let mut e = card_entry("a", &p);
+        let key = |e: &ResolvedEntry| {
+            still_key(&cache, &caps, e, 0, 4.0, f64::INFINITY, Resolution::Hd1080)
+        };
+        let plain = key(&e);
+        e.frame = Some((10, 20, 50, 40));
+        let framed = key(&e);
+        assert_ne!(plain, framed);
+        e.frame = Some((10, 20, 50, 41));
+        assert_ne!(framed, key(&e));
+    }
+
+    #[test]
+    fn a_framed_collage_member_covers_its_cell_and_lays_out_by_its_framed_aspect() {
+        // 2:1 photo in a 144x162 cell would normally sit whole over blur
+        // (see cells_cover_when_close_and_contain_when_far); framed, it
+        // fills the cell edge to edge, cut around the centre.
+        let mut land = image::RgbImage::from_pixel(400, 200, image::Rgb([200, 30, 30]));
+        for y in 0..20 {
+            for x in 0..20 {
+                land.put_pixel(x, y, image::Rgb([30, 200, 30]));
+            }
+        }
+        let cell = fill_cell(&land, 144, 162, true);
+        assert_eq!((cell.width(), cell.height()), (144, 162));
+        assert_eq!(cell.get_pixel(0, 0), &image::Rgb([200, 30, 30]));
+        assert_eq!(cell.get_pixel(143, 161), &image::Rgb([200, 30, 30]));
+        // The photo rectangle of a framed member is the whole tile.
+        assert_eq!(photo_rect(2.0, true, 9, 9, 400, 900), (9, 9, 400, 900));
+        assert_ne!(photo_rect(2.0, false, 9, 9, 400, 900), (9, 9, 400, 900));
+        // A framed photo is always charged its crop, never the contain rate.
+        assert!(cell_penalty(2.0, 0.44, false) < 1.0);
+        assert_eq!(cell_penalty(2.0, 0.44, true), crop_loss(2.0, 0.44));
+        // The frame cuts the decoded pixels in display orientation.
+        let mut img = image::RgbImage::from_pixel(200, 100, image::Rgb([0, 0, 0]));
+        for y in 0..100 {
+            for x in 100..200 {
+                img.put_pixel(x, y, image::Rgb([9, 9, 9]));
+            }
+        }
+        let right = crop_to_frame(&img, (50, 0, 50, 100));
+        assert_eq!((right.width(), right.height()), (100, 100));
+        assert_eq!(right.get_pixel(0, 0), &image::Rgb([9, 9, 9]));
+        let sliver = crop_to_frame(&img, (99, 99, 1, 1));
+        assert_eq!((sliver.width(), sliver.height()), (2, 1));
+        // Layout: every framed member covers (never the contain penalty),
+        // so the layout of far-off aspects still tiles the canvas.
+        let aspects = [2.5, 0.5];
+        let cells = collage_layout(&aspects, &[true, true], 2880, 1620);
+        assert_eq!(cells.len(), 2);
+        let area: u32 = cells.iter().map(|c| c.w * c.h).sum();
+        assert_eq!(area, 2880 * 1620);
+    }
+
+    #[test]
+    fn a_still_member_never_plays_motion_and_a_framed_one_frames_its_motion() {
+        let caps = crate::ffmpeg::probe_capabilities("ffmpeg", "ffprobe");
+        if !caps.libx264 || !caps.perspective {
+            eprintln!("ffmpeg caps insufficient; skipping still-member test");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let member = |name: &str, rgb: [u8; 3]| {
+            let still = dir.join(format!("{name}.png"));
+            image::RgbImage::from_pixel(480, 640, image::Rgb(rgb))
+                .save(&still)
+                .unwrap();
+            let motion = dir.join(format!("{name}.mov"));
+            let made = std::process::Command::new(&caps.ffmpeg_bin)
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+                .arg("testsrc2=s=480x640:r=30:d=2")
+                .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+                .arg(&motion)
+                .status()
+                .unwrap();
+            assert!(made.success());
+            let mut e = card_entry(name, &still);
+            e.motion_path = Some(motion);
+            e
+        };
+        let a = member("a", [40, 90, 160]);
+        let mut b = member("b", [160, 90, 40]);
+        let canvas = dir.join("canvas.png");
+        let play = |members: &[&ResolvedEntry]| {
+            let photos =
+                compose_collage(&caps.ffmpeg_bin, members, Resolution::Hd1080, &canvas).unwrap();
+            live_cells(&caps, members, &photos, 5.0)
+        };
+        assert_eq!(play(&[&a, &b]).len(), 2);
+        // Played as a still: its cell stays a still.
+        b.still = true;
+        assert!(live_motion(&b).is_none());
+        let cells = play(&[&a, &b]);
+        assert_eq!(cells.len(), 1);
+        assert!(cells[0].src.ends_with("a.mov"));
+        // Framed: the motion gets the same rectangle, and covers.
+        b.still = false;
+        b.frame = Some((0, 25, 100, 50));
+        let cells = play(&[&a, &b]);
+        assert_eq!(cells.len(), 2);
+        let framed = cells.iter().find(|c| c.src.ends_with("b.mov")).unwrap();
+        assert_eq!(framed.frame, Some((0, 25, 100, 50)));
+        let g = live_collage_graph(&caps, &cells, 150, 0, Resolution::Hd1080);
+        assert!(
+            g.contains(&format!(
+                "{}fps=30",
+                ffmpeg::frame_crop(Some((0, 25, 100, 50)))
+            )),
+            "{g}"
+        );
     }
 
     /// Neighbouring groups with the same hash take different variants.

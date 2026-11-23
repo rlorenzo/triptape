@@ -12,12 +12,28 @@ use std::process::Command;
 use std::sync::{Mutex, PoisonError};
 use triptape_core::process;
 use triptape_core::proxies;
-use triptape_core::types::AssetKind;
+use triptape_core::types::{AssetKind, Frame};
 
 use crate::resolution::Resolution;
 
 /// Single-pass EBU R128 loudness target shared by every renderer.
 pub const LOUDNORM: &str = "loudnorm=I=-16:TP=-1.5:LRA=11";
+
+/// The `crop` filter (with its trailing comma) that cuts a source to the
+/// owner's framing rectangle (percent of the displayed source from its top
+/// left), or nothing without one. Placed right after the input, before any
+/// scale, fit or blur, so the rest of the graph sees a source that was
+/// framed to begin with.
+pub fn frame_crop(frame: Option<Frame>) -> String {
+    frame.map_or(String::new(), |(x, y, w, h)| {
+        // At least 2 pixels each way, kept inside the source, so a tiny
+        // frame on a small source still crops to something ffmpeg accepts.
+        format!(
+            "crop=w='max(2,iw*{w}/100)':h='max(2,ih*{h}/100)':\
+             x='min(iw*{x}/100,iw-ow)':y='min(ih*{y}/100,ih-oh)',"
+        )
+    })
+}
 
 /// Filter-graph fragment showing the full `input` photo fitted over its own
 /// blurred fill at `w`x`h` (no crop of the subject, no aspect distortion).
