@@ -866,6 +866,16 @@ fn first_frame_args(clip: &Path, out: &Path) -> Vec<String> {
     ]
 }
 
+/// The title card's date line: the owner's own wins (a blank one means no
+/// date line at all), else the range worked out from the photos.
+fn title_date_line(owner: Option<&str>, photos: Option<&str>) -> Option<String> {
+    owner
+        .map(str::trim)
+        .or(photos)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+}
+
 /// Seconds the closing map segment will run for these options.
 fn closing_map_len(opts: &VideoOptions) -> f64 {
     match &opts.journey {
@@ -1090,11 +1100,7 @@ pub fn render_hero_video(
             .filter_map(|r| r.taken_at.map(|t| (t, r.tz_offset_secs)))
             .collect::<Vec<_>>(),
     );
-    // The owner's date line wins; a blank one means no date line at all.
-    let title_dates = match opts.title_dates.as_deref().map(str::trim) {
-        Some(d) => Some(d.to_string()).filter(|d| !d.is_empty()),
-        None => date_range.clone(),
-    };
+    let title_dates = title_date_line(opts.title_dates.as_deref(), date_range.as_deref());
     const TITLE_MAP: &str = "title-map.png";
     let title_map_png = work_dir.join(TITLE_MAP);
     let mut title_map = None;
@@ -1120,11 +1126,7 @@ pub fn render_hero_video(
     if title_is_text {
         fallbacks.push(format!(
             "title card shows trip name{}{}",
-            if title_map.is_some() {
-                " over the opening map"
-            } else {
-                ""
-            },
+            title_map.map_or("", |_| " over the opening map"),
             title_dates
                 .as_deref()
                 .map_or(String::new(), |d| format!(" + {d}"))
@@ -5935,6 +5937,17 @@ mod tests {
             map_style: MapStyle::Night,
             ..clips(hops, false)
         }));
+        // The owner's date line wins over the photos'; a blank one hides it.
+        assert_eq!(
+            title_date_line(Some(" Oct 3rd – 30th "), Some("Oct 4–29")).as_deref(),
+            Some("Oct 3rd – 30th")
+        );
+        assert_eq!(title_date_line(Some("  "), Some("Oct 4–29")), None);
+        assert_eq!(
+            title_date_line(None, Some("Oct 4–29")).as_deref(),
+            Some("Oct 4–29")
+        );
+        assert_eq!(title_date_line(None, None), None);
         let args = first_frame_args(Path::new("hop0.mp4"), Path::new("title-map.png"));
         assert_eq!(
             args,
