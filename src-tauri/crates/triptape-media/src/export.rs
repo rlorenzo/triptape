@@ -440,33 +440,31 @@ pub fn export_all(
     let work = out_dir.join(".work");
     // The film's intermediates: `work` itself unless a work dir moved them.
     let scratch = scratch_dir(out_dir, opts.work_dir.as_deref());
+    // Read once: both caches key their entries on it, and reading it runs ffmpeg.
+    let version = opts
+        .segment_cache
+        .as_ref()
+        .map(|_| crate::segment_cache::ffmpeg_version(&caps.ffmpeg_bin));
+    let open = |cfg: &crate::segment_cache::SegmentCacheConfig, what: &str| {
+        let version = version.clone().unwrap_or_default();
+        match SegmentCache::open(cfg, version, &scratch) {
+            Ok(c) => (Some(c), None),
+            Err(e) => (
+                None,
+                Some(format!("{what} cache off ({}): {e}", cfg.dir.display())),
+            ),
+        }
+    };
     let (cache, cache_note) = match &opts.segment_cache {
         None => (None, None),
-        Some(cfg) => {
-            let version = crate::segment_cache::ffmpeg_version(&caps.ffmpeg_bin);
-            match SegmentCache::open(cfg, version, &scratch) {
-                Ok(c) => (Some(c), None),
-                Err(e) => (
-                    None,
-                    Some(format!("segment cache off ({}): {e}", cfg.dir.display())),
-                ),
-            }
-        }
+        Some(cfg) => open(cfg, "segment"),
     };
     caps.segment_cache = cache.clone();
     // The film's joined chunks are cached beside its segments, under their
     // own size limit. Only the film uses them.
     let (chunk_cache, chunk_note) = match &opts.segment_cache {
         Some(cfg) if cache.is_some() && matches!(opts.only.as_str(), "all" | "video") => {
-            let cfg = cfg.chunks();
-            let version = crate::segment_cache::ffmpeg_version(&caps.ffmpeg_bin);
-            match SegmentCache::open(&cfg, version, &scratch) {
-                Ok(c) => (Some(c), None),
-                Err(e) => (
-                    None,
-                    Some(format!("chunk cache off ({}): {e}", cfg.dir.display())),
-                ),
-            }
+            open(&cfg.chunks(), "chunk")
         }
         _ => (None, None),
     };
@@ -649,6 +647,18 @@ fn export_inner(
         estimate_export_bytes(plan, photos, book_cap, &opts.only),
     )
     .map_err(crate::MediaError::NoSpace)?;
+    // With --work-dir the film's segments and chunks land on another
+    // volume, so that one needs the room too.
+    if let Some(work_root) = opts.work_dir.as_deref() {
+        if matches!(opts.only.as_str(), "all" | "video") {
+            std::fs::create_dir_all(work_root).map_err(|e| crate::MediaError::Io(e.to_string()))?;
+            triptape_core::jobs::free_space_precheck(
+                work_root,
+                estimate_export_bytes(plan, 0, 0, "video"),
+            )
+            .map_err(crate::MediaError::NoSpace)?;
+        }
+    }
     let work = out_dir.join(".work");
     let scratch = scratch_dir(out_dir, opts.work_dir.as_deref());
     let stage = work.join("stage");

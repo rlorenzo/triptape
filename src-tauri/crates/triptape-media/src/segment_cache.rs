@@ -1168,8 +1168,6 @@ mod tests {
         assert_eq!(c.content_key_of(&plain).as_deref(), Some(seg_key.as_str()));
     }
 
-    /// A fetch whose entry vanished mid-way must not take the existing
-    /// destination (an overlay's base segment) down with it.
     /// Chunks live inside the segment cache's folder under their own limit:
     /// filling the chunk cache evicts chunks, never segments, and neither
     /// cache counts or clears the other's entries.
@@ -1223,6 +1221,8 @@ mod tests {
         assert!(chunk_cfg.dir.join("leases").is_dir());
     }
 
+    /// A fetch whose entry vanished mid-way must not take the existing
+    /// destination (an overlay's base segment) down with it.
     #[test]
     fn failed_place_keeps_existing_dest() {
         let t = tempfile::tempdir().unwrap();

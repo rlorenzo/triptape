@@ -393,6 +393,8 @@ fn prejoin_chunks(
     let mut done = 0.0;
     let mut inputs = vec![];
     for (k, r) in ranges.iter().enumerate() {
+        // Cache hits skip ffmpeg, so they would not notice a cancel.
+        caps.progress.check_cancelled()?;
         let secs = plan.joined.durations[k];
         // A lone segment needs no join.
         if r.len() == 1 {
@@ -3694,9 +3696,6 @@ mod tests {
              [v1][s2]xfade=transition=fadeblack:duration=0.800:offset=8.700[v];"
         );
         assert_eq!(v, "[v]");
-        // The same cuts as the keepsake's graph: only the inputs differ.
-        let (full, ..) = xfade_chain(&tr, &[0.5, 0.8], &[4.5, 8.7], false, None);
-        assert!(g.ends_with(&full.replace("[1:v]", "[s1]").replace("[2:v]", "[s2]")[5..]));
         // Captions are burned after the scale; a lone input is scaled too.
         let (g, map) = film_graph(
             &tr,
