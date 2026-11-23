@@ -2005,8 +2005,13 @@ fn write_captions_srt(
             // would leave the text floating over black.
             let cut = starts.get(i + 1).copied().unwrap_or(f64::INFINITY);
             let en = (starts[i] + (d - 0.6).min(read_secs))
-                .min(cut)
-                .max(st + 0.5);
+                .max(st + 0.5)
+                .min(cut);
+            // No time to read it before the cut: skip the cue.
+            if en - st < 0.5 {
+                n -= 1;
+                continue;
+            }
             body.push_str(&format!(
                 "{n}\n{} --> {}\n{}\n\n",
                 srt_ts(st),
@@ -3585,6 +3590,10 @@ mod tests {
         );
         let srt = std::fs::read_to_string(&out).unwrap();
         assert!(srt.contains("00:00:00,300 --> 00:00:02,200"), "{srt}");
+        // A cut too soon after the shot starts leaves no time: no cue.
+        let short = dir.path().join("s.srt");
+        let n = write_captions_srt(&segs, &[0.0, 0.6], &[false, true], &short).unwrap();
+        assert_eq!(n, 0);
         // The last shot has no cut after it, so only its own length bounds it.
         assert!(srt.contains("00:00:02,500 --> 00:00:04,600"), "{srt}");
     }
