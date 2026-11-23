@@ -2083,6 +2083,18 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
             }
         }
     }
+    // A heading that already names several places ("Tokyo · Tsukiji
+    // Outer Market") keeps them first, then the day's other places in the
+    // order visited ("· Togoshi Ginza").
+    let parts: Vec<&str> = place.split(" \u{b7} ").collect();
+    if !seen.contains(&place) && parts.len() > 1 && parts.iter().any(|p| seen.contains(p)) {
+        let mut out: Vec<&str> = parts.clone();
+        out.extend(seen.iter().filter(|s| !parts.contains(s)));
+        let listed = out.clone();
+        out.retain(|p| !listed.iter().any(|q| q != p && q.contains(p)));
+        out.truncate(MAX_HEADING_PLACES);
+        return format!("{head} — {}", out.join(" \u{b7} "));
+    }
     if !seen.contains(&place) {
         if !slot.first().is_some_and(|p| p.aboard) {
             return title.to_string();
@@ -4385,6 +4397,16 @@ mod tests {
         assert_eq!(
             places_in_time_order("Day 11 · Tue, Oct 13 — Fukuoka", &[&ship, &ship, &temple]),
             "Day 11 · Tue, Oct 13 — Carnival Luminosa · Fukuoka · Nanzoin Temple"
+        );
+        // A heading naming two places already gains the day's others.
+        let market = at("Tsukiji Outer Market");
+        let ginza = at("Togoshi Ginza");
+        assert_eq!(
+            places_in_time_order(
+                "Day 6 · Thu, Oct 8 — Tokyo · Tsukiji Outer Market",
+                &[&market, &ginza]
+            ),
+            "Day 6 · Thu, Oct 8 — Tokyo · Tsukiji Outer Market · Togoshi Ginza"
         );
         assert_eq!(places_in_time_order("Day 5", &[&tokyo]), "Day 5");
         // A placeless photo does not shift where the port goes, and a spot
