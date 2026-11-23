@@ -203,11 +203,30 @@ fn group_pages(photos: &mut Vec<BookPhoto>, groups: &[Vec<String>]) {
 /// ([`triptape_core::places::photo_places`]).
 fn book_caption(plan: &Plan, places: &HashMap<String, String>, id: &str) -> Option<String> {
     // A hidden (blank) caption still leaves the photo its place.
-    plan.captions
-        .get(id)
-        .filter(|c| has_caption(Some(c)))
-        .or_else(|| places.get(id))
-        .cloned()
+    match plan.captions.get(id).filter(|c| has_caption(Some(c))) {
+        Some(c) => Some(end_sentence(c)),
+        None => places.get(id).cloned(),
+    }
+}
+
+/// The owner's sentence with a full stop, so every caption in the book
+/// ends alike ("Alora won Candyland."). A short label ("Lamb curry") or a
+/// name ("Canal City Ramen Stadium") stays as written.
+fn end_sentence(c: &str) -> String {
+    let c = c.trim_end();
+    let words = c.split_whitespace().count();
+    let lower = c
+        .split_whitespace()
+        .filter(|w| w.starts_with(|ch: char| ch.is_lowercase()))
+        .count();
+    if words >= 3
+        && lower >= 1
+        && !c.ends_with(['.', '!', '?', '\u{2026}', ')', '"', '\u{201d}', ':'])
+    {
+        format!("{c}.")
+    } else {
+        c.to_string()
+    }
 }
 
 /// Book score added to a sharp, well-exposed panorama: on a grid page it
@@ -1302,6 +1321,20 @@ mod tests {
     }
 
     #[test]
+    fn owner_sentences_end_with_a_full_stop() {
+        assert_eq!(end_sentence("Alora won Candyland"), "Alora won Candyland.");
+        assert_eq!(
+            end_sentence("Best ramen of the trip!"),
+            "Best ramen of the trip!"
+        );
+        assert_eq!(end_sentence("Lamb curry"), "Lamb curry");
+        assert_eq!(
+            end_sentence("Canal City Ramen Stadium"),
+            "Canal City Ramen Stadium"
+        );
+    }
+
+    #[test]
     fn book_captions_prefer_user_text_then_the_shared_place() {
         let mut plan = empty_plan();
         let places: HashMap<String, String> =
@@ -1314,7 +1347,7 @@ mod tests {
         plan.captions.insert("a".into(), "Rain all day".into());
         assert_eq!(
             book_caption(&plan, &places, "a").as_deref(),
-            Some("Rain all day")
+            Some("Rain all day.")
         );
     }
 
