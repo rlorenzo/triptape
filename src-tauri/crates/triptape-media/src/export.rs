@@ -364,10 +364,13 @@ fn estimate_export_bytes(plan: &Plan, photos: usize, book_cap: usize, only: &str
 /// Scratch the film needs on the work volume: each entry's cached segment
 /// plus its share of the joined chunks, sized for the frame (4K segments
 /// run ~50 Mbit/s and chunks ~66 Mbit/s, about 6 s an entry).
-fn estimate_work_bytes(plan: &Plan, res: Resolution) -> u64 {
-    let per_entry = match res {
-        Resolution::Uhd4k => 120_000_000,
-        Resolution::Hd1080 => 35_000_000,
+fn estimate_work_bytes(plan: &Plan, res: Resolution, draft: bool) -> u64 {
+    // A draft still copies the full-size segments in, but joins 1080p
+    // chunks at ~20 Mbit/s instead of keepsake chunks at ~66.
+    let per_entry = match (res, draft) {
+        (Resolution::Uhd4k, false) => 120_000_000,
+        (Resolution::Uhd4k, true) => 55_000_000,
+        (Resolution::Hd1080, _) => 35_000_000,
     };
     estimate_with(plan, 0, 0, "video", per_entry)
 }
@@ -675,7 +678,7 @@ fn export_inner(
             std::fs::create_dir_all(work_root).map_err(|e| crate::MediaError::Io(e.to_string()))?;
             triptape_core::jobs::free_space_precheck(
                 work_root,
-                estimate_work_bytes(plan, opts.resolution),
+                estimate_work_bytes(plan, opts.resolution, opts.draft),
             )
             .map_err(crate::MediaError::NoSpace)?;
         }
@@ -1310,10 +1313,13 @@ mod tests {
             rendition: Rendition::Still,
         };
         plan.hero = vec![entry; 100];
-        let uhd = estimate_work_bytes(&plan, Resolution::Uhd4k);
-        let hd = estimate_work_bytes(&plan, Resolution::Hd1080);
+        let uhd = estimate_work_bytes(&plan, Resolution::Uhd4k, false);
+        let hd = estimate_work_bytes(&plan, Resolution::Hd1080, false);
+        let draft = estimate_work_bytes(&plan, Resolution::Uhd4k, true);
+        assert!(hd < draft && draft < uhd, "{hd} {draft} {uhd}");
         assert!(uhd >= 10_000_000_000, "{uhd}");
-        assert!(hd < uhd);
+        // A 1080p film's chunks are already small: a draft saves nothing.
+        assert_eq!(estimate_work_bytes(&plan, Resolution::Hd1080, true), hd);
     }
 
     #[test]
