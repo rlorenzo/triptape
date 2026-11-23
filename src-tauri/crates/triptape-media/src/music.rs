@@ -31,6 +31,10 @@ const FINAL_FADE_SECS: f64 = 1.5;
 const NATURAL_END_WINDOW_SECS: f64 = 10.0;
 /// Fade-out used in the natural-end case.
 const NATURAL_END_FADE_SECS: f64 = 3.0;
+/// A track this much shorter than the film still covers it: a bed cut to
+/// the film's exact length probes a few milliseconds short (container
+/// rounding), and wrapping it would crossfade its ending into its intro.
+const COVER_SLACK_SECS: f64 = 0.05;
 /// Per-track gain adjustment is clamped to this many dB either way.
 const MAX_GAIN_DB: f64 = 6.0;
 /// Hard cap on placements (guards against pathological tiny tracks).
@@ -128,7 +132,7 @@ pub fn plan_bed(durations: &[f64], total: f64) -> BedPlan {
     let mut bed_end = 0.0;
     let mut prev: Option<(usize, f64)> = None;
     let mut k = 0usize;
-    while (uses.is_empty() || bed_end < total - 1e-6) && uses.len() < MAX_USES {
+    while (uses.is_empty() || bed_end < total - COVER_SLACK_SECS) && uses.len() < MAX_USES {
         let i = k % durations.len();
         let d = durations[i];
         let start = match prev {
@@ -154,7 +158,7 @@ pub fn plan_bed(durations: &[f64], total: f64) -> BedPlan {
         k += 1;
     }
     let tail = bed_end - total;
-    let ends_naturally = (0.0..NATURAL_END_WINDOW_SECS).contains(&tail);
+    let ends_naturally = (-COVER_SLACK_SECS..NATURAL_END_WINDOW_SECS).contains(&tail);
     BedPlan {
         uses,
         seams,
@@ -345,6 +349,17 @@ mod tests {
                 gain_db: 0.0,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_bed_cut_to_the_film_plays_once_and_ends_naturally() {
+        // A bed made for a 924.163 s film probes a millisecond short.
+        let p = plan_bed(&[924.162], 924.163);
+        assert_eq!(p.uses.len(), 1);
+        assert!(p.seams.is_empty());
+        assert!(p.ends_naturally);
+        // Well short still wraps.
+        assert_eq!(plan_bed(&[900.0], 924.163).uses.len(), 2);
     }
 
     #[test]
