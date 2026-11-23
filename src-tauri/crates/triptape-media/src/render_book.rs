@@ -1614,7 +1614,10 @@ pub fn render_book(
                 if title.is_some() {
                     bannered.insert(page_no);
                 }
-                let title = title.map(|t| places_in_time_order(&t, &slot));
+                // The day's places across all its pages, in the order
+                // visited ("Tokyo · Tsukiji Outer Market · Togoshi Ginza").
+                let day_shots = same_day(photos, slot[0]);
+                let title = title.map(|t| places_in_time_order(&t, &day_shots));
                 page_caps = titled(title, page_caps);
                 if !page_caps.is_empty() {
                     captions.entry(page_no).or_default().extend(page_caps);
@@ -1742,7 +1745,7 @@ pub fn render_book(
                     &[FULL_PAGE],
                     &mut last_time,
                 ));
-                let lines = divider_lines(bg, chapters, &mut announced);
+                let lines = divider_lines_in(bg, &same_day(photos, bg), chapters, &mut announced);
                 let strip = strip_px(&lines, true, opts.preset, th);
                 // Full brightness: the title sits in the caption strip, which
                 // carries its own dark backing.
@@ -2065,8 +2068,16 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
         return title.to_string();
     };
     let mut seen: Vec<&str> = vec![];
+    // On board, the ship alone: no deck or lounge ("Lido Deck") after it.
+    let mut aboard_named = false;
     for p in slot {
         if let Some(pl) = p.place.as_deref() {
+            if p.aboard {
+                if aboard_named {
+                    continue;
+                }
+                aboard_named = true;
+            }
             if !seen.contains(&pl) {
                 seen.push(pl);
             }
@@ -2093,7 +2104,20 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
     // twice: a place already inside another listed place goes.
     let listed = seen.clone();
     seen.retain(|p| !listed.iter().any(|q| q != p && q.contains(p)));
+    seen.truncate(MAX_HEADING_PLACES);
     format!("{head} — {}", seen.join(" · "))
+}
+
+/// Most places a day heading names.
+const MAX_HEADING_PLACES: usize = 4;
+
+/// The photos of `p`'s day, in book order (`p` itself when its day is
+/// unknown).
+fn same_day<'a>(photos: &'a [BookPhoto], p: &'a BookPhoto) -> Vec<&'a BookPhoto> {
+    if p.day.is_none() {
+        return vec![p];
+    }
+    photos.iter().filter(|q| q.day == p.day).collect()
 }
 
 /// Pages whose strip prints large: a divider or bannered page whose
@@ -2124,10 +2148,22 @@ fn day_title_pages(
 
 /// Caption lines for a divider page: its background photo's chapter title
 /// plus that photo's own caption, since the photo is consumed here.
+#[cfg(test)]
 fn divider_lines(bg: &BookPhoto, chapters: &[String], announced: &mut Announced) -> Vec<String> {
+    divider_lines_in(bg, &[bg], chapters, announced)
+}
+
+/// [`divider_lines`] whose day heading names the places of `day` (the
+/// day's photos in book order).
+fn divider_lines_in(
+    bg: &BookPhoto,
+    day: &[&BookPhoto],
+    chapters: &[String],
+    announced: &mut Announced,
+) -> Vec<String> {
     // A captioned background keeps its place too, as on photo pages.
     titled(
-        opening_title(bg, chapters, announced).map(|t| places_in_time_order(&t, &[bg])),
+        opening_title(bg, chapters, announced).map(|t| places_in_time_order(&t, day)),
         page_caption(&[bg], PageKind::PhotoCaption),
     )
 }
@@ -2378,7 +2414,9 @@ fn fit_photo_focused(
     fb: &mut Vec<String>,
 ) -> RgbImage {
     let src = load(p, fit.ffmpeg, fb);
-    if p.whole {
+    // Cover tiles and spreads (`whole_if_cut` false) always fill: bars
+    // in the cover mosaic look broken.
+    if p.whole && whole_if_cut {
         // The owner wants all of it (the glass floor at the bottom edge).
         let strip_px = (reserve.clamp(0.0, 1.0) * f64::from(th)).round() as u32;
         return contain_on_page(&src, tw, th, strip_px);
@@ -4349,8 +4387,8 @@ mod tests {
             "Day 11 · Tue, Oct 13 — Carnival Luminosa · Fukuoka · Nanzoin Temple"
         );
         assert_eq!(places_in_time_order("Day 5", &[&tokyo]), "Day 5");
-        // A placeless photo does not shift where the port goes: it comes
-        // after every place on board, however the photos interleave.
+        // A placeless photo does not shift where the port goes, and a spot
+        // on board (a deck) is not listed after the ship.
         let mut deck = at("Lido Deck");
         deck.aboard = true;
         let blank = BookPhoto::blank();
@@ -4359,7 +4397,7 @@ mod tests {
                 "Day 11 · Tue, Oct 13 — Fukuoka",
                 &[&ship, &blank, &deck, &temple]
             ),
-            "Day 11 · Tue, Oct 13 — Carnival Luminosa · Lido Deck · Fukuoka · Nanzoin Temple"
+            "Day 11 · Tue, Oct 13 — Carnival Luminosa · Fukuoka · Nanzoin Temple"
         );
     }
 
