@@ -62,6 +62,9 @@ pub struct ExportOptions {
     pub hop_clips: Vec<PathBuf>,
     /// The owner's own picture for the book's back cover.
     pub back_cover: Option<PathBuf>,
+    /// The owner's own picture for the book's front cover (the sights
+    /// mosaic then takes the back).
+    pub front_cover: Option<PathBuf>,
 }
 
 /// How the segment cache served one export.
@@ -1055,6 +1058,7 @@ fn export_inner(
                 faces: opts.faces.clone(),
                 journey: journey(),
                 back_cover_image: opts.back_cover.clone(),
+                front_cover_image: opts.front_cover.clone(),
             },
         ) {
             Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
@@ -1499,6 +1503,7 @@ mod tests {
                 map_style: Default::default(),
                 hop_clips: vec![],
                 back_cover: None,
+                front_cover: None,
             },
         );
         assert!(matches!(err, Err(crate::MediaError::Cancelled)), "{err:?}");
@@ -1558,6 +1563,7 @@ mod tests {
             map_style: Default::default(),
             hop_clips: vec![],
             back_cover: None,
+            front_cover: None,
         };
         let report = export_all(&Default::default(), &empty_plan(), &[], &out, &opts).unwrap();
         assert!(!out.join(".work").exists(), "{:?}", report.fallbacks);

@@ -7,7 +7,7 @@
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
 //!                [--solo REF...] [--unsolo REF...] [--live REF...] [--unlive REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--feature REF...] [--whole REF...] [--still VIDEO SECS] [--group REF REF...] [--unfeature|--unwhole|--unstill|--ungroup REF...] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
-//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--resolution 4k|1080p] [--jobs N] [--quiet]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--front-cover IMAGE] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
 //! triptape cache stats|clear [--segment-cache DIR]
 //! triptape pick --db trip.db --out /path/to/new-folder [--count 800] [--project ID] [--stills-only]
@@ -858,6 +858,10 @@ fn export_cmd(flags: &HashMap<String, String>) {
         clips
     });
     let back_cover = flags.get("back-cover").map(PathBuf::from);
+    let front_cover = flags.get("front-cover").map(PathBuf::from);
+    if let Some(p) = front_cover.as_ref().filter(|p| !p.exists()) {
+        die("front-cover", format!("not found: {}", p.display()));
+    }
     if let Some(p) = back_cover.as_ref().filter(|p| !p.is_file()) {
         die("back-cover", format!("not found: {}", p.display()));
     }
@@ -890,6 +894,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             map_style,
             hop_clips,
             back_cover,
+            front_cover,
             known_faces,
         },
     );

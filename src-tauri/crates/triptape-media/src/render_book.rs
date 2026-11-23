@@ -825,6 +825,9 @@ pub struct BookOptions {
     pub journey: Option<triptape_core::journey::Journey>,
     /// The owner's own back-cover picture, used in place of the drawn map.
     pub back_cover_image: Option<PathBuf>,
+    /// The owner's own front-cover picture (the titled route map): the
+    /// photo mosaic then moves to the back cover, as sights without people.
+    pub front_cover_image: Option<PathBuf>,
 }
 
 /// Finds the faces in a decoded photo, as boxes normalised to 0..1.
@@ -1561,18 +1564,44 @@ pub fn render_book(
     // The book's first pages open the trip: the cover shows other photos,
     // so turning the cover never shows the same shot again straight away.
     let opening: Vec<usize> = order.iter().take(COVER_SKIPS_FIRST).copied().collect();
-    let cover_tiles = cover_picks(photos, &opening);
-    let cover = draw_cover_collage(
-        photos,
-        &cover_tiles,
-        (tw, th),
-        opts,
-        &fit,
-        &out_dir.join("cover.jpg"),
-        &mut fallbacks,
-    );
     let back_cover_jpg = out_dir.join("back-cover.jpg");
-    let back_cover = make_back_cover(opts, (tw, th), &back_cover_jpg, &mut fallbacks);
+    let (cover_tiles, cover, back_cover) = match &opts.front_cover_image {
+        // The owner's picture on the front; the back shows the places
+        // themselves, without the family: shots the pages do not print.
+        Some(front) => {
+            let cover = image_cover(front, (tw, th), &out_dir.join("cover.jpg"), &mut fallbacks);
+            let printed: HashSet<&str> = photos.iter().map(|p| p.asset_id.as_str()).collect();
+            let unprinted: Vec<BookPhoto> = viable
+                .iter()
+                .filter(|p| !printed.contains(p.asset_id.as_str()))
+                .cloned()
+                .collect();
+            let sights = sight_picks(&unprinted);
+            let back = draw_sights_mosaic(
+                &unprinted,
+                &sights,
+                (tw, th),
+                &fit,
+                &back_cover_jpg,
+                &mut fallbacks,
+            );
+            (vec![], cover, back)
+        }
+        None => {
+            let tiles = cover_picks(photos, &opening);
+            let cover = draw_cover_collage(
+                photos,
+                &tiles,
+                (tw, th),
+                opts,
+                &fit,
+                &out_dir.join("cover.jpg"),
+                &mut fallbacks,
+            );
+            let back = make_back_cover(opts, (tw, th), &back_cover_jpg, &mut fallbacks);
+            (tiles, cover, back)
+        }
+    };
     let covers = (cover.as_deref(), back_cover.as_deref());
     let mut cursor = 0usize;
     let mut page_no = 0usize;
@@ -1627,10 +1656,9 @@ pub fn render_book(
                 if title.is_some() {
                     bannered.insert(page_no);
                 }
-                // The day's places across all its pages, in the order
-                // visited ("Tokyo · Tsukiji Outer Market · Togoshi Ginza").
-                let day_shots = same_day(photos, slot[0]);
-                let title = title.map(|t| places_in_time_order(&t, &day_shots));
+                // The places of this page's photos, in the order visited:
+                // a label names what the page shows, not the whole day.
+                let title = title.map(|t| places_in_time_order(&t, &slot));
                 page_caps = titled(title, page_caps);
                 if !page_caps.is_empty() {
                     captions.entry(page_no).or_default().extend(page_caps);
@@ -1758,7 +1786,7 @@ pub fn render_book(
                     &[FULL_PAGE],
                     &mut last_time,
                 ));
-                let lines = divider_lines_in(bg, &same_day(photos, bg), chapters, &mut announced);
+                let lines = divider_lines_in(bg, &[bg], chapters, &mut announced);
                 let strip = strip_px(&lines, true, opts.preset, th);
                 // Full brightness: the title sits in the caption strip, which
                 // carries its own dark backing.
@@ -2135,15 +2163,6 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
 
 /// Most places a day heading names.
 const MAX_HEADING_PLACES: usize = 4;
-
-/// The photos of `p`'s day, in book order (`p` itself when its day is
-/// unknown).
-fn same_day<'a>(photos: &'a [BookPhoto], p: &'a BookPhoto) -> Vec<&'a BookPhoto> {
-    if p.day.is_none() {
-        return vec![p];
-    }
-    photos.iter().filter(|q| q.day == p.day).collect()
-}
 
 /// Pages whose strip prints large: a divider or bannered page whose
 /// heading starts a new day ("Day 21 · …"). A mid-day divider (a new place
@@ -3395,6 +3414,123 @@ fn draw_cover_collage(
     }
 }
 
+/// An owner's picture as a cover page, cropped to `size` around its centre.
+fn image_cover(
+    src: &Path,
+    size: (u32, u32),
+    out: &Path,
+    fallbacks: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let _ = std::fs::remove_file(out);
+    let made = image::open(src)
+        .map(|img| {
+            let img = img.to_rgb8();
+            let (sw, sh) = (
+                f64::from(img.width().max(1)),
+                f64::from(img.height().max(1)),
+            );
+            let window = focus_window(sw, sh, f64::from(size.0), f64::from(size.1), (0.5, 0.5));
+            crop_window(&img, window, size.0, size.1)
+        })
+        .map_err(|e| crate::MediaError::Io(format!("{}: {e}", src.display())));
+    match made.and_then(|img| save_jpg(&img, out)) {
+        Ok(()) => Some(out.to_path_buf()),
+        Err(e) => {
+            fallbacks.push(format!("front cover skipped: {e}"));
+            None
+        }
+    }
+}
+
+/// Most tiles the sights mosaic holds (four by four).
+const SIGHT_TILES: usize = 16;
+
+/// Close-ups of the trip's sights for the back cover: photos with no one in
+/// them (no tagged person, no face), not panoramas or screenshots, one per
+/// place, best-scored first, then in trip order. A place is the owner's
+/// named place, else the photo's place label.
+fn sight_picks(photos: &[BookPhoto]) -> Vec<usize> {
+    let nobody = |p: &BookPhoto| {
+        p.tagged_people == 0 && p.people == 0 && p.family.is_empty() && p.face_size < 0.01
+    };
+    let shaped = |p: &BookPhoto| {
+        p.width > 0
+            && p.height > 0
+            && f64::from(p.width) / f64::from(p.height) < PANORAMA_ASPECT
+            && !p
+                .path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+    };
+    let mut best: HashMap<String, usize> = HashMap::new();
+    for (i, p) in photos.iter().enumerate() {
+        if p.still_ms.is_some() || !nobody(p) || !shaped(p) {
+            continue;
+        }
+        let Some(place) = p.area.clone().or_else(|| p.place.clone()) else {
+            continue;
+        };
+        let keep = best.get(&place).is_none_or(|&j| p.score > photos[j].score);
+        if keep {
+            best.insert(place, i);
+        }
+    }
+    let mut picks: Vec<usize> = best.into_values().collect();
+    picks.sort_by(|&a, &b| photos[b].score.total_cmp(&photos[a].score));
+    picks.truncate(SIGHT_TILES);
+    // Trip order on the page.
+    picks.sort_by_key(|&i| photos[i].taken_at);
+    picks
+}
+
+/// The back cover as a full page of square sight tiles, no text. `None`
+/// (with a note) when there are no sights to show.
+fn draw_sights_mosaic(
+    photos: &[BookPhoto],
+    picks: &[usize],
+    (tw, th): (u32, u32),
+    fit: &Fit,
+    out: &Path,
+    fallbacks: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let _ = std::fs::remove_file(out);
+    // The biggest square grid the sights fill: 16, 9 or 4 tiles.
+    let cols = [4u32, 3, 2]
+        .into_iter()
+        .find(|&c| picks.len() >= (c * c) as usize)?;
+    let n = (cols * cols) as usize;
+    let gap = 14u32;
+    let tile_w = (tw - gap * (cols + 1)) / cols;
+    let tile_h = (th - gap * (cols + 1)) / cols;
+    let mut canvas = solid(tw, th, Rgb([18, 20, 26]));
+    for (k, &pi) in picks.iter().take(n).enumerate() {
+        let (cx, cy) = ((k as u32) % cols, (k as u32) / cols);
+        let p = &photos[pi];
+        let tile = fit_photo_focused(
+            p,
+            p.crop_focus,
+            (tile_w, tile_h),
+            0.0,
+            false,
+            fit,
+            fallbacks,
+        );
+        image::imageops::replace(
+            &mut canvas,
+            &tile,
+            (gap + cx * (tile_w + gap)) as i64,
+            (gap + cy * (tile_h + gap)) as i64,
+        );
+    }
+    match save_jpg(&canvas, out) {
+        Ok(()) => Some(out.to_path_buf()),
+        Err(e) => {
+            fallbacks.push(format!("back cover sights failed ({e})"));
+            None
+        }
+    }
+}
+
 /// Build `back-cover.jpg` at `size`: the owner's own picture when given,
 /// else the journey's whole route on a parchment map under the trip's
 /// name. `None` when there is neither, or (with a note) when it cannot be
@@ -3826,6 +3962,7 @@ mod tests {
             faces: None,
             journey: None,
             back_cover_image: None,
+            front_cover_image: None,
         }
     }
 
@@ -3958,6 +4095,28 @@ mod tests {
         let far = vec![shot(0, false), shot(1000, false), shot(4000, true)];
         let order = consumption_order(&far, &flow, BookPreset::P1);
         assert_eq!(&order[1..], [1, 2]);
+    }
+
+    #[test]
+    fn sights_are_one_unpeopled_close_up_per_place() {
+        let shot = |area: &str, people: u32, w: u32, score: f32, t: i64| BookPhoto {
+            area: Some(area.into()),
+            people,
+            width: w,
+            height: 3000,
+            score,
+            taken_at: Some(t),
+            ..BookPhoto::blank()
+        };
+        let photos = vec![
+            shot("Buddha", 0, 4000, 0.5, 3),
+            shot("Buddha", 0, 4000, 0.9, 2),
+            shot("Buddha", 3, 4000, 1.0, 1),
+            shot("Harbour", 0, 16000, 1.0, 4),
+            shot("Temple", 0, 4000, 0.4, 5),
+        ];
+        // The better Buddha close-up, the temple; no family shot, no panorama.
+        assert_eq!(sight_picks(&photos), [1, 4]);
     }
 
     #[test]
