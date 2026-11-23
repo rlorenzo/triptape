@@ -1641,10 +1641,14 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
         .map(|(id, f)| (id.clone(), *f))
         .collect();
     out.crop = edits.crop.clone();
+    // A book pin may name any photo of the project, not only one the plan
+    // holds: the book places a set-aside near-duplicate (the better take of
+    // a burst) beside the shot nearest it in time.
+    let known = |id: &str| by_id.contains_key(id) || in_plan.contains(id);
     out.book = edits
         .book
         .iter()
-        .filter(|id| in_plan.contains(id.as_str()) && !dead.contains(id.as_str()))
+        .filter(|id| known(id.as_str()) && !dead.contains(id.as_str()))
         .cloned()
         .collect();
     out.closing = edits
@@ -1652,8 +1656,10 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
         .clone()
         .filter(|id| in_plan.contains(id.as_str()) && !dead.contains(id.as_str()));
     out.book_layout = edits.book_layout.clone();
-    out.book_layout
-        .retain_assets(|id| in_plan.contains(id) && !dead.contains(id));
+    // Layout choices follow the photos the book can place (above).
+    out.book_layout.retain_assets(|id| {
+        (in_plan.contains(id) || out.book.iter().any(|b| b == id)) && !dead.contains(id)
+    });
     out.collage
         .retain_assets(|id| in_plan.contains(id) && !dead.contains(id));
     out

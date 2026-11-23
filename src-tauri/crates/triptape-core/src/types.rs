@@ -342,6 +342,10 @@ pub struct BookLayout {
     /// Photos that share one page (printed in story order).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<Vec<String>>,
+    /// Photos laid side by side: a page whose photos are all listed here
+    /// is one row of full-height cells (three cabin doors, door to floor).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<String>,
 }
 
 impl BookLayout {
@@ -350,12 +354,14 @@ impl BookLayout {
             && self.whole.is_empty()
             && self.stills.is_empty()
             && self.groups.is_empty()
+            && self.rows.is_empty()
     }
 
     /// Whether any layout choice names this asset.
     pub fn mentions(&self, id: &str) -> bool {
         self.feature.iter().any(|x| x == id)
             || self.whole.iter().any(|x| x == id)
+            || self.rows.iter().any(|x| x == id)
             || self.stills.contains_key(id)
             || self.groups.iter().flatten().any(|x| x == id)
     }
@@ -368,6 +374,11 @@ impl BookLayout {
     /// Show a photo whole (never cropped), or let it crop again.
     pub fn set_whole(&mut self, asset: String, on: bool) {
         set_listed(&mut self.whole, asset, on);
+    }
+
+    /// Lay a photo side by side with its page's others, or not.
+    pub fn set_row(&mut self, asset: String, on: bool) {
+        set_listed(&mut self.rows, asset, on);
     }
 
     /// Show a video as its frame `ms` milliseconds in, or (`None`) not at all.
@@ -402,6 +413,7 @@ impl BookLayout {
     pub fn retain_assets(&mut self, keep: impl Fn(&str) -> bool) {
         self.feature.retain(|id| keep(id));
         self.whole.retain(|id| keep(id));
+        self.rows.retain(|id| keep(id));
         self.stills.retain(|id, _| keep(id));
         self.retain_grouped(keep);
     }

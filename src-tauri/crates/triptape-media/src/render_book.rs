@@ -142,6 +142,8 @@ pub struct BookPhoto {
     pub feature: bool,
     /// The owner wants this photo never cropped.
     pub whole: bool,
+    /// The owner wants this photo's page laid out as one row (`--row`).
+    pub row: bool,
     /// In one of the owner's page groups: its stretch prints on one page.
     pub page_group: bool,
     /// The photo's place is a city the trip stopped in (not a sight).
@@ -194,6 +196,7 @@ impl BookPhoto {
             still_ms: None,
             feature: false,
             whole: false,
+            row: false,
             page_group: false,
             place_is_city: false,
             aboard: false,
@@ -3056,7 +3059,15 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
         }
     };
     let mut best: Option<(f64, Vec<Rect>)> = None;
-    for rows in row_splits(n) {
+    // The owner laid this page out side by side: one row, full height
+    // (three cabin doors, door to floor), however tall the cells.
+    let side_by_side = n <= 3 && slot.iter().all(|p| p.row);
+    let splits = if side_by_side {
+        vec![vec![n]]
+    } else {
+        row_splits(n)
+    };
+    for rows in splits {
         // Photos keep their order (time order): only the rows vary.
         let avail_h = h - gap * (rows.len() + 1) as f64;
         let mut at = 0;
@@ -5156,6 +5167,27 @@ mod tests {
                 taken.iter().map(|&i| photos[i].area.as_deref()).collect();
             assert!(on_page.len() <= 1, "{kind:?} mixes {on_page:?}");
         }
+    }
+
+    #[test]
+    fn a_row_page_lays_its_photos_side_by_side_full_height() {
+        let door = |row: bool| BookPhoto {
+            width: 3024,
+            height: 4032,
+            row,
+            ..BookPhoto::blank()
+        };
+        let doors = [door(true), door(true), door(true)];
+        let cells = grid_layout(&doors.iter().collect::<Vec<_>>(), 12.0, 12.0, 0.2);
+        // One row: every cell starts at the top margin and runs the page.
+        assert!(cells
+            .iter()
+            .all(|c| (c.1 - 0.2).abs() < 1e-9 && (c.3 - 11.6).abs() < 1e-9));
+        assert!(cells[0].0 < cells[1].0 && cells[1].0 < cells[2].0);
+        // Without the owner's choice the slivers lose to stacked rows.
+        let plain = [door(false), door(false), door(false)];
+        let cells = grid_layout(&plain.iter().collect::<Vec<_>>(), 12.0, 12.0, 0.2);
+        assert!(cells.iter().any(|c| c.3 < 11.0));
     }
 
     #[test]

@@ -165,6 +165,39 @@ fn verify_source(entry: &PlanEntry, path: &Path) -> Result<(), String> {
     }
 }
 
+/// The plan as the book sees it. A photo the owner pinned into the book
+/// (`--book`) that no chapter holds (a near-duplicate the scan set aside,
+/// such as the better take of a burst, or a shot the planner left out)
+/// joins the chapter of the shot nearest it in time, beside that shot. Only
+/// the book reads this; the film keeps the plan's own chapters.
+fn with_book_pins(plan: &Plan, assets: &[triptape_core::types::Asset]) -> Plan {
+    let taken: HashMap<&str, i64> = assets
+        .iter()
+        .filter_map(|a| a.taken_at.map(|t| (a.id.as_str(), t)))
+        .collect();
+    let mut out = plan.clone();
+    for id in &plan.book {
+        if out.chapters.iter().any(|c| c.asset_ids.contains(id)) {
+            continue;
+        }
+        let Some(&t) = taken.get(id.as_str()) else {
+            continue;
+        };
+        let nearest = out
+            .chapters
+            .iter()
+            .enumerate()
+            .flat_map(|(ci, c)| c.asset_ids.iter().enumerate().map(move |(i, a)| (ci, i, a)))
+            .filter_map(|(ci, i, a)| taken.get(a.as_str()).map(|&ta| (ci, i, ta)))
+            .min_by_key(|&(_, _, ta)| (ta - t).abs());
+        if let Some((ci, i, ta)) = nearest {
+            let at = if t < ta { i } else { i + 1 };
+            out.chapters[ci].asset_ids.insert(at, id.clone());
+        }
+    }
+    out
+}
+
 /// Asset id -> index of its chapter in the plan's book flow.
 fn book_chapter_of(plan: &Plan) -> HashMap<&str, usize> {
     plan.chapters
@@ -845,6 +878,8 @@ fn export_inner(
             reason: elig.book_reason.clone(),
         });
     } else {
+        let book_plan = with_book_pins(plan, assets);
+        let plan = &book_plan;
         let chapter_of = book_chapter_of(plan);
         // Day 1 is the earliest local date in the project, as the plan
         // numbers its chapters.
@@ -972,6 +1007,7 @@ fn export_inner(
                 still_ms: layout.stills.get(&a.id).copied(),
                 feature: layout.feature.contains(&a.id),
                 whole: layout.whole.contains(&a.id),
+                row: layout.rows.contains(&a.id),
                 page_group: false,
                 place_is_city: book_places
                     .get(&a.id)
@@ -1310,6 +1346,42 @@ mod tests {
         assert!(in_book_flow(&chapter_of, "a"));
         assert!(!in_book_flow(&chapter_of, "dupe"));
         assert!(!in_book_flow(&chapter_of, "cut"));
+    }
+
+    #[test]
+    fn a_book_pin_outside_the_plan_joins_the_shot_nearest_it() {
+        use triptape_core::types::{Asset, Chapter};
+        let chapter = |ids: &[&str]| Chapter {
+            title: String::new(),
+            asset_ids: ids.iter().map(|s| s.to_string()).collect(),
+            place: None,
+            day_index: None,
+            date_label: None,
+            film_place: None,
+            film_place_changes: vec![],
+        };
+        let at = |id: &str, t: i64| {
+            let mut a = Asset::new(id, PathBuf::from(format!("/t/{id}.jpg")), AssetKind::Photo);
+            a.taken_at = Some(t);
+            a
+        };
+        let assets = [
+            at("a", 100),
+            at("b", 200),
+            at("c", 1000),
+            at("take2", 210),
+            at("early", 950),
+        ];
+        let mut plan = empty_plan();
+        plan.chapters = vec![chapter(&["a", "b"]), chapter(&["c"])];
+        plan.book = vec!["take2".into(), "early".into(), "b".into()];
+        let book = with_book_pins(&plan, &assets);
+        // The better take of b's burst lands just after b; a shot 50 s
+        // before c lands just before it, in c's chapter.
+        assert_eq!(book.chapters[0].asset_ids, ["a", "b", "take2"]);
+        assert_eq!(book.chapters[1].asset_ids, ["early", "c"]);
+        // The film's plan is untouched.
+        assert_eq!(plan.chapters[0].asset_ids, ["a", "b"]);
     }
 
     #[test]
