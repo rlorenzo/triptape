@@ -144,6 +144,9 @@ pub struct BookPhoto {
     pub whole: bool,
     /// The owner wants this photo's page laid out as one row (`--row`).
     pub row: bool,
+    /// The owner's caption speaks for the whole page (`--page-caption`):
+    /// it prints in the page's bottom line, not under this photo.
+    pub caption_for_page: bool,
     /// In one of the owner's page groups: its stretch prints on one page.
     pub page_group: bool,
     /// The photo's place is a city the trip stopped in (not a sight).
@@ -197,6 +200,7 @@ impl BookPhoto {
             feature: false,
             whole: false,
             row: false,
+            caption_for_page: false,
             page_group: false,
             place_is_city: false,
             aboard: false,
@@ -266,7 +270,7 @@ pub fn dpi_verdict(photo_w: u32, photo_h: u32, slot_w_in: f64, slot_h_in: f64) -
     let dpi = (photo_w as f64 / slot_w_in).min(photo_h as f64 / slot_h_in);
     if dpi >= 300.0 {
         DpiVerdict::Ok
-    } else if dpi >= 200.0 {
+    } else if dpi >= MIN_PRINT_DPI {
         DpiVerdict::Warn
     } else {
         DpiVerdict::Block
@@ -728,7 +732,7 @@ pub fn flow_pages_marked(
 pub fn slot_sizes(preset: BookPreset, kind: PageKind, slot: &[&BookPhoto]) -> Vec<(f64, f64)> {
     if kind == PageKind::Grid && slot.len() > 1 {
         let (w, h) = preset.trim_inches();
-        return grid_cells(slot, w, h)
+        return sharp_cells(slot, grid_cells(slot, w, h), 1.0)
             .into_iter()
             .map(|(_, _, cw, ch)| (cw, ch))
             .collect();
@@ -1684,7 +1688,9 @@ pub fn render_book(
                 }
                 // The places of this page's photos, in the order visited:
                 // a label names what the page shows, not the whole day.
-                let title = title.map(|t| places_in_time_order(&t, &slot));
+                let page_w = opts.preset.trim_inches().0;
+                let title =
+                    title.map(|t| one_line_heading(places_in_time_order(&t, &slot), &slot, page_w));
                 page_caps = titled(title, page_caps);
                 if !page_caps.is_empty() {
                     captions.entry(page_no).or_default().extend(page_caps);
@@ -1698,9 +1704,11 @@ pub fn render_book(
                 // Grid photos stop above the page's caption strip: a day
                 // banner never lies over a face in the bottom row.
                 let cells = match fp.kind {
-                    PageKind::Grid => {
-                        grid_cells(&slot, f64::from(tw), f64::from(th.saturating_sub(strip)))
-                    }
+                    PageKind::Grid => sharp_cells(
+                        &slot,
+                        grid_cells(&slot, f64::from(tw), f64::from(th.saturating_sub(strip))),
+                        f64::from(tw) / opts.preset.trim_inches().0,
+                    ),
                     _ => vec![FULL_PAGE; slot.len()],
                 };
                 if fp.kind == PageKind::Grid {
@@ -1792,11 +1800,15 @@ pub fn render_book(
                 )?;
             }
             PageKind::Map => {
-                draw_map_page(route_card.unwrap(), tw, th, &out)?;
-                captions
-                    .entry(page_no)
-                    .or_default()
-                    .push(crate::titlecard::ROUTE_LABEL.to_string());
+                let card = route_card.unwrap();
+                draw_map_page(card, tw, th, &out)?;
+                // The owner's own map carries its own title.
+                if opts.front_cover_image.as_deref() != Some(card) {
+                    captions
+                        .entry(page_no)
+                        .or_default()
+                        .push(crate::titlecard::ROUTE_LABEL.to_string());
+                }
             }
             PageKind::Divider => {
                 // Consume the background photo: it belongs to this
@@ -2165,12 +2177,17 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
         }
     }
     // A heading that already names several places ("Tokyo · Tsukiji
-    // Outer Market") keeps them first, then the day's other places in the
-    // order visited ("· Togoshi Ginza").
+    // Outer Market") keeps those the page does not show (its city) first,
+    // then the page's places in the order visited ("· Togoshi Ginza"): the
+    // durian at Marina Bay Sands before the Flower Dome after it.
     let parts: Vec<&str> = place.split(" \u{b7} ").collect();
     if !seen.contains(&place) && parts.len() > 1 && parts.iter().any(|p| seen.contains(p)) {
-        let mut out: Vec<&str> = parts.clone();
-        out.extend(seen.iter().filter(|s| !parts.contains(s)));
+        let mut out: Vec<&str> = parts
+            .iter()
+            .copied()
+            .filter(|p| !seen.contains(p))
+            .collect();
+        out.extend(seen.iter().copied());
         let listed = out.clone();
         out.retain(|p| !listed.iter().any(|q| q != p && q.contains(p)));
         out.truncate(MAX_HEADING_PLACES);
@@ -2216,6 +2233,35 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
 
 /// Most places a day heading names.
 const MAX_HEADING_PLACES: usize = 4;
+
+/// A day heading on one line of its banner: when the places run onto a
+/// second line, those no photo on the page shows (the day's city, named
+/// for context) are dropped, and the page's own places stay as they are.
+fn one_line_heading(heading: String, slot: &[&BookPhoto], page_w: f64) -> String {
+    if heading_fits_one_line(&heading, page_w) {
+        return heading;
+    }
+    let Some((head, places)) = heading.split_once(" — ") else {
+        return heading;
+    };
+    let listed: Vec<&str> = places.split(" \u{b7} ").collect();
+    let shown: Vec<&str> = listed
+        .iter()
+        .copied()
+        .filter(|pl| slot.iter().any(|p| p.place.as_deref() == Some(*pl)))
+        .collect();
+    if shown.is_empty() || shown.len() == listed.len() {
+        return heading;
+    }
+    format!("{head} — {}", shown.join(" \u{b7} "))
+}
+
+/// Whether a day heading fits one line of the banner (24 pt, 14 pt inset):
+/// the burn's Avenir Next averages under 0.47 em a character.
+fn heading_fits_one_line(text: &str, page_w: f64) -> bool {
+    let (size, inset) = (24.0, 14.0);
+    text.chars().count() as f64 * size * 0.47 <= page_w * 72.0 - 2.0 * inset
+}
 
 /// Pages whose strip prints large: a divider or bannered page whose
 /// heading starts a new day ("Day 21 · …"). A mid-day divider (a new place
@@ -2291,6 +2337,12 @@ fn grid_captions(slot: &[&BookPhoto]) -> (Vec<String>, Vec<CellCaption>) {
     let mut lines: Vec<String> = vec![];
     for (k, p) in slot.iter().enumerate() {
         match caption_of(p).into_iter().next().filter(|_| p.own_caption()) {
+            // Words the owner said speak for the whole page lead its
+            // bottom line, before the places.
+            Some(c) if p.caption_for_page => {
+                lines.insert(0, c);
+                lines.extend(p.place.clone());
+            }
             // The user's words go on the photo; its place still joins the
             // page's location strip (the lounge, the ramen hall). The same
             // words on several photos of one page print once.
@@ -3090,7 +3142,16 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
             let row_w = w - gap * (k + 1) as f64;
             natural.push(row_w / sum);
             fixed.push(k == 1 && sum >= PANORAMA_ASPECT);
-            placed.extend(members.map(|i| (i, r, aspect(slot[i]) / sum)));
+            // Side by side, the owner's photos share the row evenly: a door
+            // cropped out of a hallway panorama is as wide as the others.
+            placed.extend(members.map(|i| {
+                let share = if side_by_side {
+                    1.0 / k as f64
+                } else {
+                    aspect(slot[i]) / sum
+                };
+                (i, r, share)
+            }));
         }
         let total: f64 = natural.iter().sum();
         let held: f64 = natural
@@ -3221,6 +3282,33 @@ fn grid_layout(slot: &[&BookPhoto], w: f64, h: f64, gap: f64) -> Vec<Rect> {
 /// 1% of the page width: one geometry for sizing, drawing and captions.
 fn grid_cells(slot: &[&BookPhoto], w: f64, h: f64) -> Vec<Rect> {
     grid_layout(slot, w, h, w / 100.0)
+}
+
+/// Lowest print resolution a photo is stretched to.
+const MIN_PRINT_DPI: f64 = 200.0;
+
+/// `cells` (in units of `per_inch` to the inch) with each low-resolution
+/// photo's cell shrunk, about its centre, to what the photo fills at
+/// [`MIN_PRINT_DPI`]: a small picture (the owner's 1536px "2009 and now"
+/// collage) prints as big as it stays sharp, rather than being dropped for
+/// a cell too big for it.
+fn sharp_cells(slot: &[&BookPhoto], cells: Vec<Rect>, per_inch: f64) -> Vec<Rect> {
+    slot.iter()
+        .zip(cells)
+        .map(|(p, (x, y, w, h))| {
+            if p.width == 0 || p.height == 0 {
+                return (x, y, w, h);
+            }
+            // A hair over the line, so rounding never tips it under.
+            let dpi = MIN_PRINT_DPI + 1.0;
+            let (mw, mh) = (
+                f64::from(p.width) / dpi * per_inch,
+                f64::from(p.height) / dpi * per_inch,
+            );
+            let (cw, ch) = (w.min(mw), h.min(mh));
+            (x + (w - cw) / 2.0, y + (h - ch) / 2.0, cw, ch)
+        })
+        .collect()
 }
 
 /// Paint `slot` into `cells` (from [`grid_cells`] at `tw`x`th`).
@@ -4260,6 +4348,51 @@ mod tests {
     }
 
     #[test]
+    fn a_low_resolution_photo_prints_as_big_as_it_stays_sharp() {
+        let small = BookPhoto {
+            width: 1536,
+            height: 1024,
+            ..BookPhoto::blank()
+        };
+        let big = BookPhoto {
+            width: 4032,
+            height: 3024,
+            ..BookPhoto::blank()
+        };
+        let cells = vec![(0.0, 0.0, 7.76, 5.36), (7.9, 0.0, 4.0, 5.36)];
+        let sharp = sharp_cells(&[&small, &big], cells.clone(), 1.0);
+        // Shrunk about its centre to what 1536x1024 fills at 200 dpi.
+        let (x, y, w, h) = sharp[0];
+        assert!(w < 7.68 && h < 5.12 && w > 7.6, "{:?}", sharp[0]);
+        assert!((x + w / 2.0 - 3.88).abs() < 1e-9 && (y + h / 2.0 - 2.68).abs() < 1e-9);
+        assert_ne!(dpi_verdict(1536, 1024, w, h), DpiVerdict::Block);
+        // A sharp photo keeps its cell.
+        assert_eq!(sharp[1], cells[1]);
+    }
+
+    #[test]
+    fn a_caption_for_the_whole_page_leads_its_bottom_line() {
+        let shot = |cap: Option<&str>| BookPhoto {
+            caption: cap.map(str::to_string),
+            place: Some("Pokémon Center Osaka".to_string()),
+            keep: true,
+            ..BookPhoto::blank()
+        };
+        let mut first = shot(Some("Alora posing as the various anime characters."));
+        first.caption_for_page = true;
+        let (rest, more) = (shot(None), shot(None));
+        let (line, cells) = grid_captions(&[&first, &rest, &more]);
+        assert!(cells.is_empty(), "{cells:?}");
+        assert_eq!(
+            line,
+            [
+                "Alora posing as the various anime characters.",
+                "Pokémon Center Osaka"
+            ]
+        );
+    }
+
+    #[test]
     fn grid_caption_collapses_to_one_dateline() {
         let mk = |cap: &str| BookPhoto {
             asset_id: cap.to_string(),
@@ -4691,6 +4824,37 @@ mod tests {
                 &[&ship, &blank, &deck, &temple]
             ),
             "Day 11 · Tue, Oct 13 — Carnival Luminosa · Fukuoka · Nanzoin Temple"
+        );
+    }
+
+    #[test]
+    fn a_heading_too_long_for_one_line_drops_the_city_the_page_does_not_show() {
+        let at = |place: &str| BookPhoto {
+            place: Some(place.to_string()),
+            ..BookPhoto::blank()
+        };
+        let (durian, dome) = (
+            at("Marina Bay Sands"),
+            at("Flower Dome, Gardens by the Bay"),
+        );
+        let slot = [&durian, &dome];
+        let heading = places_in_time_order(
+            "Day 21 · Fri, Oct 23 — Singapore · Flower Dome, Gardens by the Bay",
+            &slot,
+        );
+        assert_eq!(
+            heading,
+            "Day 21 · Fri, Oct 23 — Singapore · Marina Bay Sands · Flower Dome, Gardens by the Bay"
+        );
+        assert_eq!(
+            one_line_heading(heading, &slot, 12.0),
+            "Day 21 · Fri, Oct 23 — Marina Bay Sands · Flower Dome, Gardens by the Bay"
+        );
+        // One that fits keeps its city.
+        let tokyo = "Day 6 · Thu, Oct 8 — Tokyo · Tsukiji Outer Market";
+        assert_eq!(
+            one_line_heading(tokyo.to_string(), &[&at("Tsukiji Outer Market")], 12.0),
+            tokyo
         );
     }
 
@@ -5189,6 +5353,18 @@ mod tests {
             .iter()
             .all(|c| (c.1 - 0.2).abs() < 1e-9 && (c.3 - 11.6).abs() < 1e-9));
         assert!(cells[0].0 < cells[1].0 && cells[1].0 < cells[2].0);
+        // A door cropped out of a hallway panorama gets the same width.
+        let hall = BookPhoto {
+            width: 9840,
+            height: 3726,
+            row: true,
+            ..BookPhoto::blank()
+        };
+        let cells = grid_layout(&[&hall, &doors[1], &doors[2]], 12.0, 12.0, 0.2);
+        assert!(
+            cells.iter().all(|c| (c.2 - cells[1].2).abs() < 1e-9),
+            "{cells:?}"
+        );
         // Without the owner's choice the slivers lose to stacked rows.
         let plain = [door(false), door(false), door(false)];
         let cells = grid_layout(&plain.iter().collect::<Vec<_>>(), 12.0, 12.0, 0.2);

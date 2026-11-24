@@ -235,6 +235,28 @@ fn group_pages(photos: &mut Vec<BookPhoto>, groups: &[Vec<String>]) {
     }
 }
 
+/// The owner's placements out of time order (`--book-after`): each photo
+/// moves to right after its anchor and joins the anchor's stretch (day,
+/// chapter, page group), so the two can share a page. Its own place stays.
+fn book_moves(photos: &mut Vec<BookPhoto>, after: &[(String, String)]) {
+    for (id, anchor) in after {
+        let Some(from) = photos.iter().position(|p| p.asset_id == *id) else {
+            continue;
+        };
+        let mut moved = photos.remove(from);
+        let Some(at) = photos.iter().position(|p| p.asset_id == *anchor) else {
+            photos.insert(from, moved);
+            continue;
+        };
+        let a = &photos[at];
+        moved.day = a.day;
+        moved.chapter = a.chapter;
+        moved.area.clone_from(&a.area);
+        moved.page_group = a.page_group;
+        photos.insert(at + 1, moved);
+    }
+}
+
 /// A book photo's caption: the user's, else its shared place
 /// ([`triptape_core::places::photo_places`]).
 fn book_caption(plan: &Plan, places: &HashMap<String, String>, id: &str) -> Option<String> {
@@ -1008,6 +1030,7 @@ fn export_inner(
                 feature: layout.feature.contains(&a.id),
                 whole: layout.whole.contains(&a.id),
                 row: layout.rows.contains(&a.id),
+                caption_for_page: layout.page_captions.contains(&a.id),
                 page_group: false,
                 place_is_city: book_places
                     .get(&a.id)
@@ -1034,6 +1057,7 @@ fn export_inner(
                 .unwrap_or(usize::MAX)
         });
         group_pages(&mut book_photos, &layout.groups);
+        book_moves(&mut book_photos, &layout.after);
         let book_dir = out_dir.join("book");
         let staged_book = stage.join("book");
         // Day-marker titles: day once, with the location.
@@ -1066,8 +1090,12 @@ fn export_inner(
         // across an ocean and shrink the trip to a corner.
         let book_route = trip_route(&plan.map_polyline);
         // The owner's back cover is the trip's map: no second, plainer
-        // route map before it.
-        let book_map = if book_route.len() >= 2 && opts.back_cover.is_none() {
+        // route map before it. Their front cover is the trip's map too: the
+        // map page shows it, not a plainer drawn one.
+        let owner_map = opts.front_cover.as_ref().filter(|p| p.is_file());
+        let book_map = if let Some(front) = owner_map.filter(|_| opts.back_cover.is_none()) {
+            Some(front.clone())
+        } else if book_route.len() >= 2 && opts.back_cover.is_none() {
             let card = work.join("route_card_book.png");
             match crate::map::save_route_card(book_route, &[], 1800, 1800, &card) {
                 Ok(_) => Some(card),
@@ -1405,6 +1433,35 @@ mod tests {
         assert_eq!(ids, ["pano1", "pano2", "pano3", "selfie", "street"]);
         assert!(photos[..3].iter().all(|p| p.area == photos[0].area));
         assert_ne!(photos[3].area, photos[0].area, "its own page");
+    }
+
+    #[test]
+    fn a_photo_the_owner_places_after_another_joins_its_stretch() {
+        let photo = |id: &str, area: &str| BookPhoto {
+            asset_id: id.into(),
+            day: Some(27),
+            area: Some(area.into()),
+            place: Some(area.into()),
+            ..BookPhoto::blank()
+        };
+        let mut photos = vec![
+            photo("bay", "Merlion Park"),
+            photo("merlion", "Merlion Park"),
+            photo("snack", "Esplanade"),
+            photo("group", "Esplanade"),
+        ];
+        book_moves(&mut photos, &[("bay".into(), "group".into())]);
+        let ids: Vec<&str> = photos.iter().map(|p| p.asset_id.as_str()).collect();
+        assert_eq!(ids, ["merlion", "snack", "group", "bay"]);
+        assert_eq!(photos[3].area.as_deref(), Some("Esplanade"));
+        assert_eq!(
+            photos[3].place.as_deref(),
+            Some("Merlion Park"),
+            "its own place"
+        );
+        // An anchor the book doesn't hold leaves the photo where it was.
+        book_moves(&mut photos, &[("snack".into(), "gone".into())]);
+        assert_eq!(photos[1].asset_id, "snack");
     }
 
     #[test]

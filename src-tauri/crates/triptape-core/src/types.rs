@@ -346,6 +346,16 @@ pub struct BookLayout {
     /// is one row of full-height cells (three cabin doors, door to floor).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rows: Vec<String>,
+    /// Photos whose caption speaks for their whole page ("Alora posing as
+    /// the various anime characters"): it goes in the page's bottom line,
+    /// not under the one photo.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub page_captions: Vec<String>,
+    /// Photos the owner placed right after another, out of time order:
+    /// `(photo, anchor)` (`--book-after`). The photo joins its anchor's
+    /// stretch of the book, so the two can share a page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<(String, String)>,
 }
 
 impl BookLayout {
@@ -355,6 +365,8 @@ impl BookLayout {
             && self.stills.is_empty()
             && self.groups.is_empty()
             && self.rows.is_empty()
+            && self.page_captions.is_empty()
+            && self.after.is_empty()
     }
 
     /// Whether any layout choice names this asset.
@@ -362,6 +374,8 @@ impl BookLayout {
         self.feature.iter().any(|x| x == id)
             || self.whole.iter().any(|x| x == id)
             || self.rows.iter().any(|x| x == id)
+            || self.page_captions.iter().any(|x| x == id)
+            || self.after.iter().any(|(x, a)| x == id || a == id)
             || self.stills.contains_key(id)
             || self.groups.iter().flatten().any(|x| x == id)
     }
@@ -379,6 +393,20 @@ impl BookLayout {
     /// Lay a photo side by side with its page's others, or not.
     pub fn set_row(&mut self, asset: String, on: bool) {
         set_listed(&mut self.rows, asset, on);
+    }
+
+    /// Print a photo's caption in its page's bottom line, or under it.
+    pub fn set_page_caption(&mut self, asset: String, on: bool) {
+        set_listed(&mut self.page_captions, asset, on);
+    }
+
+    /// Place `asset` right after `anchor` in the book, or (`None`) back in
+    /// time order.
+    pub fn set_after(&mut self, asset: String, anchor: Option<String>) {
+        self.after.retain(|(x, _)| *x != asset);
+        if let Some(anchor) = anchor {
+            self.after.push((asset, anchor));
+        }
     }
 
     /// Show a video as its frame `ms` milliseconds in, or (`None`) not at all.
@@ -414,6 +442,8 @@ impl BookLayout {
         self.feature.retain(|id| keep(id));
         self.whole.retain(|id| keep(id));
         self.rows.retain(|id| keep(id));
+        self.page_captions.retain(|id| keep(id));
+        self.after.retain(|(x, a)| keep(x) && keep(a));
         self.stills.retain(|id, _| keep(id));
         self.retain_grouped(keep);
     }
