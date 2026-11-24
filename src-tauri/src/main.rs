@@ -1260,6 +1260,7 @@ fn export_blocking(
         music_paths: Vec::new(),
         keep_ambience: false,
         live_collages: choices.live_collages,
+        book_approved: None,
         // The default film: no map card after the title.
         opening_map: false,
         only: keepsakes_of(kind).to_string(),

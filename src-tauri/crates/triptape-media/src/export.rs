@@ -34,6 +34,9 @@ pub struct ExportOptions {
     pub keep_ambience: bool,
     /// Live Photos in a hero collage play their motion in their cell.
     pub live_collages: bool,
+    /// Asset ids of a book the owner approved: the book prints only these
+    /// and the owner's pins.
+    pub book_approved: Option<std::collections::HashSet<String>>,
     /// The hero film shows the route map after its title too (default
     /// false; the closing recap always plays).
     pub opening_map: bool,
@@ -1131,6 +1134,7 @@ fn export_inner(
                 journey: journey(),
                 back_cover_image: opts.back_cover.clone(),
                 front_cover_image: opts.front_cover.clone(),
+                approved: opts.book_approved.clone(),
             },
         ) {
             Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
@@ -1628,6 +1632,7 @@ mod tests {
                 music_paths: vec![],
                 keep_ambience: false,
                 live_collages: true,
+                book_approved: None,
                 opening_map: false,
                 only: "all".into(),
                 resolution: Resolution::default(),
@@ -1688,6 +1693,7 @@ mod tests {
             music_paths: Vec::new(),
             keep_ambience: false,
             live_collages: true,
+            book_approved: None,
             opening_map: false,
             only: "reels".into(),
             resolution: Default::default(),

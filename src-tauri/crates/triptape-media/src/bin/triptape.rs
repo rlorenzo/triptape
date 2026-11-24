@@ -7,7 +7,7 @@
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
 //!                [--solo REF...] [--unsolo REF...] [--live REF...] [--unlive REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--feature REF...] [--whole REF...] [--row REF...] [--page-caption REF...] [--book-after REF ANCHOR]... [--still VIDEO SECS] [--group REF REF...] [--unfeature|--unwhole|--unrow|--unpage-caption|--unbook-after|--unstill|--ungroup REF...] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
-//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--front-cover IMAGE] [--resolution 4k|1080p] [--jobs N] [--quiet]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--front-cover IMAGE] [--approved-book BOOK.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
 //! triptape cache stats|clear [--segment-cache DIR]
 //! triptape pick --db trip.db --out /path/to/new-folder [--count 800] [--project ID] [--stills-only]
@@ -825,6 +825,13 @@ fn export_cmd(flags: &HashMap<String, String>) {
     // The route map after the title is off unless asked for; the closing
     // recap always plays.
     let opening_map = flags.get("opening-map").is_some_and(|v| v != "false");
+    // The photos of a book the owner approved (its book.json): the book
+    // prints only these and the owner's pins.
+    let book_approved = flags.get("approved-book").map(|p| {
+        let text = std::fs::read_to_string(p)
+            .unwrap_or_else(|e| die("approved-book", format!("{p}: {e}")));
+        approved_ids(&text).unwrap_or_else(|| die("approved-book", format!("{p}: not a book.json")))
+    });
     // Hero segments rendered at once (default: cores / 4, memory permitting).
     let jobs = flags.get("jobs").map(|v| match v.parse::<usize>() {
         Ok(n) if n >= 1 => n,
@@ -884,6 +891,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             keep_ambience,
             live_collages,
             opening_map,
+            book_approved,
             only,
             resolution,
             jobs,
@@ -1990,6 +1998,21 @@ const DEFAULT_PICK_COUNT: usize = 800;
 
 /// A file name in `dir` for `src` that no earlier copy took: `IMG_1.HEIC`,
 /// then `IMG_1-2.HEIC`, ... (two source folders can hold the same name).
+/// The asset ids printed on the pages of a rendered `book.json`; `None`
+/// when the text is not one.
+fn approved_ids(text: &str) -> Option<HashSet<String>> {
+    let book: serde_json::Value = serde_json::from_str(text).ok()?;
+    let ids: HashSet<String> = book
+        .get("pages")?
+        .as_array()?
+        .iter()
+        .filter_map(|page| page.get("photos")?.as_array())
+        .flatten()
+        .filter_map(|photo| Some(photo.get("asset_id")?.as_str()?.to_string()))
+        .collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
 #[cfg(test)]
 fn free_name(src: &Path, taken: &mut HashSet<String>) -> String {
     free_names(src, None, taken).0
@@ -2198,6 +2221,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_approved_book_lists_the_photos_on_its_pages() {
+        let book = r#"{"pages": [
+            {"page": 1, "photos": [{"asset_id": "a", "file": "A.HEIC"}]},
+            {"page": 2, "kind": "map"},
+            {"page": 3, "photos": [{"asset_id": "b"}, {"asset_id": "a"}]}
+        ]}"#;
+        let ids = approved_ids(book).unwrap();
+        assert_eq!(ids, HashSet::from(["a".to_string(), "b".to_string()]));
+        assert!(approved_ids("{}").is_none());
+        assert!(approved_ids("not json").is_none());
+    }
 
     #[test]
     fn music_flag_repeats_and_semicolons() {

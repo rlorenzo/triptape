@@ -836,6 +836,11 @@ pub struct BookOptions {
     /// The owner's own front-cover picture (the titled route map): the
     /// photo mosaic then moves to the back cover, as sights without people.
     pub front_cover_image: Option<PathBuf>,
+    /// The photos of a book the owner approved page by page (asset ids):
+    /// when set, the pages print only these and the owner's pins, so an
+    /// edit to one page no longer reshuffles the automatic picks on the
+    /// others.
+    pub approved: Option<HashSet<String>>,
 }
 
 /// Finds the faces in a decoded photo, as boxes normalised to 0..1.
@@ -962,6 +967,19 @@ fn drop_lone_scenery(photos: &mut Vec<BookPhoto>) -> HashSet<String> {
     let lone: HashSet<String> = lone_scenery(photos).into_iter().collect();
     photos.retain(|p| !lone.contains(&p.asset_id));
     lone
+}
+
+/// Whether `p` may print on the pages at all. With the owner's front cover,
+/// the pinned sights belong to the back cover alone. With an
+/// [`BookOptions::approved`] book, only its photos and the owner's pins
+/// print.
+fn on_pages(p: &BookPhoto, opts: &BookOptions) -> bool {
+    let back_cover_only = opts.front_cover_image.is_some() && p.cover_focus.is_some();
+    let approved = opts
+        .approved
+        .as_ref()
+        .is_none_or(|ids| p.pinned || p.closing || ids.contains(&p.asset_id));
+    !back_cover_only && approved
 }
 
 /// Largest selection size found whose flowed book fits `cap` counted pages.
@@ -1442,13 +1460,9 @@ pub fn render_book(
     let mut cap_note: Option<(usize, usize)>;
     let mut cap_dropped: Vec<String>;
     let mut pruned: Vec<BookPhoto> = loop {
-        // With the owner's front cover, the pinned sights belong to the back
-        // cover alone: the pages never print them too.
-        let back_cover_only =
-            |p: &BookPhoto| opts.front_cover_image.is_some() && p.cover_focus.is_some();
         let pool: Vec<BookPhoto> = viable
             .iter()
-            .filter(|p| !excluded.contains(&p.asset_id) && !back_cover_only(p))
+            .filter(|p| !excluded.contains(&p.asset_id) && on_pages(p, opts))
             .cloned()
             .collect();
         // Cap math runs on the survivors: dropping the only wide photo
@@ -4136,6 +4150,7 @@ mod tests {
             journey: None,
             back_cover_image: None,
             front_cover_image: None,
+            approved: None,
         }
     }
 
@@ -4295,6 +4310,40 @@ mod tests {
         let mut pinned = photos;
         pinned[2].cover_focus = Some(0.5);
         assert_eq!(sight_picks(&pinned), [2, 4]);
+    }
+
+    #[test]
+    fn an_approved_book_prints_just_its_photos_and_the_owners_pins() {
+        let mut opts = test_opts("typst");
+        let shot = |id: &str| BookPhoto {
+            asset_id: id.into(),
+            ..BookPhoto::blank()
+        };
+        let (seen, new) = (shot("seen"), shot("new"));
+        let pin = BookPhoto {
+            pinned: true,
+            keep: true,
+            ..shot("pin")
+        };
+        assert!([&seen, &new, &pin].iter().all(|p| on_pages(p, &opts)));
+        opts.approved = Some(HashSet::from(["seen".to_string()]));
+        assert!(on_pages(&seen, &opts) && on_pages(&pin, &opts));
+        assert!(!on_pages(&new, &opts));
+        // A captioned photo the approved book left out stays out.
+        let worded = BookPhoto {
+            keep: true,
+            caption: Some("Lunch".into()),
+            ..shot("worded")
+        };
+        assert!(!on_pages(&worded, &opts));
+        let mine = pin;
+        // A back-cover sight stays off the pages, pinned or not.
+        opts.front_cover_image = Some(PathBuf::from("cover.jpg"));
+        let sight = BookPhoto {
+            cover_focus: Some(0.5),
+            ..mine
+        };
+        assert!(!on_pages(&sight, &opts));
     }
 
     #[test]
