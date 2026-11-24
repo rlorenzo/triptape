@@ -177,7 +177,7 @@ fn with_book_pins(plan: &Plan, assets: &[triptape_core::types::Asset]) -> Plan {
         .collect();
     let mut out = plan.clone();
     for id in &plan.book {
-        if out.chapters.iter().any(|c| c.asset_ids.contains(id)) {
+        if out.chapter_of(id).is_some() {
             continue;
         }
         let Some(&t) = taken.get(id.as_str()) else {
@@ -272,13 +272,10 @@ fn book_caption(plan: &Plan, places: &HashMap<String, String>, id: &str) -> Opti
 /// name ("Canal City Ramen Stadium") stays as written.
 fn end_sentence(c: &str) -> String {
     let c = c.trim_end();
-    let words = c.split_whitespace().count();
-    let lower = c
-        .split_whitespace()
-        .filter(|w| w.starts_with(|ch: char| ch.is_lowercase()))
-        .count();
-    if words >= 3
-        && lower >= 1
+    let mut words = c.split_whitespace();
+    let lower = words.clone().any(|w| w.starts_with(char::is_lowercase));
+    if words.nth(2).is_some()
+        && lower
         && !c.ends_with(['.', '!', '?', '\u{2026}', ')', '"', '\u{201d}', ':'])
     {
         format!("{c}.")

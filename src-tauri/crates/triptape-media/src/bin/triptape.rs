@@ -859,7 +859,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
     });
     let back_cover = flags.get("back-cover").map(PathBuf::from);
     let front_cover = flags.get("front-cover").map(PathBuf::from);
-    if let Some(p) = front_cover.as_ref().filter(|p| !p.exists()) {
+    if let Some(p) = front_cover.as_ref().filter(|p| !p.is_file()) {
         die("front-cover", format!("not found: {}", p.display()));
     }
     if let Some(p) = back_cover.as_ref().filter(|p| !p.is_file()) {
@@ -1302,17 +1302,27 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
     let layout = &edits.book_layout;
     if !layout.is_empty() {
         println!(
-            "book layout: {} featured, {} whole, {} stills, {} groups",
+            "book layout: {} featured, {} whole, {} rows, {} page captions, {} placed after, {} stills, {} groups",
             layout.feature.len(),
             layout.whole.len(),
+            layout.rows.len(),
+            layout.page_captions.len(),
+            layout.after.len(),
             layout.stills.len(),
             layout.groups.len()
         );
-        for id in &layout.feature {
-            println!("  feature {}", show(id));
+        for (label, ids) in [
+            ("feature", &layout.feature),
+            ("whole", &layout.whole),
+            ("row", &layout.rows),
+            ("page-caption", &layout.page_captions),
+        ] {
+            for id in ids {
+                println!("  {label} {}", show(id));
+            }
         }
-        for id in &layout.whole {
-            println!("  whole {}", show(id));
+        for (id, anchor) in &layout.after {
+            println!("  book-after {} after {}", show(id), show(anchor));
         }
         for (id, ms) in &layout.stills {
             println!("  still {} at {:.1}s", show(id), f64::from(*ms) / 1000.0);
@@ -1525,11 +1535,11 @@ fn edit_cmd(args: &[String]) {
     let groups: Vec<Vec<&Asset>> = a.group.iter().map(|g| resolve(g)).collect();
     let ungroups = resolve(&a.ungroup);
     // Layout choices only reach photos the book can place: the plan's, and
-    // those pinned into the book (now or before).
+    // those pinned into the book (now, or before and not unpinned now).
     let placeable = |x: &Asset| {
         ep.base.chapter_of(&x.id).is_some()
             || books.iter().any(|b| b.id == x.id)
-            || ep.edits.book.contains(&x.id)
+            || (ep.edits.book.contains(&x.id) && !unbooks.iter().any(|u| u.id == x.id))
     };
     let mut laid_out = features
         .iter()
@@ -1612,33 +1622,28 @@ fn edit_cmd(args: &[String]) {
     }
     {
         let layout = &mut edits.book_layout;
-        for asset in &unfeatures {
-            layout.set_feature(asset.id.clone(), false);
-            println!("unfeature: {}", asset_label(asset));
-        }
-        for asset in &features {
-            layout.set_feature(asset.id.clone(), true);
-            println!("feature: {}", asset_label(asset));
-        }
-        for asset in &unwholes {
-            layout.set_whole(asset.id.clone(), false);
-            println!("unwhole: {}", asset_label(asset));
-        }
-        for asset in &unrows {
-            layout.set_row(asset.id.clone(), false);
-            println!("unrow: {}", asset_label(asset));
-        }
-        for asset in &rows {
-            layout.set_row(asset.id.clone(), true);
-            println!("row: {}", asset_label(asset));
-        }
-        for asset in &unpage_captions {
-            layout.set_page_caption(asset.id.clone(), false);
-            println!("unpage-caption: {}", asset_label(asset));
-        }
-        for asset in &page_captions {
-            layout.set_page_caption(asset.id.clone(), true);
-            println!("page-caption: {}", asset_label(asset));
+        // Each on/off layout flag: un- first, so both in one call leave it on.
+        type Set = fn(&mut BookLayout, String, bool);
+        let flags: [(&str, &[&Asset], &[&Asset], Set); 4] = [
+            ("feature", &features, &unfeatures, BookLayout::set_feature),
+            ("whole", &wholes, &unwholes, BookLayout::set_whole),
+            ("row", &rows, &unrows, BookLayout::set_row),
+            (
+                "page-caption",
+                &page_captions,
+                &unpage_captions,
+                BookLayout::set_page_caption,
+            ),
+        ];
+        for (name, on, off, set) in flags {
+            for asset in off {
+                set(layout, asset.id.clone(), false);
+                println!("un{name}: {}", asset_label(asset));
+            }
+            for asset in on {
+                set(layout, asset.id.clone(), true);
+                println!("{name}: {}", asset_label(asset));
+            }
         }
         for asset in &unbook_afters {
             layout.set_after(asset.id.clone(), None);
@@ -1650,10 +1655,6 @@ fn edit_cmd(args: &[String]) {
             }
             layout.set_after(x.id.clone(), Some(y.id.clone()));
             println!("book-after: {} after {}", asset_label(x), asset_label(y));
-        }
-        for asset in &wholes {
-            layout.set_whole(asset.id.clone(), true);
-            println!("whole: {}", asset_label(asset));
         }
         for asset in &unstills {
             layout.set_still(asset.id.clone(), None);

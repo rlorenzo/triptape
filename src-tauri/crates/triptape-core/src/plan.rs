@@ -1264,18 +1264,12 @@ impl PlanEdits {
     /// Play a Live Photo's motion in the film, or put it back to the
     /// planner's choice.
     pub fn set_motion(&mut self, asset: String, on: bool) {
-        self.motion.retain(|id| *id != asset);
-        if on {
-            self.motion.push(asset);
-        }
+        crate::types::set_listed(&mut self.motion, asset, on);
     }
 
     /// Pin a photo into the book, or unpin it.
     pub fn set_book(&mut self, asset: String, on: bool) {
-        self.book.retain(|id| *id != asset);
-        if on {
-            self.book.push(asset);
-        }
+        crate::types::set_listed(&mut self.book, asset, on);
     }
 
     /// Set (or clear, `None`) where a photo's crops centre, in percent.

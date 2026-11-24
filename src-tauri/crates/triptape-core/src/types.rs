@@ -457,7 +457,7 @@ impl BookLayout {
 }
 
 /// Add `asset` to the end of `list` (once), or remove it.
-fn set_listed(list: &mut Vec<String>, asset: String, on: bool) {
+pub(crate) fn set_listed(list: &mut Vec<String>, asset: String, on: bool) {
     list.retain(|id| *id != asset);
     if on {
         list.push(asset);
