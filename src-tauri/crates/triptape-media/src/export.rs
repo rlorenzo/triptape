@@ -210,6 +210,15 @@ fn book_chapter_of(plan: &Plan) -> HashMap<&str, usize> {
         .collect()
 }
 
+/// A stretch of its own inside `area`: photos sharing the tagged name share
+/// a page, apart from the rest of the place.
+fn stretch_area(area: &Option<String>, tag: std::fmt::Arguments) -> Option<String> {
+    Some(format!(
+        "{} \u{b7} {tag}",
+        area.as_deref().unwrap_or_default()
+    ))
+}
+
 /// The owner's page groups (`--group`): each group's photos move together
 /// to where its earliest photo stands in story order and become one stretch
 /// of that photo's day, so they share a page.
@@ -222,11 +231,7 @@ fn group_pages(photos: &mut Vec<BookPhoto>, groups: &[Vec<String>]) {
         let mut members: Vec<BookPhoto> = photos.extract_if(at.., in_group).collect();
         if let [first, _, ..] = members.as_slice() {
             let (day, chapter) = (first.day, first.chapter);
-            let area = Some(format!(
-                "{} \u{b7} page {}",
-                first.area.clone().unwrap_or_default(),
-                n + 1
-            ));
+            let area = stretch_area(&first.area, format_args!("page {}", n + 1));
             for m in &mut members {
                 m.day = day;
                 m.chapter = chapter;
@@ -266,11 +271,7 @@ fn book_moves(photos: &mut Vec<BookPhoto>, after: &[(String, String)]) {
 /// folded into a neighbour nor dropped as lone scenery.
 fn own_pages(photos: &mut [BookPhoto], own: &[String]) {
     for p in photos.iter_mut().filter(|p| own.contains(&p.asset_id)) {
-        p.area = Some(format!(
-            "{} \u{b7} own page {}",
-            p.area.as_deref().unwrap_or_default(),
-            p.asset_id
-        ));
+        p.area = stretch_area(&p.area, format_args!("own page {}", p.asset_id));
         p.page_group = true;
     }
 }

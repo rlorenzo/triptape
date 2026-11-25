@@ -2015,16 +2015,17 @@ fn learn_cmd(flags: &HashMap<String, String>) {
 /// Photos `pick` copies when `--count` is not given.
 const DEFAULT_PICK_COUNT: usize = 800;
 
-/// A file name in `dir` for `src` that no earlier copy took: `IMG_1.HEIC`,
-/// then `IMG_1-2.HEIC`, ... (two source folders can hold the same name).
 /// The asset ids printed on the pages of a rendered `book.json`; `None`
-/// when the text is not one.
+/// when the text is not one. The closing page is left out: its automatic
+/// pick is a photo the pages do not print, and approving it would put it on
+/// them (a closing photo that repeats a page's is on that page anyway).
 fn approved_ids(text: &str) -> Option<HashSet<String>> {
     let book: serde_json::Value = serde_json::from_str(text).ok()?;
     let ids: HashSet<String> = book
         .get("pages")?
         .as_array()?
         .iter()
+        .filter(|page| page.get("kind").and_then(serde_json::Value::as_str) != Some("closing"))
         .filter_map(|page| page.get("photos")?.as_array())
         .flatten()
         .filter_map(|photo| Some(photo.get("asset_id")?.as_str()?.to_string()))
@@ -2032,6 +2033,8 @@ fn approved_ids(text: &str) -> Option<HashSet<String>> {
     (!ids.is_empty()).then_some(ids)
 }
 
+/// A file name in `dir` for `src` that no earlier copy took: `IMG_1.HEIC`,
+/// then `IMG_1-2.HEIC`, ... (two source folders can hold the same name).
 #[cfg(test)]
 fn free_name(src: &Path, taken: &mut HashSet<String>) -> String {
     free_names(src, None, taken).0
@@ -2246,7 +2249,8 @@ mod tests {
         let book = r#"{"pages": [
             {"page": 1, "photos": [{"asset_id": "a", "file": "A.HEIC"}]},
             {"page": 2, "kind": "map"},
-            {"page": 3, "photos": [{"asset_id": "b"}, {"asset_id": "a"}]}
+            {"page": 3, "kind": "grid", "photos": [{"asset_id": "b"}, {"asset_id": "a"}]},
+            {"page": 4, "kind": "closing", "photos": [{"asset_id": "end"}]}
         ]}"#;
         let ids = approved_ids(book).unwrap();
         assert_eq!(ids, HashSet::from(["a".to_string(), "b".to_string()]));
