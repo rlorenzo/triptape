@@ -2234,7 +2234,7 @@ fn render_group(
     // is its collage caption, trimmed).
     // Short mode also keeps it within the group's fair share, so one long
     // caption neither starves later chapters nor freezes a clip just trimmed.
-    let read_secs = caption_hold_secs(collage_caption(present).as_deref())
+    let hold_secs = caption_hold_secs(collage_caption(present).as_deref())
         .min(limits.cap)
         .min(limits.budget);
     let rendered = if present.len() == 1 {
@@ -2243,7 +2243,7 @@ fn render_group(
             r,
             idx,
             variant,
-            still_secs.max(read_secs),
+            still_secs.max(hold_secs),
             limits.cap,
             opts.resolution,
             work_dir,
@@ -2257,7 +2257,7 @@ fn render_group(
             variant,
             // The collage's scaled hold, raised to the reading time (not the
             // reading time scaled, which would overrun CAPTION_MAX_SECS).
-            still_secs.max(read_secs / collage_hold_secs(present.len(), 1.0)),
+            still_secs.max(hold_secs / collage_hold_secs(present.len(), 1.0)),
             opts.live_collages,
             opts.resolution,
             work_dir,
@@ -2287,7 +2287,7 @@ fn render_group(
         .unwrap_or(dur);
     // Flash frames are unwatchable: a sub-2.5s clip (most Live Photo
     // motions) is freeze-padded on its last frame to a minimum hold.
-    let dur = match clip_pad_target(probed, limits.budget, read_secs).filter(|_| kind == "clip") {
+    let dur = match clip_pad_target(probed, limits.budget, hold_secs).filter(|_| kind == "clip") {
         Some(target) => match pad_segment_freeze(caps, &seg_path, target) {
             Ok(()) => target,
             Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
@@ -6351,6 +6351,11 @@ mod tests {
             let (st, en) = caption_cue(10.0, hold, next, read).expect("cue");
             assert!(en - st >= read - 1e-9, "{cap}: {st}..{en}");
         }
+        // The hold's cut allowance covers the slowest transition.
+        assert_eq!(
+            plan::CAPTION_CUT_OVERLAP_SECS,
+            transition_overlap(&Transition::FadeBlack)
+        );
         // A short shot with no hold padding still skips rather than flashes.
         assert_eq!(caption_cue(0.0, 1.0, 0.5, 3.0), None);
         // The cut still bounds the cue.
