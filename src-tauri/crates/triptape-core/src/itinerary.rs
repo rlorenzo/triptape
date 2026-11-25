@@ -221,6 +221,11 @@ impl ItinStop {
     }
 }
 
+/// The stop nearest to `gps`.
+fn nearest<'a>(stops: impl Iterator<Item = &'a ItinStop>, gps: (f64, f64)) -> Option<&'a ItinStop> {
+    stops.min_by(|a, b| haversine_m(gps, a.pos()).total_cmp(&haversine_m(gps, b.pos())))
+}
+
 impl Itinerary {
     pub fn from_json(s: &str) -> Result<Self, String> {
         let it: Self = serde_json::from_str(s).map_err(|e| format!("itinerary json: {e}"))?;
@@ -278,11 +283,7 @@ impl Itinerary {
     /// The label of the stop active on `day` nearest to `gps`: on the day
     /// a trip flies home, a shot back home is home, not the last city.
     fn stop_near(&self, day: NaiveDate, gps: (f64, f64)) -> Option<String> {
-        self.stops
-            .iter()
-            .filter(|s| s.active_on(day))
-            .min_by(|a, b| haversine_m(gps, a.pos()).total_cmp(&haversine_m(gps, b.pos())))
-            .map(|s| s.label.clone())
+        nearest(self.stops.iter().filter(|s| s.active_on(day)), gps).map(|s| s.label.clone())
     }
 
     /// Whether the owner asked never to name this attraction.
@@ -464,8 +465,15 @@ impl Itinerary {
     /// takes the city of the stop the owner is at that day. Off the cruise
     /// the city of the active stop applies. Never a place-of-interest name.
     pub fn label_for(&self, day: NaiveDate, gps: Option<(f64, f64)>) -> Option<DayLabel> {
-        // The stop the owner is at today: a city or port first, home last.
+        // The stop the owner is at today. A travel day has the stop left
+        // and the stop reached both active: a shot with GPS takes the one
+        // it is nearer (dinner in Tokyo after the train from Hakone is in
+        // Tokyo; a shot back home on the day the trip flies home is home).
         let city = || {
+            if let Some(p) = gps {
+                return self.stop_near(day, p);
+            }
+            // No fix: the city or port listed first, home last.
             let at = |s: &&ItinStop| s.active_on(day);
             self.stops
                 .iter()
@@ -993,6 +1001,21 @@ mod tests {
             travel.stop_on(day("2026-10-03"), &[asakusa]).as_deref(),
             Some("Tokyo")
         );
+        // Off a cruise, a shot on the travel day takes the stop it is near.
+        let label = |gps| travel.label_for(day("2026-10-03"), gps).map(|l| l.place);
+        assert_eq!(label(Some(asakusa)).as_deref(), Some("Tokyo"));
+        assert_eq!(label(Some((35.0, 135.76))).as_deref(), Some("Kyoto"));
+        // No fix: the stop listed first, as before.
+        assert_eq!(label(None).as_deref(), Some("Kyoto"));
+        // The day the trip flies home: a shot back home is home, a shot
+        // before the flight (or one with no fix) the last city.
+        let label = |gps| it.label_for(day("2026-10-30"), gps).map(|l| l.place);
+        assert_eq!(
+            label(Some((33.94, -118.41))).as_deref(),
+            Some("Los Angeles")
+        );
+        assert_eq!(label(Some((1.28, 103.86))).as_deref(), Some("Singapore"));
+        assert_eq!(label(None).as_deref(), Some("Singapore"));
         assert_eq!(it.port_call(day("2026-10-11")).as_deref(), Some("Osaka"));
         // A hidden port, and a day at sea, name nothing.
         assert_eq!(it.port_call(day("2026-10-09")), None);
