@@ -700,6 +700,18 @@ fn cache_use(
     })
 }
 
+/// On board, for the book's day headings: the itinerary puts the shot on
+/// the ship, or the owner named the ship for it (a port morning's time
+/// window, "Carnival Luminosa" 08:00–08:29 at Fukuoka), so the heading
+/// leads with the ship as on every other day aboard.
+fn shot_aboard(spot: &Spot, ships: &[String]) -> bool {
+    match spot {
+        Spot::Aboard(_) => true,
+        Spot::Named(name) => ships.iter().any(|s| s == name),
+        Spot::Ashore => false,
+    }
+}
+
 /// The place a chapter's book heading names, when the itinerary adds to
 /// the chapter's own: a port day aboard names the port beside the ship
 /// ("Carnival Luminosa · Fukuoka"), and a sight leads with the stop it
@@ -1076,6 +1088,11 @@ fn export_inner(
             .as_ref()
             .map(|i| i.stops.iter().map(|s| s.label.clone()).collect())
             .unwrap_or_default();
+        let ships: Vec<String> = opts
+            .itinerary
+            .as_ref()
+            .map(|i| i.cruises().into_iter().map(|c| c.ship).collect())
+            .unwrap_or_default();
         let layout = &plan.book_layout;
         for a in assets
             .iter()
@@ -1129,7 +1146,7 @@ fn export_inner(
                 height: h,
                 caption: book_caption(plan, &book_places, &a.id),
                 place,
-                aboard: matches!(spot, Spot::Aboard(_)),
+                aboard: shot_aboard(&spot, &ships),
                 faces: vec![],
                 closing,
                 family: opts
@@ -1207,11 +1224,6 @@ fn export_inner(
         let book_dir = out_dir.join("book");
         let staged_book = stage.join("book");
         // Day-marker titles: day once, with the location.
-        let ships: Vec<String> = opts
-            .itinerary
-            .as_ref()
-            .map(|i| i.cruises().into_iter().map(|c| c.ship).collect())
-            .unwrap_or_default();
         let chapter_titles: Vec<String> = plan
             .chapters
             .iter()
@@ -1431,6 +1443,23 @@ mod tests {
         assert_eq!(heading("asakusa", "Tokyo Tower"), None);
         // A boarding day keeps its own heading.
         assert_eq!(heading("ship", "Carnival Luminosa Embarkation"), None);
+    }
+
+    #[test]
+    fn a_shot_the_owner_names_as_the_ship_is_aboard() {
+        let ships = vec!["Carnival Luminosa".to_string()];
+        assert!(shot_aboard(
+            &Spot::Aboard("Carnival Luminosa".into()),
+            &ships
+        ));
+        assert!(shot_aboard(&Spot::Named("Carnival Luminosa"), &ships));
+        // The terminal before boarding, and a sight at the dock, are ashore.
+        assert!(!shot_aboard(
+            &Spot::Named("Carnival Luminosa Embarkation"),
+            &ships
+        ));
+        assert!(!shot_aboard(&Spot::Named("Fukuoka Cruise Center"), &ships));
+        assert!(!shot_aboard(&Spot::Ashore, &ships));
     }
 
     #[test]
