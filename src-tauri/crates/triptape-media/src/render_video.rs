@@ -633,11 +633,22 @@ fn assign_transitions_by_chunk(
     out
 }
 
+/// Whether `place` is a way through rather than a place we went: an
+/// airport, a station or a train (`Narita Airport`, `Tokyo Station`,
+/// `Shinkansen`). The shot still carries the label; the card leaves it off.
+fn is_transit_place(place: &str) -> bool {
+    place
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| matches!(word, "airport" | "station" | "shinkansen" | "train"))
+}
+
 /// The places card's list: two sights in one place (`Flower Dome, Gardens
 /// by the Bay` and `Cloud Forest, Gardens by the Bay`) are named once, by
 /// that place, where the first of them stood. A sight alone keeps its
 /// whole name. A country is no such place: `Tokyo, Japan` and
-/// `Kyoto, Japan` stay two cities.
+/// `Kyoto, Japan` stay two cities. Airports, stations and trains
+/// ([`is_transit_place`]) stay off.
 fn credit_places(places: &[String]) -> Vec<String> {
     fn parent(p: &str) -> Option<&str> {
         if triptape_core::geo::without_country(p) != p {
@@ -647,15 +658,20 @@ fn credit_places(places: &[String]) -> Vec<String> {
             .map(|(_, par)| par)
             .filter(|par| !par.is_empty())
     }
+    let places: Vec<&str> = places
+        .iter()
+        .map(String::as_str)
+        .filter(|p| !is_transit_place(p))
+        .collect();
     let mut sights: HashMap<&str, usize> = HashMap::new();
-    for par in places.iter().filter_map(|p| parent(p.as_str())) {
+    for par in places.iter().filter_map(|p| parent(p)) {
         *sights.entry(par).or_default() += 1;
     }
     let mut out: Vec<String> = vec![];
-    for p in places {
+    for &p in &places {
         let name = match parent(p) {
             Some(par) if sights[par] > 1 => par,
-            _ => p.as_str(),
+            _ => p,
         };
         if !out.iter().any(|q| q == name) {
             out.push(name.to_string());
@@ -3723,7 +3739,11 @@ mod tests {
                 "A-Mei Tea House, Jiufen",
                 "Ontario, California",
                 "Tokyo, Japan",
+                "Narita Airport",
+                "Tokyo Station",
+                "Shinkansen",
                 "Kyoto, Japan",
+                "Trainspotting Café",
             ])),
             names(&[
                 "Marina Bay Sands",
@@ -3732,6 +3752,7 @@ mod tests {
                 "Ontario, California",
                 "Tokyo, Japan",
                 "Kyoto, Japan",
+                "Trainspotting Café",
             ])
         );
     }
