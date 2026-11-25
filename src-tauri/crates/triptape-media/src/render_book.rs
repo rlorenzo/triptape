@@ -2290,7 +2290,8 @@ const MAX_HEADING_PLACES: usize = 4;
 
 /// A day heading on one line of its banner: when the places run onto a
 /// second line, those no photo on the page shows (the day's city, named
-/// for context) are dropped, and the page's own places stay as they are.
+/// for context) are dropped first, then the page's last places until it
+/// fits. The first place always stays.
 fn one_line_heading(heading: String, slot: &[&BookPhoto], page_w: f64) -> String {
     if heading_fits_one_line(&heading, page_w) {
         return heading;
@@ -2299,22 +2300,79 @@ fn one_line_heading(heading: String, slot: &[&BookPhoto], page_w: f64) -> String
         return heading;
     };
     let listed: Vec<&str> = places.split(" \u{b7} ").collect();
-    let shown: Vec<&str> = listed
+    let mut kept: Vec<&str> = listed
         .iter()
         .copied()
         .filter(|pl| slot.iter().any(|p| p.place.as_deref() == Some(*pl)))
         .collect();
-    if shown.is_empty() || shown.len() == listed.len() {
-        return heading;
+    if kept.is_empty() {
+        kept = listed;
     }
-    format!("{head} — {}", shown.join(" \u{b7} "))
+    // Still too long with the page's own places: the first ones visited,
+    // as many as fit ("Independence Palace", the museum named on its own
+    // page after).
+    let line = |kept: &[&str]| format!("{head} — {}", kept.join(" \u{b7} "));
+    while kept.len() > 1 && !heading_fits_one_line(&line(&kept), page_w) {
+        kept.pop();
+    }
+    line(&kept)
 }
 
-/// Whether a day heading fits one line of the banner (24 pt, 14 pt inset):
-/// the burn's Avenir Next averages under 0.47 em a character.
+/// Whether a day heading fits one line of the banner (24 pt, 14 pt inset).
 fn heading_fits_one_line(text: &str, page_w: f64) -> bool {
-    let (size, inset) = (24.0, 14.0);
-    text.chars().count() as f64 * size * 0.47 <= page_w * 72.0 - 2.0 * inset
+    fits_one_line(text, 24.0, 14.0, page_w)
+}
+
+/// Whether `text` at `size` pt fits one line of a strip with `inset` pt
+/// of padding each side on a `page_w`-inch page.
+fn fits_one_line(text: &str, size: f64, inset: f64, page_w: f64) -> bool {
+    text_width_em(text) * size <= page_w * 72.0 - 2.0 * inset
+}
+
+/// Advance widths (thousandths of an em) of printable ASCII, `' '..='~'`,
+/// in Avenir Next as the burn sets it, measured with Typst.
+const ASCII_ADVANCE: [u16; 95] = [
+    250, 328, 405, 556, 580, 833, 704, 260, 300, 300, 444, 666, 260, 320, 260,
+    370, // ' '..='/'
+    580, 580, 580, 580, 580, 580, 580, 580, 580, 580, 300, 300, 666, 666, 666,
+    482, // '0'..='?'
+    800, 700, 636, 720, 757, 592, 562, 779, 718, 260, 492, 628, 510, 886, 764,
+    850, // '@'..='O'
+    580, 843, 599, 564, 570, 710, 623, 972, 649, 602, 572, 300, 370, 300, 666,
+    500, // 'P'..='_'
+    240, 534, 637, 500, 637, 572, 295, 632, 583, 250, 251, 510, 252, 883, 581,
+    611, // '`'..='o'
+    635, 635, 360, 444, 317, 581, 488, 746, 484, 488, 442, 300, 222, 300, 666, // 'p'..='~'
+];
+
+/// Width of `text` in ems as the burn sets it: each glyph's own advance
+/// (an "M" is three times an "i"), so a heading of capitals and m's that
+/// wraps is told from one as long that fits. Without kerning it reads a
+/// little wide, never narrow.
+fn text_width_em(text: &str) -> f64 {
+    let thousandths: u32 = text
+        .chars()
+        .map(|c| match c {
+            ' '..='~' => u32::from(ASCII_ADVANCE[c as usize - ' ' as usize]),
+            '\u{b7}' => 260,
+            '\u{2014}' => 600,
+            '\u{2013}' => 400,
+            '\u{2018}' | '\u{2019}' => 222,
+            '\u{201c}' | '\u{201d}' => 387,
+            '\u{2026}' => 1000,
+            // Japanese and Korean script, and full-width forms: a full em.
+            '\u{2e80}'..='\u{9fff}'
+            | '\u{ac00}'..='\u{d7af}'
+            | '\u{f900}'..='\u{faff}'
+            | '\u{ff00}'..='\u{ffef}' => 1000,
+            // Accented capitals ("Ō", "Æ") as wide as the widest capitals.
+            c if c.is_uppercase() => 850,
+            // Accented lowercase and the rest: as wide as the widest
+            // lowercase ("ō" 0.61 em).
+            _ => 620,
+        })
+        .sum();
+    f64::from(thousandths) / 1000.0
 }
 
 /// Pages whose strip prints large: a divider or bannered page whose
@@ -2483,9 +2541,18 @@ fn collapse_lines(lines: Vec<String>, kind: PageKind) -> Vec<String> {
             date_only(caps.last().unwrap())
         )];
     }
-    caps.truncate(2);
+    // Two lines; a third when all three still fit one line of the strip
+    // (14 pt, 8 pt inset) on the narrowest page ("Ho Chi Minh Campaign
+    // Museum · War Remnants Museum · Saigon Central Post Office"): the
+    // page names what it shows.
+    let three_fit =
+        caps.len() > 2 && fits_one_line(&caps[..3].join(" \u{b7} "), 14.0, 8.0, NARROWEST_PAGE_IN);
+    caps.truncate(if three_fit { 3 } else { 2 });
     caps
 }
+
+/// Width (in) of the narrowest page any preset prints: Travel Landscape.
+const NARROWEST_PAGE_IN: f64 = 11.0;
 
 fn is_dateline(c: &str) -> bool {
     split_dateline(c).is_some()
@@ -4642,6 +4709,48 @@ mod tests {
         assert_eq!(page_caption(&[&u, &a], PageKind::Grid).len(), 2);
     }
 
+    #[test]
+    fn a_grid_names_a_third_place_when_the_line_still_fits() {
+        let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let saigon = lines(&[
+            "Ho Chi Minh Campaign Museum",
+            "War Remnants Museum",
+            "Saigon Central Post Office",
+        ]);
+        assert_eq!(collapse_lines(saigon.clone(), PageKind::Grid), saigon);
+        // Too long for one line: the first two.
+        let long = lines(&[
+            "Final ice cream pose for Alora. She always wanted a photo whenever we saw an ice cream sign.",
+            "Carnival Luminosa",
+            "Victoria Harbour",
+        ]);
+        assert_eq!(collapse_lines(long.clone(), PageKind::Grid), long[..2]);
+        // The width it is measured against is the narrowest preset's.
+        let narrowest = [BookPreset::P1, BookPreset::P2]
+            .iter()
+            .map(|p| p.trim_inches().0)
+            .fold(f64::INFINITY, f64::min);
+        assert_eq!(NARROWEST_PAGE_IN, narrowest);
+        // Never a fourth.
+        let four = lines(&["Tokyo Tower", "Zojo-ji", "Shiba Park", "Atago Shrine"]);
+        assert_eq!(collapse_lines(four.clone(), PageKind::Grid), four[..3]);
+    }
+
+    #[test]
+    fn text_width_follows_each_glyph() {
+        // An "M" is wider than an "i"; ten of each tell apart.
+        assert!(text_width_em(&"M".repeat(10)) > 3.0 * text_width_em(&"i".repeat(10)));
+        // Kanji take a full em; an accented capital is a capital's width.
+        assert_eq!(text_width_em("浅草寺"), 3.0);
+        assert!(text_width_em("Ō") > text_width_em("ō"));
+        // As Typst sets them at 24 pt on a 12 in page (836 pt of banner):
+        // the Day 19 heading wraps (870 pt), the Day 21 one fits (819 pt).
+        let wraps = "Day 19 · Wed, Oct 21 — Independence Palace · Ho Chi Minh Campaign Museum";
+        let fits = "Day 21 · Fri, Oct 23 — Marina Bay Sands · Flower Dome, Gardens by the Bay";
+        assert!(!heading_fits_one_line(wraps, 12.0));
+        assert!(heading_fits_one_line(fits, 12.0));
+    }
+
     /// `n` photos split evenly into `d` chapters (no chapters when `d` is 0).
     fn even_chapters(n: usize, d: usize) -> Vec<Option<usize>> {
         (0..n).map(|i| (d > 0).then(|| i * d / n)).collect()
@@ -5083,6 +5192,21 @@ mod tests {
             one_line_heading(tokyo.to_string(), &[&at("Tsukiji Outer Market")], 12.0),
             tokyo
         );
+        // The page's own places still too long for the 12 in book: the
+        // first visited, as many as fit.
+        let (palace, museum) = (at("Independence Palace"), at("Ho Chi Minh Campaign Museum"));
+        assert_eq!(
+            one_line_heading(
+                "Day 19 · Wed, Oct 21 — Independence Palace · Ho Chi Minh Campaign Museum"
+                    .to_string(),
+                &[&palace, &museum],
+                12.0
+            ),
+            "Day 19 · Wed, Oct 21 — Independence Palace"
+        );
+        // A single place stays, however long.
+        let long = "Day 19 · Wed, Oct 21 — Ho Chi Minh Campaign Museum and War Remnants Museum";
+        assert_eq!(one_line_heading(long.to_string(), &[&museum], 12.0), long);
     }
 
     #[test]
