@@ -26,6 +26,9 @@ pub struct ExportOptions {
     /// Book page cap; `None` keeps the preset's default max.
     pub book_max_pages: Option<usize>,
     pub trip_name: String,
+    /// The owner's date line for the film's title card; `None` works it
+    /// out from the photos.
+    pub title_dates: Option<String>,
     pub typst_bin: String,
     /// Music playlist in order (crossfaded); empty uses the bundled theme.
     pub music_paths: Vec<PathBuf>,
@@ -68,6 +71,42 @@ pub struct ExportOptions {
     /// The owner's own picture for the book's front cover (the sights
     /// mosaic then takes the back).
     pub front_cover: Option<PathBuf>,
+    /// Folder for the film's scratch files (segments, chunks) instead of
+    /// `<out>/.work`: see [`scratch_dir`]. `None` keeps them in `<out>/.work`.
+    pub work_dir: Option<PathBuf>,
+    /// Render the hero film as a draft for reviewing edits (see
+    /// [`VideoOptions::draft`]): `hero-draft.mp4` and its sidecars, beside
+    /// any keepsake `hero.mp4`, which is left alone.
+    pub draft: bool,
+}
+
+/// File stem of the hero film and its sidecars: a draft never takes the
+/// keepsake's name, so it can neither replace nor be mistaken for it.
+pub fn film_stem(draft: bool) -> &'static str {
+    if draft {
+        "hero-draft"
+    } else {
+        "hero"
+    }
+}
+
+/// Where the hero film's intermediates (segments, pre-joined chunks) go.
+/// By default `<out>/.work`. With [`ExportOptions::work_dir`] they go to a
+/// folder of their own inside it, named after the output folder so two
+/// exports sharing a work dir never share files. On the segment cache's
+/// volume a cache hit is then a hard link or an APFS clone, where an output
+/// folder on a network share costs a full copy of every segment per export.
+/// Finished keepsakes are still staged in `<out>/.work/stage`, beside where
+/// they end up, so they move into place with a rename.
+pub fn scratch_dir(out_dir: &Path, work_dir: Option<&Path>) -> PathBuf {
+    match work_dir {
+        None => out_dir.join(".work"),
+        Some(d) => {
+            let out = std::path::absolute(out_dir).unwrap_or_else(|_| out_dir.to_path_buf());
+            let id = blake3::hash(out.to_string_lossy().as_bytes()).to_hex();
+            d.join(format!("triptape-work-{}", &id[..12]))
+        }
+    }
 }
 
 /// How the segment cache served one export.
@@ -98,6 +137,9 @@ pub struct Skipped {
 pub struct ExportReport {
     pub trip_name: String,
     pub video: Option<String>,
+    /// The film is a draft for review (`hero-draft.mp4`), not the keepsake.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub draft: bool,
     pub reels: Vec<String>,
     pub book_pages: usize,
     pub skipped: Vec<Skipped>,
@@ -105,6 +147,10 @@ pub struct ExportReport {
     pub attribution: Vec<String>,
     /// Present when a segment cache was in use.
     pub segment_cache: Option<SegmentCacheReport>,
+    /// How the chunk cache served the film's pre-joined chunks (`reused`
+    /// of `total`), when the film was long enough to be joined in chunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_cache: Option<SegmentCacheReport>,
 }
 
 /// Resolve a plan entry to files from the asset map.
@@ -120,6 +166,7 @@ fn resolve_entry(
         AssetKind::Video => (a.path.clone(), Some(a.path.clone())),
         AssetKind::LivePhoto => (a.path.clone(), a.companion_path.clone()),
     };
+    let frame = plan.frame.get(asset_id).copied();
     Some(ResolvedEntry {
         // The caller's entry, not a lookup by asset id: sibling windows of
         // one clip share the id but not the trim.
@@ -135,8 +182,10 @@ fn resolve_entry(
             .cloned(),
         taken_at: a.taken_at,
         tz_offset_secs: a.tz_offset_secs,
-        aspect: a.display_aspect(),
+        aspect: a.framed_aspect(frame),
         gps: a.gps,
+        frame,
+        still: plan.still.iter().any(|id| id == asset_id),
     })
 }
 
@@ -433,6 +482,30 @@ fn resolve_verified(
 /// default 60 pages), so a raised cap raises the estimate with it.
 fn estimate_export_bytes(plan: &Plan, photos: usize, book_cap: usize, only: &str) -> u64 {
     const PER_FILM_ENTRY: u64 = 30_000_000;
+    estimate_with(plan, photos, book_cap, only, PER_FILM_ENTRY)
+}
+
+/// Scratch the film needs on the work volume: each entry's cached segment
+/// plus its share of the joined chunks, sized for the frame (4K segments
+/// run ~50 Mbit/s and chunks ~66 Mbit/s, about 6 s an entry).
+fn estimate_work_bytes(plan: &Plan, res: Resolution, draft: bool) -> u64 {
+    // A draft still copies the full-size segments in, but joins 1080p
+    // chunks at ~20 Mbit/s instead of keepsake chunks at ~66.
+    let per_entry = match (res, draft) {
+        (Resolution::Uhd4k, false) => 120_000_000,
+        (Resolution::Uhd4k, true) => 55_000_000,
+        (Resolution::Hd1080, _) => 35_000_000,
+    };
+    estimate_with(plan, 0, 0, "video", per_entry)
+}
+
+fn estimate_with(
+    plan: &Plan,
+    photos: usize,
+    book_cap: usize,
+    only: &str,
+    per_film_entry: u64,
+) -> u64 {
     const PER_REEL: u64 = 60_000_000;
     const PER_BOOK_PHOTO: u64 = 10_000_000;
     const BOOK_PHOTOS_PER_PAGE: u64 = 2;
@@ -440,7 +513,7 @@ fn estimate_export_bytes(plan: &Plan, photos: usize, book_cap: usize, only: &str
     let wanted = |keepsake: &str| only == "all" || only == keepsake;
     let mut bytes = 0;
     if wanted("video") {
-        bytes += PER_FILM_ENTRY * plan.hero.len() as u64;
+        bytes += per_film_entry * plan.hero.len() as u64;
     }
     if wanted("reels") {
         bytes += PER_REEL * plan.reel_selects.len().min(5) as u64;
@@ -513,20 +586,37 @@ pub fn export_all(
     // The cache takes its lease before any segment is used and gives it back
     // however the export ends (the handle also releases on drop).
     let work = out_dir.join(".work");
-    let (cache, cache_note) = match &opts.segment_cache {
-        None => (None, None),
-        Some(cfg) => {
-            let version = crate::segment_cache::ffmpeg_version(&caps.ffmpeg_bin);
-            match SegmentCache::open(cfg, version, &work) {
-                Ok(c) => (Some(c), None),
-                Err(e) => (
-                    None,
-                    Some(format!("segment cache off ({}): {e}", cfg.dir.display())),
-                ),
-            }
+    // The film's intermediates: `work` itself unless a work dir moved them.
+    let scratch = scratch_dir(out_dir, opts.work_dir.as_deref());
+    // Read once: both caches key their entries on it, and reading it runs ffmpeg.
+    let version = opts
+        .segment_cache
+        .as_ref()
+        .map(|_| crate::segment_cache::ffmpeg_version(&caps.ffmpeg_bin));
+    let open = |cfg: &crate::segment_cache::SegmentCacheConfig, what: &str| {
+        let version = version.clone().unwrap_or_default();
+        match SegmentCache::open(cfg, version, &scratch) {
+            Ok(c) => (Some(c), None),
+            Err(e) => (
+                None,
+                Some(format!("{what} cache off ({}): {e}", cfg.dir.display())),
+            ),
         }
     };
+    let (cache, cache_note) = match &opts.segment_cache {
+        None => (None, None),
+        Some(cfg) => open(cfg, "segment"),
+    };
     caps.segment_cache = cache.clone();
+    // The film's joined chunks are cached beside its segments, under their
+    // own size limit. Only the film uses them.
+    let (chunk_cache, chunk_note) = match &opts.segment_cache {
+        Some(cfg) if cache.is_some() && matches!(opts.only.as_str(), "all" | "video") => {
+            open(&cfg.chunks(), "chunk")
+        }
+        _ => (None, None),
+    };
+    caps.chunk_cache = chunk_cache.clone();
     // Installed for this thread so FFmpeg and Typst children started outside
     // the progress-aware runners die on cancel too (see `triptape_core::process`).
     let mut out = triptape_core::process::with_cancel(&opts.progress.cancel_flag(), || {
@@ -536,14 +626,28 @@ pub fn export_all(
     // staged in here, so a failed or cancelled one never reaches `out_dir`. This must
     // precede `cache.finish()`: `.work` holds hard links to cache entries, so
     // while it exists eviction and `cache clear` cannot reclaim their bytes.
-    if let Err(e) = std::fs::remove_dir_all(&work) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            if let Ok(report) = out.as_mut() {
-                report.fallbacks.push(format!(
-                    "could not remove intermediates ({}): {e}; cached segments they share stay allocated",
-                    work.display()
-                ));
+    let mut dirs = vec![&work];
+    if scratch != work {
+        dirs.push(&scratch);
+    }
+    for dir in dirs {
+        if let Err(e) = std::fs::remove_dir_all(dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                if let Ok(report) = out.as_mut() {
+                    report.fallbacks.push(format!(
+                        "could not remove intermediates ({}): {e}; cached segments they share stay allocated",
+                        dir.display()
+                    ));
+                }
             }
+        }
+    }
+    // Chunks first: when the volume is under its free-space floor, the
+    // chunks give the space back before any segment has to.
+    if let Some(chunks) = chunk_cache {
+        let evicted = chunks.finish();
+        if let Ok(report) = out.as_mut() {
+            report.chunk_cache = cache_use(&chunks, evicted.removed, "chunk", report);
         }
     }
     if let Some(cache) = cache {
@@ -551,11 +655,13 @@ pub fn export_all(
         // this export used is protected any longer than it is needed.
         let evicted = cache.finish();
         if let Ok(report) = out.as_mut() {
-            record_cache_use(&cache, evicted.removed, report);
+            report.segment_cache = cache_use(&cache, evicted.removed, "segment", report);
         }
     }
-    if let (Ok(report), Some(note)) = (out.as_mut(), cache_note) {
-        report.fallbacks.push(note);
+    for note in [cache_note, chunk_note].into_iter().flatten() {
+        if let Ok(report) = out.as_mut() {
+            report.fallbacks.push(note);
+        }
     }
     // Written last so the durable record includes the cache diagnostics.
     if let Ok(report) = &out {
@@ -567,29 +673,33 @@ pub fn export_all(
     out
 }
 
-/// Add how `cache` served this export to `report`: the reuse summary and,
-/// when the volume ran low, a fallback note.
-fn record_cache_use(cache: &SegmentCache, evicted: usize, report: &mut ExportReport) {
+/// How `cache` (the "segment" or the "chunk" cache: `what`) served this
+/// export: the reuse summary, when it was asked for anything, and, when the
+/// volume ran low, a fallback note added to `report`.
+fn cache_use(
+    cache: &SegmentCache,
+    evicted: usize,
+    what: &str,
+    report: &mut ExportReport,
+) -> Option<SegmentCacheReport> {
     let stats = cache.stats();
     let total = stats.hits + stats.misses;
-    if total > 0 {
-        report.segment_cache = Some(SegmentCacheReport {
-            dir: cache.dir().to_string_lossy().into_owned(),
-            reused: stats.hits,
-            total,
-            stored: stats.stored,
-            overlays_reused: stats.overlay_hits,
-            overlays_total: stats.overlay_hits + stats.overlay_misses,
-            skipped_low_disk: stats.skipped_low_disk,
-            evicted,
-        });
-    }
     if stats.skipped_low_disk > 0 {
         report.fallbacks.push(format!(
-            "segment cache: {} segments not cached (storing them would drop free space below the floor)",
+            "{what} cache: {} {what}s not cached (storing them would drop free space below the floor)",
             stats.skipped_low_disk
         ));
     }
+    (total > 0).then(|| SegmentCacheReport {
+        dir: cache.dir().to_string_lossy().into_owned(),
+        reused: stats.hits,
+        total,
+        stored: stats.stored,
+        overlays_reused: stats.overlay_hits,
+        overlays_total: stats.overlay_hits + stats.overlay_misses,
+        skipped_low_disk: stats.skipped_low_disk,
+        evicted,
+    })
 }
 
 /// The place a chapter's book heading names, when the itinerary adds to
@@ -685,7 +795,20 @@ fn export_inner(
         estimate_export_bytes(plan, photos, book_cap, &opts.only),
     )
     .map_err(crate::MediaError::NoSpace)?;
+    // With --work-dir the film's segments and chunks land on another
+    // volume, so that one needs the room too.
+    if let Some(work_root) = opts.work_dir.as_deref() {
+        if matches!(opts.only.as_str(), "all" | "video") {
+            std::fs::create_dir_all(work_root).map_err(|e| crate::MediaError::Io(e.to_string()))?;
+            triptape_core::jobs::free_space_precheck(
+                work_root,
+                estimate_work_bytes(plan, opts.resolution, opts.draft),
+            )
+            .map_err(crate::MediaError::NoSpace)?;
+        }
+    }
     let work = out_dir.join(".work");
+    let scratch = scratch_dir(out_dir, opts.work_dir.as_deref());
     let stage = work.join("stage");
     // A crashed run may have left a half-finished keepsake here.
     let _ = std::fs::remove_dir_all(&stage);
@@ -694,12 +817,14 @@ fn export_inner(
     let mut report = ExportReport {
         trip_name: opts.trip_name.clone(),
         video: None,
+        draft: false,
         reels: vec![],
         book_pages: 0,
         skipped: vec![],
         fallbacks: vec![],
         attribution: vec![crate::map::MAP_ATTRIBUTION.to_string()],
         segment_cache: None,
+        chunk_cache: None,
     };
 
     // Map card once, shared by the hero film and the book map page.
@@ -743,14 +868,16 @@ fn export_inner(
             .collect();
         let staged_video = stage.join("video");
         std::fs::create_dir_all(&staged_video).map_err(|e| crate::MediaError::Io(e.to_string()))?;
-        let out_mp4 = out_dir.join("hero.mp4");
+        let stem = film_stem(opts.draft);
+        let film_name = format!("{stem}.mp4");
+        let out_mp4 = out_dir.join(&film_name);
         match render_video::render_hero_video(
             caps,
             plan,
             &resolved,
             map_card.as_deref(),
-            &work.join("video"),
-            &staged_video.join("hero.mp4"),
+            &scratch.join("video"),
+            &staged_video.join(&film_name),
             &VideoOptions {
                 trip_name: opts.trip_name.clone(),
                 short_mode: elig.video == "short",
@@ -759,6 +886,8 @@ fn export_inner(
                 live_collages: opts.live_collages,
                 opening_map: opts.opening_map,
                 typst_bin: opts.typst_bin.clone(),
+                draft: opts.draft,
+                title_dates: opts.title_dates.clone(),
                 resolution: opts.resolution,
                 jobs: opts.jobs,
                 map_style: opts.map_style,
@@ -781,16 +910,18 @@ fn export_inner(
                 opts.progress.check_cancelled()?;
                 // Sidecars first, film last. A film with no captions must
                 // not keep the previous film's.
-                for name in ["hero.srt", "hero.edl.json"] {
-                    let staged = staged_video.join(name);
+                for ext in ["srt", "edl.json"] {
+                    let name = format!("{stem}.{ext}");
+                    let staged = staged_video.join(&name);
                     if staged.exists() {
-                        promote_file(&staged, &out_dir.join(name))?;
+                        promote_file(&staged, &out_dir.join(&name))?;
                     } else {
-                        let _ = std::fs::remove_file(out_dir.join(name));
+                        let _ = std::fs::remove_file(out_dir.join(&name));
                     }
                 }
-                promote_file(&staged_video.join("hero.mp4"), &out_mp4)?;
+                promote_file(&staged_video.join(&film_name), &out_mp4)?;
                 report.video = Some(out_mp4.to_string_lossy().into_owned());
+                report.draft = opts.draft;
                 report.fallbacks.extend(v.fallbacks);
             }
             Err(e) => {
@@ -1333,6 +1464,27 @@ mod tests {
     }
 
     #[test]
+    fn the_work_estimate_scales_with_the_frame() {
+        let mut plan = empty_plan();
+        let entry = PlanEntry {
+            asset_id: "a".into(),
+            window: 0,
+            content_hash: None,
+            size_bytes: 0,
+            mtime: 0,
+            rendition: Rendition::Still,
+        };
+        plan.hero = vec![entry; 100];
+        let uhd = estimate_work_bytes(&plan, Resolution::Uhd4k, false);
+        let hd = estimate_work_bytes(&plan, Resolution::Hd1080, false);
+        let draft = estimate_work_bytes(&plan, Resolution::Uhd4k, true);
+        assert!(hd < draft && draft < uhd, "{hd} {draft} {uhd}");
+        assert!(uhd >= 10_000_000_000, "{uhd}");
+        // A 1080p film's chunks are already small: a draft saves nothing.
+        assert_eq!(estimate_work_bytes(&plan, Resolution::Hd1080, true), hd);
+    }
+
+    #[test]
     fn estimate_counts_only_the_selected_keepsake() {
         let mut plan = empty_plan();
         let entry = PlanEntry {
@@ -1671,6 +1823,7 @@ mod tests {
                 preset: render_book::BookPreset::P1,
                 book_max_pages: None,
                 trip_name: "Trip".into(),
+                title_dates: None,
                 typst_bin: "typst".into(),
                 music_paths: vec![],
                 keep_ambience: false,
@@ -1689,6 +1842,8 @@ mod tests {
                 hop_clips: vec![],
                 back_cover: None,
                 front_cover: None,
+                work_dir: None,
+                draft: false,
             },
         );
         assert!(matches!(err, Err(crate::MediaError::Cancelled)), "{err:?}");
@@ -1716,6 +1871,8 @@ mod tests {
             },
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
             book_layout: Default::default(),
@@ -1732,6 +1889,7 @@ mod tests {
             preset: render_book::BookPreset::P1,
             book_max_pages: None,
             trip_name: "t".into(),
+            title_dates: None,
             typst_bin: "typst".into(),
             music_paths: Vec::new(),
             keep_ambience: false,
@@ -1750,10 +1908,32 @@ mod tests {
             hop_clips: vec![],
             back_cover: None,
             front_cover: None,
+            work_dir: None,
+            draft: false,
         };
         let report = export_all(&Default::default(), &empty_plan(), &[], &out, &opts).unwrap();
         assert!(!out.join(".work").exists(), "{:?}", report.fallbacks);
         assert!(out.join("export.json").exists());
+        // A work dir elsewhere holds the film's scratch files in a folder
+        // of its own, removed with the export; the folder given stays.
+        let local = t.path().join("local");
+        let scratch = scratch_dir(&out, Some(&local));
+        assert_eq!(scratch.parent(), Some(local.as_path()));
+        assert_ne!(scratch, scratch_dir(&t.path().join("other"), Some(&local)));
+        std::fs::create_dir_all(scratch.join("video")).unwrap();
+        std::fs::write(local.join("mine.txt"), "kept").unwrap();
+        let opts = ExportOptions {
+            work_dir: Some(local.clone()),
+            ..opts
+        };
+        let report = export_all(&Default::default(), &empty_plan(), &[], &out, &opts).unwrap();
+        assert!(!scratch.exists(), "{:?}", report.fallbacks);
+        assert!(!out.join(".work").exists());
+        assert!(local.join("mine.txt").exists());
+        assert_eq!(scratch_dir(&out, None), out.join(".work"));
+        // A draft never takes the keepsake's file names.
+        assert_eq!(film_stem(false), "hero");
+        assert_eq!(film_stem(true), "hero-draft");
     }
 
     #[test]
@@ -1799,6 +1979,8 @@ mod tests {
             tz_offset_secs: None,
             aspect: None,
             gps: None,
+            frame: None,
+            still: false,
         };
         // Both selected stills are reserved up front, as export_all does.
         let mut used: HashSet<PathBuf> = [&by_id["p1"].path, &by_id["p3"].path]

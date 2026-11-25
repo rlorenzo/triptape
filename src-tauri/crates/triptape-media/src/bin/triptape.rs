@@ -5,11 +5,11 @@
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m] [--models DIR]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
-//!                [--solo REF...] [--unsolo REF...] [--live REF...] [--unlive REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--feature REF...] [--whole REF...] [--row REF...] [--page-caption REF...] [--own-page REF...] [--book-after REF ANCHOR]... [--still VIDEO SECS] [--group REF REF...] [--unfeature|--unwhole|--unrow|--unpage-caption|--unown-page|--unbook-after|--unstill|--ungroup REF...] [--list]
+//!                [--solo REF...] [--unsolo REF...] [--live REF...] [--unlive REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--frame REF X Y W H]... [--unframe REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--feature REF...] [--whole REF...] [--row REF...] [--page-caption REF...] [--own-page REF...] [--book-after REF ANCHOR]... [--still VIDEO SECS] [--group REF REF...] [--unfeature|--unwhole|--unrow|--unpage-caption|--unown-page|--unbook-after|--unstill|--ungroup REF...] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
-//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--front-cover IMAGE] [--approved-book BOOK.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
-//!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
-//! triptape cache stats|clear [--segment-cache DIR]
+//! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--title TEXT] [--title-dates TEXT] [--front-cover IMAGE] [--approved-book BOOK.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
+//!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE] [--chunk-cache-max SIZE] [--work-dir DIR] [--draft]
+//! triptape cache stats|clear [--segment-cache DIR] [--chunk-cache-max SIZE]
 //! triptape pick --db trip.db --out /path/to/new-folder [--count 800] [--project ID] [--stills-only]
 //! triptape maps --itinerary itinerary.json --out /path/to/out [--db trip.db] [--title TEXT] [--resolution 4k|1080p] [--page WxH] [--stills-only]
 //! ```
@@ -17,6 +17,32 @@
 //! Without `--home` or `--segment-cache-max`, `plan`, `export` and `cache`
 //! use the home and limit saved in the app's Settings (`TRIPTAPE_SETTINGS`
 //! names another settings file).
+//!
+//! `export` keeps the film's scratch files in `<out>/.work` unless
+//! `--work-dir DIR` names another folder for them (the finished keepsakes
+//! still land in `--out`). Keep the work dir and the segment cache
+//! (`--segment-cache DIR`, by default the platform cache dir) on the same
+//! local disk: a cached segment is then reused by a hard link or an APFS
+//! clone. With either on a network share (SMB has no hard links) every
+//! reused segment is copied in full, about 14 GB for a 16-minute 4K film
+//! on each export.
+//!
+//! A long film (over 40 segments) is joined in chunks, cut at chapter
+//! starts, before its final encode. The joined chunks are cached too, in
+//! `chunks/` inside the segment cache folder, under their own limit
+//! (`--chunk-cache-max SIZE`, 16 GB by default; a 16-minute 4K film's
+//! chunks take about 10 GB, its draft's about 2 GB). After an edit only
+//! the chunk holding the edited shots is joined again; `cache stats` and
+//! `cache clear` cover both caches.
+//!
+//! `export --draft` renders the film for reviewing an edit, in minutes:
+//! `hero-draft.mp4` (with `hero-draft.srt` and `hero-draft.edl.json`),
+//! beside any `hero.mp4`, which it leaves alone. A draft is the same film
+//! (the same cached 4K segments, cuts, burned captions and music, so the
+//! timing is the keepsake's) joined at 1080p with Apple's hardware encoder
+//! (`hevc_videotoolbox`, else `h264_videotoolbox`, else libx264
+//! ultrafast). It is for review only: the hardware encoder has no strict
+//! bitrate cap, so render without `--draft` for the film to keep.
 //!
 //! `scan` and `export` take `--ffmpeg`, `--ffprobe` (and `export` `--typst`)
 //! paths; without them each tool comes from `TRIPTAPE_FFMPEG` and friends,
@@ -27,6 +53,7 @@ use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use triptape_ai_local::local::{LocalModels, ModelPaths};
 use triptape_core::plan::{MoveRejection, PlanEdits};
+use triptape_core::types::{valid_frame, Frame};
 use triptape_core::{
     asset_ref, cluster,
     db::{Db, EditedPlan},
@@ -773,11 +800,16 @@ fn export_cmd(flags: &HashMap<String, String>) {
     let known_faces = db
         .known_faces(&project_id)
         .unwrap_or_else(|e| die("known faces", e));
-    let trip_name = db
-        .get_project(&project_id)
-        .unwrap_or_else(|e| die("project", e))
-        .map(|p| p.name.clone())
-        .unwrap_or_else(|| "trip".to_string());
+    // The owner's own title for the keepsakes, else the project's name.
+    let trip_name = match flags.get("title") {
+        Some(t) => t.clone(),
+        None => db
+            .get_project(&project_id)
+            .unwrap_or_else(|e| die("project", e))
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "trip".to_string()),
+    };
+    let title_dates = flags.get("title-dates").cloned();
 
     let caps = ffmpeg::probe_capabilities(&ffmpeg_bin, &ffprobe_bin);
     println!(
@@ -873,6 +905,19 @@ fn export_cmd(flags: &HashMap<String, String>) {
         die("back-cover", format!("not found: {}", p.display()));
     }
     let segment_cache = segment_cache_config(flags);
+    // A draft of the film for reviewing an edit: 1080p, fastest encoder.
+    let draft = flags.get("draft").is_some_and(|v| v != "false");
+    // The film's scratch files go beside the output unless moved (to a
+    // local disk, when the output is on a network share).
+    let work_dir = flags.get("work-dir").map(|v| {
+        let dir = PathBuf::from(v);
+        if v == "true" || v.is_empty() {
+            die("work-dir", "want a folder");
+        }
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| die("work-dir", format!("{}: {e}", dir.display())));
+        dir
+    });
     // Only the book crops around faces; skip loading the models otherwise.
     let faces = matches!(only.as_str(), "all" | "book")
         .then(|| book_faces(flags))
@@ -886,6 +931,7 @@ fn export_cmd(flags: &HashMap<String, String>) {
             preset,
             book_max_pages,
             trip_name,
+            title_dates,
             typst_bin,
             music_paths: music,
             keep_ambience,
@@ -903,6 +949,8 @@ fn export_cmd(flags: &HashMap<String, String>) {
             hop_clips,
             back_cover,
             front_cover,
+            work_dir,
+            draft,
             known_faces,
         },
     );
@@ -910,12 +958,22 @@ fn export_cmd(flags: &HashMap<String, String>) {
     let report = exported.unwrap_or_else(|e| die("export", e));
 
     if let Some(v) = &report.video {
-        println!("video: {v}");
+        if report.draft {
+            println!("video (draft, for review only): {v}");
+        } else {
+            println!("video: {v}");
+        }
     }
     if let Some(c) = &report.segment_cache {
         println!(
             "video: segments reused {}/{} from cache, overlays {}/{} ({} new, {} evicted; {})",
             c.reused, c.total, c.overlays_reused, c.overlays_total, c.stored, c.evicted, c.dir
+        );
+    }
+    if let Some(c) = &report.chunk_cache {
+        println!(
+            "video: chunks reused {}/{} from cache ({} new, {} evicted; {})",
+            c.reused, c.total, c.stored, c.evicted, c.dir
         );
     }
     for r in &report.reels {
@@ -953,8 +1011,10 @@ fn segment_cache_config(flags: &HashMap<String, String>) -> Option<SegmentCacheC
         eprintln!("segment cache off: no cache directory on this platform");
     }
     let min_free_bytes = cache_min_free_flag(flags);
+    let chunk_max_bytes = chunk_max_flag(flags);
     dir.map(|dir| SegmentCacheConfig {
         max_bytes,
+        chunk_max_bytes,
         min_free_bytes,
         ..SegmentCacheConfig::new(dir)
     })
@@ -974,6 +1034,13 @@ fn cache_max_flag(flags: &HashMap<String, String>) -> Option<u64> {
         .get("segment-cache-max")
         .map(|v| segment_cache::parse_size(v).unwrap_or_else(|e| die("segment-cache-max", e)))
         .or_else(|| saved_settings().segment_cache_max_bytes)
+}
+
+/// `--chunk-cache-max SIZE`, when given.
+fn chunk_max_flag(flags: &HashMap<String, String>) -> Option<u64> {
+    flags
+        .get("chunk-cache-max")
+        .map(|v| segment_cache::parse_size(v).unwrap_or_else(|e| die("chunk-cache-max", e)))
 }
 
 /// `--segment-cache-min-free SIZE`, when given.
@@ -1015,9 +1082,20 @@ fn cache_cmd(sub: &str, flags: &HashMap<String, String>) {
                 free.map_or_else(|| "unknown".into(), size),
                 size(policy.headroom(st.bytes, free))
             );
+            let chunks = segment_cache::disk_stats(&segment_cache::chunk_dir(&dir));
+            println!(
+                "chunks: {}  size: {}  limit: {}",
+                chunks.entries,
+                size(chunks.bytes),
+                size(chunk_max_flag(flags).unwrap_or(segment_cache::DEFAULT_CHUNK_CAP_BYTES))
+            );
         }
         "clear" => {
-            let r = segment_cache::clear(&dir);
+            let mut r = segment_cache::clear(&dir);
+            let chunks = segment_cache::clear(&segment_cache::chunk_dir(&dir));
+            r.removed += chunks.removed;
+            r.freed += chunks.freed;
+            r.protected += chunks.protected;
             println!(
                 "removed {} entries ({})",
                 r.removed,
@@ -1053,8 +1131,8 @@ struct EditArgs {
     unexclude: Vec<String>,
     solo: Vec<String>,
     unsolo: Vec<String>,
-    /// Live Photos to play their motion in the film (`--live`), or back
-    /// to the planner's choice (`--unlive`).
+    /// Live Photos to play their motion in the film (`--live`), or to play
+    /// as a still, in a collage cell too (`--unlive`).
     live: Vec<String>,
     unlive: Vec<String>,
     join: Vec<(String, String)>,
@@ -1072,6 +1150,9 @@ struct EditArgs {
     /// Crop focus: (asset, x percent, y percent).
     crop: Vec<(String, u8, u8)>,
     uncrop: Vec<String>,
+    /// Film framing: (asset, x, y, w, h) in percent of the source.
+    frame: Vec<(String, Frame)>,
+    unframe: Vec<String>,
     /// Photos pinned into (or out of) the book.
     book: Vec<String>,
     unbook: Vec<String>,
@@ -1104,6 +1185,14 @@ struct EditArgs {
 }
 
 const MOVE_USAGE: &str = "--move wants --after REF or --before REF";
+
+/// A whole percent, 0-100; `what` names the value in the error.
+fn parse_pct(what: &str, v: &str) -> Result<u8, String> {
+    match v.parse::<u8>() {
+        Ok(p) if p <= 100 => Ok(p),
+        _ => Err(format!("{what} must be 0-100, got {v:?}")),
+    }
+}
 
 fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
     let mut out = EditArgs::default();
@@ -1173,10 +1262,7 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
             "no-closing" => return Err("--no-closing takes no value".to_string()),
             "crop" => match <[String; 3]>::try_from(values) {
                 Ok([a, x, y]) => {
-                    let pct = |v: &str| match v.parse::<u8>() {
-                        Ok(p) if p <= 100 => Ok(p),
-                        _ => Err(format!("--crop focus must be 0-100, got {v:?}")),
-                    };
+                    let pct = |v: &str| parse_pct("--crop focus", v);
                     out.crop.push((a, pct(&x)?, pct(&y)?));
                 }
                 Err(_) => {
@@ -1184,6 +1270,22 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                         "--crop wants an asset and its focus X Y in percent (0 0 top left)".into(),
                     )
                 }
+            },
+            "frame" => match <[String; 5]>::try_from(values) {
+                Ok([a, x, y, w, h]) => {
+                    let pct = |v: &str| parse_pct("--frame values", v);
+                    let f = (pct(&x)?, pct(&y)?, pct(&w)?, pct(&h)?);
+                    if !valid_frame(f) {
+                        return Err(format!(
+                            "--frame W and H must be above 0, with X+W and Y+H at most 100 (got {x} {y} {w} {h})"
+                        ));
+                    }
+                    out.frame.push((a, f));
+                }
+                Err(_) => return Err(
+                    "--frame wants an asset and its rectangle X Y W H in percent (0 0 top left)"
+                        .into(),
+                ),
             },
             "move" => {
                 if pending_move.is_some() {
@@ -1198,10 +1300,10 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                 out.moves.push((asset, single(values)?, flag == "after"));
             }
             "include" | "exclude" | "uninclude" | "unexclude" | "solo" | "unsolo" | "live"
-            | "unlive" | "unjoin" | "unmove" | "uncover" | "hide-caption" | "uncrop" | "book"
-            | "unbook" | "feature" | "unfeature" | "whole" | "unwhole" | "row" | "unrow"
-            | "page-caption" | "unpage-caption" | "own-page" | "unown-page" | "unbook-after"
-            | "unstill" | "ungroup" => {
+            | "unlive" | "unjoin" | "unmove" | "uncover" | "hide-caption" | "uncrop"
+            | "unframe" | "book" | "unbook" | "feature" | "unfeature" | "whole" | "unwhole"
+            | "row" | "unrow" | "page-caption" | "unpage-caption" | "own-page" | "unown-page"
+            | "unbook-after" | "unstill" | "ungroup" => {
                 if values.is_empty() {
                     return Err(format!("--{flag} wants at least one asset"));
                 }
@@ -1218,6 +1320,7 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     "uncover" => out.uncover.extend(values),
                     "hide-caption" => out.hide_caption.extend(values),
                     "uncrop" => out.uncrop.extend(values),
+                    "unframe" => out.unframe.extend(values),
                     "book" => out.book.extend(values),
                     "unbook" => out.unbook.extend(values),
                     "feature" => out.feature.extend(values),
@@ -1306,6 +1409,10 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
     for id in &edits.motion {
         println!("  {}", show(id));
     }
+    println!("plays as a still: {}", edits.still.len());
+    for id in &edits.still {
+        println!("  {}", show(id));
+    }
     println!("joins: {}", collage.joins.len());
     for (a, b) in &collage.joins {
         println!("  {} + {}", show(a), show(b));
@@ -1357,6 +1464,10 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
     println!("crop focus: {}", edits.crop.len());
     for (id, (x, y)) in &edits.crop {
         println!("  {} at {x}%, {y}%", show(id));
+    }
+    println!("film framing: {}", edits.frame.len());
+    for (id, (x, y, w, h)) in &edits.frame {
+        println!("  {} uses {w}% x {h}% from {x}%, {y}%", show(id));
     }
     println!("cover pins: {}", edits.cover.len());
     for (id, focus) in &edits.cover {
@@ -1436,6 +1547,7 @@ fn edit_cmd(args: &[String]) {
     let set_solo: Setter = |e, id, on| e.collage.set_solo(id, on);
     let solos = resolve(&a.solo);
     let set_live: Setter = PlanEdits::set_motion;
+    let set_still: Setter = PlanEdits::set_still;
     let lives = resolve(&a.live);
     if let Some(asset) = lives.iter().find(|x| !x.has_live_motion()) {
         die(
@@ -1471,7 +1583,7 @@ fn edit_cmd(args: &[String]) {
         (resolve(&a.unsolo), "unsolo", set_solo, false),
         (solos.clone(), "solo", set_solo, true),
         // Motion after the pins, which it may apply to.
-        (resolve(&a.unlive), "unlive", set_live, false),
+        (resolve(&a.unlive), "unlive", set_still, true),
         (lives.clone(), "live", set_live, true),
     ];
     let unjoins = resolve(&a.unjoin);
@@ -1500,6 +1612,8 @@ fn edit_cmd(args: &[String]) {
         .map(|(q, x, y)| (resolve_one(q), *x, *y))
         .collect();
     let uncrops = resolve(&a.uncrop);
+    let frames: Vec<(&Asset, Frame)> = a.frame.iter().map(|(q, f)| (resolve_one(q), *f)).collect();
+    let unframes = resolve(&a.unframe);
     let closing = a.closing.as_deref().map(resolve_one);
     if let Some(asset) = closing.filter(|x| x.kind == AssetKind::Video) {
         die(
@@ -1588,6 +1702,8 @@ fn edit_cmd(args: &[String]) {
         || !hidden.is_empty()
         || !crops.is_empty()
         || !uncrops.is_empty()
+        || !frames.is_empty()
+        || !unframes.is_empty()
         || !books.is_empty()
         || !unbooks.is_empty()
         || closing.is_some()
@@ -1611,7 +1727,7 @@ fn edit_cmd(args: &[String]) {
     if !changed && !a.list {
         die(
             "edit",
-            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--live/--unlive/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--book/--unbook/--closing/--no-closing/--feature/--whole/--row/--page-caption/--own-page/--book-after/--still/--group (and their un- forms) or --list",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--live/--unlive/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--frame/--unframe/--book/--unbook/--closing/--no-closing/--feature/--whole/--row/--page-caption/--own-page/--book-after/--still/--group (and their un- forms) or --list",
         );
     }
     let mut edits = ep.edits.clone();
@@ -1726,6 +1842,18 @@ fn edit_cmd(args: &[String]) {
         edits.set_crop(asset.id.clone(), Some((*x, *y)));
         println!(
             "crop: {} centred at {x}% across, {y}% down",
+            asset_label(asset)
+        );
+    }
+    for asset in &unframes {
+        edits.set_frame(asset.id.clone(), None);
+        println!("unframe: {}", asset_label(asset));
+    }
+    for &(asset, f) in &frames {
+        let (x, y, w, h) = f;
+        edits.set_frame(asset.id.clone(), Some(f));
+        println!(
+            "frame: {} uses {w}% x {h}% of the photo from {x}% across, {y}% down",
             asset_label(asset)
         );
     }
@@ -2446,6 +2574,28 @@ mod tests {
         assert_eq!(a.own_page, ["a", "b"]);
         assert_eq!(a.unown_page, ["c"]);
         assert!(parse_edit_args(&args("--db t.db --own-page")).is_err());
+    }
+
+    #[test]
+    fn edit_args_take_frame_and_unframe() {
+        let a = parse_edit_args(&args("--frame a 10 20 50 60 --unframe b c")).unwrap();
+        assert_eq!(a.frame, [("a".to_string(), (10, 20, 50, 60))]);
+        assert_eq!(a.unframe, ["b", "c"]);
+        for bad in [
+            "--frame a 10 20 50",
+            "--frame a 10 20 50 60 70",
+            "--frame a 10 20 0 60",
+            "--frame a 10 20 50 0",
+            "--frame a 60 0 50 50",
+            "--frame a 0 60 50 50",
+            "--frame a 0 0 101 50",
+            "--frame a x 0 50 50",
+            "--frame a -1 0 50 50",
+            "--unframe",
+        ] {
+            assert!(parse_edit_args(&args(bad)).is_err(), "{bad}");
+        }
+        assert!(parse_edit_args(&args("--frame a 0 0 100 100")).is_ok());
     }
 
     #[test]

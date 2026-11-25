@@ -232,6 +232,8 @@ fn reel_from_a_tagged_rotated_clip_is_clean_and_upright() {
         tz_offset_secs: None,
         aspect: Some(0.75),
         gps: None,
+        frame: None,
+        still: false,
     };
     let out = t.path().join("reels");
     let made = render_reels(
@@ -299,6 +301,8 @@ fn film_from_tagged_sources_is_clean_and_carries_no_rotation() {
             tz_offset_secs: None,
             aspect: None,
             gps: None,
+            frame: None,
+            still: false,
         };
     let entries = [
         entry("a0", Rendition::Still, &still, None),
@@ -331,6 +335,8 @@ fn film_from_tagged_sources_is_clean_and_carries_no_rotation() {
         collage: Default::default(),
         cover: Default::default(),
         crop: Default::default(),
+        frame: Default::default(),
+        still: Default::default(),
         book: Default::default(),
         closing: Default::default(),
         book_layout: Default::default(),

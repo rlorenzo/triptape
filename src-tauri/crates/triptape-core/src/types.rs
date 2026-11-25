@@ -4,6 +4,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// A film framing rectangle: (x, y, w, h) in percent of the displayed
+/// source, measured from its top left. See [`valid_frame`].
+pub type Frame = (u8, u8, u8, u8);
+
+/// Whether `f` is a usable framing: a non-empty rectangle inside the source.
+pub fn valid_frame(f: Frame) -> bool {
+    let (x, y, w, h) = f;
+    w > 0 && h > 0 && u16::from(x) + u16::from(w) <= 100 && u16::from(y) + u16::from(h) <= 100
+}
+
+/// Aspect (width / height) of a source of aspect `aspect` once cut to
+/// `frame`; unchanged without one.
+pub fn frame_aspect(aspect: f64, frame: Option<Frame>) -> f64 {
+    frame.map_or(aspect, |(_, _, w, h)| {
+        aspect * f64::from(w) / f64::from(h.max(1))
+    })
+}
+
 /// What kind of media an asset is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -132,6 +150,11 @@ impl Asset {
     /// play its motion.
     pub fn has_live_motion(&self) -> bool {
         self.kind == AssetKind::LivePhoto && self.companion_path.is_some()
+    }
+
+    /// [`Self::display_aspect`] after the owner's framing, if any.
+    pub fn framed_aspect(&self, frame: Option<Frame>) -> Option<f64> {
+        Some(frame_aspect(self.display_aspect()?, frame))
     }
 
     /// Width / height as displayed (EXIF rotation applied); `None` when
@@ -315,6 +338,16 @@ pub struct Plan {
     /// centres on, for heads the face detector cannot see (a mascot).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub crop: BTreeMap<String, (u8, u8)>,
+    /// Film framing the owner set per photo or clip: asset id -> (x, y, w,
+    /// h) percent of the displayed source, from its top left. The film
+    /// uses only that rectangle, as if the source had been cropped to it
+    /// first (see [`frame_aspect`]). The book ignores it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub frame: BTreeMap<String, Frame>,
+    /// Photos the owner set to play as a still in the film: never their
+    /// Live Photo motion, in a collage cell either.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub still: Vec<String>,
     /// Photos the owner pinned into the book: always placed, like a
     /// captioned photo.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

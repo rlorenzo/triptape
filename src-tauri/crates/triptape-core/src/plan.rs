@@ -11,8 +11,8 @@ use crate::cluster::{day_of, gps_outliers_in, same_day, story_positions, story_t
 use crate::embedding::{same_scene, Embedding};
 use crate::party::Track;
 use crate::types::{
-    distinct_assets, Asset, AssetKind, Chapter, CollageEdits, MusicPick, Plan, PlanEntry,
-    Rendition, Score,
+    distinct_assets, valid_frame, Asset, AssetKind, Chapter, CollageEdits, Frame, MusicPick, Plan,
+    PlanEntry, Rendition, Score,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -113,15 +113,17 @@ pub fn places_card_secs(places: usize) -> f64 {
         .clamp(PLACES_CARD_MIN_SECS, PLACES_CARD_MAX_SECS)
 }
 
-/// Longest a caption may stretch its shot.
+/// Longest reading time a caption asks of its shot (see
+/// [`caption_hold_secs`] for the hold, which adds the cue lead-in and the
+/// cut overlap on top).
 pub const CAPTION_MAX_SECS: f64 = 8.0;
 /// Reading time per caption word, on top of [`CAPTION_BASE_SECS`].
 const CAPTION_SECS_PER_WORD: f64 = 0.3;
 /// Time to notice a caption before reading it.
 const CAPTION_BASE_SECS: f64 = 1.5;
 
-/// Seconds a shot must stay on screen for its caption to be read: a
-/// 25-word caption on a 1.6 s Live Photo could not be. `0.0` without one.
+/// Seconds a caption must stay on screen to be read: a 25-word caption on
+/// a 1.6 s Live Photo could not be. `0.0` without one.
 /// Shared by the renderer and the planner's estimate.
 pub fn caption_read_secs(caption: Option<&str>) -> f64 {
     let words = caption.map_or(0, |c| c.split_whitespace().count());
@@ -130,6 +132,26 @@ pub fn caption_read_secs(caption: Option<&str>) -> f64 {
     }
     (CAPTION_BASE_SECS + CAPTION_SECS_PER_WORD * words as f64).min(CAPTION_MAX_SECS)
 }
+
+/// Delay between a segment's start and its caption cue.
+pub const CAPTION_LEAD_IN_SECS: f64 = 0.3;
+/// Longest transition overlap that can cut a caption's cue short at the
+/// segment's end (the 0.8 s fadeblack). Deliberately the worst case for
+/// every shot, not the shot's own cut.
+pub const CAPTION_CUT_OVERLAP_SECS: f64 = 0.8;
+
+/// Seconds to hold a shot so its caption is on screen for the whole of
+/// [`caption_read_secs`]: the read time, plus the cue's lead-in and the
+/// worst-case overlap of the cut out. `0.0` without a caption. Shared by
+/// the renderer and the planner's estimate.
+pub fn caption_hold_secs(caption: Option<&str>) -> f64 {
+    let read = caption_read_secs(caption);
+    if read == 0.0 {
+        return 0.0;
+    }
+    read + CAPTION_LEAD_IN_SECS + CAPTION_CUT_OVERLAP_SECS
+}
+
 /// Overlap of the first cut (circleopen) and the last (circleclose).
 const EST_BOOKEND_OVERLAP_SECS: f64 = 0.7;
 /// Overlaps at chapter breaks and other cuts into or out of a card: the
@@ -472,7 +494,11 @@ impl HeroGrouping {
         let by_id: HashMap<&str, &Asset> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
         Self::new(
             plan,
-            |id| by_id.get(id).and_then(|a| a.display_aspect()),
+            |id| {
+                by_id
+                    .get(id)
+                    .and_then(|a| a.framed_aspect(plan.frame.get(id).copied()))
+            },
             |id| by_id.get(id).and_then(|a| a.taken_at),
             |id| by_id.get(id).is_some_and(|a| a.path.exists()),
         )
@@ -843,7 +869,9 @@ pub fn estimate_plan_secs(plan: &Plan, assets: &[Asset]) -> f64 {
     let pano: HashMap<&str, f64> = assets
         .iter()
         .filter_map(|a| {
-            let asp = a.display_aspect().filter(|&x| is_panorama(x))?;
+            let asp = a
+                .framed_aspect(plan.frame.get(a.id.as_str()).copied())
+                .filter(|&x| is_panorama(x))?;
             Some((a.id.as_str(), pano_motion(asp).hold_secs))
         })
         .collect();
@@ -864,7 +892,7 @@ pub fn estimate_plan_secs(plan: &Plan, assets: &[Asset]) -> f64 {
         &plan.hero,
         |id| labels[chapter.get(id).copied().unwrap_or(plan.chapters.len())].as_str(),
         |id| pano.get(id).copied(),
-        |id| caption_read_secs(plan.captions.get(id).map(String::as_str)),
+        |id| caption_hold_secs(plan.captions.get(id).map(String::as_str)),
         |id| taken.get(id).copied(),
         cards,
         &plan.collage,
@@ -1221,6 +1249,11 @@ pub struct PlanEdits {
     /// [`apply_edits`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub motion: Vec<String>,
+    /// Photos the user set to play as a still ("Play as a still"), oldest
+    /// first: a Live Photo the planner chose for motion plays its still
+    /// instead, in a collage cell too. Mutually exclusive with `motion`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub still: Vec<String>,
     /// Film photos the user set to play on their own ("Show on its own")
     /// or joined into one collage ("Join with next"), oldest first. Stored
     /// flat (`solo`, `joins`) beside the other edits. See [`collage_slots`].
@@ -1233,6 +1266,9 @@ pub struct PlanEdits {
     /// Per-photo crop focus (see [`crate::types::Plan::crop`]).
     #[serde(default)]
     pub crop: BTreeMap<String, (u8, u8)>,
+    /// Per-photo film framing rectangle (see [`crate::types::Plan::frame`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub frame: BTreeMap<String, Frame>,
     /// Photos pinned into the book (see [`crate::types::Plan::book`]).
     #[serde(default)]
     pub book: Vec<String>,
@@ -1253,9 +1289,11 @@ impl PlanEdits {
             && self.caption_overrides.is_empty()
             && self.moves.is_empty()
             && self.motion.is_empty()
+            && self.still.is_empty()
             && self.collage.is_empty()
             && self.cover.is_empty()
             && self.crop.is_empty()
+            && self.frame.is_empty()
             && self.book.is_empty()
             && self.closing.is_none()
             && self.book_layout.is_empty()
@@ -1264,7 +1302,27 @@ impl PlanEdits {
     /// Play a Live Photo's motion in the film, or put it back to the
     /// planner's choice.
     pub fn set_motion(&mut self, asset: String, on: bool) {
-        crate::types::set_listed(&mut self.motion, asset, on);
+        self.motion.retain(|id| *id != asset);
+        if on {
+            self.still.retain(|id| *id != asset);
+            self.motion.push(asset);
+        }
+    }
+
+    /// Force a photo to play as a still in the film (even a Live Photo the
+    /// planner chose for motion), or put it back to the planner's choice.
+    pub fn set_still(&mut self, asset: String, on: bool) {
+        self.still.retain(|id| *id != asset);
+        if on {
+            self.motion.retain(|id| *id != asset);
+            self.still.push(asset);
+        }
+    }
+
+    /// Set (or clear, `None`) the film framing rectangle of a photo or
+    /// clip. An invalid rectangle (see [`valid_frame`]) clears it.
+    pub fn set_frame(&mut self, asset: String, frame: Option<Frame>) {
+        set_pin(&mut self.frame, asset, frame.filter(|f| valid_frame(*f)));
     }
 
     /// Pin a photo into the book, or unpin it.
@@ -1608,6 +1666,15 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
         }
     }
 
+    // Photos the user set to play as a still, even one the planner chose
+    // for motion.
+    let still: HashSet<&str> = edits.still.iter().map(String::as_str).collect();
+    for e in &mut out.hero {
+        if still.contains(e.asset_id.as_str()) && matches!(e.rendition, Rendition::Motion { .. }) {
+            e.rendition = Rendition::Still;
+        }
+    }
+
     // Exclusions: out of every pick and out of the book flow.
     out.hero.retain(|e| !dead.contains(e.asset_id.as_str()));
     out.reel_selects
@@ -1635,6 +1702,18 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
         .map(|(id, f)| (id.clone(), *f))
         .collect();
     out.crop = edits.crop.clone();
+    out.frame = edits
+        .frame
+        .iter()
+        .filter(|(id, f)| in_plan.contains(id.as_str()) && valid_frame(**f))
+        .map(|(id, f)| (id.clone(), *f))
+        .collect();
+    out.still = edits
+        .still
+        .iter()
+        .filter(|id| in_plan.contains(id.as_str()))
+        .cloned()
+        .collect();
     // A book pin may name any photo of the project, not only one the plan
     // holds: the book places a set-aside near-duplicate (the better take of
     // a burst) beside the shot nearest it in time.
@@ -1966,7 +2045,7 @@ pub fn build_plan_with_length(
         entry_score,
         similar,
         pano_secs_of,
-        |id| caption_read_secs(by_id.get(id).and_then(|a| a.user_caption.as_deref())),
+        |id| caption_hold_secs(by_id.get(id).and_then(|a| a.user_caption.as_deref())),
         |id| by_id.get(id).and_then(|a| a.taken_at),
         budget,
     );
@@ -2043,6 +2122,8 @@ pub fn build_plan_with_length(
         },
         cover: Default::default(),
         crop: Default::default(),
+        frame: Default::default(),
+        still: Default::default(),
         book: Default::default(),
         closing: Default::default(),
         book_layout: Default::default(),
@@ -3389,7 +3470,7 @@ mod tests {
             &plan.hero,
             |id| clusters.get(id).map_or(UNGROUPED, String::as_str),
             |_| None,
-            |id| caption_read_secs(plan.captions.get(id).map(String::as_str)),
+            |id| caption_hold_secs(plan.captions.get(id).map(String::as_str)),
             |_| Some(0),
             HeroCards {
                 route: !plan.map_polyline.is_empty(),
@@ -3704,7 +3785,7 @@ mod tests {
                 &entries,
                 |_| "X",
                 |_| None,
-                |id| caption_read_secs(caps.get(id).copied()),
+                |id| caption_hold_secs(caps.get(id).copied()),
                 |_| Some(0),
                 bare,
             )
@@ -5323,6 +5404,8 @@ mod tests {
             },
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
             book_layout: Default::default(),
@@ -5377,6 +5460,8 @@ mod tests {
             },
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
             book_layout: Default::default(),
@@ -5426,6 +5511,143 @@ mod tests {
     }
 
     #[test]
+    fn play_as_a_still_overrides_a_planned_motion_pick() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let assets = vec![
+            live_asset("lp", Some(2.0), true),
+            asset("ph", T0, AssetKind::Photo),
+        ];
+        let motion = Rendition::Motion {
+            trim_start: 0.0,
+            trim_end: 2.0,
+        };
+        let mut planned = still_entry("lp");
+        planned.rendition = motion.clone();
+        let plan = Plan {
+            plan_version: PLAN_VERSION,
+            schema_version: Plan::SCHEMA_VERSION,
+            hero: vec![planned, still_entry("ph")],
+            reel_selects: vec![],
+            chapters: vec![Chapter {
+                asset_ids: ids(&["lp", "ph"]),
+                ..Default::default()
+            }],
+            captions: Default::default(),
+            collage: Default::default(),
+            map_polyline: vec![],
+            music: MusicPick {
+                track: "t".into(),
+                rationale: "r".into(),
+            },
+            cover: Default::default(),
+            crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
+            book_layout: Default::default(),
+            book: Default::default(),
+            closing: Default::default(),
+        };
+        let rendition = |p: &Plan, id: &str| {
+            p.hero
+                .iter()
+                .find(|e| e.asset_id == id)
+                .map(|e| e.rendition.clone())
+        };
+        let mut edits = PlanEdits::default();
+        assert_eq!(
+            rendition(&apply_edits(&plan, &assets, &edits), "lp"),
+            Some(motion.clone())
+        );
+        edits.set_still("lp".into(), true);
+        edits.set_still("ph".into(), true);
+        let out = apply_edits(&plan, &assets, &edits);
+        assert_eq!(rendition(&out, "lp"), Some(Rendition::Still));
+        assert_eq!(rendition(&out, "ph"), Some(Rendition::Still));
+        // The renderer hears of it, so a collage cell stays a still too.
+        assert_eq!(out.still, ids(&["lp", "ph"]));
+        // --live and --unlive toggle cleanly.
+        edits.set_motion("lp".into(), true);
+        assert!(edits.motion == ids(&["lp"]) && edits.still == ids(&["ph"]));
+        let out = apply_edits(&plan, &assets, &edits);
+        assert_eq!(rendition(&out, "lp"), Some(motion));
+        edits.set_still("lp".into(), true);
+        assert!(edits.motion.is_empty() && edits.still == ids(&["ph", "lp"]));
+        edits.set_still("lp".into(), false);
+        edits.set_still("ph".into(), false);
+        assert!(edits.is_empty());
+        // Old edits load; an empty list is not stored; a set one counts.
+        let old: PlanEdits = serde_json::from_str(r#"{"excluded":["x"]}"#).unwrap();
+        assert!(old.still.is_empty() && old.frame.is_empty());
+        let json = serde_json::to_value(PlanEdits::default()).unwrap();
+        assert!(json.get("still").is_none() && json.get("frame").is_none());
+        assert!(!PlanEdits {
+            still: vec!["lp".into()],
+            ..Default::default()
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn a_film_frame_rides_onto_the_plan_and_changes_the_aspect() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let assets = vec![asset("a", T0, AssetKind::Photo)];
+        let plan = Plan {
+            plan_version: PLAN_VERSION,
+            schema_version: Plan::SCHEMA_VERSION,
+            hero: vec![still_entry("a")],
+            reel_selects: vec![],
+            chapters: vec![Chapter {
+                asset_ids: ids(&["a"]),
+                ..Default::default()
+            }],
+            captions: Default::default(),
+            collage: Default::default(),
+            map_polyline: vec![],
+            music: MusicPick {
+                track: "t".into(),
+                rationale: "r".into(),
+            },
+            cover: Default::default(),
+            crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
+            book_layout: Default::default(),
+            book: Default::default(),
+            closing: Default::default(),
+        };
+        let mut edits = PlanEdits::default();
+        edits.set_frame("a".into(), Some((10, 20, 50, 40)));
+        edits.set_frame("gone".into(), Some((0, 0, 50, 50)));
+        // A rectangle outside the photo is refused.
+        edits.set_frame("bad".into(), Some((60, 0, 50, 50)));
+        assert!(!edits.frame.contains_key("bad"));
+        assert!(!edits.is_empty());
+        let out = apply_edits(&plan, &assets, &edits);
+        assert_eq!(out.frame.get("a"), Some(&(10, 20, 50, 40)));
+        assert!(!out.frame.contains_key("gone"));
+        // The framed aspect is the source's times W / H.
+        assert!((crate::types::frame_aspect(1.5, Some((0, 0, 50, 100))) - 0.75).abs() < 1e-9);
+        assert_eq!(crate::types::frame_aspect(1.5, None), 1.5);
+        let mut a = asset("a", T0, AssetKind::Photo);
+        assert_eq!(a.framed_aspect(Some((10, 20, 50, 40))), None);
+        (a.width, a.height) = (Some(4000), Some(3000));
+        let framed = a.framed_aspect(Some((10, 20, 50, 40))).unwrap();
+        assert!((framed - 4.0 / 3.0 * 50.0 / 40.0).abs() < 1e-9);
+        assert_eq!(a.framed_aspect(None), a.display_aspect());
+        assert!(crate::types::valid_frame((0, 0, 100, 100)));
+        assert!(
+            !crate::types::valid_frame((0, 0, 0, 10)) && !crate::types::valid_frame((0, 0, 10, 0))
+        );
+        assert!(
+            !crate::types::valid_frame((91, 0, 10, 10))
+                && !crate::types::valid_frame((0, 91, 10, 10))
+        );
+        edits.set_frame("a".into(), None);
+        edits.set_frame("gone".into(), None);
+        assert!(edits.is_empty());
+    }
+
+    #[test]
     fn hero_grouping_reads_chapters_captions_aspect_and_presence() {
         let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let plan = Plan {
@@ -5464,6 +5686,8 @@ mod tests {
             },
             cover: Default::default(),
             crop: Default::default(),
+            frame: Default::default(),
+            still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
             book_layout: Default::default(),
