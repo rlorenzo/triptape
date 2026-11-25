@@ -107,6 +107,12 @@ pub struct Hop {
     pub home: bool,
     /// Where it arrives (`lat, lon`, longitude in -180..180).
     pub pos: (f64, f64),
+    /// Where it leaves from, in the same form.
+    pub from: (f64, f64),
+    /// When the trip actually moves: the time (unix seconds) of the shot the
+    /// hop plays in front of, set by [`with_moves`]. `i64::MAX` when no shot
+    /// follows it; `None` until set, when the hop's day decides.
+    pub moved_at: Option<i64>,
 }
 
 /// `p` with its longitude wrapped into -180..180 (journey paths unwrap it
@@ -129,62 +135,121 @@ fn at_home(hop: &Hop, gps: Option<(f64, f64)>) -> bool {
     gps.is_some_and(|g| within_home_reach(g, hop.pos))
 }
 
-/// Where each hop plays in a film whose shots were taken at `shots` (unix
+/// Where each hop plays: for each, the index of the shot it goes in front
+/// of and that shot's time (unix seconds), or `shots.len()` and `i64::MAX`
+/// to follow them all, and `None` for an undated hop that plays wherever the
+/// previous one did. Hops keep their order.
+///
+/// A hop plays at the actual move, the first shot on or after its day taken
+/// nearer its destination than its origin, so the morning's shots in the
+/// departure city stay before it. Shots without GPS never trigger the cut,
+/// nor do shots from the next later-dated hop's day on; when none in that
+/// window has GPS nearer the destination, the first shot on or after the day
+/// does. The last hop home plays before the first
+/// shot taken back home (within [`HOME_REACH_M`], on or after its day), or
+/// after every shot when none was or it has no day.
+fn moves(
+    hops: &[Hop],
+    shots: &[Option<(i64, Option<i32>)>],
+    gps: &[Option<(f64, f64)>],
+) -> Vec<(usize, Option<i64>)> {
+    let day_of = |s: usize| shots[s].and_then(|(t, tz)| crate::metadata::local_date(t, tz));
+    let time_of = |s: usize| shots.get(s).copied().flatten().map(|(t, _)| t);
+    let gps_of = |s: usize| gps.get(s).copied().flatten();
+    let mut at = 0;
+    let mut floor = i64::MIN;
+    let mut out = vec![];
+    for (i, hop) in hops.iter().enumerate() {
+        if hop.home && i + 1 == hops.len() {
+            at = hop
+                .day
+                .and_then(|day| {
+                    (at..shots.len())
+                        .find(|&s| at_home(hop, gps_of(s)) && day_of(s).is_some_and(|sd| sd >= day))
+                })
+                .unwrap_or(shots.len());
+        } else if let Some(day) = hop.day {
+            let on_day = |s: &usize| day_of(*s).is_some_and(|d| d >= day);
+            // The move is made before the next hop's day: a shot from a
+            // later stop is not this hop's arrival, however near it is.
+            let next_day = hops[i + 1..]
+                .iter()
+                .filter_map(|h| h.day)
+                .find(|&d| d > day);
+            let before_next =
+                |s: &usize| day_of(*s).is_some_and(|d| next_day.is_none_or(|n| d < n));
+            at = (at..shots.len())
+                .find(|s| {
+                    on_day(s)
+                        && before_next(s)
+                        && gps_of(*s).is_some_and(|g| {
+                            crate::geo::haversine_m(g, hop.pos)
+                                < crate::geo::haversine_m(g, hop.from)
+                        })
+                })
+                .or_else(|| (at..shots.len()).find(on_day))
+                .unwrap_or(shots.len());
+        }
+        // An undated hop has no move of its own; the others never play out
+        // of order.
+        let when = hop.day.map(|_| time_of(at).unwrap_or(i64::MAX).max(floor));
+        floor = when.unwrap_or(floor);
+        out.push((at, when));
+    }
+    out
+}
+
+/// `hops` with each one's [`Hop::moved_at`] set from the film's shots (unix
 /// seconds and UTC offset, in film order; `None` for an undated shot) and
-/// `gps`: the index of the shot it goes in front of, which is the first one
-/// taken on or after the hop's day, or `shots.len()` to follow them all.
-/// Hops keep their order. The last hop home plays before the first shot
-/// taken back home (within [`HOME_REACH_M`], on or after its day), or after
-/// every shot when none was or it has no day.
+/// `gps`, for [`hops_reached`]. [`hop_cuts`] places the same hops.
+pub fn with_moves(
+    mut hops: Vec<Hop>,
+    shots: &[Option<(i64, Option<i32>)>],
+    gps: &[Option<(f64, f64)>],
+) -> Vec<Hop> {
+    let placed = moves(&hops, shots, gps);
+    for (hop, (_, when)) in hops.iter_mut().zip(placed) {
+        hop.moved_at = when;
+    }
+    hops
+}
+
+/// Where each hop plays in a film whose shots were taken at `shots` and
+/// `gps`: the index of the shot it goes in front of, or `shots.len()` to
+/// follow them all (see [`moves`] for the rule).
 pub fn hop_cuts(
     hops: &[Hop],
     shots: &[Option<(i64, Option<i32>)>],
     gps: &[Option<(f64, f64)>],
 ) -> Vec<usize> {
-    let day_of = |s: usize| shots[s].and_then(|(t, tz)| crate::metadata::local_date(t, tz));
-    let mut at = 0;
-    let mut out = vec![];
-    for (i, hop) in hops.iter().enumerate() {
-        if hop.home && i + 1 == hops.len() {
-            // An undated hop home follows every shot, as `hops_reached`
-            // never counts it.
-            at = hop
-                .day
-                .and_then(|day| {
-                    (at..shots.len()).find(|&s| {
-                        at_home(hop, gps.get(s).copied().flatten())
-                            && day_of(s).is_some_and(|sd| sd >= day)
-                    })
-                })
-                .unwrap_or(shots.len());
-        } else if let Some(day) = hop.day {
-            at = (at..shots.len())
-                .find(|&s| day_of(s).is_some_and(|d| d >= day))
-                .unwrap_or(shots.len());
-        }
-        out.push(at);
-    }
-    out
+    moves(hops, shots, gps).into_iter().map(|m| m.0).collect()
 }
 
 /// How many hops the trip has made by the time a shot was taken (unix
-/// seconds and UTC offset) at `gps`: the hops whose day is on or before the
-/// shot's. Shots either side of a hop get different counts, so a film can
-/// keep them in separate segments and play the hop between them. An undated
-/// shot counts none; the last hop home counts only for a shot taken back
-/// home (see [`hop_cuts`]).
+/// seconds and UTC offset) at `gps`: the hops it plays at or after (their
+/// [`Hop::moved_at`]), or, for hops not yet placed by [`with_moves`], the
+/// hops whose day is on or before the shot's. Shots either side of a hop get
+/// different counts, so a film can keep them in separate segments and play
+/// the hop between them. An undated shot counts none; the last hop home
+/// counts only for a shot taken back home (see [`hop_cuts`]).
 pub fn hops_reached(
     hops: &[Hop],
     shot: Option<(i64, Option<i32>)>,
     gps: Option<(f64, f64)>,
 ) -> usize {
-    let Some(day) = shot.and_then(|(t, tz)| crate::metadata::local_date(t, tz)) else {
+    let Some((t, tz)) = shot else {
+        return 0;
+    };
+    let Some(day) = crate::metadata::local_date(t, tz) else {
         return 0;
     };
     hops.iter()
         .enumerate()
         .filter(|(i, h)| !(h.home && i + 1 == hops.len()) || at_home(h, gps))
-        .filter(|(_, h)| h.day.is_some_and(|d| d <= day))
+        .filter(|(_, h)| match h.moved_at {
+            Some(m) => t >= m,
+            None => h.day.is_some_and(|d| d <= day),
+        })
         .count()
 }
 
@@ -303,6 +368,8 @@ impl Journey {
                     .or(node.arrive),
                 home: node.home,
                 pos: wrapped(node.pos),
+                from: wrapped(self.nodes[start].pos),
+                moved_at: None,
             });
             start = i + 1;
         }
@@ -896,6 +963,91 @@ mod tests {
             ),
             "Oct 30 \u{2013} Nov 2"
         );
+    }
+
+    #[test]
+    fn hops_play_at_the_move_not_the_start_of_the_day() {
+        let itin = Itinerary::from_json(
+            r#"{"stops": [
+                {"id": "a", "label": "Los Angeles", "lat": 34.05, "lon": -118.24, "home": true, "depart": "2026-09-20"},
+                {"id": "b", "label": "Tokyo", "lat": 35.68, "lon": 139.69, "arrive": "2026-09-21", "depart": "2026-09-28"},
+                {"id": "c", "label": "Osaka", "lat": 34.69, "lon": 135.5, "arrive": "2026-09-28", "depart": "2026-09-30"},
+                {"id": "d", "label": "Los Angeles", "lat": 34.05, "lon": -118.24, "home": true, "arrive": "2026-10-01"}],
+              "legs": [{"from": "a", "to": "b", "mode": "flight"},
+                       {"from": "b", "to": "c", "mode": "ground"},
+                       {"from": "c", "to": "d", "mode": "flight"}]}"#,
+        )
+        .unwrap();
+        let hops = Journey::build(&itin, &[]).hops();
+        assert_eq!(hops.len(), 3);
+        let tokyo = Some((35.68, 139.69));
+        let osaka = Some((34.69, 135.5));
+        let la = Some((34.05, -118.24));
+        // Local hour (UTC+9) of a day in the trip.
+        let at = |m: i8, d: i8, h: i8| {
+            let t = jiff::civil::date(2026, m, d).at(h, 0, 0, 0);
+            let ts = jiff::tz::TimeZone::UTC.to_timestamp(t).unwrap();
+            Some((ts.as_second() - 9 * 3600, Some(9 * 3600)))
+        };
+        // Landing in Tokyo, then the 28th: hotel, station and train still
+        // near Tokyo (one without GPS), then Osaka, then the flight home.
+        let shots = [
+            at(9, 21, 10),
+            at(9, 28, 7),
+            at(9, 28, 8),
+            at(9, 28, 9),
+            at(9, 28, 10),
+            at(9, 28, 15),
+            at(9, 30, 9),
+            at(10, 1, 9),
+        ];
+        let gps = [tokyo, tokyo, None, tokyo, None, osaka, osaka, la];
+        let cuts = hop_cuts(&hops, &shots, &gps);
+        assert_eq!(cuts, [0, 5, 7], "Osaka plays at the first Osaka shot");
+        let placed = with_moves(hops.clone(), &shots, &gps);
+        // The hop and the segments agree on every shot.
+        let reached: Vec<_> = shots
+            .iter()
+            .zip(&gps)
+            .map(|(s, g)| hops_reached(&placed, *s, *g))
+            .collect();
+        assert_eq!(reached, [1, 1, 1, 1, 1, 2, 2, 3]);
+        // No shot on the 28th is nearer Osaka: the first on the day does.
+        let mut far = gps;
+        far[5] = tokyo;
+        far[6] = tokyo;
+        assert_eq!(hop_cuts(&hops, &shots, &far)[1], 1);
+        let placed = with_moves(hops.clone(), &shots, &far);
+        assert_eq!(hops_reached(&placed, shots[1], far[1]), 2);
+        assert_eq!(hops_reached(&placed, shots[0], far[0]), 1);
+        // No GPS at all on the day: the first shot on the day.
+        let blind = [tokyo, None, None, None, None, None, None, la];
+        assert_eq!(hop_cuts(&hops, &shots, &blind), [0, 1, 7]);
+        // A stay without GPS: a later stop's shot, though nearer Osaka than
+        // Tokyo, does not carry the hop past the stay.
+        let later = [tokyo, None, None, None, None, None, None, osaka];
+        assert_eq!(hop_cuts(&hops, &shots, &later)[1], 1);
+        // The hop home still waits for a shot taken at home, and until one
+        // is, no shot has reached it, wherever it was taken.
+        assert_eq!(hop_cuts(&hops, &shots[..7], &gps[..7])[2], 7);
+        let placed = with_moves(hops.clone(), &shots[..7], &gps[..7]);
+        assert_eq!(placed[2].moved_at, Some(i64::MAX));
+        assert_eq!(hops_reached(&placed, at(10, 1, 9), la), 2);
+        // An undated hop plays where the one before it did and splits no
+        // shots; the hops after it are still placed.
+        let mut undated = hops.clone();
+        undated[1].day = None;
+        assert_eq!(hop_cuts(&undated, &shots, &gps), [0, 0, 7]);
+        let placed = with_moves(undated, &shots, &gps);
+        assert_eq!(placed[1].moved_at, None);
+        assert_eq!(hops_reached(&placed, shots[5], gps[5]), 1);
+        assert_eq!(hops_reached(&placed, shots[7], gps[7]), 2);
+        // A film that is not in time order: a hop never moves before the
+        // one ahead of it, so the counts still only grow with the hops.
+        let mut jumbled = shots;
+        jumbled[0] = at(9, 29, 10);
+        let placed = with_moves(hops.clone(), &jumbled, &gps);
+        assert_eq!(placed[1].moved_at, placed[0].moved_at);
     }
 
     #[test]

@@ -689,6 +689,13 @@ pub struct ResolvedEntry {
     pub still: bool,
 }
 
+impl ResolvedEntry {
+    /// When it was taken: unix seconds and UTC offset; `None` when undated.
+    fn taken(&self) -> Option<(i64, Option<i32>)> {
+        self.taken_at.map(|t| (t, self.tz_offset_secs))
+    }
+}
+
 /// How an itinerary's travel is shown in the film.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MapStyle {
@@ -1097,7 +1104,7 @@ pub fn render_hero_video(
     let date_range = crate::titlecard::format_date_range(
         &resolved
             .iter()
-            .filter_map(|r| r.taken_at.map(|t| (t, r.tz_offset_secs)))
+            .filter_map(ResolvedEntry::taken)
             .collect::<Vec<_>>(),
     );
     let title_dates = title_date_line(opts.title_dates.as_deref(), date_range.as_deref());
@@ -1257,14 +1264,13 @@ pub fn render_hero_video(
             .journey
             .as_ref()
             .filter(|_| opts.map_style == MapStyle::Parchment)
-            .map_or_else(Vec::new, |j| j.hops());
-        let stage_of = |r: &ResolvedEntry| {
-            triptape_core::journey::hops_reached(
-                &hops,
-                r.taken_at.map(|t| (t, r.tz_offset_secs)),
-                r.gps,
-            )
-        };
+            .map_or_else(Vec::new, |j| {
+                let shots: Vec<_> = selected.iter().map(|r| r.taken()).collect();
+                let gps: Vec<_> = selected.iter().map(|r| r.gps).collect();
+                triptape_core::journey::with_moves(j.hops(), &shots, &gps)
+            });
+        let stage_of =
+            |r: &ResolvedEntry| triptape_core::journey::hops_reached(&hops, r.taken(), r.gps);
         hero_groups(
             &selected,
             |r| {
@@ -1402,10 +1408,8 @@ pub fn render_hero_video(
             .iter()
             .position(|s| !is_card(&s.0.entry.asset_id))
             .unwrap_or(segs.len());
-        let shots: Vec<Option<(i64, Option<i32>)>> = segs[first_shot..]
-            .iter()
-            .map(|s| s.0.taken_at.map(|t| (t, s.0.tz_offset_secs)))
-            .collect();
+        let shots: Vec<Option<(i64, Option<i32>)>> =
+            segs[first_shot..].iter().map(|s| s.0.taken()).collect();
         let gps: Vec<Option<(f64, f64)>> = segs[first_shot..].iter().map(|s| s.0.gps).collect();
         let cuts = triptape_core::journey::hop_cuts(&hops, &shots, &gps);
         let adopt = hop_clips_adopted(opts);
@@ -2308,6 +2312,9 @@ fn render_group(
     let mut collage_members = vec![];
     if present.len() > 1 {
         seg_entry.caption = collage_caption(present);
+        // Where it was taken is any member's place: the travel map is cut
+        // in by GPS, and the lead photo may have none.
+        seg_entry.gps = present.iter().find_map(|m| m.gps);
         collage_members = present.iter().map(|m| m.entry.asset_id.clone()).collect();
     }
     Ok(GroupOutcome {
