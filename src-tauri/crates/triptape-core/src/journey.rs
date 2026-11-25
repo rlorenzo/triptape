@@ -379,7 +379,7 @@ impl Journey {
                 l.path
                     .as_ref()
                     .filter(|_| l.mode != LegMode::Flight && !l.is_loop)
-                    .map(|p| p.iter().map(|q| (q[0], q[1])).collect())
+                    .map(|p| traced_path(p))
             })
             .collect();
         for (li, leg) in itin.legs.iter().enumerate() {
@@ -387,10 +387,7 @@ impl Journey {
                 itin.stop(&leg.from).expect("validated chain"),
                 itin.stop(&leg.to).expect("validated chain"),
             );
-            let explicit: Option<Vec<(f64, f64)>> = leg
-                .path
-                .as_ref()
-                .map(|p| p.iter().map(|q| (q[0], q[1])).collect());
+            let explicit = leg.path.as_ref().map(|p| traced_path(p));
             let path = match leg.mode {
                 // A traced path is smoothed through its points (flights keep
                 // their exact arc).
@@ -406,11 +403,15 @@ impl Journey {
                         .and_then(Option::as_ref)
                         .filter(|t| t.len() >= 2)
                         .map(|t| t[1]);
+                    // Neighbours were unwrapped on their own: bring their
+                    // tangent points into this leg's frame.
+                    let near = |q: (f64, f64), to: (f64, f64)| (q.0, lon_near(q.1, to.1));
+                    let (head, tail) = (own[0], own[own.len() - 1]);
                     catmull_rom_through(
                         &own,
                         10,
-                        before.filter(|_| !leg.is_loop),
-                        after.filter(|_| !leg.is_loop),
+                        before.filter(|_| !leg.is_loop).map(|q| near(q, head)),
+                        after.filter(|_| !leg.is_loop).map(|q| near(q, tail)),
                     )
                 }
                 _ if explicit.is_some() => explicit.unwrap_or_default(),
@@ -465,6 +466,10 @@ impl Journey {
     fn unwrap_longitudes(&mut self) {
         let mut prev = self.nodes[0].pos;
         for (i, leg) in self.legs.iter_mut().enumerate() {
+            // Within the leg too: a routed or traced sea path can hold
+            // points on both sides of the antimeridian (LA to Japan), and
+            // must take the short way across the Pacific, not the long way.
+            unwrap_path(&mut leg.path);
             let shift = ((prev.1 - leg.path[0].1) / 360.0).round() * 360.0;
             for p in &mut leg.path {
                 p.1 += shift;
@@ -475,6 +480,28 @@ impl Journey {
         }
         self.nodes[0].pos = self.legs[0].path[0];
     }
+}
+
+/// Shift longitudes by multiples of 360 so no step along `pts` jumps more
+/// than 180 degrees (the short way across the antimeridian).
+fn unwrap_path(pts: &mut [(f64, f64)]) {
+    for k in 1..pts.len() {
+        pts[k].1 = lon_near(pts[k].1, pts[k - 1].1);
+    }
+}
+
+/// `lon` shifted by a multiple of 360 to lie within 180 degrees of `of`.
+fn lon_near(lon: f64, of: f64) -> f64 {
+    of + (lon - of + 180.0).rem_euclid(360.0) - 180.0
+}
+
+/// An itinerary leg's traced path as `(lat, lon)` points, unwrapped:
+/// smoothing runs on a continuous path, not one that jumps 340 degrees at
+/// the date line.
+fn traced_path(path: &[[f64; 2]]) -> Vec<(f64, f64)> {
+    let mut pts: Vec<(f64, f64)> = path.iter().map(|q| (q[0], q[1])).collect();
+    unwrap_path(&mut pts);
+    pts
 }
 
 /// Positions at sea between two dates, in capture order.
@@ -570,7 +597,7 @@ pub fn great_circle(a: (f64, f64), b: (f64, f64)) -> Vec<(f64, f64)> {
         ];
         let lat = v[2].clamp(-1.0, 1.0).asin().to_degrees();
         let raw = v[1].atan2(v[0]).to_degrees();
-        lon += (raw - lon + 180.0).rem_euclid(360.0) - 180.0;
+        lon = lon_near(raw, lon);
         out.push((lat, lon));
     }
     out
@@ -733,6 +760,61 @@ mod tests {
         let home = &j.legs[10].path;
         assert!((home[home.len() - 1].1 - (-118.4085 - 360.0 * 0.0 - 0.0)).abs() < 400.0);
         assert!((j.nodes[11].pos.1 - j.nodes[9].pos.1).abs() < 200.0);
+    }
+
+    #[test]
+    fn a_ship_leg_across_the_pacific_takes_the_short_way() {
+        let json = r#"{
+          "stops": [
+            { "id": "la", "label": "Los Angeles", "lat": 33.7364, "lon": -118.2732, "depart": "2026-10-03", "kind": "home" },
+            { "id": "muroran", "label": "Muroran", "lat": 42.3474, "lon": 140.9465, "arrive": "2026-10-15", "depart": "2026-10-15", "kind": "port" },
+            { "id": "hakodate", "label": "Hakodate", "lat": 41.77, "lon": 140.73, "arrive": "2026-10-16", "depart": "2026-10-16", "kind": "port" },
+            { "id": "tokyo", "label": "Tokyo", "lat": 35.6646, "lon": 139.7613, "arrive": "2026-10-18", "depart": "2026-10-20" },
+            { "id": "la2", "label": "Los Angeles", "lat": 33.9416, "lon": -118.4085, "arrive": "2026-10-20", "kind": "home" }
+          ],
+          "legs": [
+            { "from": "la", "to": "muroran", "mode": "ship", "ship": "Ship" },
+            { "from": "muroran", "to": "hakodate", "mode": "ship", "ship": "Ship" },
+            { "from": "hakodate", "to": "tokyo", "mode": "ground" },
+            { "from": "tokyo", "to": "la2", "mode": "flight" }
+          ]
+        }"#;
+        let j = Journey::build(&Itinerary::from_json(json).unwrap(), &[]);
+        for (i, leg) in j.legs.iter().enumerate() {
+            for w in leg.path.windows(2) {
+                assert!(
+                    (w[1].1 - w[0].1).abs() <= 180.0,
+                    "leg {i} jumps: {:?}",
+                    leg.path
+                );
+            }
+        }
+        // West from California past -180, not east across the Atlantic.
+        let ship = &j.legs[0].path;
+        assert!(ship.last().unwrap().1 < -180.0, "{ship:?}");
+        assert!(ship.iter().all(|p| p.1 < -100.0));
+        for w in j.nodes.windows(2) {
+            assert!((w[1].pos.1 - w[0].pos.1).abs() <= 180.0);
+        }
+    }
+
+    #[test]
+    fn an_explicit_ship_path_is_unwrapped_too() {
+        let json = r#"{
+          "stops": [
+            { "id": "la", "label": "Los Angeles", "lat": 33.7, "lon": -118.3, "depart": "2026-10-03", "kind": "home" },
+            { "id": "muroran", "label": "Muroran", "lat": 42.3, "lon": 140.9, "arrive": "2026-10-15", "kind": "port" }
+          ],
+          "legs": [
+            { "from": "la", "to": "muroran", "mode": "ship", "ship": "Ship",
+              "path": [[33.7, -118.3], [40.0, -170.0], [45.0, 170.0], [42.3, 140.9]] }
+          ]
+        }"#;
+        let j = Journey::build(&Itinerary::from_json(json).unwrap(), &[]);
+        for w in j.legs[0].path.windows(2) {
+            assert!((w[1].1 - w[0].1).abs() <= 180.0, "{:?}", j.legs[0].path);
+        }
+        assert!(j.legs[0].path.last().unwrap().1 < -180.0);
     }
 
     #[test]

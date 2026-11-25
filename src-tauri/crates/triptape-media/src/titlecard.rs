@@ -141,13 +141,18 @@ pub fn lower_third_doc(top: &str, bottom: Option<&str>) -> String {
 /// film an ending instead of stopping on the last photo.
 pub fn places_card_doc(trip_name: &str, places: &[String], date_range: Option<&str>) -> String {
     // A name never breaks across lines ("Victoria / Peak", "Kōtoku- / in"):
-    // its spaces and hyphens are non-breaking, so lines wrap only at the
-    // separators.
+    // its spaces and hyphens are non-breaking. The rows are packed in Typst
+    // (greedy, by measured width) and each row joined with the separator, so
+    // a wrapped line never starts or ends on a stray "·".
     let list = places
         .iter()
-        .map(|p| p.replace(' ', "\u{a0}").replace('-', "\u{2011}"))
-        .collect::<Vec<_>>()
-        .join("  ·  ");
+        .map(|p| {
+            format!(
+                "\"{}\", ",
+                esc(&p.replace(' ', "\u{a0}").replace('-', "\u{2011}"))
+            )
+        })
+        .collect::<String>();
     let footer = match date_range {
         Some(d) => format!("{} · {}", esc(trip_name), esc(d)),
         None => esc(trip_name),
@@ -158,11 +163,28 @@ pub fn places_card_doc(trip_name: &str, places: &[String], date_range: Option<&s
 #place(center + horizon, stack(dir: ttb, spacing: 26pt,
   text(size: 72pt, weight: "bold", "The places we went"),
   line(length: 340pt, stroke: 6pt + rgb("#f5b242")),
-  box(width: 1560pt, text(size: 40pt, fill: rgb("#c8cfdb"), align(center, "{list}"))),
+  context {{
+    let items = ({list})
+    let sep = "  ·  "
+    let style(body) = text(size: 40pt, fill: rgb("#c8cfdb"), body)
+    let rows = ()
+    let cur = ()
+    for it in items {{
+      let trial = cur + (it,)
+      if cur.len() > 0 and measure(style(trial.join(sep))).width > 1560pt {{
+        rows.push(cur)
+        cur = (it,)
+      }} else {{
+        cur = trial
+      }}
+    }}
+    if cur.len() > 0 {{ rows.push(cur) }}
+    stack(dir: ttb, spacing: 14pt, ..rows.map(r => box(width: 1560pt, style(align(center, r.join(sep))))))
+  }},
   text(size: 34pt, fill: rgb("#8b95a8"), "{footer}"),
 ))"##,
         fonts = FONT_STACK,
-        list = esc(&list),
+        list = list,
         footer = footer,
     )
 }
@@ -362,6 +384,27 @@ mod tests {
             ],
             None,
         );
-        assert!(doc.contains("Victoria\u{a0}Peak  ·  Hong\u{a0}Kong\u{a0}Disneyland"));
+        assert!(doc.contains("\"Victoria\u{a0}Peak\", \"Hong\u{a0}Kong\u{a0}Disneyland\", )"));
+    }
+
+    #[test]
+    fn places_card_compiles_for_any_number_of_places() {
+        let typst = std::env::var("TRIPTAPE_TYPST").unwrap_or_else(|_| "typst".into());
+        if !typst_available(&typst) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // None, one (a one-item Typst array needs its trailing comma), a
+        // quoted name, and enough to wrap onto several rows.
+        let many: Vec<String> = (0..40).map(|i| format!("Place Number-{i}")).collect();
+        let quoted = [r#"The "Big" Buddha"#.to_string()];
+        for (i, places) in [&[][..], &many[..1], &quoted[..], &many[..]]
+            .into_iter()
+            .enumerate()
+        {
+            let png = dir.path().join(format!("places-{i}.png"));
+            render_text_png(&typst, &places_card_doc("Trip", places, None), &png, 72).unwrap();
+            assert!(png.is_file());
+        }
     }
 }

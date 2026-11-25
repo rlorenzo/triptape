@@ -1571,4 +1571,34 @@ mod tests {
         };
         assert!(red(&last) > red(&first) + 50, "the line was drawn");
     }
+
+    #[test]
+    fn a_ship_hop_from_los_angeles_to_japan_is_drawn_across_the_pacific() {
+        let typst = std::env::var("TRIPTAPE_TYPST").unwrap_or_else(|_| "typst".into());
+        if !crate::titlecard::typst_available(&typst) {
+            return;
+        }
+        let json = r#"{
+          "stops": [
+            { "id": "la", "label": "Los Angeles", "lat": 33.7364, "lon": -118.2732, "depart": "2026-10-03", "kind": "home" },
+            { "id": "muroran", "label": "Muroran", "lat": 42.3474, "lon": 140.9465, "arrive": "2026-10-15", "kind": "port" }
+          ],
+          "legs": [
+            { "from": "la", "to": "muroran", "mode": "ship", "ship": "Ship" }
+          ]
+        }"#;
+        let j = Journey::build(&Itinerary::from_json(json).unwrap(), &[]);
+        let hops = j.hops();
+        let mut notes = vec![];
+        let mut scene = HopScene::build(&j, &hops[0], (960, 540), &typst, &mut notes).unwrap();
+        let frames = frame_count(hops[0].secs);
+        let last = scene.frame(frames - 1, frames);
+        if let Ok(dir) = std::env::var("TRIPTAPE_SAVE_HOP") {
+            last.save(Path::new(&dir).join("hop-01.png")).unwrap();
+        }
+        // The route is one continuous Pacific crossing (the unwrapped
+        // longitudes are checked in the journey tests); the frame renders.
+        assert_eq!(last.dimensions(), (960, 540));
+        assert!(notes.is_empty(), "{notes:?}");
+    }
 }
