@@ -5,7 +5,7 @@
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m] [--models DIR]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
-//!                [--solo REF...] [--unsolo REF...] [--live REF...] [--unlive REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--feature REF...] [--whole REF...] [--row REF...] [--page-caption REF...] [--book-after REF ANCHOR]... [--still VIDEO SECS] [--group REF REF...] [--unfeature|--unwhole|--unrow|--unpage-caption|--unbook-after|--unstill|--ungroup REF...] [--list]
+//!                [--solo REF...] [--unsolo REF...] [--live REF...] [--unlive REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--feature REF...] [--whole REF...] [--row REF...] [--page-caption REF...] [--own-page REF...] [--book-after REF ANCHOR]... [--still VIDEO SECS] [--group REF REF...] [--unfeature|--unwhole|--unrow|--unpage-caption|--unown-page|--unbook-after|--unstill|--ungroup REF...] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--front-cover IMAGE] [--approved-book BOOK.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE]
@@ -1089,6 +1089,9 @@ struct EditArgs {
     /// Photos whose caption speaks for the whole page (or not).
     page_caption: Vec<String>,
     unpage_caption: Vec<String>,
+    /// Photos on a page of their own (or not).
+    own_page: Vec<String>,
+    unown_page: Vec<String>,
     /// Photos placed right after another in the book: (photo, anchor).
     book_after: Vec<(String, String)>,
     unbook_after: Vec<String>,
@@ -1197,7 +1200,8 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
             "include" | "exclude" | "uninclude" | "unexclude" | "solo" | "unsolo" | "live"
             | "unlive" | "unjoin" | "unmove" | "uncover" | "hide-caption" | "uncrop" | "book"
             | "unbook" | "feature" | "unfeature" | "whole" | "unwhole" | "row" | "unrow"
-            | "page-caption" | "unpage-caption" | "unbook-after" | "unstill" | "ungroup" => {
+            | "page-caption" | "unpage-caption" | "own-page" | "unown-page" | "unbook-after"
+            | "unstill" | "ungroup" => {
                 if values.is_empty() {
                     return Err(format!("--{flag} wants at least one asset"));
                 }
@@ -1224,6 +1228,8 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     "unrow" => out.unrow.extend(values),
                     "page-caption" => out.page_caption.extend(values),
                     "unpage-caption" => out.unpage_caption.extend(values),
+                    "own-page" => out.own_page.extend(values),
+                    "unown-page" => out.unown_page.extend(values),
                     "unbook-after" => out.unbook_after.extend(values),
                     "unstill" => out.unstill.extend(values),
                     "ungroup" => out.ungroup.extend(values),
@@ -1310,11 +1316,12 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
     let layout = &edits.book_layout;
     if !layout.is_empty() {
         println!(
-            "book layout: {} featured, {} whole, {} rows, {} page captions, {} placed after, {} stills, {} groups",
+            "book layout: {} featured, {} whole, {} rows, {} page captions, {} own pages, {} placed after, {} stills, {} groups",
             layout.feature.len(),
             layout.whole.len(),
             layout.rows.len(),
             layout.page_captions.len(),
+            layout.own_page.len(),
             layout.after.len(),
             layout.stills.len(),
             layout.groups.len()
@@ -1324,6 +1331,7 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
             ("whole", &layout.whole),
             ("row", &layout.rows),
             ("page-caption", &layout.page_captions),
+            ("own-page", &layout.own_page),
         ] {
             for id in ids {
                 println!("  {label} {}", show(id));
@@ -1523,6 +1531,8 @@ fn edit_cmd(args: &[String]) {
     let unrows = resolve(&a.unrow);
     let page_captions = resolve(&a.page_caption);
     let unpage_captions = resolve(&a.unpage_caption);
+    let own_pages = resolve(&a.own_page);
+    let unown_pages = resolve(&a.unown_page);
     let book_afters: Vec<(&Asset, &Asset)> = a
         .book_after
         .iter()
@@ -1554,6 +1564,7 @@ fn edit_cmd(args: &[String]) {
         .chain(&wholes)
         .chain(&rows)
         .chain(&page_captions)
+        .chain(&own_pages)
         .chain(book_afters.iter().flat_map(|(x, y)| [x, y]))
         .chain(stills.iter().map(|(x, _)| x))
         .chain(groups.iter().flatten());
@@ -1589,6 +1600,8 @@ fn edit_cmd(args: &[String]) {
         || !unrows.is_empty()
         || !page_captions.is_empty()
         || !unpage_captions.is_empty()
+        || !own_pages.is_empty()
+        || !unown_pages.is_empty()
         || !book_afters.is_empty()
         || !unbook_afters.is_empty()
         || !stills.is_empty()
@@ -1598,7 +1611,7 @@ fn edit_cmd(args: &[String]) {
     if !changed && !a.list {
         die(
             "edit",
-            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--live/--unlive/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--book/--unbook/--closing/--no-closing/--feature/--whole/--row/--page-caption/--book-after/--still/--group (and their un- forms) or --list",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--live/--unlive/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--book/--unbook/--closing/--no-closing/--feature/--whole/--row/--page-caption/--own-page/--book-after/--still/--group (and their un- forms) or --list",
         );
     }
     let mut edits = ep.edits.clone();
@@ -1632,7 +1645,7 @@ fn edit_cmd(args: &[String]) {
         let layout = &mut edits.book_layout;
         // Each on/off layout flag: un- first, so both in one call leave it on.
         type Set = fn(&mut BookLayout, String, bool);
-        let flags: [(&str, &[&Asset], &[&Asset], Set); 4] = [
+        let flags: [(&str, &[&Asset], &[&Asset], Set); 5] = [
             ("feature", &features, &unfeatures, BookLayout::set_feature),
             ("whole", &wholes, &unwholes, BookLayout::set_whole),
             ("row", &rows, &unrows, BookLayout::set_row),
@@ -1641,6 +1654,12 @@ fn edit_cmd(args: &[String]) {
                 &page_captions,
                 &unpage_captions,
                 BookLayout::set_page_caption,
+            ),
+            (
+                "own-page",
+                &own_pages,
+                &unown_pages,
+                BookLayout::set_own_page,
             ),
         ];
         for (name, on, off, set) in flags {
@@ -2415,6 +2434,14 @@ mod tests {
         assert_eq!(a.unsolo, ["c"]);
         assert_eq!(a.join, [("d".into(), "e".into()), ("f".into(), "g".into())]);
         assert_eq!(a.unjoin, ["h"]);
+    }
+
+    #[test]
+    fn edit_args_take_own_page_and_unown_page() {
+        let a = parse_edit_args(&args("--db t.db --own-page a b --unown-page c")).unwrap();
+        assert_eq!(a.own_page, ["a", "b"]);
+        assert_eq!(a.unown_page, ["c"]);
+        assert!(parse_edit_args(&args("--db t.db --own-page")).is_err());
     }
 
     #[test]

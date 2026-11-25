@@ -1114,7 +1114,8 @@ fn lone_scenery(photos: &[BookPhoto]) -> Vec<String> {
             .find(|&i| key(&photos[i]) != key(&photos[start]))
             .unwrap_or(photos.len());
         let p = &photos[start];
-        if end - start == 1 && !p.keep && !p.is_of_people() && p.day.is_some() {
+        let owners_page = p.page_group;
+        if end - start == 1 && !p.keep && !owners_page && !p.is_of_people() && p.day.is_some() {
             out.push(p.asset_id.clone());
         }
         start = end;
@@ -1135,7 +1136,8 @@ fn fold_lone_kept(photos: &mut [BookPhoto]) {
     }
     for (r, &(start, end)) in runs.iter().enumerate() {
         let p = &photos[start];
-        if end - start != 1 || !p.keep || p.is_of_people() || p.day.is_none() {
+        // A page the owner gave this photo alone (`--own-page`) stays its own.
+        if end - start != 1 || !p.keep || p.is_of_people() || p.day.is_none() || p.page_group {
             continue;
         }
         let day = p.day;
@@ -5043,6 +5045,30 @@ mod tests {
             shot("menu", 4, false, true),
         ];
         assert_eq!(lone_scenery(&photos), ["food"]);
+    }
+
+    #[test]
+    fn the_owners_own_page_is_neither_dropped_nor_folded() {
+        let shot = |id: &str, area: &str, keep: bool, page_group: bool| BookPhoto {
+            asset_id: id.to_string(),
+            day: Some(6),
+            area: Some(area.into()),
+            keep,
+            page_group,
+            ..BookPhoto::blank()
+        };
+        let mut photos = vec![
+            shot("statue", "Kirby Cafe \u{b7} own page statue", false, true),
+            shot("plate", "Kirby Cafe \u{b7} own page plate", true, true),
+            shot("alley", "Shinsaibashi-suji", false, false),
+            shot("puffs", "Shinsaibashi-suji", false, false),
+        ];
+        assert!(lone_scenery(&photos).is_empty());
+        fold_lone_kept(&mut photos);
+        assert_eq!(
+            photos[1].area.as_deref(),
+            Some("Kirby Cafe \u{b7} own page plate")
+        );
     }
 
     #[test]

@@ -260,6 +260,21 @@ fn book_moves(photos: &mut Vec<BookPhoto>, after: &[(String, String)]) {
     }
 }
 
+/// The owner's pages of their own (`--own-page`): each photo becomes a
+/// stretch of one, so it prints alone right where it stands (after its
+/// anchor, with `--book-after`), and as the owner's page it is neither
+/// folded into a neighbour nor dropped as lone scenery.
+fn own_pages(photos: &mut [BookPhoto], own: &[String]) {
+    for p in photos.iter_mut().filter(|p| own.contains(&p.asset_id)) {
+        p.area = Some(format!(
+            "{} \u{b7} own page {}",
+            p.area.as_deref().unwrap_or_default(),
+            p.asset_id
+        ));
+        p.page_group = true;
+    }
+}
+
 /// A book photo's caption: the user's, else its shared place
 /// ([`triptape_core::places::photo_places`]).
 fn book_caption(plan: &Plan, places: &HashMap<String, String>, id: &str) -> Option<String> {
@@ -1058,6 +1073,7 @@ fn export_inner(
         });
         group_pages(&mut book_photos, &layout.groups);
         book_moves(&mut book_photos, &layout.after);
+        own_pages(&mut book_photos, &layout.own_page);
         let book_dir = out_dir.join("book");
         let staged_book = stage.join("book");
         // Day-marker titles: day once, with the location.
@@ -1463,6 +1479,32 @@ mod tests {
         // An anchor the book doesn't hold leaves the photo where it was.
         book_moves(&mut photos, &[("snack".into(), "gone".into())]);
         assert_eq!(photos[1].asset_id, "snack");
+    }
+
+    #[test]
+    fn an_own_page_photo_takes_the_page_after_its_anchors() {
+        let photo = |id: &str, area: &str| BookPhoto {
+            asset_id: id.into(),
+            day: Some(6),
+            area: Some(area.into()),
+            ..BookPhoto::blank()
+        };
+        let mut photos = vec![
+            photo("castle", "Osaka Castle Park"),
+            photo("pikachu", "Osaka Castle Park"),
+            photo("alley", "Shinsaibashi-suji"),
+            photo("puffs", "Shinsaibashi-suji"),
+            photo("dinner", "Dotonbori"),
+        ];
+        book_moves(&mut photos, &[("pikachu".into(), "puffs".into())]);
+        own_pages(&mut photos, &["pikachu".into()]);
+        let ids: Vec<&str> = photos.iter().map(|p| p.asset_id.as_str()).collect();
+        assert_eq!(ids, ["castle", "alley", "puffs", "pikachu", "dinner"]);
+        let area = |i: usize| photos[i].area.clone();
+        assert_eq!(area(1), area(2), "the alley page stays whole");
+        assert_ne!(area(3), area(2), "a page of its own");
+        assert_ne!(area(3), area(4));
+        assert!(photos[3].page_group);
     }
 
     #[test]

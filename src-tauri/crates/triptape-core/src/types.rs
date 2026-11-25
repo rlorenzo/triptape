@@ -356,6 +356,11 @@ pub struct BookLayout {
     /// stretch of the book, so the two can share a page.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<(String, String)>,
+    /// Photos on a page of their own (`--own-page`): with `--book-after`,
+    /// the photo takes the page after its anchor's ("replace this page's
+    /// picture with that one").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub own_page: Vec<String>,
 }
 
 impl BookLayout {
@@ -367,6 +372,7 @@ impl BookLayout {
             && self.rows.is_empty()
             && self.page_captions.is_empty()
             && self.after.is_empty()
+            && self.own_page.is_empty()
     }
 
     /// Whether any layout choice names this asset.
@@ -375,6 +381,7 @@ impl BookLayout {
             || self.whole.iter().any(|x| x == id)
             || self.rows.iter().any(|x| x == id)
             || self.page_captions.iter().any(|x| x == id)
+            || self.own_page.iter().any(|x| x == id)
             || self.after.iter().any(|(x, a)| x == id || a == id)
             || self.stills.contains_key(id)
             || self.groups.iter().flatten().any(|x| x == id)
@@ -398,6 +405,11 @@ impl BookLayout {
     /// Print a photo's caption in its page's bottom line, or under it.
     pub fn set_page_caption(&mut self, asset: String, on: bool) {
         set_listed(&mut self.page_captions, asset, on);
+    }
+
+    /// Give a photo a page of its own, or let it share again.
+    pub fn set_own_page(&mut self, asset: String, on: bool) {
+        set_listed(&mut self.own_page, asset, on);
     }
 
     /// Place `asset` right after `anchor` in the book, or (`None`) back in
@@ -443,6 +455,7 @@ impl BookLayout {
         self.whole.retain(|id| keep(id));
         self.rows.retain(|id| keep(id));
         self.page_captions.retain(|id| keep(id));
+        self.own_page.retain(|id| keep(id));
         self.after.retain(|(x, a)| keep(x) && keep(a));
         self.stills.retain(|id, _| keep(id));
         self.retain_grouped(keep);
@@ -710,6 +723,12 @@ mod tests {
         l.set_feature("a".into(), true);
         l.set_whole("b".into(), true);
         l.set_still("v".into(), Some(1500));
+        l.set_own_page("p".into(), true);
+        l.set_own_page("p".into(), true);
+        assert_eq!(l.own_page, ["p"]);
+        assert!(l.mentions("p"));
+        l.retain_assets(|id| id != "p");
+        assert!(l.own_page.is_empty() && !l.mentions("p"));
         assert_eq!(l.feature, ["a"]);
         assert!(l.mentions("a") && l.mentions("b") && l.mentions("v"));
         l.group(vec!["a".into(), "b".into(), "c".into()]);
