@@ -633,12 +633,24 @@ fn assign_transitions_by_chunk(
     out
 }
 
+/// Whether `place` is a way through rather than a place we went: an
+/// airport, a station or a train (`Narita Airport`, `Tokyo Station`,
+/// `Shinkansen`). The shot still carries the label; the card leaves it off.
+fn is_transit_place(place: &str) -> bool {
+    let p = place.to_lowercase();
+    ["airport", "station", "shinkansen", "train"]
+        .iter()
+        .any(|w| p.split(|c: char| !c.is_alphanumeric()).any(|t| t == *w))
+}
+
 /// The places card's list: two sights in one place (`Flower Dome, Gardens
 /// by the Bay` and `Cloud Forest, Gardens by the Bay`) are named once, by
 /// that place, where the first of them stood. A sight alone keeps its
 /// whole name. A country is no such place: `Tokyo, Japan` and
-/// `Kyoto, Japan` stay two cities.
+/// `Kyoto, Japan` stay two cities. Airports, stations and trains
+/// ([`is_transit_place`]) stay off.
 fn credit_places(places: &[String]) -> Vec<String> {
+    let places: Vec<&String> = places.iter().filter(|p| !is_transit_place(p)).collect();
     fn parent(p: &str) -> Option<&str> {
         if triptape_core::geo::without_country(p) != p {
             return None;
@@ -652,7 +664,7 @@ fn credit_places(places: &[String]) -> Vec<String> {
         *sights.entry(par).or_default() += 1;
     }
     let mut out: Vec<String> = vec![];
-    for p in places {
+    for &p in &places {
         let name = match parent(p) {
             Some(par) if sights[par] > 1 => par,
             _ => p.as_str(),
@@ -3723,7 +3735,11 @@ mod tests {
                 "A-Mei Tea House, Jiufen",
                 "Ontario, California",
                 "Tokyo, Japan",
+                "Narita Airport",
+                "Tokyo Station",
+                "Shinkansen",
                 "Kyoto, Japan",
+                "Trainspotting Café",
             ])),
             names(&[
                 "Marina Bay Sands",
@@ -3732,6 +3748,7 @@ mod tests {
                 "Ontario, California",
                 "Tokyo, Japan",
                 "Kyoto, Japan",
+                "Trainspotting Café",
             ])
         );
     }
