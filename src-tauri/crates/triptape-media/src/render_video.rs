@@ -2198,22 +2198,48 @@ impl SegmentLimits {
 /// shot can change the shot after it, and a rotated group can occasionally
 /// land on the same variant as a neighbour that was itself rotated (about
 /// 1 in 16 neighbours instead of 1 in 4, versus never with position).
+///
+/// Back-to-back panoramas are the exception: they must pan opposite ways
+/// ([`pano_reversed`]), which only a comparison with the previous panorama's
+/// *final* variant can guarantee. That chain is as long as the run of
+/// panoramas and no longer; the first of a run keeps its hashed variant.
 fn glide_variants(groups: &[Vec<&ResolvedEntry>]) -> Vec<usize> {
     let hashed: Vec<usize> = groups
         .iter()
         .map(|g| g.first().map_or(0, |r| stable_variant(&r.entry)))
         .collect();
-    hashed
-        .iter()
-        .enumerate()
-        .map(|(i, &h)| {
-            if i > 0 && hashed[i - 1] == h {
-                (h + 1) % ffmpeg::GLIDE_VARIANTS
-            } else {
-                h
-            }
-        })
-        .collect()
+    let mut out: Vec<usize> = Vec::with_capacity(hashed.len());
+    for (i, &h) in hashed.iter().enumerate() {
+        let mut v = if i > 0 && hashed[i - 1] == h {
+            (h + 1) % ffmpeg::GLIDE_VARIANTS
+        } else {
+            h
+        };
+        // Would pan the same way as the panorama before it: take the next
+        // variant (GLIDE_VARIANTS is even, so +1 always flips the direction).
+        if i > 0
+            && is_pano_group(&groups[i])
+            && is_pano_group(&groups[i - 1])
+            && pano_reversed(v) == pano_reversed(out[i - 1])
+        {
+            v = (v + 1) % ffmpeg::GLIDE_VARIANTS;
+        }
+        out.push(v);
+    }
+    out
+}
+
+/// Whether a panorama on this motion variant pans in reverse: the one place
+/// that maps a variant to a pan direction.
+fn pano_reversed(variant: usize) -> bool {
+    variant % 2 == 1
+}
+
+/// A group that renders as a panorama pan: one still whose (framed) aspect
+/// is panoramic, the same test `render_entry_segment` applies.
+fn is_pano_group(g: &[&ResolvedEntry]) -> bool {
+    matches!(g, [r] if matches!(r.entry.rendition, Rendition::Still)
+        && r.aspect.is_some_and(is_panorama))
 }
 
 /// Hashed over the asset id and window index, so sibling windows of one clip
@@ -3467,7 +3493,7 @@ fn pano_graph(
             res.height(),
             aspect,
             coverage,
-            variant % 2 == 1
+            pano_reversed(variant)
         )
     )
 }
@@ -7215,6 +7241,39 @@ mod tests {
         let v = glide_variants(&groups);
         assert_ne!(v[0], v[1]);
         assert_eq!(v[0], stable_variant(&a.entry));
+    }
+
+    /// Consecutive panoramas alternate pan direction (variant parity); the
+    /// first keeps its hashed variant.
+    #[test]
+    fn glide_variants_alternate_consecutive_panoramas() {
+        let mk = |id: &str, aspect: f64| {
+            let mut e = card_entry(id, Path::new("x.png"));
+            e.entry.asset_id = id.into();
+            e.entry.rendition = Rendition::Still;
+            e.aspect = Some(aspect);
+            e
+        };
+        let ents: Vec<_> = (0..40).map(|i| mk(&format!("p{i}"), 4.0)).collect();
+        let groups: Vec<Vec<&ResolvedEntry>> = ents.iter().map(|e| vec![e]).collect();
+        let v = glide_variants(&groups);
+        assert_eq!(v[0], stable_variant(&ents[0].entry));
+        for w in v.windows(2) {
+            assert_ne!(pano_reversed(w[0]), pano_reversed(w[1]), "{v:?}");
+            assert!(w[1] < ffmpeg::GLIDE_VARIANTS);
+        }
+        // A non-panorama after a panorama only gets the equal-neighbour
+        // rotation, never the parity rule.
+        let plain = mk("plain", 1.5);
+        let groups2 = vec![vec![&ents[0]], vec![&plain]];
+        let v2 = glide_variants(&groups2);
+        let h = stable_variant(&plain.entry);
+        let expect = if h == stable_variant(&ents[0].entry) {
+            (h + 1) % ffmpeg::GLIDE_VARIANTS
+        } else {
+            h
+        };
+        assert_eq!(v2[1], expect);
     }
 
     /// Lower thirds are cached on the base segment plus their text: a repeat
