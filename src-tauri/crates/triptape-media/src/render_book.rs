@@ -2246,6 +2246,9 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
             .filter(|p| !seen.contains(p))
             .collect();
         out.extend(seen.iter().copied());
+        // The ship still leads: a sea-day title ("Carnival Luminosa ·
+        // Fukuoka") over a page shot on board stays ship first.
+        out.sort_by_key(|pl| rank(pl) != 0);
         drop_contained(&mut out);
         out.truncate(MAX_HEADING_PLACES);
         return format!("{head} — {}", out.join(" \u{b7} "));
@@ -5014,6 +5017,15 @@ mod tests {
                 &[&market, &ginza]
             ),
             "Day 6 · Thu, Oct 8 — Tokyo · Tsukiji Outer Market · Togoshi Ginza"
+        );
+        // A ship-and-port title over a page shot only on board: the ship
+        // first, as on every other page.
+        assert_eq!(
+            places_in_time_order(
+                "Day 11 · Tue, Oct 13 — Carnival Luminosa · Fukuoka",
+                &[&ship]
+            ),
+            "Day 11 · Tue, Oct 13 — Carnival Luminosa · Fukuoka"
         );
         assert_eq!(places_in_time_order("Day 5", &[&tokyo]), "Day 5");
         // A city leads its sights, whatever order the photos came in.
