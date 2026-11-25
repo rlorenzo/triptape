@@ -1909,7 +1909,7 @@ fn lower_third_graph(seg_dur: f64, res: Resolution) -> String {
     format!(
         "[0:v][1:v]overlay={}:H-{}:format=yuv420:enable='between(t,0.3,{seg_dur:.3})'[v]",
         48 * k,
-        160 * k
+        160 * k,
     )
 }
 
@@ -2037,15 +2037,20 @@ fn repeated_captions(segs: &[(Option<&str>, Option<usize>, Option<i64>)]) -> Vec
 /// lasting `d`: it appears [`plan::CAPTION_LEAD_IN_SECS`] in and stays for
 /// `read_secs`, but never past the segment's end margin or the cut into
 /// the next shot (`next`; a dip to black there would leave the text
-/// floating over black). `None` when under 0.5 s remain.
+/// floating over black). `None` when under [`CAPTION_CUE_MIN_SECS`] remain.
 fn caption_cue(start: f64, d: f64, next: f64, read_secs: f64) -> Option<(f64, f64)> {
     let st = start + plan::CAPTION_LEAD_IN_SECS;
     let en = (st + read_secs)
-        .min(start + d - 0.6)
-        .max(st + 0.5)
+        .min(start + d - CAPTION_CUE_END_MARGIN_SECS)
+        .max(st + CAPTION_CUE_MIN_SECS)
         .min(next);
-    (en - st >= 0.5).then_some((st, en))
+    (en - st >= CAPTION_CUE_MIN_SECS).then_some((st, en))
 }
+
+/// Shortest caption cue worth showing: anything briefer only flashes.
+const CAPTION_CUE_MIN_SECS: f64 = 0.5;
+/// A caption's cue ends this long before its segment does.
+const CAPTION_CUE_END_MARGIN_SECS: f64 = 0.6;
 
 /// Write the film's captions as SRT cues timed to each segment's `starts`,
 /// leaving out the captions `repeats` marks ([`repeated_captions`]).
@@ -2062,16 +2067,15 @@ fn write_captions_srt(
             if c.trim().is_empty() || repeats.get(i).copied().unwrap_or(false) {
                 continue;
             }
-            n += 1;
             // As long as the shot was held to read it; multi-line
             // (collage) cues get at least 3.5 s per caption.
             let read_secs = caption_read_secs(Some(c)).max(3.5 * c.trim().lines().count() as f64);
             let next = starts.get(i + 1).copied().unwrap_or(f64::INFINITY);
             let Some((st, en)) = caption_cue(starts[i], *d, next, read_secs) else {
                 // No time to read it before the cut: skip the cue.
-                n -= 1;
                 continue;
             };
+            n += 1;
             body.push_str(&format!(
                 "{n}\n{} --> {}\n{}\n\n",
                 srt_ts(st),
@@ -2255,8 +2259,8 @@ fn render_group(
             present,
             idx,
             variant,
-            // The collage's scaled hold, raised to the reading time (not the
-            // reading time scaled, which would overrun CAPTION_MAX_SECS).
+            // The collage's scaled hold, raised to the caption hold (not the
+            // caption hold scaled, which would overrun it).
             still_secs.max(hold_secs / collage_hold_secs(present.len(), 1.0)),
             opts.live_collages,
             opts.resolution,
@@ -6360,6 +6364,9 @@ mod tests {
         assert_eq!(caption_cue(0.0, 1.0, 0.5, 3.0), None);
         // The cut still bounds the cue.
         assert_eq!(caption_cue(0.0, 10.0, 2.0, 3.0), Some((0.3, 2.0)));
+        // No caption, no hold.
+        assert_eq!(caption_hold_secs(None), 0.0);
+        assert_eq!(caption_hold_secs(Some("  ")), 0.0);
     }
 
     /// Default (4K) hero render end to end: Typst title, caption burn-in

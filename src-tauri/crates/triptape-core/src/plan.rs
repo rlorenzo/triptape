@@ -135,9 +135,9 @@ pub fn caption_read_secs(caption: Option<&str>) -> f64 {
 
 /// Delay between a segment's start and its caption cue.
 pub const CAPTION_LEAD_IN_SECS: f64 = 0.3;
-/// Deliberately the worst case for every shot, not the shot's own cut.
 /// Longest transition overlap that can cut a caption's cue short at the
-/// segment's end (the 0.8 s fadeblack).
+/// segment's end (the 0.8 s fadeblack). Deliberately the worst case for
+/// every shot, not the shot's own cut.
 pub const CAPTION_CUT_OVERLAP_SECS: f64 = 0.8;
 
 /// Seconds to hold a shot so its caption is on screen for the whole of
