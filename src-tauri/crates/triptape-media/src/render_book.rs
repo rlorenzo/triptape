@@ -2290,7 +2290,8 @@ const MAX_HEADING_PLACES: usize = 4;
 
 /// A day heading on one line of its banner: when the places run onto a
 /// second line, those no photo on the page shows (the day's city, named
-/// for context) are dropped, and the page's own places stay as they are.
+/// for context) are dropped first, then the page's last places until it
+/// fits. The first place always stays.
 fn one_line_heading(heading: String, slot: &[&BookPhoto], page_w: f64) -> String {
     if heading_fits_one_line(&heading, page_w) {
         return heading;
@@ -2299,15 +2300,22 @@ fn one_line_heading(heading: String, slot: &[&BookPhoto], page_w: f64) -> String
         return heading;
     };
     let listed: Vec<&str> = places.split(" \u{b7} ").collect();
-    let shown: Vec<&str> = listed
+    let mut kept: Vec<&str> = listed
         .iter()
         .copied()
         .filter(|pl| slot.iter().any(|p| p.place.as_deref() == Some(*pl)))
         .collect();
-    if shown.is_empty() || shown.len() == listed.len() {
-        return heading;
+    if kept.is_empty() {
+        kept = listed;
     }
-    format!("{head} — {}", shown.join(" \u{b7} "))
+    // Still too long with the page's own places: the first ones visited,
+    // as many as fit ("Independence Palace", the museum named on its own
+    // page after).
+    let line = |kept: &[&str]| format!("{head} — {}", kept.join(" \u{b7} "));
+    while kept.len() > 1 && !heading_fits_one_line(&line(&kept), page_w) {
+        kept.pop();
+    }
+    line(&kept)
 }
 
 /// Whether a day heading fits one line of the banner (24 pt, 14 pt inset):
@@ -5083,6 +5091,21 @@ mod tests {
             one_line_heading(tokyo.to_string(), &[&at("Tsukiji Outer Market")], 12.0),
             tokyo
         );
+        // The page's own places still too long for an 8 in page: the first
+        // visited, as many as fit.
+        let (palace, museum) = (at("Independence Palace"), at("Ho Chi Minh Campaign Museum"));
+        assert_eq!(
+            one_line_heading(
+                "Day 19 · Wed, Oct 21 — Independence Palace · Ho Chi Minh Campaign Museum"
+                    .to_string(),
+                &[&palace, &museum],
+                8.0
+            ),
+            "Day 19 · Wed, Oct 21 — Independence Palace"
+        );
+        // A single place stays, however long.
+        let long = "Day 19 · Wed, Oct 21 — Ho Chi Minh Campaign Museum and War Remnants Museum";
+        assert_eq!(one_line_heading(long.to_string(), &[&museum], 8.0), long);
     }
 
     #[test]
