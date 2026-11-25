@@ -142,9 +142,10 @@ fn at_home(hop: &Hop, gps: Option<(f64, f64)>) -> bool {
 ///
 /// A hop plays at the actual move, the first shot on or after its day taken
 /// nearer its destination than its origin, so the morning's shots in the
-/// departure city stay before it. Shots without GPS never trigger the cut;
-/// when none on or after the day has GPS nearer the destination, the first
-/// shot on or after the day does. The last hop home plays before the first
+/// departure city stay before it. Shots without GPS never trigger the cut,
+/// nor do shots from the next later-dated hop's day on; when none in that
+/// window has GPS nearer the destination, the first shot on or after the day
+/// does. The last hop home plays before the first
 /// shot taken back home (within [`HOME_REACH_M`], on or after its day), or
 /// after every shot when none was or it has no day.
 fn moves(
@@ -159,7 +160,6 @@ fn moves(
     let mut floor = i64::MIN;
     let mut out = vec![];
     for (i, hop) in hops.iter().enumerate() {
-        let mut when = None;
         if hop.home && i + 1 == hops.len() {
             at = hop
                 .day
@@ -168,12 +168,20 @@ fn moves(
                         .find(|&s| at_home(hop, gps_of(s)) && day_of(s).is_some_and(|sd| sd >= day))
                 })
                 .unwrap_or(shots.len());
-            when = hop.day.map(|_| time_of(at).unwrap_or(i64::MAX));
         } else if let Some(day) = hop.day {
             let on_day = |s: &usize| day_of(*s).is_some_and(|d| d >= day);
+            // The move is made before the next hop's day: a shot from a
+            // later stop is not this hop's arrival, however near it is.
+            let next_day = hops[i + 1..]
+                .iter()
+                .filter_map(|h| h.day)
+                .find(|&d| d > day);
+            let before_next =
+                |s: &usize| day_of(*s).is_some_and(|d| next_day.is_none_or(|n| d < n));
             at = (at..shots.len())
                 .find(|s| {
                     on_day(s)
+                        && before_next(s)
                         && gps_of(*s).is_some_and(|g| {
                             crate::geo::haversine_m(g, hop.pos)
                                 < crate::geo::haversine_m(g, hop.from)
@@ -181,13 +189,11 @@ fn moves(
                 })
                 .or_else(|| (at..shots.len()).find(on_day))
                 .unwrap_or(shots.len());
-            when = Some(time_of(at).unwrap_or(i64::MAX));
         }
-        // Hops never play out of order.
-        let when = when.map(|w| w.max(floor));
-        if let Some(w) = when {
-            floor = w;
-        }
+        // An undated hop has no move of its own; the others never play out
+        // of order.
+        let when = hop.day.map(|_| time_of(at).unwrap_or(i64::MAX).max(floor));
+        floor = when.unwrap_or(floor);
         out.push((at, when));
     }
     out
@@ -1017,8 +1023,31 @@ mod tests {
         // No GPS at all on the day: the first shot on the day.
         let blind = [tokyo, None, None, None, None, None, None, la];
         assert_eq!(hop_cuts(&hops, &shots, &blind), [0, 1, 7]);
-        // The hop home still waits for a shot taken at home.
+        // A stay without GPS: a later stop's shot, though nearer Osaka than
+        // Tokyo, does not carry the hop past the stay.
+        let later = [tokyo, None, None, None, None, None, None, osaka];
+        assert_eq!(hop_cuts(&hops, &shots, &later)[1], 1);
+        // The hop home still waits for a shot taken at home, and until one
+        // is, no shot has reached it, wherever it was taken.
         assert_eq!(hop_cuts(&hops, &shots[..7], &gps[..7])[2], 7);
+        let placed = with_moves(hops.clone(), &shots[..7], &gps[..7]);
+        assert_eq!(placed[2].moved_at, Some(i64::MAX));
+        assert_eq!(hops_reached(&placed, at(10, 1, 9), la), 2);
+        // An undated hop plays where the one before it did and splits no
+        // shots; the hops after it are still placed.
+        let mut undated = hops.clone();
+        undated[1].day = None;
+        assert_eq!(hop_cuts(&undated, &shots, &gps), [0, 0, 7]);
+        let placed = with_moves(undated, &shots, &gps);
+        assert_eq!(placed[1].moved_at, None);
+        assert_eq!(hops_reached(&placed, shots[5], gps[5]), 1);
+        assert_eq!(hops_reached(&placed, shots[7], gps[7]), 2);
+        // A film that is not in time order: a hop never moves before the
+        // one ahead of it, so the counts still only grow with the hops.
+        let mut jumbled = shots;
+        jumbled[0] = at(9, 29, 10);
+        let placed = with_moves(hops.clone(), &jumbled, &gps);
+        assert_eq!(placed[1].moved_at, placed[0].moved_at);
     }
 
     #[test]
