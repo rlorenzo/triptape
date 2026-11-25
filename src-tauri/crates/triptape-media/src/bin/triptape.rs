@@ -1247,7 +1247,10 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
             "closing" => out.closing = Some(single(values)?),
             "still" => match <[String; 2]>::try_from(values) {
                 Ok([a, secs]) => match secs.parse::<f64>() {
-                    Ok(t) if t.is_finite() && t >= 0.0 => out.still.push((a, t)),
+                    // Stored as whole milliseconds in a u32.
+                    Ok(t) if t.is_finite() && t >= 0.0 && t * 1000.0 <= f64::from(u32::MAX) => {
+                        out.still.push((a, t))
+                    }
                     _ => {
                         return Err(format!(
                             "--still wants seconds into the video, got {secs:?}"
@@ -1659,6 +1662,19 @@ fn edit_cmd(args: &[String]) {
             "edit",
             format!(
                 "{} is not a video; --still takes a frame from a video",
+                asset_label(asset)
+            ),
+        );
+    }
+    // A frame past the end can't be read: the book would print gray.
+    if let Some((asset, t, d)) = stills
+        .iter()
+        .find_map(|&(x, t)| x.duration_secs.filter(|&d| t > d).map(|d| (x, t, d)))
+    {
+        die(
+            "edit",
+            format!(
+                "{} is {d:.1}s long; --still {t}s is past its end",
                 asset_label(asset)
             ),
         );
@@ -2574,6 +2590,8 @@ mod tests {
         assert_eq!(a.own_page, ["a", "b"]);
         assert_eq!(a.unown_page, ["c"]);
         assert!(parse_edit_args(&args("--db t.db --own-page")).is_err());
+        assert!(parse_edit_args(&args("--db t.db --still v 4294967.296")).is_err());
+        assert!(parse_edit_args(&args("--db t.db --still v 12.5")).is_ok());
     }
 
     #[test]
