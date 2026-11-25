@@ -355,6 +355,174 @@ pub struct Plan {
     /// The owner's photo for the book's closing page, if chosen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closing: Option<String>,
+    /// The owner's book layout choices (see [`BookLayout`]).
+    #[serde(default, skip_serializing_if = "BookLayout::is_empty")]
+    pub book_layout: BookLayout,
+}
+
+/// How the owner wants particular photos laid out in the book.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BookLayout {
+    /// Photos that get the biggest cell on their page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feature: Vec<String>,
+    /// Photos never cropped: shown whole in their cell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub whole: Vec<String>,
+    /// Videos shown in the book as one frame: asset id -> milliseconds in.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stills: BTreeMap<String, u32>,
+    /// Photos that share one page (printed in story order).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<Vec<String>>,
+    /// Photos laid side by side: a page whose photos are all listed here
+    /// is one row of full-height cells (three cabin doors, door to floor).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<String>,
+    /// Photos whose caption speaks for their whole page ("Alora posing as
+    /// the various anime characters"): it goes in the page's bottom line,
+    /// not under the one photo.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub page_captions: Vec<String>,
+    /// Photos the owner placed right after another, out of time order:
+    /// `(photo, anchor)` (`--book-after`). The photo joins its anchor's
+    /// stretch of the book, so the two can share a page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<(String, String)>,
+    /// Photos on a page of their own (`--own-page`): with `--book-after`,
+    /// the photo takes the page after its anchor's ("replace this page's
+    /// picture with that one").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub own_page: Vec<String>,
+}
+
+impl BookLayout {
+    /// The plain per-photo lists: each names the photos one choice is on for.
+    fn listed(&self) -> [&Vec<String>; 5] {
+        [
+            &self.feature,
+            &self.whole,
+            &self.rows,
+            &self.page_captions,
+            &self.own_page,
+        ]
+    }
+
+    /// [`Self::listed`], to change: the same lists.
+    fn listed_mut(&mut self) -> [&mut Vec<String>; 5] {
+        [
+            &mut self.feature,
+            &mut self.whole,
+            &mut self.rows,
+            &mut self.page_captions,
+            &mut self.own_page,
+        ]
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.listed().iter().all(|list| list.is_empty())
+            && self.stills.is_empty()
+            && self.groups.is_empty()
+            && self.after.is_empty()
+    }
+
+    /// Whether any layout choice names this asset.
+    pub fn mentions(&self, id: &str) -> bool {
+        self.listed()
+            .iter()
+            .any(|list| list.iter().any(|x| x == id))
+            || self.after.iter().any(|(x, a)| x == id || a == id)
+            || self.stills.contains_key(id)
+            || self.groups.iter().flatten().any(|x| x == id)
+    }
+
+    /// Feature a photo (biggest cell on its page), or stop featuring it.
+    pub fn set_feature(&mut self, asset: String, on: bool) {
+        set_listed(&mut self.feature, asset, on);
+    }
+
+    /// Show a photo whole (never cropped), or let it crop again.
+    pub fn set_whole(&mut self, asset: String, on: bool) {
+        set_listed(&mut self.whole, asset, on);
+    }
+
+    /// Lay a photo side by side with its page's others, or not.
+    pub fn set_row(&mut self, asset: String, on: bool) {
+        set_listed(&mut self.rows, asset, on);
+    }
+
+    /// Print a photo's caption in its page's bottom line, or under it.
+    pub fn set_page_caption(&mut self, asset: String, on: bool) {
+        set_listed(&mut self.page_captions, asset, on);
+    }
+
+    /// Give a photo a page of its own, or let it share again.
+    pub fn set_own_page(&mut self, asset: String, on: bool) {
+        set_listed(&mut self.own_page, asset, on);
+    }
+
+    /// Place `asset` right after `anchor` in the book, or (`None`) back in
+    /// time order.
+    pub fn set_after(&mut self, asset: String, anchor: Option<String>) {
+        self.after.retain(|(x, _)| *x != asset);
+        if let Some(anchor) = anchor {
+            self.after.push((asset, anchor));
+        }
+    }
+
+    /// Show a video as its frame `ms` milliseconds in, or (`None`) not at all.
+    pub fn set_still(&mut self, asset: String, ms: Option<u32>) {
+        match ms {
+            Some(ms) => self.stills.insert(asset, ms),
+            None => self.stills.remove(&asset),
+        };
+    }
+
+    /// Put these photos on one page. A photo is in at most one group, so
+    /// they leave any earlier group.
+    pub fn group(&mut self, assets: Vec<String>) {
+        let mut unique: Vec<String> = Vec::with_capacity(assets.len());
+        for id in assets {
+            if !unique.contains(&id) {
+                unique.push(id);
+            }
+        }
+        self.retain_grouped(|id| !unique.iter().any(|a| a == id));
+        if unique.len() >= 2 {
+            self.groups.push(unique);
+        }
+    }
+
+    /// Take a photo out of its page group.
+    pub fn ungroup(&mut self, asset: &str) {
+        self.retain_grouped(|id| id != asset);
+    }
+
+    /// Keep only the asset ids `keep` accepts; groups left with fewer
+    /// than two photos go.
+    pub fn retain_assets(&mut self, keep: impl Fn(&str) -> bool) {
+        for list in self.listed_mut() {
+            list.retain(|id| keep(id));
+        }
+        self.after.retain(|(x, a)| keep(x) && keep(a));
+        self.stills.retain(|id, _| keep(id));
+        self.retain_grouped(keep);
+    }
+
+    fn retain_grouped(&mut self, keep: impl Fn(&str) -> bool) {
+        for g in &mut self.groups {
+            g.retain(|id| keep(id));
+        }
+        self.groups.retain(|g| g.len() >= 2);
+    }
+}
+
+/// Add `asset` to the end of `list` (once), or remove it.
+pub(crate) fn set_listed(list: &mut Vec<String>, asset: String, on: bool) {
+    list.retain(|id| *id != asset);
+    if on {
+        list.push(asset);
+    }
 }
 
 /// How the user regrouped the film's collages, by asset id. Read by
@@ -595,6 +763,65 @@ pub struct Job {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn book_layout_setters_keep_one_entry_and_one_group_per_photo() {
+        let mut l = BookLayout::default();
+        l.set_feature("a".into(), true);
+        l.set_feature("a".into(), true);
+        l.set_whole("b".into(), true);
+        l.set_still("v".into(), Some(1500));
+        l.set_own_page("p".into(), true);
+        l.set_own_page("p".into(), true);
+        assert_eq!(l.own_page, ["p"]);
+        assert!(l.mentions("p"));
+        l.retain_assets(|id| id != "p");
+        assert!(l.own_page.is_empty() && !l.mentions("p"));
+        assert_eq!(l.feature, ["a"]);
+        assert!(l.mentions("a") && l.mentions("b") && l.mentions("v"));
+        l.group(vec!["a".into(), "b".into(), "c".into()]);
+        l.group(vec!["c".into(), "d".into()]);
+        assert_eq!(l.groups, [vec!["a", "b"], vec!["c", "d"]], "c moved groups");
+        l.ungroup("d");
+        assert_eq!(l.groups, [vec!["a", "b"]], "a group of one goes");
+        l.group(vec!["e".into(), "e".into()]);
+        assert_eq!(l.groups, [vec!["a", "b"]], "one photo twice is no group");
+        assert!(!l.mentions("e"));
+        assert!(!l.mentions("c") && !l.mentions("d"));
+        l.set_feature("a".into(), false);
+        l.set_whole("b".into(), false);
+        l.set_still("v".into(), None);
+        l.ungroup("a");
+        assert!(l.is_empty());
+    }
+
+    #[test]
+    fn every_book_layout_choice_counts_as_a_mention_and_is_pruned() {
+        type Set = fn(&mut BookLayout, String);
+        let choices: [Set; 8] = [
+            |l, id| l.set_feature(id, true),
+            |l, id| l.set_whole(id, true),
+            |l, id| l.set_row(id, true),
+            |l, id| l.set_page_caption(id, true),
+            |l, id| l.set_own_page(id, true),
+            |l, id| l.set_still(id, Some(1500)),
+            |l, id| l.set_after(id, Some("anchor".into())),
+            |l, id| l.group(vec![id, "other".into()]),
+        ];
+        for (n, set) in choices.into_iter().enumerate() {
+            let mut l = BookLayout::default();
+            set(&mut l, "p".into());
+            assert!(!l.is_empty() && l.mentions("p"), "choice {n}");
+            l.retain_assets(|id| id != "p");
+            assert!(l.is_empty() && !l.mentions("p"), "choice {n}");
+        }
+        // A placement goes with its anchor too.
+        let mut l = BookLayout::default();
+        l.set_after("p".into(), Some("anchor".into()));
+        assert!(l.mentions("anchor"));
+        l.retain_assets(|id| id != "anchor");
+        assert!(l.is_empty());
+    }
 
     #[test]
     fn old_single_clip_window_loads_as_one_window() {

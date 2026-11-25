@@ -1275,6 +1275,9 @@ pub struct PlanEdits {
     /// The book's closing photo (see [`crate::types::Plan::closing`]).
     #[serde(default)]
     pub closing: Option<String>,
+    /// Book layout choices (see [`crate::types::BookLayout`]).
+    #[serde(default)]
+    pub book_layout: crate::types::BookLayout,
 }
 
 impl PlanEdits {
@@ -1293,6 +1296,7 @@ impl PlanEdits {
             && self.frame.is_empty()
             && self.book.is_empty()
             && self.closing.is_none()
+            && self.book_layout.is_empty()
     }
 
     /// Play a Live Photo's motion in the film, or put it back to the
@@ -1323,10 +1327,7 @@ impl PlanEdits {
 
     /// Pin a photo into the book, or unpin it.
     pub fn set_book(&mut self, asset: String, on: bool) {
-        self.book.retain(|id| *id != asset);
-        if on {
-            self.book.push(asset);
-        }
+        crate::types::set_listed(&mut self.book, asset, on);
     }
 
     /// Set (or clear, `None`) where a photo's crops centre, in percent.
@@ -1713,16 +1714,25 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
         .filter(|id| in_plan.contains(id.as_str()))
         .cloned()
         .collect();
+    // A book pin may name any photo of the project, not only one the plan
+    // holds: the book places a set-aside near-duplicate (the better take of
+    // a burst) beside the shot nearest it in time.
+    let known = |id: &str| by_id.contains_key(id) || in_plan.contains(id);
     out.book = edits
         .book
         .iter()
-        .filter(|id| in_plan.contains(id.as_str()) && !dead.contains(id.as_str()))
+        .filter(|id| known(id.as_str()) && !dead.contains(id.as_str()))
         .cloned()
         .collect();
     out.closing = edits
         .closing
         .clone()
         .filter(|id| in_plan.contains(id.as_str()) && !dead.contains(id.as_str()));
+    out.book_layout = edits.book_layout.clone();
+    // Layout choices follow the photos the book can place (above).
+    out.book_layout.retain_assets(|id| {
+        (in_plan.contains(id) || out.book.iter().any(|b| b == id)) && !dead.contains(id)
+    });
     out.collage
         .retain_assets(|id| in_plan.contains(id) && !dead.contains(id));
     out
@@ -2116,6 +2126,7 @@ pub fn build_plan_with_length(
         still: Default::default(),
         book: Default::default(),
         closing: Default::default(),
+        book_layout: Default::default(),
     }
 }
 
@@ -5397,6 +5408,7 @@ mod tests {
             still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
+            book_layout: Default::default(),
         };
         let g = HeroGrouping::new(&plan, |_| None, |_| Some(0), |_| true);
         assert_eq!(g.plays_alone(0), Some(PlaysAlone::Motion));
@@ -5452,6 +5464,7 @@ mod tests {
             still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
+            book_layout: Default::default(),
         };
         let rendition = |p: &Plan, id: &str| {
             p.hero
@@ -5530,6 +5543,7 @@ mod tests {
             crop: Default::default(),
             frame: Default::default(),
             still: Default::default(),
+            book_layout: Default::default(),
             book: Default::default(),
             closing: Default::default(),
         };
@@ -5597,6 +5611,7 @@ mod tests {
             crop: Default::default(),
             frame: Default::default(),
             still: Default::default(),
+            book_layout: Default::default(),
             book: Default::default(),
             closing: Default::default(),
         };
@@ -5675,6 +5690,7 @@ mod tests {
             still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
+            book_layout: Default::default(),
         };
         // a4 is a panorama: solo. a1 and a3 join across the clip; b1 and
         // b3 across the captioned b2; nothing joins across the chapters.

@@ -37,6 +37,9 @@ pub struct ExportOptions {
     pub keep_ambience: bool,
     /// Live Photos in a hero collage play their motion in their cell.
     pub live_collages: bool,
+    /// Asset ids of a book the owner approved: the book prints only these
+    /// and the owner's pins.
+    pub book_approved: Option<std::collections::HashSet<String>>,
     /// The hero film shows the route map after its title too (default
     /// false; the closing recap always plays).
     pub opening_map: bool,
@@ -65,6 +68,9 @@ pub struct ExportOptions {
     pub hop_clips: Vec<PathBuf>,
     /// The owner's own picture for the book's back cover.
     pub back_cover: Option<PathBuf>,
+    /// The owner's own picture for the book's front cover (the sights
+    /// mosaic then takes the back).
+    pub front_cover: Option<PathBuf>,
     /// Folder for the film's scratch files (segments, chunks) instead of
     /// `<out>/.work`: see [`scratch_dir`]. `None` keeps them in `<out>/.work`.
     pub work_dir: Option<PathBuf>,
@@ -211,6 +217,39 @@ fn verify_source(entry: &PlanEntry, path: &Path) -> Result<(), String> {
     }
 }
 
+/// The plan as the book sees it. A photo the owner pinned into the book
+/// (`--book`) that no chapter holds (a near-duplicate the scan set aside,
+/// such as the better take of a burst, or a shot the planner left out)
+/// joins the chapter of the shot nearest it in time, beside that shot. Only
+/// the book reads this; the film keeps the plan's own chapters.
+fn with_book_pins(plan: &Plan, assets: &[triptape_core::types::Asset]) -> Plan {
+    let taken: HashMap<&str, i64> = assets
+        .iter()
+        .filter_map(|a| a.taken_at.map(|t| (a.id.as_str(), t)))
+        .collect();
+    let mut out = plan.clone();
+    for id in &plan.book {
+        if out.chapter_of(id).is_some() {
+            continue;
+        }
+        let Some(&t) = taken.get(id.as_str()) else {
+            continue;
+        };
+        let nearest = out
+            .chapters
+            .iter()
+            .enumerate()
+            .flat_map(|(ci, c)| c.asset_ids.iter().enumerate().map(move |(i, a)| (ci, i, a)))
+            .filter_map(|(ci, i, a)| taken.get(a.as_str()).map(|&ta| (ci, i, ta)))
+            .min_by_key(|&(_, _, ta)| ta.abs_diff(t));
+        if let Some((ci, i, ta)) = nearest {
+            let at = if t < ta { i } else { i + 1 };
+            out.chapters[ci].asset_ids.insert(at, id.clone());
+        }
+    }
+    out
+}
+
 /// Asset id -> index of its chapter in the plan's book flow.
 fn book_chapter_of(plan: &Plan) -> HashMap<&str, usize> {
     plan.chapters
@@ -220,15 +259,95 @@ fn book_chapter_of(plan: &Plan) -> HashMap<&str, usize> {
         .collect()
 }
 
+/// A stretch of its own inside `area`: photos sharing the tagged name share
+/// a page, apart from the rest of the place.
+fn stretch_area(area: Option<&str>, tag: &str) -> Option<String> {
+    Some(format!("{} \u{b7} {tag}", area.unwrap_or_default()))
+}
+
+/// The owner's page groups (`--group`): each group's photos move together
+/// to where its earliest photo stands in story order and become one stretch
+/// of that photo's day, so they share a page.
+fn group_pages(photos: &mut Vec<BookPhoto>, groups: &[Vec<String>]) {
+    for (n, group) in groups.iter().enumerate() {
+        let in_group = |p: &mut BookPhoto| group.contains(&p.asset_id);
+        let Some(at) = photos.iter_mut().position(in_group) else {
+            continue;
+        };
+        let mut members: Vec<BookPhoto> = photos.extract_if(at.., in_group).collect();
+        if let [first, _, ..] = members.as_slice() {
+            let (day, chapter) = (first.day, first.chapter);
+            let area = stretch_area(first.area.as_deref(), &format!("page {}", n + 1));
+            for m in &mut members {
+                m.day = day;
+                m.chapter = chapter;
+                m.area = area.clone();
+                m.page_group = true;
+            }
+        }
+        photos.splice(at..at, members);
+    }
+}
+
+/// The owner's placements out of time order (`--book-after`): each photo
+/// moves to right after its anchor and joins the anchor's stretch (day,
+/// chapter, page group), so the two can share a page. Its own place stays.
+fn book_moves(photos: &mut Vec<BookPhoto>, after: &[(String, String)]) {
+    for (id, anchor) in after {
+        let Some(from) = photos.iter().position(|p| p.asset_id == *id) else {
+            continue;
+        };
+        let mut moved = photos.remove(from);
+        let Some(at) = photos.iter().position(|p| p.asset_id == *anchor) else {
+            photos.insert(from, moved);
+            continue;
+        };
+        let a = &photos[at];
+        moved.day = a.day;
+        moved.chapter = a.chapter;
+        moved.area.clone_from(&a.area);
+        moved.page_group = a.page_group;
+        photos.insert(at + 1, moved);
+    }
+}
+
+/// The owner's pages of their own (`--own-page`): each photo becomes a
+/// stretch of one, so it prints alone right where it stands (after its
+/// anchor, with `--book-after`), and as the owner's page it is neither
+/// folded into a neighbour nor dropped as lone scenery.
+fn own_pages(photos: &mut [BookPhoto], own: &[String]) {
+    for p in photos.iter_mut().filter(|p| own.contains(&p.asset_id)) {
+        p.area = stretch_area(p.area.as_deref(), &format!("own page {}", p.asset_id));
+        p.page_group = true;
+    }
+}
+
 /// A book photo's caption: the user's, else its shared place
 /// ([`triptape_core::places::photo_places`]).
 fn book_caption(plan: &Plan, places: &HashMap<String, String>, id: &str) -> Option<String> {
     // A hidden (blank) caption still leaves the photo its place.
-    plan.captions
-        .get(id)
-        .filter(|c| has_caption(Some(c)))
-        .or_else(|| places.get(id))
-        .cloned()
+    match plan.captions.get(id).filter(|c| has_caption(Some(c))) {
+        Some(c) => Some(end_sentence(c)),
+        None => places.get(id).cloned(),
+    }
+}
+
+/// The owner's sentence with a full stop, so every caption in the book
+/// ends alike ("Alora won Candyland."). A short label ("Lamb curry") or a
+/// name ("Canal City Ramen Stadium") stays as written.
+fn end_sentence(c: &str) -> String {
+    let c = c.trim_end();
+    let mut words = c.split_whitespace();
+    let lower = words.clone().any(|w| w.starts_with(char::is_lowercase));
+    if words.nth(2).is_some()
+        && lower
+        && !c.ends_with(render_book::SENTENCE_END)
+        && !c.ends_with(':')
+    {
+        format!("{c}.")
+    } else {
+        c.to_string()
+    }
 }
 
 /// Book score added to a sharp, well-exposed panorama: on a grid page it
@@ -926,6 +1045,8 @@ fn export_inner(
             reason: elig.book_reason.clone(),
         });
     } else {
+        let book_plan = with_book_pins(plan, assets);
+        let plan = &book_plan;
         let chapter_of = book_chapter_of(plan);
         // Day 1 is the earliest local date in the project, as the plan
         // numbers its chapters.
@@ -949,9 +1070,20 @@ fn export_inner(
                 )
             })
             .collect();
+        // The trip's stop cities, to tell a city from a sight in headings.
+        let cities: HashSet<String> = opts
+            .itinerary
+            .as_ref()
+            .map(|i| i.stops.iter().map(|s| s.label.clone()).collect())
+            .unwrap_or_default();
+        let layout = &plan.book_layout;
         for a in assets
             .iter()
-            .filter(|a| a.kind != AssetKind::Video && in_book_flow(&chapter_of, &a.id))
+            // Videos only as the frame the owner chose (`--still`).
+            .filter(|a| {
+                (a.kind != AssetKind::Video || layout.stills.contains_key(&a.id))
+                    && in_book_flow(&chapter_of, &a.id)
+            })
         {
             if let Err(reason) = verify_source(&asset_snapshot(a), &a.path) {
                 report.fallbacks.push(format!("book: {reason}; skipped"));
@@ -980,6 +1112,13 @@ fn export_inner(
             let day = asset_day(a).zip(trip_start).map(|(d, s)| trip_day(d, s));
             let place = book_places.get(&a.id).cloned();
             let closing = plan.closing.as_deref() == Some(a.id.as_str());
+            // Pinned by the owner: into the book, onto the cover, or by a
+            // layout choice.
+            let pinned = plan.book.contains(&a.id)
+                || plan.book_layout.mentions(&a.id)
+                // A back-cover sight (front cover is the owner's picture) is
+                // not also forced onto the pages: the covers don't repeat them.
+                || (opts.front_cover.is_none() && plan.cover.contains_key(&a.id));
             let itin = opts.itinerary.as_ref();
             let spot =
                 triptape_core::places::spot_with_fix(itin, a, borrowed.get(a.id.as_str()).copied());
@@ -1011,11 +1150,10 @@ fn export_inner(
                 }),
                 // Captioned, pinned into the book, or pinned to the cover by
                 // the owner: always placed (the page cap never drops it).
-                keep: plan.book.contains(&a.id)
-                    || plan.cover.contains_key(&a.id)
+                keep: pinned
                     || closing
                     || has_caption(plan.captions.get(&a.id).map(String::as_str)),
-                pinned: plan.book.contains(&a.id) || plan.cover.contains_key(&a.id),
+                pinned,
                 taken_at: a.taken_at,
                 phash: a.phash,
                 people_sig: a.people_sig,
@@ -1033,6 +1171,15 @@ fn export_inner(
                     .crop
                     .get(&a.id)
                     .map(|&(x, y)| (f32::from(x) / 100.0, f32::from(y) / 100.0)),
+                still_ms: layout.stills.get(&a.id).copied(),
+                feature: layout.feature.contains(&a.id),
+                whole: layout.whole.contains(&a.id),
+                row: layout.rows.contains(&a.id),
+                caption_for_page: layout.page_captions.contains(&a.id),
+                page_group: false,
+                place_is_city: book_places
+                    .get(&a.id)
+                    .is_some_and(|pl| cities.contains(pl.as_str())),
             });
         }
         // A photo and the owner's `_edited` version of it are one photo:
@@ -1054,6 +1201,9 @@ fn export_inner(
                 .copied()
                 .unwrap_or(usize::MAX)
         });
+        group_pages(&mut book_photos, &layout.groups);
+        book_moves(&mut book_photos, &layout.after);
+        own_pages(&mut book_photos, &layout.own_page);
         let book_dir = out_dir.join("book");
         let staged_book = stage.join("book");
         // Day-marker titles: day once, with the location.
@@ -1086,8 +1236,12 @@ fn export_inner(
         // across an ocean and shrink the trip to a corner.
         let book_route = trip_route(&plan.map_polyline);
         // The owner's back cover is the trip's map: no second, plainer
-        // route map before it.
-        let book_map = if book_route.len() >= 2 && opts.back_cover.is_none() {
+        // route map before it. Their front cover is the trip's map too: the
+        // map page shows it, not a plainer drawn one.
+        let owner_map = opts.front_cover.as_ref().filter(|p| p.is_file());
+        let book_map = if let Some(front) = owner_map.filter(|_| opts.back_cover.is_none()) {
+            Some(front.clone())
+        } else if book_route.len() >= 2 && opts.back_cover.is_none() {
             let card = work.join("route_card_book.png");
             match crate::map::save_route_card(book_route, &[], 1800, 1800, &card) {
                 Ok(_) => Some(card),
@@ -1125,6 +1279,8 @@ fn export_inner(
                 faces: opts.faces.clone(),
                 journey: journey(),
                 back_cover_image: opts.back_cover.clone(),
+                front_cover_image: opts.front_cover.clone(),
+                approved: opts.book_approved.clone(),
             },
         ) {
             Err(crate::MediaError::Cancelled) => return Err(crate::MediaError::Cancelled),
@@ -1389,6 +1545,134 @@ mod tests {
     }
 
     #[test]
+    fn a_book_pin_outside_the_plan_joins_the_shot_nearest_it() {
+        use triptape_core::types::{Asset, Chapter};
+        let chapter = |ids: &[&str]| Chapter {
+            title: String::new(),
+            asset_ids: ids.iter().map(|s| s.to_string()).collect(),
+            place: None,
+            day_index: None,
+            date_label: None,
+            film_place: None,
+            film_place_changes: vec![],
+        };
+        let at = |id: &str, t: i64| {
+            let mut a = Asset::new(id, PathBuf::from(format!("/t/{id}.jpg")), AssetKind::Photo);
+            a.taken_at = Some(t);
+            a
+        };
+        let assets = [
+            at("a", 100),
+            at("b", 200),
+            at("c", 1000),
+            at("take2", 210),
+            at("early", 950),
+        ];
+        let mut plan = empty_plan();
+        plan.chapters = vec![chapter(&["a", "b"]), chapter(&["c"])];
+        plan.book = vec!["take2".into(), "early".into(), "b".into()];
+        let book = with_book_pins(&plan, &assets);
+        // The better take of b's burst lands just after b; a shot 50 s
+        // before c lands just before it, in c's chapter.
+        assert_eq!(book.chapters[0].asset_ids, ["a", "b", "take2"]);
+        assert_eq!(book.chapters[1].asset_ids, ["early", "c"]);
+        // The film's plan is untouched.
+        assert_eq!(plan.chapters[0].asset_ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn a_page_group_moves_together_to_its_first_photo() {
+        let photo = |id: &str, area: &str| BookPhoto {
+            asset_id: id.into(),
+            day: Some(19),
+            area: Some(area.into()),
+            ..BookPhoto::blank()
+        };
+        let mut photos = vec![
+            photo("pano1", "Palace"),
+            photo("selfie", "Palace"),
+            photo("pano2", "Palace"),
+            photo("street", "Street"),
+            photo("pano3", "Post Office"),
+        ];
+        let groups = vec![vec!["pano1".to_string(), "pano2".into(), "pano3".into()]];
+        group_pages(&mut photos, &groups);
+        let ids: Vec<&str> = photos.iter().map(|p| p.asset_id.as_str()).collect();
+        assert_eq!(ids, ["pano1", "pano2", "pano3", "selfie", "street"]);
+        assert!(photos[..3].iter().all(|p| p.area == photos[0].area));
+        assert_ne!(photos[3].area, photos[0].area, "its own page");
+    }
+
+    #[test]
+    fn a_photo_the_owner_places_after_another_joins_its_stretch() {
+        let photo = |id: &str, area: &str| BookPhoto {
+            asset_id: id.into(),
+            day: Some(27),
+            area: Some(area.into()),
+            place: Some(area.into()),
+            ..BookPhoto::blank()
+        };
+        let mut photos = vec![
+            photo("bay", "Merlion Park"),
+            photo("merlion", "Merlion Park"),
+            photo("snack", "Esplanade"),
+            photo("group", "Esplanade"),
+        ];
+        book_moves(&mut photos, &[("bay".into(), "group".into())]);
+        let ids: Vec<&str> = photos.iter().map(|p| p.asset_id.as_str()).collect();
+        assert_eq!(ids, ["merlion", "snack", "group", "bay"]);
+        assert_eq!(photos[3].area.as_deref(), Some("Esplanade"));
+        assert_eq!(
+            photos[3].place.as_deref(),
+            Some("Merlion Park"),
+            "its own place"
+        );
+        // An anchor the book doesn't hold leaves the photo where it was.
+        book_moves(&mut photos, &[("snack".into(), "gone".into())]);
+        assert_eq!(photos[1].asset_id, "snack");
+    }
+
+    #[test]
+    fn an_own_page_photo_takes_the_page_after_its_anchors() {
+        let photo = |id: &str, area: &str| BookPhoto {
+            asset_id: id.into(),
+            day: Some(6),
+            area: Some(area.into()),
+            ..BookPhoto::blank()
+        };
+        let mut photos = vec![
+            photo("castle", "Osaka Castle Park"),
+            photo("pikachu", "Osaka Castle Park"),
+            photo("alley", "Shinsaibashi-suji"),
+            photo("puffs", "Shinsaibashi-suji"),
+            photo("dinner", "Dotonbori"),
+        ];
+        book_moves(&mut photos, &[("pikachu".into(), "puffs".into())]);
+        own_pages(&mut photos, &["pikachu".into()]);
+        let ids: Vec<&str> = photos.iter().map(|p| p.asset_id.as_str()).collect();
+        assert_eq!(ids, ["castle", "alley", "puffs", "pikachu", "dinner"]);
+        let area = |i: usize| photos[i].area.clone();
+        assert_eq!(area(1), area(2), "the alley page stays whole");
+        assert_ne!(area(3), area(2), "a page of its own");
+        assert_ne!(area(3), area(4));
+        assert!(photos[3].page_group);
+    }
+
+    #[test]
+    fn owner_sentences_end_with_a_full_stop() {
+        assert_eq!(end_sentence("Alora won Candyland"), "Alora won Candyland.");
+        assert_eq!(
+            end_sentence("Best ramen of the trip!"),
+            "Best ramen of the trip!"
+        );
+        assert_eq!(end_sentence("Lamb curry"), "Lamb curry");
+        assert_eq!(
+            end_sentence("Canal City Ramen Stadium"),
+            "Canal City Ramen Stadium"
+        );
+    }
+
+    #[test]
     fn book_captions_prefer_user_text_then_the_shared_place() {
         let mut plan = empty_plan();
         let places: HashMap<String, String> =
@@ -1401,7 +1685,7 @@ mod tests {
         plan.captions.insert("a".into(), "Rain all day".into());
         assert_eq!(
             book_caption(&plan, &places, "a").as_deref(),
-            Some("Rain all day")
+            Some("Rain all day.")
         );
     }
 
@@ -1542,6 +1826,7 @@ mod tests {
                 music_paths: vec![],
                 keep_ambience: false,
                 live_collages: true,
+                book_approved: None,
                 opening_map: false,
                 only: "all".into(),
                 resolution: Resolution::default(),
@@ -1554,6 +1839,7 @@ mod tests {
                 map_style: Default::default(),
                 hop_clips: vec![],
                 back_cover: None,
+                front_cover: None,
                 work_dir: None,
                 draft: false,
             },
@@ -1587,6 +1873,7 @@ mod tests {
             still: Default::default(),
             book: Default::default(),
             closing: Default::default(),
+            book_layout: Default::default(),
         }
     }
 
@@ -1605,6 +1892,7 @@ mod tests {
             music_paths: Vec::new(),
             keep_ambience: false,
             live_collages: true,
+            book_approved: None,
             opening_map: false,
             only: "reels".into(),
             resolution: Default::default(),
@@ -1617,6 +1905,7 @@ mod tests {
             map_style: Default::default(),
             hop_clips: vec![],
             back_cover: None,
+            front_cover: None,
             work_dir: None,
             draft: false,
         };
