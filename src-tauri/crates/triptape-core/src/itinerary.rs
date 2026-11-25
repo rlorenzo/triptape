@@ -465,12 +465,17 @@ impl Itinerary {
     /// the city of the active stop applies. Never a place-of-interest name.
     pub fn label_for(&self, day: NaiveDate, gps: Option<(f64, f64)>) -> Option<DayLabel> {
         // The stop the owner is at today: a city or port first, home last.
+        // A travel day has the stop left and the stop reached both active:
+        // a shot with GPS takes the one it is nearer (dinner in Tokyo after
+        // the train from Hakone is in Tokyo).
         let city = || {
             let at = |s: &&ItinStop| s.active_on(day);
+            let away = |s: &ItinStop| gps.map_or(0.0, |p| haversine_m(p, s.pos()));
             self.stops
                 .iter()
                 .filter(at)
-                .find(|s| s.kind != StopKind::Home)
+                .filter(|s| s.kind != StopKind::Home)
+                .min_by(|a, b| away(a).total_cmp(&away(b)))
                 .or_else(|| self.stops.iter().find(at))
                 .map(|s| s.label.clone())
         };
@@ -992,6 +997,22 @@ mod tests {
         assert_eq!(
             travel.stop_on(day("2026-10-03"), &[asakusa]).as_deref(),
             Some("Tokyo")
+        );
+        // Off a cruise, a shot on the travel day takes the stop it is near.
+        let label = |p| {
+            travel
+                .label_for(day("2026-10-03"), Some(p))
+                .map(|l| l.place)
+        };
+        assert_eq!(label(asakusa).as_deref(), Some("Tokyo"));
+        assert_eq!(label((35.0, 135.76)).as_deref(), Some("Kyoto"));
+        // No fix: the stop listed first, as before.
+        assert_eq!(
+            travel
+                .label_for(day("2026-10-03"), None)
+                .map(|l| l.place)
+                .as_deref(),
+            Some("Kyoto")
         );
         assert_eq!(it.port_call(day("2026-10-11")).as_deref(), Some("Osaka"));
         // A hidden port, and a day at sea, name nothing.
