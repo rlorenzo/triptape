@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use triptape_core::plan::{
-    self, caption_read_secs, collage_hold_secs, is_panorama, pano_coverage, pano_motion,
-    places_card_secs, MAX_CLIP_SECS, MAX_COLLAGE, MIN_SEGMENT_SECS,
+    self, caption_hold_secs, caption_read_secs, collage_hold_secs, is_panorama, pano_coverage,
+    pano_motion, places_card_secs, MAX_CLIP_SECS, MAX_COLLAGE, MIN_SEGMENT_SECS,
 };
 use triptape_core::types::{
     frame_aspect, Chapter, CollageEdits, Frame, Plan, PlanEntry, Rendition,
@@ -2033,6 +2033,20 @@ fn repeated_captions(segs: &[(Option<&str>, Option<usize>, Option<i64>)]) -> Vec
         .collect()
 }
 
+/// Start and end of a caption's cue in a segment starting at `start` and
+/// lasting `d`: it appears [`plan::CAPTION_LEAD_IN_SECS`] in and stays for
+/// `read_secs`, but never past the segment's end margin or the cut into
+/// the next shot (`next`; a dip to black there would leave the text
+/// floating over black). `None` when under 0.5 s remain.
+fn caption_cue(start: f64, d: f64, next: f64, read_secs: f64) -> Option<(f64, f64)> {
+    let st = start + plan::CAPTION_LEAD_IN_SECS;
+    let en = (st + read_secs)
+        .min(start + d - 0.6)
+        .max(st + 0.5)
+        .min(next);
+    (en - st >= 0.5).then_some((st, en))
+}
+
 /// Write the film's captions as SRT cues timed to each segment's `starts`,
 /// leaving out the captions `repeats` marks ([`repeated_captions`]).
 fn write_captions_srt(
@@ -2049,21 +2063,15 @@ fn write_captions_srt(
                 continue;
             }
             n += 1;
-            let st = starts[i] + 0.3;
             // As long as the shot was held to read it; multi-line
             // (collage) cues get at least 3.5 s per caption.
             let read_secs = caption_read_secs(Some(c)).max(3.5 * c.trim().lines().count() as f64);
-            // Never past the cut into the next shot: a dip to black there
-            // would leave the text floating over black.
-            let cut = starts.get(i + 1).copied().unwrap_or(f64::INFINITY);
-            let en = (starts[i] + (d - 0.6).min(read_secs))
-                .max(st + 0.5)
-                .min(cut);
-            // No time to read it before the cut: skip the cue.
-            if en - st < 0.5 {
+            let next = starts.get(i + 1).copied().unwrap_or(f64::INFINITY);
+            let Some((st, en)) = caption_cue(starts[i], *d, next, read_secs) else {
+                // No time to read it before the cut: skip the cue.
                 n -= 1;
                 continue;
-            }
+            };
             body.push_str(&format!(
                 "{n}\n{} --> {}\n{}\n\n",
                 srt_ts(st),
@@ -2226,7 +2234,7 @@ fn render_group(
     // is its collage caption, trimmed).
     // Short mode also keeps it within the group's fair share, so one long
     // caption neither starves later chapters nor freezes a clip just trimmed.
-    let read_secs = caption_read_secs(collage_caption(present).as_deref())
+    let read_secs = caption_hold_secs(collage_caption(present).as_deref())
         .min(limits.cap)
         .min(limits.budget);
     let rendered = if present.len() == 1 {
@@ -4154,6 +4162,10 @@ mod tests {
                             "clip",
                         ),
                     };
+                    // A caption holds its (solo) shot until it can be read.
+                    let dur = dur.max(caption_hold_secs(
+                        captions.get(&e.asset_id).map(String::as_str),
+                    ));
                     segs.push((e.asset_id.clone(), dur, kind));
                 }
                 if cards.route {
@@ -4195,7 +4207,7 @@ mod tests {
                     &entries,
                     |id| CHAPTER_LABELS[id[1..3].parse::<usize>().unwrap()],
                     |_| None,
-                    |id| caption_read_secs(captions.get(id).map(String::as_str)),
+                    |id| caption_hold_secs(captions.get(id).map(String::as_str)),
                     taken_of,
                     cards,
                 );
@@ -6321,6 +6333,28 @@ mod tests {
         // Already capped to the remaining budget: nothing to pad.
         assert_eq!(clip_pad_target(0.6, 0.6, 0.0), None);
         assert_eq!(clip_pad_target(3.0, 10.0, 0.0), None);
+    }
+
+    /// A captioned shot held for `caption_hold_secs` shows its caption for
+    /// the whole read time, even when the next cut overlaps by 0.8 s.
+    #[test]
+    fn caption_cue_lasts_the_read_time() {
+        for cap in [
+            "Alora is behind Lana's head",
+            "Very good pork rib soup",
+            "Hi there",
+        ] {
+            let read = caption_read_secs(Some(cap));
+            let hold = caption_hold_secs(Some(cap));
+            assert!(hold >= read + 1.1 - 1e-9, "{cap}");
+            let next = 10.0 + hold - 0.8;
+            let (st, en) = caption_cue(10.0, hold, next, read).expect("cue");
+            assert!(en - st >= read - 1e-9, "{cap}: {st}..{en}");
+        }
+        // A short shot with no hold padding still skips rather than flashes.
+        assert_eq!(caption_cue(0.0, 1.0, 0.5, 3.0), None);
+        // The cut still bounds the cue.
+        assert_eq!(caption_cue(0.0, 10.0, 2.0, 3.0), Some((0.3, 2.0)));
     }
 
     /// Default (4K) hero render end to end: Typst title, caption burn-in
