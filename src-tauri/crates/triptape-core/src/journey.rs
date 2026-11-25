@@ -379,11 +379,7 @@ impl Journey {
                 l.path
                     .as_ref()
                     .filter(|_| l.mode != LegMode::Flight && !l.is_loop)
-                    .map(|p| {
-                        let mut v: Vec<(f64, f64)> = p.iter().map(|q| (q[0], q[1])).collect();
-                        unwrap_path(&mut v);
-                        v
-                    })
+                    .map(|p| traced_path(p))
             })
             .collect();
         for (li, leg) in itin.legs.iter().enumerate() {
@@ -391,16 +387,7 @@ impl Journey {
                 itin.stop(&leg.from).expect("validated chain"),
                 itin.stop(&leg.to).expect("validated chain"),
             );
-            let explicit: Option<Vec<(f64, f64)>> = leg
-                .path
-                .as_ref()
-                .map(|p| p.iter().map(|q| (q[0], q[1])).collect());
-            // Smoothing runs on a continuous path, not one that jumps 340
-            // degrees at the date line.
-            let explicit = explicit.map(|mut p: Vec<(f64, f64)>| {
-                unwrap_path(&mut p);
-                p
-            });
+            let explicit = leg.path.as_ref().map(|p| traced_path(p));
             let path = match leg.mode {
                 // A traced path is smoothed through its points (flights keep
                 // their exact arc).
@@ -418,9 +405,7 @@ impl Journey {
                         .map(|t| t[1]);
                     // Neighbours were unwrapped on their own: bring their
                     // tangent points into this leg's frame.
-                    let near = |q: (f64, f64), to: (f64, f64)| {
-                        (q.0, to.1 + (q.1 - to.1 + 180.0).rem_euclid(360.0) - 180.0)
-                    };
+                    let near = |q: (f64, f64), to: (f64, f64)| (q.0, lon_near(q.1, to.1));
                     let (head, tail) = (own[0], own[own.len() - 1]);
                     catmull_rom_through(
                         &own,
@@ -501,9 +486,22 @@ impl Journey {
 /// than 180 degrees (the short way across the antimeridian).
 fn unwrap_path(pts: &mut [(f64, f64)]) {
     for k in 1..pts.len() {
-        let prev = pts[k - 1].1;
-        pts[k].1 = prev + (pts[k].1 - prev + 180.0).rem_euclid(360.0) - 180.0;
+        pts[k].1 = lon_near(pts[k].1, pts[k - 1].1);
     }
+}
+
+/// `lon` shifted by a multiple of 360 to lie within 180 degrees of `of`.
+fn lon_near(lon: f64, of: f64) -> f64 {
+    of + (lon - of + 180.0).rem_euclid(360.0) - 180.0
+}
+
+/// An itinerary leg's traced path as `(lat, lon)` points, unwrapped:
+/// smoothing runs on a continuous path, not one that jumps 340 degrees at
+/// the date line.
+fn traced_path(path: &[[f64; 2]]) -> Vec<(f64, f64)> {
+    let mut pts: Vec<(f64, f64)> = path.iter().map(|q| (q[0], q[1])).collect();
+    unwrap_path(&mut pts);
+    pts
 }
 
 /// Positions at sea between two dates, in capture order.
@@ -599,7 +597,7 @@ pub fn great_circle(a: (f64, f64), b: (f64, f64)) -> Vec<(f64, f64)> {
         ];
         let lat = v[2].clamp(-1.0, 1.0).asin().to_degrees();
         let raw = v[1].atan2(v[0]).to_degrees();
-        lon += (raw - lon + 180.0).rem_euclid(360.0) - 180.0;
+        lon = lon_near(raw, lon);
         out.push((lat, lon));
     }
     out

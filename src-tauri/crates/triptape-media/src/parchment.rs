@@ -1581,16 +1581,10 @@ mod tests {
         let json = r#"{
           "stops": [
             { "id": "la", "label": "Los Angeles", "lat": 33.7364, "lon": -118.2732, "depart": "2026-10-03", "kind": "home" },
-            { "id": "muroran", "label": "Muroran", "lat": 42.3474, "lon": 140.9465, "arrive": "2026-10-15", "depart": "2026-10-15", "kind": "port" },
-            { "id": "hakodate", "label": "Hakodate", "lat": 41.77, "lon": 140.73, "arrive": "2026-10-16", "depart": "2026-10-16", "kind": "port" },
-            { "id": "tokyo", "label": "Tokyo", "lat": 35.6646, "lon": 139.7613, "arrive": "2026-10-18", "depart": "2026-10-20" },
-            { "id": "la2", "label": "Los Angeles", "lat": 33.9416, "lon": -118.4085, "arrive": "2026-10-20", "kind": "home" }
+            { "id": "muroran", "label": "Muroran", "lat": 42.3474, "lon": 140.9465, "arrive": "2026-10-15", "kind": "port" }
           ],
           "legs": [
-            { "from": "la", "to": "muroran", "mode": "ship", "ship": "Ship" },
-            { "from": "muroran", "to": "hakodate", "mode": "ship", "ship": "Ship" },
-            { "from": "hakodate", "to": "tokyo", "mode": "ground" },
-            { "from": "tokyo", "to": "la2", "mode": "flight" }
+            { "from": "la", "to": "muroran", "mode": "ship", "ship": "Ship" }
           ]
         }"#;
         let j = Journey::build(&Itinerary::from_json(json).unwrap(), &[]);

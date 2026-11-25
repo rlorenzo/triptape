@@ -148,11 +148,10 @@ pub fn places_card_doc(trip_name: &str, places: &[String], date_range: Option<&s
         .iter()
         .map(|p| {
             format!(
-                "\"{}\"",
+                "\"{}\", ",
                 esc(&p.replace(' ', "\u{a0}").replace('-', "\u{2011}"))
             )
         })
-        .map(|p| format!("{p}, "))
         .collect::<String>();
     let footer = match date_range {
         Some(d) => format!("{} · {}", esc(trip_name), esc(d)),
@@ -386,5 +385,26 @@ mod tests {
             None,
         );
         assert!(doc.contains("\"Victoria\u{a0}Peak\", \"Hong\u{a0}Kong\u{a0}Disneyland\", )"));
+    }
+
+    #[test]
+    fn places_card_compiles_for_any_number_of_places() {
+        let typst = std::env::var("TRIPTAPE_TYPST").unwrap_or_else(|_| "typst".into());
+        if !typst_available(&typst) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // None, one (a one-item Typst array needs its trailing comma), a
+        // quoted name, and enough to wrap onto several rows.
+        let many: Vec<String> = (0..40).map(|i| format!("Place Number-{i}")).collect();
+        let quoted = [r#"The "Big" Buddha"#.to_string()];
+        for (i, places) in [&[][..], &many[..1], &quoted[..], &many[..]]
+            .into_iter()
+            .enumerate()
+        {
+            let png = dir.path().join(format!("places-{i}.png"));
+            render_text_png(&typst, &places_card_doc("Trip", places, None), &png, 72).unwrap();
+            assert!(png.is_file());
+        }
     }
 }
