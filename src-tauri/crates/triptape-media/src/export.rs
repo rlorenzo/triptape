@@ -241,7 +241,7 @@ fn with_book_pins(plan: &Plan, assets: &[triptape_core::types::Asset]) -> Plan {
             .enumerate()
             .flat_map(|(ci, c)| c.asset_ids.iter().enumerate().map(move |(i, a)| (ci, i, a)))
             .filter_map(|(ci, i, a)| taken.get(a.as_str()).map(|&ta| (ci, i, ta)))
-            .min_by_key(|&(_, _, ta)| (ta - t).abs());
+            .min_by_key(|&(_, _, ta)| ta.abs_diff(t));
         if let Some((ci, i, ta)) = nearest {
             let at = if t < ta { i } else { i + 1 };
             out.chapters[ci].asset_ids.insert(at, id.clone());
@@ -261,11 +261,8 @@ fn book_chapter_of(plan: &Plan) -> HashMap<&str, usize> {
 
 /// A stretch of its own inside `area`: photos sharing the tagged name share
 /// a page, apart from the rest of the place.
-fn stretch_area(area: &Option<String>, tag: std::fmt::Arguments) -> Option<String> {
-    Some(format!(
-        "{} \u{b7} {tag}",
-        area.as_deref().unwrap_or_default()
-    ))
+fn stretch_area(area: Option<&str>, tag: &str) -> Option<String> {
+    Some(format!("{} \u{b7} {tag}", area.unwrap_or_default()))
 }
 
 /// The owner's page groups (`--group`): each group's photos move together
@@ -280,7 +277,7 @@ fn group_pages(photos: &mut Vec<BookPhoto>, groups: &[Vec<String>]) {
         let mut members: Vec<BookPhoto> = photos.extract_if(at.., in_group).collect();
         if let [first, _, ..] = members.as_slice() {
             let (day, chapter) = (first.day, first.chapter);
-            let area = stretch_area(&first.area, format_args!("page {}", n + 1));
+            let area = stretch_area(first.area.as_deref(), &format!("page {}", n + 1));
             for m in &mut members {
                 m.day = day;
                 m.chapter = chapter;
@@ -320,7 +317,7 @@ fn book_moves(photos: &mut Vec<BookPhoto>, after: &[(String, String)]) {
 /// folded into a neighbour nor dropped as lone scenery.
 fn own_pages(photos: &mut [BookPhoto], own: &[String]) {
     for p in photos.iter_mut().filter(|p| own.contains(&p.asset_id)) {
-        p.area = stretch_area(&p.area, format_args!("own page {}", p.asset_id));
+        p.area = stretch_area(p.area.as_deref(), &format!("own page {}", p.asset_id));
         p.page_group = true;
     }
 }
@@ -344,7 +341,8 @@ fn end_sentence(c: &str) -> String {
     let lower = words.clone().any(|w| w.starts_with(char::is_lowercase));
     if words.nth(2).is_some()
         && lower
-        && !c.ends_with(['.', '!', '?', '\u{2026}', ')', '"', '\u{201d}', ':'])
+        && !c.ends_with(render_book::SENTENCE_END)
+        && !c.ends_with(':')
     {
         format!("{c}.")
     } else {

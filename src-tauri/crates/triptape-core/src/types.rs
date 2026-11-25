@@ -397,24 +397,29 @@ pub struct BookLayout {
 }
 
 impl BookLayout {
+    /// The plain per-photo lists: each names the photos one choice is on for.
+    fn listed(&self) -> [&Vec<String>; 5] {
+        [
+            &self.feature,
+            &self.whole,
+            &self.rows,
+            &self.page_captions,
+            &self.own_page,
+        ]
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.feature.is_empty()
-            && self.whole.is_empty()
+        self.listed().iter().all(|list| list.is_empty())
             && self.stills.is_empty()
             && self.groups.is_empty()
-            && self.rows.is_empty()
-            && self.page_captions.is_empty()
             && self.after.is_empty()
-            && self.own_page.is_empty()
     }
 
     /// Whether any layout choice names this asset.
     pub fn mentions(&self, id: &str) -> bool {
-        self.feature.iter().any(|x| x == id)
-            || self.whole.iter().any(|x| x == id)
-            || self.rows.iter().any(|x| x == id)
-            || self.page_captions.iter().any(|x| x == id)
-            || self.own_page.iter().any(|x| x == id)
+        self.listed()
+            .iter()
+            .any(|list| list.iter().any(|x| x == id))
             || self.after.iter().any(|(x, a)| x == id || a == id)
             || self.stills.contains_key(id)
             || self.groups.iter().flatten().any(|x| x == id)
@@ -484,11 +489,15 @@ impl BookLayout {
     /// Keep only the asset ids `keep` accepts; groups left with fewer
     /// than two photos go.
     pub fn retain_assets(&mut self, keep: impl Fn(&str) -> bool) {
-        self.feature.retain(|id| keep(id));
-        self.whole.retain(|id| keep(id));
-        self.rows.retain(|id| keep(id));
-        self.page_captions.retain(|id| keep(id));
-        self.own_page.retain(|id| keep(id));
+        for list in [
+            &mut self.feature,
+            &mut self.whole,
+            &mut self.rows,
+            &mut self.page_captions,
+            &mut self.own_page,
+        ] {
+            list.retain(|id| keep(id));
+        }
         self.after.retain(|(x, a)| keep(x) && keep(a));
         self.stills.retain(|id, _| keep(id));
         self.retain_grouped(keep);
@@ -777,6 +786,34 @@ mod tests {
         l.set_whole("b".into(), false);
         l.set_still("v".into(), None);
         l.ungroup("a");
+        assert!(l.is_empty());
+    }
+
+    #[test]
+    fn every_book_layout_choice_counts_as_a_mention_and_is_pruned() {
+        type Set = fn(&mut BookLayout, String);
+        let choices: [Set; 8] = [
+            |l, id| l.set_feature(id, true),
+            |l, id| l.set_whole(id, true),
+            |l, id| l.set_row(id, true),
+            |l, id| l.set_page_caption(id, true),
+            |l, id| l.set_own_page(id, true),
+            |l, id| l.set_still(id, Some(1500)),
+            |l, id| l.set_after(id, Some("anchor".into())),
+            |l, id| l.group(vec![id, "other".into()]),
+        ];
+        for (n, set) in choices.into_iter().enumerate() {
+            let mut l = BookLayout::default();
+            set(&mut l, "p".into());
+            assert!(!l.is_empty() && l.mentions("p"), "choice {n}");
+            l.retain_assets(|id| id != "p");
+            assert!(l.is_empty() && !l.mentions("p"), "choice {n}");
+        }
+        // A placement goes with its anchor too.
+        let mut l = BookLayout::default();
+        l.set_after("p".into(), Some("anchor".into()));
+        assert!(l.mentions("anchor"));
+        l.retain_assets(|id| id != "anchor");
         assert!(l.is_empty());
     }
 

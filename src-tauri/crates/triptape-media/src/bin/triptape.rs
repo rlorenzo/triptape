@@ -862,7 +862,8 @@ fn export_cmd(flags: &HashMap<String, String>) {
     let book_approved = flags.get("approved-book").map(|p| {
         let text = std::fs::read_to_string(p)
             .unwrap_or_else(|e| die("approved-book", format!("{p}: {e}")));
-        approved_ids(&text).unwrap_or_else(|| die("approved-book", format!("{p}: not a book.json")))
+        triptape_media::render_book::approved_ids(&text)
+            .unwrap_or_else(|| die("approved-book", format!("{p}: not a book.json")))
     });
     // Hero segments rendered at once (default: cores / 4, memory permitting).
     let jobs = flags.get("jobs").map(|v| match v.parse::<usize>() {
@@ -2159,24 +2160,6 @@ fn learn_cmd(flags: &HashMap<String, String>) {
 /// Photos `pick` copies when `--count` is not given.
 const DEFAULT_PICK_COUNT: usize = 800;
 
-/// The asset ids printed on the pages of a rendered `book.json`; `None`
-/// when the text is not one. The closing page is left out: its automatic
-/// pick is a photo the pages do not print, and approving it would put it on
-/// them (a closing photo that repeats a page's is on that page anyway).
-fn approved_ids(text: &str) -> Option<HashSet<String>> {
-    let book: serde_json::Value = serde_json::from_str(text).ok()?;
-    let ids: HashSet<String> = book
-        .get("pages")?
-        .as_array()?
-        .iter()
-        .filter(|page| page.get("kind").and_then(serde_json::Value::as_str) != Some("closing"))
-        .filter_map(|page| page.get("photos")?.as_array())
-        .flatten()
-        .filter_map(|photo| Some(photo.get("asset_id")?.as_str()?.to_string()))
-        .collect();
-    (!ids.is_empty()).then_some(ids)
-}
-
 /// A file name in `dir` for `src` that no earlier copy took: `IMG_1.HEIC`,
 /// then `IMG_1-2.HEIC`, ... (two source folders can hold the same name).
 #[cfg(test)]
@@ -2387,20 +2370,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_approved_book_lists_the_photos_on_its_pages() {
-        let book = r#"{"pages": [
-            {"page": 1, "photos": [{"asset_id": "a", "file": "A.HEIC"}]},
-            {"page": 2, "kind": "map"},
-            {"page": 3, "kind": "grid", "photos": [{"asset_id": "b"}, {"asset_id": "a"}]},
-            {"page": 4, "kind": "closing", "photos": [{"asset_id": "end"}]}
-        ]}"#;
-        let ids = approved_ids(book).unwrap();
-        assert_eq!(ids, HashSet::from(["a".to_string(), "b".to_string()]));
-        assert!(approved_ids("{}").is_none());
-        assert!(approved_ids("not json").is_none());
-    }
 
     #[test]
     fn music_flag_repeats_and_semicolons() {
