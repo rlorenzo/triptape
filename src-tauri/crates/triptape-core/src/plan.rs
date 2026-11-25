@@ -113,15 +113,17 @@ pub fn places_card_secs(places: usize) -> f64 {
         .clamp(PLACES_CARD_MIN_SECS, PLACES_CARD_MAX_SECS)
 }
 
-/// Longest a caption may stretch its shot.
+/// Longest reading time a caption asks of its shot (see
+/// [`caption_hold_secs`] for the hold, which adds the cue lead-in and the
+/// cut overlap on top).
 pub const CAPTION_MAX_SECS: f64 = 8.0;
 /// Reading time per caption word, on top of [`CAPTION_BASE_SECS`].
 const CAPTION_SECS_PER_WORD: f64 = 0.3;
 /// Time to notice a caption before reading it.
 const CAPTION_BASE_SECS: f64 = 1.5;
 
-/// Seconds a shot must stay on screen for its caption to be read: a
-/// 25-word caption on a 1.6 s Live Photo could not be. `0.0` without one.
+/// Seconds a caption must stay on screen to be read: a 25-word caption on
+/// a 1.6 s Live Photo could not be. `0.0` without one.
 /// Shared by the renderer and the planner's estimate.
 pub fn caption_read_secs(caption: Option<&str>) -> f64 {
     let words = caption.map_or(0, |c| c.split_whitespace().count());
@@ -130,6 +132,26 @@ pub fn caption_read_secs(caption: Option<&str>) -> f64 {
     }
     (CAPTION_BASE_SECS + CAPTION_SECS_PER_WORD * words as f64).min(CAPTION_MAX_SECS)
 }
+
+/// Delay between a segment's start and its caption cue.
+pub const CAPTION_LEAD_IN_SECS: f64 = 0.3;
+/// Longest transition overlap that can cut a caption's cue short at the
+/// segment's end (the 0.8 s fadeblack). Deliberately the worst case for
+/// every shot, not the shot's own cut.
+pub const CAPTION_CUT_OVERLAP_SECS: f64 = 0.8;
+
+/// Seconds to hold a shot so its caption is on screen for the whole of
+/// [`caption_read_secs`]: the read time, plus the cue's lead-in and the
+/// worst-case overlap of the cut out. `0.0` without a caption. Shared by
+/// the renderer and the planner's estimate.
+pub fn caption_hold_secs(caption: Option<&str>) -> f64 {
+    let read = caption_read_secs(caption);
+    if read == 0.0 {
+        return 0.0;
+    }
+    read + CAPTION_LEAD_IN_SECS + CAPTION_CUT_OVERLAP_SECS
+}
+
 /// Overlap of the first cut (circleopen) and the last (circleclose).
 const EST_BOOKEND_OVERLAP_SECS: f64 = 0.7;
 /// Overlaps at chapter breaks and other cuts into or out of a card: the
@@ -870,7 +892,7 @@ pub fn estimate_plan_secs(plan: &Plan, assets: &[Asset]) -> f64 {
         &plan.hero,
         |id| labels[chapter.get(id).copied().unwrap_or(plan.chapters.len())].as_str(),
         |id| pano.get(id).copied(),
-        |id| caption_read_secs(plan.captions.get(id).map(String::as_str)),
+        |id| caption_hold_secs(plan.captions.get(id).map(String::as_str)),
         |id| taken.get(id).copied(),
         cards,
         &plan.collage,
@@ -2013,7 +2035,7 @@ pub fn build_plan_with_length(
         entry_score,
         similar,
         pano_secs_of,
-        |id| caption_read_secs(by_id.get(id).and_then(|a| a.user_caption.as_deref())),
+        |id| caption_hold_secs(by_id.get(id).and_then(|a| a.user_caption.as_deref())),
         |id| by_id.get(id).and_then(|a| a.taken_at),
         budget,
     );
@@ -3437,7 +3459,7 @@ mod tests {
             &plan.hero,
             |id| clusters.get(id).map_or(UNGROUPED, String::as_str),
             |_| None,
-            |id| caption_read_secs(plan.captions.get(id).map(String::as_str)),
+            |id| caption_hold_secs(plan.captions.get(id).map(String::as_str)),
             |_| Some(0),
             HeroCards {
                 route: !plan.map_polyline.is_empty(),
@@ -3752,7 +3774,7 @@ mod tests {
                 &entries,
                 |_| "X",
                 |_| None,
-                |id| caption_read_secs(caps.get(id).copied()),
+                |id| caption_hold_secs(caps.get(id).copied()),
                 |_| Some(0),
                 bare,
             )
