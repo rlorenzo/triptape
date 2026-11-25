@@ -408,6 +408,17 @@ impl BookLayout {
         ]
     }
 
+    /// [`Self::listed`], to change: the same lists.
+    fn listed_mut(&mut self) -> [&mut Vec<String>; 5] {
+        [
+            &mut self.feature,
+            &mut self.whole,
+            &mut self.rows,
+            &mut self.page_captions,
+            &mut self.own_page,
+        ]
+    }
+
     pub fn is_empty(&self) -> bool {
         self.listed().iter().all(|list| list.is_empty())
             && self.stills.is_empty()
@@ -477,8 +488,9 @@ impl BookLayout {
             }
         }
         self.retain_grouped(|id| !unique.iter().any(|a| a == id));
-        self.groups.push(unique);
-        self.groups.retain(|g| g.len() >= 2);
+        if unique.len() >= 2 {
+            self.groups.push(unique);
+        }
     }
 
     /// Take a photo out of its page group.
@@ -489,13 +501,7 @@ impl BookLayout {
     /// Keep only the asset ids `keep` accepts; groups left with fewer
     /// than two photos go.
     pub fn retain_assets(&mut self, keep: impl Fn(&str) -> bool) {
-        for list in [
-            &mut self.feature,
-            &mut self.whole,
-            &mut self.rows,
-            &mut self.page_captions,
-            &mut self.own_page,
-        ] {
+        for list in self.listed_mut() {
             list.retain(|id| keep(id));
         }
         self.after.retain(|(x, a)| keep(x) && keep(a));

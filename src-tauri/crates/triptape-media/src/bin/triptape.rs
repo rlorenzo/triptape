@@ -1656,6 +1656,10 @@ fn edit_cmd(args: &[String]) {
         .iter()
         .map(|(x, y)| (resolve_one(x), resolve_one(y)))
         .collect();
+    // Checked before any edit prints as applied.
+    if book_afters.iter().any(|(x, y)| x.id == y.id) {
+        die("edit", "a photo can't follow itself");
+    }
     let unbook_afters = resolve(&a.unbook_after);
     let stills: Vec<(&Asset, f64)> = a.still.iter().map(|(q, t)| (resolve_one(q), *t)).collect();
     if let Some((asset, _)) = stills.iter().find(|(x, _)| x.kind != AssetKind::Video) {
@@ -1690,12 +1694,28 @@ fn edit_cmd(args: &[String]) {
             || books.iter().any(|b| b.id == x.id)
             || (ep.edits.book.contains(&x.id) && !unbooks.iter().any(|u| u.id == x.id))
     };
-    let mut laid_out = features
+    // Each on/off layout flag, with the photos it turns on and off.
+    type Set = fn(&mut BookLayout, String, bool);
+    let flags: [(&str, &[&Asset], &[&Asset], Set); 5] = [
+        ("feature", &features, &unfeatures, BookLayout::set_feature),
+        ("whole", &wholes, &unwholes, BookLayout::set_whole),
+        ("row", &rows, &unrows, BookLayout::set_row),
+        (
+            "page-caption",
+            &page_captions,
+            &unpage_captions,
+            BookLayout::set_page_caption,
+        ),
+        (
+            "own-page",
+            &own_pages,
+            &unown_pages,
+            BookLayout::set_own_page,
+        ),
+    ];
+    let mut laid_out = flags
         .iter()
-        .chain(&wholes)
-        .chain(&rows)
-        .chain(&page_captions)
-        .chain(&own_pages)
+        .flat_map(|(_, on, ..)| on.iter())
         .chain(book_afters.iter().flat_map(|(x, y)| [x, y]))
         .chain(stills.iter().map(|(x, _)| x))
         .chain(groups.iter().flatten());
@@ -1725,16 +1745,9 @@ fn edit_cmd(args: &[String]) {
         || !unbooks.is_empty()
         || closing.is_some()
         || a.no_closing
-        || !features.is_empty()
-        || !unfeatures.is_empty()
-        || !wholes.is_empty()
-        || !unwholes.is_empty()
-        || !rows.is_empty()
-        || !unrows.is_empty()
-        || !page_captions.is_empty()
-        || !unpage_captions.is_empty()
-        || !own_pages.is_empty()
-        || !unown_pages.is_empty()
+        || flags
+            .iter()
+            .any(|(_, on, off, _)| !on.is_empty() || !off.is_empty())
         || !book_afters.is_empty()
         || !unbook_afters.is_empty()
         || !stills.is_empty()
@@ -1776,25 +1789,7 @@ fn edit_cmd(args: &[String]) {
     }
     {
         let layout = &mut edits.book_layout;
-        // Each on/off layout flag: un- first, so both in one call leave it on.
-        type Set = fn(&mut BookLayout, String, bool);
-        let flags: [(&str, &[&Asset], &[&Asset], Set); 5] = [
-            ("feature", &features, &unfeatures, BookLayout::set_feature),
-            ("whole", &wholes, &unwholes, BookLayout::set_whole),
-            ("row", &rows, &unrows, BookLayout::set_row),
-            (
-                "page-caption",
-                &page_captions,
-                &unpage_captions,
-                BookLayout::set_page_caption,
-            ),
-            (
-                "own-page",
-                &own_pages,
-                &unown_pages,
-                BookLayout::set_own_page,
-            ),
-        ];
+        // Un- first, so both in one call leave the flag on.
         for (name, on, off, set) in flags {
             for asset in off {
                 set(layout, asset.id.clone(), false);
@@ -1810,9 +1805,6 @@ fn edit_cmd(args: &[String]) {
             println!("unbook-after: {}", asset_label(asset));
         }
         for (x, y) in &book_afters {
-            if x.id == y.id {
-                die("edit", "a photo can't follow itself");
-            }
             layout.set_after(x.id.clone(), Some(y.id.clone()));
             println!("book-after: {} after {}", asset_label(x), asset_label(y));
         }

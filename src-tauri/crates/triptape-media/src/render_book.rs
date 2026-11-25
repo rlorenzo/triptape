@@ -1616,37 +1616,13 @@ pub fn render_book(
     // so turning the cover never shows the same shot again straight away.
     let opening: Vec<usize> = order.iter().take(COVER_SKIPS_FIRST).copied().collect();
     let back_cover_jpg = out_dir.join("back-cover.jpg");
-    let (cover_tiles, cover, back_cover) = match &opts.front_cover_image {
-        // The owner's picture on the front, and on the back too when they
-        // gave one.
-        Some(front) if opts.back_cover_image.is_some() => {
-            let cover = image_cover(front, (tw, th), &out_dir.join("cover.jpg"), &mut fallbacks);
-            let back = make_back_cover(opts, (tw, th), &back_cover_jpg, &mut fallbacks);
-            (vec![], cover, back)
-        }
-        // The owner's picture on the front; the back shows the places
-        // themselves, without the family: shots the pages do not print.
-        Some(front) => {
-            let cover = image_cover(front, (tw, th), &out_dir.join("cover.jpg"), &mut fallbacks);
-            // The owner's cover pins first (chosen sights, printed or not),
-            // then automatic picks from shots the pages do not print.
-            let printed: HashSet<&str> = photos.iter().map(|p| p.asset_id.as_str()).collect();
-            let unprinted: Vec<BookPhoto> = viable
-                .iter()
-                .filter(|p| p.cover_focus.is_some() || !printed.contains(p.asset_id.as_str()))
-                .cloned()
-                .collect();
-            let sights = sight_picks(&unprinted);
-            let back = draw_sights_mosaic(
-                &unprinted,
-                &sights,
-                (tw, th),
-                &fit,
-                &back_cover_jpg,
-                &mut fallbacks,
-            );
-            (vec![], cover, back)
-        }
+    let cover_jpg = out_dir.join("cover.jpg");
+    let (cover_tiles, cover) = match &opts.front_cover_image {
+        // The owner's picture on the front.
+        Some(front) => (
+            vec![],
+            image_cover(front, (tw, th), &cover_jpg, &mut fallbacks),
+        ),
         None => {
             let tiles = cover_picks(photos, &opening);
             let cover = draw_cover_collage(
@@ -1655,12 +1631,33 @@ pub fn render_book(
                 (tw, th),
                 opts,
                 &fit,
-                &out_dir.join("cover.jpg"),
+                &cover_jpg,
                 &mut fallbacks,
             );
-            let back = make_back_cover(opts, (tw, th), &back_cover_jpg, &mut fallbacks);
-            (tiles, cover, back)
+            (tiles, cover)
         }
+    };
+    let back_cover = if opts.front_cover_image.is_some() && opts.back_cover_image.is_none() {
+        // Under the owner's front cover and no back of their own, the back
+        // shows the places themselves, without the family: the owner's
+        // cover pins first (chosen sights, printed or not), then automatic
+        // picks from shots the pages do not print.
+        let printed: HashSet<&str> = photos.iter().map(|p| p.asset_id.as_str()).collect();
+        let unprinted: Vec<&BookPhoto> = viable
+            .iter()
+            .filter(|p| p.cover_focus.is_some() || !printed.contains(p.asset_id.as_str()))
+            .collect();
+        let sights = sight_picks(&unprinted);
+        draw_sights_mosaic(
+            &unprinted,
+            &sights,
+            (tw, th),
+            &fit,
+            &back_cover_jpg,
+            &mut fallbacks,
+        )
+    } else {
+        make_back_cover(opts, (tw, th), &back_cover_jpg, &mut fallbacks)
     };
     let covers = (cover.as_deref(), back_cover.as_deref());
     let mut cursor = 0usize;
@@ -2209,13 +2206,16 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
         }
     };
 
-    // The heading over `places`: none said twice, ranked, at most
+    // The heading over `places` as ordered: none said twice, at most
     // [`MAX_HEADING_PLACES`].
-    let ranked = |mut places: Vec<&str>| {
+    let heading = |mut places: Vec<&str>| {
         drop_contained(&mut places);
-        places.sort_by_key(|pl| rank(pl));
         places.truncate(MAX_HEADING_PLACES);
         format!("{head} — {}", places.join(" \u{b7} "))
+    };
+    let ranked = |mut places: Vec<&str>| {
+        places.sort_by_key(|pl| rank(pl));
+        heading(places)
     };
 
     let mut seen: Vec<&str> = vec![];
@@ -2249,9 +2249,7 @@ fn places_in_time_order(title: &str, slot: &[&BookPhoto]) -> String {
         // The ship still leads: a sea-day title ("Carnival Luminosa ·
         // Fukuoka") over a page shot on board stays ship first.
         out.sort_by_key(|pl| rank(pl) != 0);
-        drop_contained(&mut out);
-        out.truncate(MAX_HEADING_PLACES);
-        return format!("{head} — {}", out.join(" \u{b7} "));
+        return heading(out);
     }
     if !seen.contains(&place) {
         if !slot.first().is_some_and(|p| p.aboard) {
@@ -2624,15 +2622,6 @@ fn fit_photo_focused(
         let strip_px = (reserve.clamp(0.0, 1.0) * f64::from(th)).round() as u32;
         return contain_on_page(&src, tw, th, strip_px);
     }
-    let faces = match fit.faces {
-        Some(f) => fit
-            .found
-            .borrow_mut()
-            .entry(p.asset_id.clone())
-            .or_insert_with(|| (f.0)(&src))
-            .clone(),
-        None => vec![],
-    };
     let (sw, sh) = (
         f64::from(src.width().max(1)),
         f64::from(src.height().max(1)),
@@ -2644,7 +2633,19 @@ fn fit_photo_focused(
             focus_window(sw, sh, tw_f, th_f, (f64::from(fx), f64::from(fy))),
             false,
         ),
-        None => frame_photo(p, (sw, sh), (tw_f, th_f), &faces, reserve),
+        None => {
+            // Only a photo left to the detector pays for a detection.
+            let faces = match fit.faces {
+                Some(f) => fit
+                    .found
+                    .borrow_mut()
+                    .entry(p.asset_id.clone())
+                    .or_insert_with(|| (f.0)(&src))
+                    .clone(),
+                None => vec![],
+            };
+            frame_photo(p, (sw, sh), (tw_f, th_f), &faces, reserve)
+        }
     };
     // Shown whole only when that still fills most of the cell: a 4:3 photo
     // pillarboxed in a wide strip leaves black voids worse than a crop.
@@ -3688,7 +3689,7 @@ const SIGHT_TILES: usize = 16;
 /// one in them (no tagged person, no face), not panoramas or screenshots,
 /// one per place the pins do not already show, best-scored first. A place
 /// is the owner's named place, else the photo's place label.
-fn sight_picks(photos: &[BookPhoto]) -> Vec<usize> {
+fn sight_picks(photos: &[&BookPhoto]) -> Vec<usize> {
     let place_of = |p: &BookPhoto| p.area.clone().or_else(|| p.place.clone());
     // The owner's chosen sights (cover pins) fill the mosaic first.
     let mut pinned: Vec<usize> = (0..photos.len())
@@ -3696,10 +3697,8 @@ fn sight_picks(photos: &[BookPhoto]) -> Vec<usize> {
         .collect();
     pinned.sort_by_key(|&i| photos[i].taken_at);
     pinned.truncate(SIGHT_TILES);
-    let pinned_places: HashSet<String> = pinned
-        .iter()
-        .filter_map(|&i| place_of(&photos[i]))
-        .collect();
+    let pinned_places: HashSet<String> =
+        pinned.iter().filter_map(|&i| place_of(photos[i])).collect();
     let nobody = |p: &BookPhoto| {
         p.tagged_people == 0 && p.people == 0 && p.family.is_empty() && p.face_size < 0.01
     };
@@ -3710,7 +3709,7 @@ fn sight_picks(photos: &[BookPhoto]) -> Vec<usize> {
             && !p.is_png()
     };
     let mut best: HashMap<String, usize> = HashMap::new();
-    for (i, p) in photos.iter().enumerate() {
+    for (i, p) in photos.iter().copied().enumerate() {
         if p.cover_focus.is_some() || p.still_ms.is_some() || !nobody(p) || !shaped(p) {
             continue;
         }
@@ -3745,7 +3744,7 @@ fn sight_picks(photos: &[BookPhoto]) -> Vec<usize> {
 /// The back cover as a full page of square sight tiles, no text. `None`
 /// (with a note) when there are fewer than four sights to show.
 fn draw_sights_mosaic(
-    photos: &[BookPhoto],
+    photos: &[&BookPhoto],
     picks: &[usize],
     (tw, th): (u32, u32),
     fit: &Fit,
@@ -3766,12 +3765,13 @@ fn draw_sights_mosaic(
     };
     let n = (cols * cols) as usize;
     let gap = 14u32;
-    let tile_w = (tw - gap * (cols + 1)) / cols;
-    let tile_h = (th - gap * (cols + 1)) / cols;
+    // At least a pixel a tile, however small the canvas.
+    let tile_w = (tw.saturating_sub(gap * (cols + 1)) / cols).max(1);
+    let tile_h = (th.saturating_sub(gap * (cols + 1)) / cols).max(1);
     let mut canvas = solid(tw, th, Rgb([18, 20, 26]));
     for (k, &pi) in picks.iter().take(n).enumerate() {
         let (cx, cy) = ((k as u32) % cols, (k as u32) / cols);
-        let p = &photos[pi];
+        let p = photos[pi];
         let focus = cover_tile_focus(p);
         let tile = fit_photo_focused(p, focus, (tile_w, tile_h), 0.0, false, fit, fallbacks);
         image::imageops::replace(
@@ -3781,13 +3781,7 @@ fn draw_sights_mosaic(
             (gap + cy * (tile_h + gap)) as i64,
         );
     }
-    match save_jpg(&canvas, out) {
-        Ok(()) => Some(out.to_path_buf()),
-        Err(e) => {
-            fallbacks.push(format!("back cover sights failed ({e})"));
-            None
-        }
-    }
+    save_cover(Ok(canvas), out, "back cover sights", fallbacks)
 }
 
 /// Build `back-cover.jpg` at `size`: the owner's own picture when given,
@@ -4206,6 +4200,10 @@ mod tests {
     }
 
     /// Book options for a P1 test book named `Test`, run with `typst_bin`.
+    fn refs(photos: &[BookPhoto]) -> Vec<&BookPhoto> {
+        photos.iter().collect()
+    }
+
     fn test_opts(typst_bin: &str) -> BookOptions {
         BookOptions {
             preset: BookPreset::P1,
@@ -4373,12 +4371,12 @@ mod tests {
             shot("Temple", 0, 4000, 0.4, 5),
         ];
         // The better Buddha close-up, the temple; no family shot, no panorama.
-        assert_eq!(sight_picks(&photos), [1, 4]);
+        assert_eq!(sight_picks(&refs(&photos)), [1, 4]);
         // A cover pin leads (family shot or not) and stands for its place;
         // automatic sights fill the tiles left over.
         let mut pinned = photos;
         pinned[2].cover_focus = Some(0.5);
-        assert_eq!(sight_picks(&pinned), [2, 4]);
+        assert_eq!(sight_picks(&refs(&pinned)), [2, 4]);
     }
 
     #[test]
@@ -4439,11 +4437,11 @@ mod tests {
             shot("E", 0.8, 5),
             shot("F", 0.9, 6),
         ];
-        assert_eq!(sight_picks(&photos), [2, 3, 4, 5]);
+        assert_eq!(sight_picks(&refs(&photos)), [2, 3, 4, 5]);
         // A late cover pin keeps its tile; the weakest extra gives way.
         photos[0].cover_focus = Some(0.5);
         photos[5].cover_focus = Some(0.5);
-        assert_eq!(sight_picks(&photos), [0, 3, 4, 5]);
+        assert_eq!(sight_picks(&refs(&photos)), [0, 3, 4, 5]);
     }
 
     #[test]
@@ -4467,7 +4465,7 @@ mod tests {
             ..BookPhoto::blank()
         });
         let want: Vec<usize> = (2..18).rev().collect();
-        assert_eq!(sight_picks(&photos), want);
+        assert_eq!(sight_picks(&refs(&photos)), want);
     }
 
     #[test]
@@ -4481,9 +4479,15 @@ mod tests {
         };
         let photos = vec![BookPhoto::blank(); 3];
         let out = dir.path().join("back-cover.jpg");
-        assert!(
-            draw_sights_mosaic(&photos, &[0, 1, 2], (800, 600), &fit, &out, &mut notes).is_none()
-        );
+        assert!(draw_sights_mosaic(
+            &refs(&photos),
+            &[0, 1, 2],
+            (800, 600),
+            &fit,
+            &out,
+            &mut notes
+        )
+        .is_none());
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("3 sight(s)"), "{notes:?}");
     }
@@ -5415,6 +5419,9 @@ mod tests {
             found: Default::default(),
         };
         let mut fb = vec![];
+        // The owner's focus places the crop: no detector run.
+        fit_photo_focused(&p, Some((0.5, 0.5)), (10, 10), 0.0, false, &fit, &mut fb);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         // A spread's two halves and a cover tile: one detector run.
         for (w, h) in [(40, 20), (40, 20), (10, 10)] {
             let img = fit_photo(&p, w, h, &fit, &mut fb);
