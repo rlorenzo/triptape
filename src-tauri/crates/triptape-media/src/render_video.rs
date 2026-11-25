@@ -1258,6 +1258,14 @@ pub fn render_hero_video(
             .as_ref()
             .filter(|_| opts.map_style == MapStyle::Parchment)
             .map_or_else(Vec::new, |j| j.hops());
+        let hops = {
+            let shots: Vec<_> = selected
+                .iter()
+                .map(|r| r.taken_at.map(|t| (t, r.tz_offset_secs)))
+                .collect();
+            let gps: Vec<_> = selected.iter().map(|r| r.gps).collect();
+            triptape_core::journey::with_moves(hops, &shots, &gps)
+        };
         let stage_of = |r: &ResolvedEntry| {
             triptape_core::journey::hops_reached(
                 &hops,
