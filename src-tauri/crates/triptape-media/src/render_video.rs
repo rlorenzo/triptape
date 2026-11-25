@@ -2194,6 +2194,11 @@ impl SegmentLimits {
 /// shot can change the shot after it, and a rotated group can occasionally
 /// land on the same variant as a neighbour that was itself rotated (about
 /// 1 in 16 neighbours instead of 1 in 4, versus never with position).
+///
+/// Back-to-back panoramas are the exception: they must pan opposite ways
+/// ([`pano_reversed`]), which only a comparison with the previous panorama's
+/// *final* variant can guarantee. That chain is as long as the run of
+/// panoramas and no longer; the first of a run keeps its hashed variant.
 fn glide_variants(groups: &[Vec<&ResolvedEntry>]) -> Vec<usize> {
     let hashed: Vec<usize> = groups
         .iter()
@@ -2206,21 +2211,24 @@ fn glide_variants(groups: &[Vec<&ResolvedEntry>]) -> Vec<usize> {
         } else {
             h
         };
-        // A panorama pans left-to-right on an even variant and right-to-left
-        // on an odd one. Back-to-back panoramas alternate: if this one would
-        // pan the same way as the panorama before it, take the next variant
-        // (GLIDE_VARIANTS is even, so +1 always flips the parity). The first
-        // panorama of a run keeps its hashed variant.
+        // Would pan the same way as the panorama before it: take the next
+        // variant (GLIDE_VARIANTS is even, so +1 always flips the direction).
         if i > 0
             && is_pano_group(&groups[i])
             && is_pano_group(&groups[i - 1])
-            && v % 2 == out[i - 1] % 2
+            && pano_reversed(v) == pano_reversed(out[i - 1])
         {
             v = (v + 1) % ffmpeg::GLIDE_VARIANTS;
         }
         out.push(v);
     }
     out
+}
+
+/// Whether a panorama on this motion variant pans in reverse: the one place
+/// that maps a variant to a pan direction.
+fn pano_reversed(variant: usize) -> bool {
+    variant % 2 == 1
 }
 
 /// A group that renders as a panorama pan: one still whose (framed) aspect
@@ -3478,7 +3486,7 @@ fn pano_graph(
             res.height(),
             aspect,
             coverage,
-            variant % 2 == 1
+            pano_reversed(variant)
         )
     )
 }
@@ -7238,7 +7246,7 @@ mod tests {
         let v = glide_variants(&groups);
         assert_eq!(v[0], stable_variant(&ents[0].entry));
         for w in v.windows(2) {
-            assert_ne!(w[0] % 2, w[1] % 2, "{v:?}");
+            assert_ne!(pano_reversed(w[0]), pano_reversed(w[1]), "{v:?}");
             assert!(w[1] < ffmpeg::GLIDE_VARIANTS);
         }
         // A non-panorama after a panorama only gets the equal-neighbour
