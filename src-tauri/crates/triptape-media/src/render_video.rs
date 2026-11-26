@@ -19,7 +19,7 @@ use triptape_core::plan::{
     pano_motion, places_card_secs, MAX_CLIP_SECS, MAX_COLLAGE, MIN_SEGMENT_SECS,
 };
 use triptape_core::types::{
-    frame_aspect, Chapter, CollageEdits, Frame, Plan, PlanEntry, Rendition,
+    frame_aspect, frame_px, Chapter, CollageEdits, Frame, Plan, PlanEntry, Rendition,
 };
 
 /// Crossfade applied at the cut *into* a segment (PLAN.md Sec 9, 6-pack).
@@ -3264,13 +3264,8 @@ fn compose_collage(
 
 /// The part of `img` inside the owner's framing rectangle (percent of the
 /// image from its top left), at least one pixel each way.
-fn crop_to_frame(img: &image::RgbImage, f: Frame) -> image::RgbImage {
-    let (iw, ih) = (img.width().max(1), img.height().max(1));
-    let at = |len: u32, pct: u8| ((u64::from(len) * u64::from(pct) + 50) / 100) as u32;
-    let x = at(iw, f.0).min(iw - 1);
-    let y = at(ih, f.1).min(ih - 1);
-    let w = at(iw, f.2).clamp(1, iw - x);
-    let h = at(ih, f.3).clamp(1, ih - y);
+pub(crate) fn crop_to_frame(img: &image::RgbImage, f: Frame) -> image::RgbImage {
+    let (x, y, w, h) = frame_px(img.width(), img.height(), f);
     image::imageops::crop_imm(img, x, y, w, h).to_image()
 }
 

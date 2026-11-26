@@ -1151,7 +1151,7 @@ struct EditArgs {
     /// Crop focus: (asset, x percent, y percent).
     crop: Vec<(String, u8, u8)>,
     uncrop: Vec<String>,
-    /// Film framing: (asset, x, y, w, h) in percent of the source.
+    /// Framing for the film and the book: (asset, x, y, w, h) in percent of the source.
     frame: Vec<(String, Frame)>,
     unframe: Vec<String>,
     /// Photos pinned into (or out of) the book.
@@ -1469,7 +1469,7 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
     for (id, (x, y)) in &edits.crop {
         println!("  {} at {x}%, {y}%", show(id));
     }
-    println!("film framing: {}", edits.frame.len());
+    println!("framing (film and book): {}", edits.frame.len());
     for (id, (x, y, w, h)) in &edits.frame {
         println!("  {} uses {w}% x {h}% from {x}%, {y}%", show(id));
     }

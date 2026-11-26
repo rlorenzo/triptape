@@ -1139,7 +1139,7 @@ fn export_inner(
             let itin = opts.itinerary.as_ref();
             let spot =
                 triptape_core::places::spot_with_fix(itin, a, borrowed.get(a.id.as_str()).copied());
-            book_photos.push(BookPhoto {
+            let photo = BookPhoto {
                 asset_id: a.id.clone(),
                 path: a.path.clone(),
                 width: w,
@@ -1189,6 +1189,7 @@ fn export_inner(
                     .get(&a.id)
                     .map(|&(x, y)| (f32::from(x) / 100.0, f32::from(y) / 100.0)),
                 still_ms: layout.stills.get(&a.id).copied(),
+                frame: None,
                 feature: layout.feature.contains(&a.id),
                 whole: layout.whole.contains(&a.id),
                 row: layout.rows.contains(&a.id),
@@ -1197,7 +1198,9 @@ fn export_inner(
                 place_is_city: book_places
                     .get(&a.id)
                     .is_some_and(|pl| cities.contains(pl.as_str())),
-            });
+            };
+            // The owner's framing (`--frame`): the page sees only that part.
+            book_photos.push(photo.framed(plan.frame.get(&a.id).copied()));
         }
         // A photo and the owner's `_edited` version of it are one photo:
         // the edit stays.

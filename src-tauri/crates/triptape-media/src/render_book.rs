@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use triptape_ai_local::FaceBox;
 use triptape_core::plan::SAME_MOMENT_SECS;
+use triptape_core::types::{frame_px, valid_frame, Frame};
 
 /// Book preset (PLAN.md Sec 11: only two in v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +139,11 @@ pub struct BookPhoto {
     pub crop_focus: Option<(f32, f32)>,
     /// A video shown as one frame, this many milliseconds in.
     pub still_ms: Option<u32>,
+    /// The owner's framing (`--frame`): the page prints only this part of
+    /// the photo, as if it were the whole picture. `width`, `height`,
+    /// `family`, `crop_focus` and `cover_focus` all describe the framed
+    /// picture.
+    pub frame: Option<Frame>,
     /// The owner wants this photo in the biggest cell on its page.
     pub feature: bool,
     /// The owner wants this photo never cropped.
@@ -170,6 +176,41 @@ impl BookPhoto {
         self.keep && !(self.pinned && self.caption == self.place)
     }
 
+    /// The photo cut to the owner's framing `frame` (`--frame`), as the
+    /// page will see it: its size, the family's boxes (those left wholly
+    /// outside are dropped), the owner's crop point and cover focus and the largest
+    /// face's share of the shorter side are all of the framed picture.
+    /// Unchanged without a usable frame (see [`valid_frame`]).
+    pub fn framed(self, frame: Option<Frame>) -> Self {
+        let Some(f) = frame.filter(|&f| valid_frame(f)) else {
+            return self;
+        };
+        let (_, _, w, h) = frame_px(self.width, self.height, f);
+        let grow = self.width.min(self.height).max(1) as f32 / w.min(h).max(1) as f32;
+        Self {
+            width: w,
+            height: h,
+            family: self
+                .family
+                .into_iter()
+                .filter_map(|k| reframe_box(&k.b, f).map(|b| KnownBox { b, ..k }))
+                .collect(),
+            // A centred cover pin (0.5) is no focus at all (see
+            // `cover_tile_focus`) and stays one.
+            cover_focus: self.cover_focus.map(|fx| {
+                if fx == 0.5 {
+                    fx
+                } else {
+                    reframe_point((fx, 0.5), f).0
+                }
+            }),
+            crop_focus: self.crop_focus.map(|p| reframe_point(p, f)),
+            face_size: (self.face_size * grow).min(1.0),
+            frame: Some(f),
+            ..self
+        }
+    }
+
     /// A 0x0 neutral-score photo with nothing set, for tests to fill in
     /// with struct-update syntax.
     #[cfg(test)]
@@ -197,6 +238,7 @@ impl BookPhoto {
             cover_focus: None,
             crop_focus: None,
             still_ms: None,
+            frame: None,
             feature: false,
             whole: false,
             row: false,
@@ -2601,29 +2643,64 @@ fn open_oriented(path: &Path) -> image::ImageResult<image::DynamicImage> {
 }
 
 fn load(photo: &BookPhoto, ffmpeg_bin: &str, fallbacks: &mut Vec<String>) -> RgbImage {
-    if let Some(ms) = photo.still_ms {
-        return video_frame(ffmpeg_bin, &photo.path, ms).unwrap_or_else(|| {
-            fallbacks.push(format!(
+    let decoded = if let Some(ms) = photo.still_ms {
+        video_frame(ffmpeg_bin, &photo.path, ms).ok_or_else(|| {
+            format!(
                 "{} frame at {:.1}s unreadable; gray placeholder",
                 photo.display_name(),
                 f64::from(ms) / 1000.0
-            ));
-            solid(800, 600, Rgb([90, 90, 95]))
-        });
-    }
-    match open_oriented(&photo.path) {
-        Ok(d) => d.to_rgb8(),
-        Err(e) => match decode_via_ffmpeg(ffmpeg_bin, &photo.path) {
-            Some(img) => img,
-            None => {
-                fallbacks.push(format!(
-                    "{} unreadable ({e}); gray placeholder",
-                    photo.asset_id
-                ));
-                solid(800, 600, Rgb([90, 90, 95]))
-            }
+            )
+        })
+    } else {
+        match open_oriented(&photo.path) {
+            Ok(d) => Ok(d.to_rgb8()),
+            Err(e) => decode_via_ffmpeg(ffmpeg_bin, &photo.path)
+                .ok_or_else(|| format!("{} unreadable ({e}); gray placeholder", photo.asset_id)),
+        }
+    };
+    match decoded {
+        // The owner's framing: the rest of the photo never reaches the page.
+        Ok(img) => match photo.frame {
+            Some(f) => crate::render_video::crop_to_frame(&img, f),
+            None => img,
         },
+        Err(note) => {
+            fallbacks.push(note);
+            solid(800, 600, Rgb([90, 90, 95]))
+        }
     }
+}
+
+/// A box (fractions of the whole picture) in the framed picture's terms,
+/// clipped to the frame; `None` when none of it is inside.
+fn reframe_box(b: &FaceBox, f: Frame) -> Option<FaceBox> {
+    let (fx, fy, fw, fh) = frame_fractions(f);
+    let x0 = ((b.x - fx) / fw).max(0.0);
+    let y0 = ((b.y - fy) / fh).max(0.0);
+    let x1 = ((b.x + b.w - fx) / fw).min(1.0);
+    let y1 = ((b.y + b.h - fy) / fh).min(1.0);
+    (x1 > x0 && y1 > y0).then_some(FaceBox {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    })
+}
+
+/// A point (fractions of the whole picture) in the framed picture's terms,
+/// held inside it.
+fn reframe_point((x, y): (f32, f32), f: Frame) -> (f32, f32) {
+    let (fx, fy, fw, fh) = frame_fractions(f);
+    (
+        ((x - fx) / fw).clamp(0.0, 1.0),
+        ((y - fy) / fh).clamp(0.0, 1.0),
+    )
+}
+
+/// `f` (a valid frame) as fractions of the picture: (x, y, w, h).
+fn frame_fractions((x, y, w, h): Frame) -> (f32, f32, f32, f32) {
+    let frac = |v: u8| f32::from(v) / 100.0;
+    (frac(x), frac(y), frac(w), frac(h))
 }
 
 /// One frame of the video at `path`, `ms` milliseconds in, upright (FFmpeg
@@ -4231,6 +4308,124 @@ fn guide_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn family_boxes_and_the_crop_point_move_into_the_frame() {
+        let f = (25, 0, 50, 100);
+        let inside = FaceBox {
+            x: 0.4,
+            y: 0.2,
+            w: 0.1,
+            h: 0.1,
+        };
+        let b = reframe_box(&inside, f).unwrap();
+        assert!((b.x - 0.3).abs() < 1e-6 && (b.w - 0.2).abs() < 1e-6);
+        assert!((b.y - 0.2).abs() < 1e-6 && (b.h - 0.1).abs() < 1e-6);
+        // Half out: clipped at the frame's edge.
+        let straddling = FaceBox {
+            x: 0.7,
+            y: 0.5,
+            w: 0.1,
+            h: 0.1,
+        };
+        let c = reframe_box(&straddling, f).unwrap();
+        assert!((c.x - 0.9).abs() < 1e-6 && (c.w - 0.1).abs() < 1e-6);
+        // Wholly out: gone.
+        assert_eq!(
+            reframe_box(
+                &FaceBox {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.2,
+                    h: 0.2
+                },
+                f
+            ),
+            None
+        );
+        let (x, y) = reframe_point((0.5, 0.3), f);
+        assert!((x - 0.5).abs() < 1e-6 && (y - 0.3).abs() < 1e-6);
+        // A point outside the frame is held at its edge.
+        assert_eq!(reframe_point((0.1, 0.3), f).0, 0.0);
+    }
+
+    #[test]
+    fn a_framed_photo_lays_out_as_its_frame() {
+        let photo = BookPhoto {
+            width: 4000,
+            height: 3000,
+            face_size: 0.1,
+            crop_focus: Some((0.5, 0.5)),
+            family: vec![
+                KnownBox {
+                    b: FaceBox {
+                        x: 0.45,
+                        y: 0.4,
+                        w: 0.1,
+                        h: 0.1,
+                    },
+                    body: false,
+                },
+                KnownBox {
+                    b: FaceBox {
+                        x: 0.05,
+                        y: 0.4,
+                        w: 0.1,
+                        h: 0.1,
+                    },
+                    body: false,
+                },
+            ],
+            ..BookPhoto::blank()
+        };
+        let same = photo.clone().framed(None);
+        assert_eq!((same.width, same.height, same.frame), (4000, 3000, None));
+        assert_eq!(same.family.len(), 2);
+        // A rectangle that is no framing (empty, or past the edge) is none.
+        let unusable = photo.clone().framed(Some((80, 0, 50, 0)));
+        assert_eq!((unusable.width, unusable.frame), (4000, None));
+        // The cover tile's focus is of the framed picture too; a centred
+        // pin (no focus) stays one.
+        let cover = |fx| BookPhoto {
+            cover_focus: Some(fx),
+            ..photo.clone()
+        };
+        let off = cover(0.7).framed(Some((25, 0, 50, 100)));
+        assert!((off.cover_focus.unwrap() - 0.9).abs() < 1e-6);
+        let centred = cover(0.5).framed(Some((0, 0, 50, 100)));
+        assert_eq!(centred.cover_focus, Some(0.5));
+        let framed = photo.framed(Some((25, 0, 50, 100)));
+        // Landscape cut to a portrait half: lays out (and checks dpi) as one.
+        assert_eq!((framed.width, framed.height), (2000, 3000));
+        assert_eq!(framed.frame, Some((25, 0, 50, 100)));
+        // The stranger at the far left is out of the picture.
+        assert_eq!(framed.family.len(), 1);
+        assert!((framed.family[0].b.x - 0.4).abs() < 1e-6);
+        assert_eq!(framed.crop_focus, Some((0.5, 0.5)));
+        // The same face is a bigger share of the narrower picture.
+        assert!((framed.face_size - 0.15).abs() < 1e-6);
+    }
+
+    #[test]
+    fn load_prints_only_the_owner_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.png");
+        let mut img = RgbImage::from_pixel(10, 10, Rgb([0, 0, 0]));
+        img.put_pixel(6, 3, Rgb([255, 0, 0]));
+        img.save(&path).unwrap();
+        let photo = BookPhoto {
+            path,
+            width: 10,
+            height: 10,
+            ..BookPhoto::blank()
+        }
+        .framed(Some((50, 20, 50, 50)));
+        let mut notes = vec![];
+        let out = load(&photo, "ffmpeg", &mut notes);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(out.dimensions(), (5, 5));
+        assert_eq!(*out.get_pixel(1, 1), Rgb([255, 0, 0]));
+    }
 
     #[test]
     fn an_approved_book_lists_the_photos_on_its_pages() {

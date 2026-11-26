@@ -1266,7 +1266,7 @@ pub struct PlanEdits {
     /// Per-photo crop focus (see [`crate::types::Plan::crop`]).
     #[serde(default)]
     pub crop: BTreeMap<String, (u8, u8)>,
-    /// Per-photo film framing rectangle (see [`crate::types::Plan::frame`]).
+    /// Per-photo framing rectangle, for the film and the book (see [`crate::types::Plan::frame`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub frame: BTreeMap<String, Frame>,
     /// Photos pinned into the book (see [`crate::types::Plan::book`]).
@@ -1319,7 +1319,7 @@ impl PlanEdits {
         }
     }
 
-    /// Set (or clear, `None`) the film framing rectangle of a photo or
+    /// Set (or clear, `None`) the framing rectangle of a photo or
     /// clip. An invalid rectangle (see [`valid_frame`]) clears it.
     pub fn set_frame(&mut self, asset: String, frame: Option<Frame>) {
         set_pin(&mut self.frame, asset, frame.filter(|f| valid_frame(*f)));
@@ -1702,12 +1702,6 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
         .map(|(id, f)| (id.clone(), *f))
         .collect();
     out.crop = edits.crop.clone();
-    out.frame = edits
-        .frame
-        .iter()
-        .filter(|(id, f)| in_plan.contains(id.as_str()) && valid_frame(**f))
-        .map(|(id, f)| (id.clone(), *f))
-        .collect();
     out.still = edits
         .still
         .iter()
@@ -1723,6 +1717,18 @@ pub fn apply_edits(plan: &Plan, assets: &[Asset], edits: &PlanEdits) -> Plan {
         .iter()
         .filter(|id| known(id.as_str()) && !dead.contains(id.as_str()))
         .cloned()
+        .collect();
+    // A framing lands on any photo the film or the book can show: a book
+    // pin from outside the plan (above) is framed like any other.
+    out.frame = edits
+        .frame
+        .iter()
+        .filter(|(id, f)| {
+            (in_plan.contains(id.as_str()) || out.book.iter().any(|b| b == *id))
+                && !dead.contains(id.as_str())
+                && valid_frame(**f)
+        })
+        .map(|(id, f)| (id.clone(), *f))
         .collect();
     out.closing = edits
         .closing
@@ -5590,7 +5596,11 @@ mod tests {
     #[test]
     fn a_film_frame_rides_onto_the_plan_and_changes_the_aspect() {
         let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let assets = vec![asset("a", T0, AssetKind::Photo)];
+        let assets = vec![
+            asset("a", T0, AssetKind::Photo),
+            asset("aside", T0, AssetKind::Photo),
+            asset("loose", T0, AssetKind::Photo),
+        ];
         let plan = Plan {
             plan_version: PLAN_VERSION,
             schema_version: Plan::SCHEMA_VERSION,
@@ -5625,6 +5635,15 @@ mod tests {
         let out = apply_edits(&plan, &assets, &edits);
         assert_eq!(out.frame.get("a"), Some(&(10, 20, 50, 40)));
         assert!(!out.frame.contains_key("gone"));
+        // A photo the plan set aside keeps its framing once the owner pins
+        // it into the book; one neither the film nor the book shows does not.
+        let mut book = edits.clone();
+        book.book.push("aside".into());
+        book.set_frame("aside".into(), Some((0, 0, 50, 100)));
+        book.set_frame("loose".into(), Some((0, 0, 50, 100)));
+        let out = apply_edits(&plan, &assets, &book);
+        assert_eq!(out.frame.get("aside"), Some(&(0, 0, 50, 100)));
+        assert!(!out.frame.contains_key("loose"));
         // The framed aspect is the source's times W / H.
         assert!((crate::types::frame_aspect(1.5, Some((0, 0, 50, 100))) - 0.75).abs() < 1e-9);
         assert_eq!(crate::types::frame_aspect(1.5, None), 1.5);

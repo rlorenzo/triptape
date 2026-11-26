@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// A film framing rectangle: (x, y, w, h) in percent of the displayed
+/// An owner framing rectangle (film and book): (x, y, w, h) in percent of the displayed
 /// source, measured from its top left. See [`valid_frame`].
 pub type Frame = (u8, u8, u8, u8);
 
@@ -20,6 +20,21 @@ pub fn frame_aspect(aspect: f64, frame: Option<Frame>) -> f64 {
     frame.map_or(aspect, |(_, _, w, h)| {
         aspect * f64::from(w) / f64::from(h.max(1))
     })
+}
+
+/// `f` (percent of a `iw`x`ih` picture) in whole pixels: (x, y, w, h),
+/// never empty and never past the picture's edges.
+pub fn frame_px(iw: u32, ih: u32, f: Frame) -> (u32, u32, u32, u32) {
+    let (fx, fy, fw, fh) = f;
+    let along = |len: u32, start: u8, span: u8| {
+        let at = |pct: u8| (f64::from(len) * f64::from(pct.min(100)) / 100.0).round() as u32;
+        let a = at(start).min(len.saturating_sub(1));
+        let b = at(start.saturating_add(span)).clamp(a + 1, len.max(a + 1));
+        (a, b - a)
+    };
+    let (x, w) = along(iw, fx, fw);
+    let (y, h) = along(ih, fy, fh);
+    (x, y, w, h)
 }
 
 /// What kind of media an asset is.
@@ -338,10 +353,10 @@ pub struct Plan {
     /// centres on, for heads the face detector cannot see (a mascot).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub crop: BTreeMap<String, (u8, u8)>,
-    /// Film framing the owner set per photo or clip: asset id -> (x, y, w,
-    /// h) percent of the displayed source, from its top left. The film
-    /// uses only that rectangle, as if the source had been cropped to it
-    /// first (see [`frame_aspect`]). The book ignores it.
+    /// Framing the owner set per photo or clip: asset id -> (x, y, w, h)
+    /// percent of the displayed source, from its top left. The film and
+    /// the book use only that rectangle, as if the source had been cropped
+    /// to it first (see [`frame_aspect`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub frame: BTreeMap<String, Frame>,
     /// Photos the owner set to play as a still in the film: never their
@@ -763,6 +778,14 @@ pub struct Job {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_in_pixels_stays_inside_the_picture() {
+        assert_eq!(frame_px(100, 50, (10, 20, 50, 60)), (10, 10, 50, 30));
+        assert_eq!(frame_px(100, 50, (0, 0, 100, 100)), (0, 0, 100, 50));
+        // A sliver at the far edge is still one pixel, not empty or past it.
+        assert_eq!(frame_px(10, 10, (99, 99, 1, 1)), (9, 9, 1, 1));
+    }
 
     #[test]
     fn book_layout_setters_keep_one_entry_and_one_group_per_photo() {
