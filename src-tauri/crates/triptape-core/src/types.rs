@@ -409,28 +409,35 @@ pub struct BookLayout {
     /// picture with that one").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub own_page: Vec<String>,
+    /// Photos whose page's day heading leaves out the places no photo on
+    /// the page shows, i.e. the day's city (`--hide-city`): "Marina Bay
+    /// Sands · Flower Dome", not "Singapore · Marina Bay Sands · …".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hide_city: Vec<String>,
 }
 
 impl BookLayout {
     /// The plain per-photo lists: each names the photos one choice is on for.
-    fn listed(&self) -> [&Vec<String>; 5] {
+    fn listed(&self) -> [&Vec<String>; 6] {
         [
             &self.feature,
             &self.whole,
             &self.rows,
             &self.page_captions,
             &self.own_page,
+            &self.hide_city,
         ]
     }
 
     /// [`Self::listed`], to change: the same lists.
-    fn listed_mut(&mut self) -> [&mut Vec<String>; 5] {
+    fn listed_mut(&mut self) -> [&mut Vec<String>; 6] {
         [
             &mut self.feature,
             &mut self.whole,
             &mut self.rows,
             &mut self.page_captions,
             &mut self.own_page,
+            &mut self.hide_city,
         ]
     }
 
@@ -474,6 +481,12 @@ impl BookLayout {
     /// Give a photo a page of its own, or let it share again.
     pub fn set_own_page(&mut self, asset: String, on: bool) {
         set_listed(&mut self.own_page, asset, on);
+    }
+
+    /// Leave the day's city out of the heading on this photo's page, or
+    /// name it again.
+    pub fn set_hide_city(&mut self, asset: String, on: bool) {
+        set_listed(&mut self.hide_city, asset, on);
     }
 
     /// Place `asset` right after `anchor` in the book, or (`None`) back in
@@ -821,7 +834,8 @@ mod tests {
     #[test]
     fn every_book_layout_choice_counts_as_a_mention_and_is_pruned() {
         type Set = fn(&mut BookLayout, String);
-        let choices: [Set; 8] = [
+        let choices: [Set; 9] = [
+            |l, id| l.set_hide_city(id, true),
             |l, id| l.set_feature(id, true),
             |l, id| l.set_whole(id, true),
             |l, id| l.set_row(id, true),

@@ -150,6 +150,9 @@ pub struct BookPhoto {
     pub whole: bool,
     /// The owner wants this photo's page laid out as one row (`--row`).
     pub row: bool,
+    /// The owner wants the day heading on this photo's page to leave out
+    /// the places no photo on it shows, i.e. the day's city (`--hide-city`).
+    pub hide_city: bool,
     /// The owner's caption speaks for the whole page (`--page-caption`):
     /// it prints in the page's bottom line, not under this photo.
     pub caption_for_page: bool,
@@ -242,6 +245,7 @@ impl BookPhoto {
             feature: false,
             whole: false,
             row: false,
+            hide_city: false,
             caption_for_page: false,
             page_group: false,
             place_is_city: false,
@@ -2331,11 +2335,12 @@ fn drop_contained(places: &mut Vec<&str>) {
 const MAX_HEADING_PLACES: usize = 4;
 
 /// A day heading on one line of its banner: when the places run onto a
-/// second line, those no photo on the page shows (the day's city, named
-/// for context) are dropped first, then the page's last places until it
-/// fits. The first place always stays.
+/// second line, or the owner hid the city on this page (`--hide-city`),
+/// those no photo on the page shows (the day's city, named for context)
+/// are dropped first; then the page's last places go until it fits. The
+/// first place always stays.
 fn one_line_heading(heading: String, slot: &[&BookPhoto], page_w: f64) -> String {
-    if heading_fits_one_line(&heading, page_w) {
+    if !slot.iter().any(|p| p.hide_city) && heading_fits_one_line(&heading, page_w) {
         return heading;
     }
     let Some((head, places)) = heading.split_once(" — ") else {
@@ -5386,6 +5391,31 @@ mod tests {
         assert_eq!(
             one_line_heading(tokyo.to_string(), &[&at("Tsukiji Outer Market")], 12.0),
             tokyo
+        );
+        // Unless the owner hid the city on that page (`--hide-city`): the
+        // heading names only what the page shows, even though it fits.
+        let fits = "Day 21 · Fri, Oct 23 — Singapore · Marina Bay Sands · Flower Dome";
+        let (durian, dome) = (at("Marina Bay Sands"), at("Flower Dome"));
+        assert_eq!(
+            one_line_heading(fits.to_string(), &[&durian, &dome], 12.0),
+            fits
+        );
+        let hidden = BookPhoto {
+            hide_city: true,
+            ..dome.clone()
+        };
+        assert_eq!(
+            one_line_heading(fits.to_string(), &[&durian, &hidden], 12.0),
+            "Day 21 · Fri, Oct 23 — Marina Bay Sands · Flower Dome"
+        );
+        // A page that shows none of the heading's places keeps them all.
+        let elsewhere = BookPhoto {
+            hide_city: true,
+            ..at("Merlion Park")
+        };
+        assert_eq!(
+            one_line_heading(fits.to_string(), &[&elsewhere], 12.0),
+            fits
         );
         // The page's own places still too long for the 12 in book: the
         // first visited, as many as fit.
