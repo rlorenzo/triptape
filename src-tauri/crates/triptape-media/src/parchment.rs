@@ -574,11 +574,35 @@ fn pick_spot(candidates: &[P], size: P, frame: P, margin: f64, taken: &[Rect], i
         )
 }
 
+/// A leg whose ends are this far apart crosses an ocean or continent. The
+/// hop that makes it frames the crossing; the hops after it frame only the
+/// region where it landed.
+const CROSSING_M: f64 = 2_500_000.0;
+
 /// Stops and sea or ground paths up to `legs` (flights left out): what a
 /// regional view has to hold. Empty when the trip so far is all flights.
 fn regional(journey: &Journey, legs: usize) -> Vec<LatLon> {
+    regional_from(journey, 0, legs)
+}
+
+/// What a hop travelling `legs` frames: the regional view, starting where
+/// the last crossing before the hop landed, so a port-to-port hop in Japan
+/// is not framed on the whole Pacific the ship crossed to get there.
+fn hop_regional(journey: &Journey, legs: &std::ops::Range<usize>) -> Vec<LatLon> {
+    let from = (0..legs.start)
+        .rev()
+        .find(|&i| {
+            triptape_core::geo::haversine_m(journey.nodes[i].pos, journey.nodes[i + 1].pos)
+                > CROSSING_M
+        })
+        .map_or(0, |i| i + 1);
+    regional_from(journey, from, legs.end)
+}
+
+/// The regional view of legs `from..legs` alone.
+fn regional_from(journey: &Journey, from: usize, legs: usize) -> Vec<LatLon> {
     let mut pts = vec![];
-    for (i, leg) in journey.legs.iter().enumerate().take(legs) {
+    for (i, leg) in journey.legs.iter().enumerate().take(legs).skip(from) {
         if leg.mode != LegMode::Flight {
             pts.extend(drawn_path(leg));
         }
@@ -892,7 +916,7 @@ impl HopScene {
         } else if last.is_loop {
             View::fit(&own, 0.6, 3.0, frame)
         } else {
-            View::fit(&regional(journey, hop.legs.end), 0.4, 5.0, frame)
+            View::fit(&hop_regional(journey, &hop.legs), 0.4, 5.0, frame)
         };
 
         // The sheet: legs already travelled in faint ink, stops already made.
@@ -1570,6 +1594,40 @@ mod tests {
                 .count()
         };
         assert!(red(&last) > red(&first) + 50, "the line was drawn");
+    }
+
+    #[test]
+    fn a_hop_after_an_ocean_crossing_frames_the_region_it_landed_in() {
+        let json = r#"{
+          "stops": [
+            { "id": "la", "label": "Los Angeles", "lat": 33.7364, "lon": -118.2732, "depart": "2026-10-03", "kind": "home" },
+            { "id": "muroran", "label": "Muroran", "lat": 42.3474, "lon": 140.9465, "arrive": "2026-10-15", "depart": "2026-10-16", "kind": "port" },
+            { "id": "hakodate", "label": "Hakodate", "lat": 41.7735, "lon": 140.7265, "arrive": "2026-10-17", "depart": "2026-10-18", "kind": "port" },
+            { "id": "tokyo", "label": "Tokyo", "lat": 35.6646, "lon": 139.7613, "arrive": "2026-10-19", "kind": "city" }
+          ],
+          "legs": [
+            { "from": "la", "to": "muroran", "mode": "ship", "ship": "Ship" },
+            { "from": "muroran", "to": "hakodate", "mode": "ship", "ship": "Ship" },
+            { "from": "hakodate", "to": "tokyo", "mode": "ship", "ship": "Ship" }
+          ]
+        }"#;
+        let j = Journey::build(&Itinerary::from_json(json).unwrap(), &[]);
+        // Longitudes are continuous across the date line, so Japan may sit at
+        // -219 here; a regional frame is one that spans only a few degrees.
+        let in_japan = |pts: &[LatLon]| {
+            let (lo, hi) = pts.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+                (lo.min(p.1), hi.max(p.1))
+            });
+            !pts.is_empty() && hi - lo < 10.0
+        };
+        // The crossing frames the Pacific; the hops after it frame Japan.
+        assert!(!in_japan(&hop_regional(&j, &(0..1))));
+        assert!(in_japan(&hop_regional(&j, &(1..2))));
+        assert!(in_japan(&hop_regional(&j, &(2..3))));
+        // A hop of several legs keeps its own crossing in frame.
+        assert!(!in_japan(&hop_regional(&j, &(0..2))));
+        // The whole-route sheet still holds the crossing.
+        assert!(!in_japan(&regional(&j, 3)));
     }
 
     #[test]
