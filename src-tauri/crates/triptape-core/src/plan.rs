@@ -1266,7 +1266,7 @@ pub struct PlanEdits {
     /// Per-photo crop focus (see [`crate::types::Plan::crop`]).
     #[serde(default)]
     pub crop: BTreeMap<String, (u8, u8)>,
-    /// Per-photo film framing rectangle (see [`crate::types::Plan::frame`]).
+    /// Per-photo framing rectangle, for the film and the book (see [`crate::types::Plan::frame`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub frame: BTreeMap<String, Frame>,
     /// Photos pinned into the book (see [`crate::types::Plan::book`]).
@@ -1319,7 +1319,7 @@ impl PlanEdits {
         }
     }
 
-    /// Set (or clear, `None`) the film framing rectangle of a photo or
+    /// Set (or clear, `None`) the framing rectangle of a photo or
     /// clip. An invalid rectangle (see [`valid_frame`]) clears it.
     pub fn set_frame(&mut self, asset: String, frame: Option<Frame>) {
         set_pin(&mut self.frame, asset, frame.filter(|f| valid_frame(*f)));

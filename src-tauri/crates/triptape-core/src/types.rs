@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// A film framing rectangle: (x, y, w, h) in percent of the displayed
+/// An owner framing rectangle (film and book): (x, y, w, h) in percent of the displayed
 /// source, measured from its top left. See [`valid_frame`].
 pub type Frame = (u8, u8, u8, u8);
 
@@ -338,10 +338,10 @@ pub struct Plan {
     /// centres on, for heads the face detector cannot see (a mascot).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub crop: BTreeMap<String, (u8, u8)>,
-    /// Film framing the owner set per photo or clip: asset id -> (x, y, w,
-    /// h) percent of the displayed source, from its top left. The film
-    /// uses only that rectangle, as if the source had been cropped to it
-    /// first (see [`frame_aspect`]). The book ignores it.
+    /// Framing the owner set per photo or clip: asset id -> (x, y, w, h)
+    /// percent of the displayed source, from its top left. The film and
+    /// the book use only that rectangle, as if the source had been cropped
+    /// to it first (see [`frame_aspect`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub frame: BTreeMap<String, Frame>,
     /// Photos the owner set to play as a still in the film: never their
