@@ -793,7 +793,7 @@ impl Default for VideoOptions {
             short_mode: false,
             still_secs: 4.0,
             overlap_secs: 0.6,
-            title_secs: 2.5,
+            title_secs: 3.5,
             map_secs: 3.0,
             opening_map: false,
             music_paths: Vec::new(),

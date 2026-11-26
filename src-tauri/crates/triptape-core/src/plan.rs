@@ -92,8 +92,9 @@ pub const MAX_CLIP_SECS: f64 = 30.0;
 // the renderer's own transition assignment. Keep in sync.
 /// Solo still hold.
 const EST_STILL_SECS: f64 = 4.0;
-/// Title card hold.
-const EST_TITLE_SECS: f64 = 2.5;
+/// Title card hold: long enough to read the trip name after the first
+/// cut's 0.7 s circleopen starts covering it.
+const EST_TITLE_SECS: f64 = 3.5;
 /// Opening route map hold (only with a GPS route).
 const EST_MAP_SECS: f64 = 3.0;
 /// Closing places card hold (only when a chapter has a named place).
@@ -3744,8 +3745,8 @@ mod tests {
             clip("y2", 1.0),
             still("y3"),
         ];
-        // Segments: title 2.5, map 3, 4-photo collage 7, solo 4, clip 6,
-        // padded clip 2.5, solo 4, closing map 4.5, places 4.5 = 38 s. Cuts:
+        // Segments: title 3.5, map 3, 4-photo collage 7, solo 4, clip 6,
+        // padded clip 2.5, solo 4, closing map 4.5, places 4.5 = 39 s. Cuts:
         // opening 0.7, map->hero break 0.8, plain 0.54, chapter break 0.5,
         // plain 0.54 x2, hero->closing break 0.5, closing 0.7 = 4.82 s.
         let cards = HeroCards {
@@ -3756,7 +3757,7 @@ mod tests {
             places: 1,
         };
         assert!(
-            (estimate_hero_secs(&entries, ch, |_| None, |_| 0.0, |_| Some(0), cards) - 33.18).abs()
+            (estimate_hero_secs(&entries, ch, |_| None, |_| 0.0, |_| Some(0), cards) - 34.18).abs()
                 < 1e-9
         );
         // Without a route or places only the title card remains.
@@ -3767,10 +3768,10 @@ mod tests {
             route_secs: None,
             places: 0,
         };
-        // 2.5 + 7 + 4 + 6 + 2.5 + 4 = 26 s; cuts 0.7 + 0.54 + 0.8 + 0.54 +
+        // 3.5 + 7 + 4 + 6 + 2.5 + 4 = 27 s; cuts 0.7 + 0.54 + 0.8 + 0.54 +
         // 0.7 = 3.28 s.
         assert!(
-            (estimate_hero_secs(&entries, ch, |_| None, |_| 0.0, |_| Some(0), bare) - 22.72).abs()
+            (estimate_hero_secs(&entries, ch, |_| None, |_| 0.0, |_| Some(0), bare) - 23.72).abs()
                 < 1e-9
         );
     }
@@ -3797,17 +3798,17 @@ mod tests {
             )
         };
         // Middle: collage of 2 (5 s), solo (4 s), collage of 2 (5 s); cuts
-        // 0.7 + 0.54 + 0.7 = 1.94 s, the title 2.5 s.
+        // 0.7 + 0.54 + 0.7 = 1.94 s, the title 3.5 s.
         let mid = est(&["a", "b", "c", "d", "e"], &[("c", "Ferry")]);
-        assert!((mid - 14.56).abs() < 1e-9, "{mid}");
+        assert!((mid - 15.56).abs() < 1e-9, "{mid}");
         // Leading and trailing captioned stills never join their neighbours.
         let lead = est(&["a", "b", "c"], &[("a", "Ferry")]);
         let trail = est(&["a", "b", "c"], &[("c", "Ferry")]);
-        assert!((lead - 10.1).abs() < 1e-9, "{lead}");
-        assert!((trail - 10.1).abs() < 1e-9, "{trail}");
+        assert!((lead - 11.1).abs() < 1e-9, "{lead}");
+        assert!((trail - 11.1).abs() < 1e-9, "{trail}");
         // A blank caption is no caption: all three still collage.
         let blank = est(&["a", "b", "c"], &[("a", "  ")]);
-        assert!((blank - 7.8).abs() < 1e-9, "{blank}");
+        assert!((blank - 8.8).abs() < 1e-9, "{blank}");
         assert!(!has_caption(Some(" \n")) && has_caption(Some(" x ")) && !has_caption(None));
     }
 
@@ -3882,8 +3883,8 @@ mod tests {
         let entries = [still("x1"), still("p"), still("x2"), still("x3")];
         let pano = |id: &str| (id == "p").then_some(8.0);
         // The pano stays solo with its 8 s hold; x1 reaches across it to
-        // collage with x2 and x3 (6 s) rather than play alone: title 2.5 +
-        // collage 6 + pano 8 = 16.5 s, cuts 0.7 + 0.7 = 1.4 s.
+        // collage with x2 and x3 (6 s) rather than play alone: title 3.5 +
+        // collage 6 + pano 8 = 17.5 s, cuts 0.7 + 0.7 = 1.4 s.
         let bare = HeroCards {
             route: false,
             opening_map: true,
@@ -3892,7 +3893,7 @@ mod tests {
             places: 0,
         };
         assert!(
-            (estimate_hero_secs(&entries, |_| "X", pano, |_| 0.0, |_| Some(0), bare) - 15.1).abs()
+            (estimate_hero_secs(&entries, |_| "X", pano, |_| 0.0, |_| Some(0), bare) - 16.1).abs()
                 < 1e-9
         );
     }
@@ -4530,8 +4531,8 @@ mod tests {
                 .map(|e| e.asset_id)
                 .collect()
         };
-        // Title + two 3 s clips fits 7.5 s; three do not.
-        assert_eq!(ids(7.5), vec!["a1", "a3"]);
+        // Title + two 3 s clips fits 8.5 s; three do not.
+        assert_eq!(ids(8.5), vec!["a1", "a3"]);
         // Plenty of time: the twin is allowed back.
         assert_eq!(ids(600.0), vec!["a1", "a2", "a3"]);
     }
@@ -4596,8 +4597,8 @@ mod tests {
                 places: 1,
             },
         );
-        // title 2.5 + still 4 - 0.7 vs + map 3 + closing map 4.5 + places 4.5.
-        assert!((bare - 5.8).abs() < 1e-9, "{bare}");
+        // title 3.5 + still 4 - 0.7 vs + map 3 + closing map 4.5 + places 4.5.
+        assert!((bare - 6.8).abs() < 1e-9, "{bare}");
         assert!((full - bare - 10.0).abs() < 1e-9, "{full}");
         // No entries: nothing but the title, and no overlap to subtract.
         assert_eq!(
@@ -5869,20 +5870,20 @@ mod tests {
             route_secs: None,
             places: 0,
         };
-        // Title 2.5, x1+x3 collage 5, clip 6, y1 solo 4 = 17.5 s; cuts
+        // Title 3.5, x1+x3 collage 5, clip 6, y1 solo 4 = 18.5 s; cuts
         // opening 0.7, plain 0.54, closing 0.7 = 1.94 s.
         let est = estimate_hero_secs(&entries, ch, |_| None, |_| 0.0, |_| Some(0), bare);
-        assert!((est - 15.56).abs() < 1e-9, "{est}");
+        assert!((est - 16.56).abs() < 1e-9, "{est}");
         // Captioning x3 leaves x1 nobody to pair with: x1 solo 4, clip 6,
-        // x3 solo 4, y1 solo 4 + title 2.5 = 20.5 s; cuts 0.7 + 0.54 +
+        // x3 solo 4, y1 solo 4 + title 3.5 = 21.5 s; cuts 0.7 + 0.54 +
         // 0.54 + 0.7 = 2.48 s.
         let short = |id: &str| if id == "x3" { 3.0 } else { 0.0 };
         let est = estimate_hero_secs(&entries, ch, |_| None, short, |_| Some(0), bare);
-        assert!((est - 18.02).abs() < 1e-9, "{est}");
+        assert!((est - 19.02).abs() < 1e-9, "{est}");
         // A caption that takes 6 s to read holds x3 for 6 s, not 4.
         let long = |id: &str| if id == "x3" { 6.0 } else { 0.0 };
         let est = estimate_hero_secs(&entries, ch, |_| None, long, |_| Some(0), bare);
-        assert!((est - 20.02).abs() < 1e-9, "{est}");
+        assert!((est - 21.02).abs() < 1e-9, "{est}");
     }
 
     fn split_fixture() -> Vec<Asset> {
