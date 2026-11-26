@@ -1193,6 +1193,7 @@ fn export_inner(
                 feature: layout.feature.contains(&a.id),
                 whole: layout.whole.contains(&a.id),
                 row: layout.rows.contains(&a.id),
+                hide_city: layout.hide_city.contains(&a.id),
                 caption_for_page: layout.page_captions.contains(&a.id),
                 page_group: false,
                 place_is_city: book_places

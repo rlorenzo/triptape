@@ -5,7 +5,7 @@
 //! triptape scan --folder /path/to/trip --db trip.db --cache /tmp/cache [--length auto|SECS|10m] [--models DIR]
 //! triptape plan --db trip.db --out plan.json [--home LAT,LON] [--itinerary itinerary.json]
 //! triptape edit --db trip.db [--project ID] [--include REF...] [--exclude REF...] [--uninclude REF...] [--unexclude REF...]
-//!                [--solo REF...] [--unsolo REF...] [--live REF...] [--unlive REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--frame REF X Y W H]... [--unframe REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--feature REF...] [--whole REF...] [--row REF...] [--page-caption REF...] [--own-page REF...] [--book-after REF ANCHOR]... [--still VIDEO SECS] [--group REF REF...] [--unfeature|--unwhole|--unrow|--unpage-caption|--unown-page|--unbook-after|--unstill|--ungroup REF...] [--list]
+//!                [--solo REF...] [--unsolo REF...] [--live REF...] [--unlive REF...] [--join REF REF]... [--unjoin REF...] [--caption REF TEXT]... [--cover REF[@PCT]...] [--uncover REF...] [--hide-caption REF...] [--crop REF X Y]... [--uncrop REF...] [--frame REF X Y W H]... [--unframe REF...] [--book REF...] [--unbook REF...] [--closing REF] [--no-closing] [--feature REF...] [--whole REF...] [--row REF...] [--page-caption REF...] [--own-page REF...] [--hide-city REF...] [--book-after REF ANCHOR]... [--still VIDEO SECS] [--group REF REF...] [--unfeature|--unwhole|--unrow|--unpage-caption|--unown-page|--unhide-city|--unbook-after|--unstill|--ungroup REF...] [--list]
 //! triptape learn --db trip.db [--project ID] [--show | --backfill | --reset | --apply [--length auto|SECS|10m] [--place-override SPEC]]
 //! triptape export --db trip.db --out /path/to/out [--preset P1|P2] [--pages N] [--home LAT,LON] [--music F]... (repeat or ';'-join for a crossfaded playlist) [--keep-ambience] [--no-live-collages] [--opening-map] [--itinerary itinerary.json] [--map-style parchment|night] [--hop-clips DIR] [--back-cover IMAGE] [--title TEXT] [--title-dates TEXT] [--front-cover IMAGE] [--approved-book BOOK.json] [--resolution 4k|1080p] [--jobs N] [--quiet]
 //!                 [--segment-cache DIR | --no-segment-cache] [--segment-cache-max SIZE] [--segment-cache-min-free SIZE] [--chunk-cache-max SIZE] [--work-dir DIR] [--draft]
@@ -1174,6 +1174,9 @@ struct EditArgs {
     /// Photos on a page of their own (or not).
     own_page: Vec<String>,
     unown_page: Vec<String>,
+    /// Photos whose page's day heading leaves out the day's city (or not).
+    hide_city: Vec<String>,
+    unhide_city: Vec<String>,
     /// Photos placed right after another in the book: (photo, anchor).
     book_after: Vec<(String, String)>,
     unbook_after: Vec<String>,
@@ -1307,7 +1310,7 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
             | "unlive" | "unjoin" | "unmove" | "uncover" | "hide-caption" | "uncrop"
             | "unframe" | "book" | "unbook" | "feature" | "unfeature" | "whole" | "unwhole"
             | "row" | "unrow" | "page-caption" | "unpage-caption" | "own-page" | "unown-page"
-            | "unbook-after" | "unstill" | "ungroup" => {
+            | "hide-city" | "unhide-city" | "unbook-after" | "unstill" | "ungroup" => {
                 if values.is_empty() {
                     return Err(format!("--{flag} wants at least one asset"));
                 }
@@ -1337,6 +1340,8 @@ fn parse_edit_args(args: &[String]) -> Result<EditArgs, String> {
                     "unpage-caption" => out.unpage_caption.extend(values),
                     "own-page" => out.own_page.extend(values),
                     "unown-page" => out.unown_page.extend(values),
+                    "hide-city" => out.hide_city.extend(values),
+                    "unhide-city" => out.unhide_city.extend(values),
                     "unbook-after" => out.unbook_after.extend(values),
                     "unstill" => out.unstill.extend(values),
                     "ungroup" => out.ungroup.extend(values),
@@ -1427,12 +1432,13 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
     let layout = &edits.book_layout;
     if !layout.is_empty() {
         println!(
-            "book layout: {} featured, {} whole, {} rows, {} page captions, {} own pages, {} placed after, {} stills, {} groups",
+            "book layout: {} featured, {} whole, {} rows, {} page captions, {} own pages, {} cities hidden, {} placed after, {} stills, {} groups",
             layout.feature.len(),
             layout.whole.len(),
             layout.rows.len(),
             layout.page_captions.len(),
             layout.own_page.len(),
+            layout.hide_city.len(),
             layout.after.len(),
             layout.stills.len(),
             layout.groups.len()
@@ -1443,6 +1449,7 @@ fn print_edits(edits: &PlanEdits, by_id: &HashMap<&str, &Asset>) {
             ("row", &layout.rows),
             ("page-caption", &layout.page_captions),
             ("own-page", &layout.own_page),
+            ("hide-city", &layout.hide_city),
         ] {
             for id in ids {
                 println!("  {label} {}", show(id));
@@ -1651,6 +1658,8 @@ fn edit_cmd(args: &[String]) {
     let unpage_captions = resolve(&a.unpage_caption);
     let own_pages = resolve(&a.own_page);
     let unown_pages = resolve(&a.unown_page);
+    let hide_cities = resolve(&a.hide_city);
+    let unhide_cities = resolve(&a.unhide_city);
     let book_afters: Vec<(&Asset, &Asset)> = a
         .book_after
         .iter()
@@ -1696,7 +1705,7 @@ fn edit_cmd(args: &[String]) {
     };
     // Each on/off layout flag, with the photos it turns on and off.
     type Set = fn(&mut BookLayout, String, bool);
-    let flags: [(&str, &[&Asset], &[&Asset], Set); 5] = [
+    let flags: [(&str, &[&Asset], &[&Asset], Set); 6] = [
         ("feature", &features, &unfeatures, BookLayout::set_feature),
         ("whole", &wholes, &unwholes, BookLayout::set_whole),
         ("row", &rows, &unrows, BookLayout::set_row),
@@ -1711,6 +1720,12 @@ fn edit_cmd(args: &[String]) {
             &own_pages,
             &unown_pages,
             BookLayout::set_own_page,
+        ),
+        (
+            "hide-city",
+            &hide_cities,
+            &unhide_cities,
+            BookLayout::set_hide_city,
         ),
     ];
     let mut laid_out = flags
@@ -1757,7 +1772,7 @@ fn edit_cmd(args: &[String]) {
     if !changed && !a.list {
         die(
             "edit",
-            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--live/--unlive/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--frame/--unframe/--book/--unbook/--closing/--no-closing/--feature/--whole/--row/--page-caption/--own-page/--book-after/--still/--group (and their un- forms) or --list",
+            "nothing to do: pass --include/--exclude/--uninclude/--unexclude/--solo/--unsolo/--live/--unlive/--join/--unjoin/--caption/--move/--unmove/--cover/--uncover/--hide-caption/--crop/--uncrop/--frame/--unframe/--book/--unbook/--closing/--no-closing/--feature/--whole/--row/--page-caption/--own-page/--hide-city/--book-after/--still/--group (and their un- forms) or --list",
         );
     }
     let mut edits = ep.edits.clone();
@@ -2551,6 +2566,10 @@ mod tests {
         assert_eq!(a.own_page, ["a", "b"]);
         assert_eq!(a.unown_page, ["c"]);
         assert!(parse_edit_args(&args("--db t.db --own-page")).is_err());
+        let h = parse_edit_args(&args("--db t.db --hide-city a --unhide-city b c")).unwrap();
+        assert_eq!(h.hide_city, ["a"]);
+        assert_eq!(h.unhide_city, ["b", "c"]);
+        assert!(parse_edit_args(&args("--db t.db --hide-city")).is_err());
         assert!(parse_edit_args(&args("--db t.db --still v 4294967.296")).is_err());
         assert!(parse_edit_args(&args("--db t.db --still v 12.5")).is_ok());
     }
