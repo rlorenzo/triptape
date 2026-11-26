@@ -18,7 +18,7 @@ use triptape_core::places::Spot;
 use triptape_core::plan::{
     check_source_integrity, has_caption, plan_eligibility, trip_day, Integrity,
 };
-use triptape_core::types::{distinct_assets, valid_frame, AssetKind, Plan, PlanEntry, Rendition};
+use triptape_core::types::{distinct_assets, AssetKind, Plan, PlanEntry, Rendition};
 
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
@@ -1200,8 +1200,7 @@ fn export_inner(
                     .is_some_and(|pl| cities.contains(pl.as_str())),
             };
             // The owner's framing (`--frame`): the page sees only that part.
-            book_photos
-                .push(photo.framed(plan.frame.get(&a.id).copied().filter(|&f| valid_frame(f))));
+            book_photos.push(photo.framed(plan.frame.get(&a.id).copied()));
         }
         // A photo and the owner's `_edited` version of it are one photo:
         // the edit stays.

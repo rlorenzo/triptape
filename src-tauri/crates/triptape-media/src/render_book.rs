@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use triptape_ai_local::FaceBox;
 use triptape_core::plan::SAME_MOMENT_SECS;
+use triptape_core::types::{frame_px, valid_frame, Frame};
 
 /// Book preset (PLAN.md Sec 11: only two in v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,8 +141,9 @@ pub struct BookPhoto {
     pub still_ms: Option<u32>,
     /// The owner's framing (`--frame`): the page prints only this part of
     /// the photo, as if it were the whole picture. `width`, `height`,
-    /// `family` and `crop_focus` all describe the framed picture.
-    pub frame: Option<triptape_core::types::Frame>,
+    /// `family`, `crop_focus` and `cover_focus` all describe the framed
+    /// picture.
+    pub frame: Option<Frame>,
     /// The owner wants this photo in the biggest cell on its page.
     pub feature: bool,
     /// The owner wants this photo never cropped.
@@ -176,11 +178,11 @@ impl BookPhoto {
 
     /// The photo cut to the owner's framing `frame` (`--frame`), as the
     /// page will see it: its size, the family's boxes (those left wholly
-    /// outside are dropped), the owner's crop point and the largest
+    /// outside are dropped), the owner's crop point and cover focus and the largest
     /// face's share of the shorter side are all of the framed picture.
-    /// Unchanged without a frame.
-    pub fn framed(self, frame: Option<triptape_core::types::Frame>) -> Self {
-        let Some(f) = frame else {
+    /// Unchanged without a usable frame (see [`valid_frame`]).
+    pub fn framed(self, frame: Option<Frame>) -> Self {
+        let Some(f) = frame.filter(|&f| valid_frame(f)) else {
             return self;
         };
         let (_, _, w, h) = frame_px(self.width, self.height, f);
@@ -193,6 +195,15 @@ impl BookPhoto {
                 .into_iter()
                 .filter_map(|k| reframe_box(&k.b, f).map(|b| KnownBox { b, ..k }))
                 .collect(),
+            // A centred cover pin (0.5) is no focus at all (see
+            // `cover_tile_focus`) and stays one.
+            cover_focus: self.cover_focus.map(|fx| {
+                if fx == 0.5 {
+                    fx
+                } else {
+                    reframe_point((fx, 0.5), f).0
+                }
+            }),
             crop_focus: self.crop_focus.map(|p| reframe_point(p, f)),
             face_size: (self.face_size * grow).min(1.0),
             frame: Some(f),
@@ -2650,7 +2661,7 @@ fn load(photo: &BookPhoto, ffmpeg_bin: &str, fallbacks: &mut Vec<String>) -> Rgb
     match decoded {
         // The owner's framing: the rest of the photo never reaches the page.
         Ok(img) => match photo.frame {
-            Some(f) => cut_to_frame(&img, f),
+            Some(f) => crate::render_video::crop_to_frame(&img, f),
             None => img,
         },
         Err(note) => {
@@ -2662,7 +2673,7 @@ fn load(photo: &BookPhoto, ffmpeg_bin: &str, fallbacks: &mut Vec<String>) -> Rgb
 
 /// A box (fractions of the whole picture) in the framed picture's terms,
 /// clipped to the frame; `None` when none of it is inside.
-fn reframe_box(b: &FaceBox, f: triptape_core::types::Frame) -> Option<FaceBox> {
+fn reframe_box(b: &FaceBox, f: Frame) -> Option<FaceBox> {
     let (fx, fy, fw, fh) = frame_fractions(f);
     let x0 = ((b.x - fx) / fw).max(0.0);
     let y0 = ((b.y - fy) / fh).max(0.0);
@@ -2678,7 +2689,7 @@ fn reframe_box(b: &FaceBox, f: triptape_core::types::Frame) -> Option<FaceBox> {
 
 /// A point (fractions of the whole picture) in the framed picture's terms,
 /// held inside it.
-fn reframe_point((x, y): (f32, f32), f: triptape_core::types::Frame) -> (f32, f32) {
+fn reframe_point((x, y): (f32, f32), f: Frame) -> (f32, f32) {
     let (fx, fy, fw, fh) = frame_fractions(f);
     (
         ((x - fx) / fw).clamp(0.0, 1.0),
@@ -2686,33 +2697,10 @@ fn reframe_point((x, y): (f32, f32), f: triptape_core::types::Frame) -> (f32, f3
     )
 }
 
-/// `f` as fractions of the picture: (x, y, w, h), never zero wide or tall.
-fn frame_fractions(f: triptape_core::types::Frame) -> (f32, f32, f32, f32) {
-    let (x, y, w, h) = f;
-    let frac = |v: u8| f32::from(v.min(100)) / 100.0;
-    (frac(x), frac(y), frac(w).max(0.01), frac(h).max(0.01))
-}
-
-/// The part of `img` inside the owner's framing `f` (percent of the
-/// displayed picture, from its top left), at least one pixel each way.
-fn cut_to_frame(img: &RgbImage, f: triptape_core::types::Frame) -> RgbImage {
-    let (x, y, w, h) = frame_px(img.width(), img.height(), f);
-    image::imageops::crop_imm(img, x, y, w, h).to_image()
-}
-
-/// `f` (percent of a `iw`x`ih` picture) in whole pixels: (x, y, w, h),
-/// never empty and never past the picture's edges.
-fn frame_px(iw: u32, ih: u32, f: triptape_core::types::Frame) -> (u32, u32, u32, u32) {
-    let (fx, fy, fw, fh) = f;
-    let along = |len: u32, start: u8, span: u8| {
-        let at = |pct: u8| (f64::from(len) * f64::from(pct.min(100)) / 100.0).round() as u32;
-        let a = at(start).min(len.saturating_sub(1));
-        let b = at(start.saturating_add(span)).clamp(a + 1, len.max(a + 1));
-        (a, b - a)
-    };
-    let (x, w) = along(iw, fx, fw);
-    let (y, h) = along(ih, fy, fh);
-    (x, y, w, h)
+/// `f` (a valid frame) as fractions of the picture: (x, y, w, h).
+fn frame_fractions((x, y, w, h): Frame) -> (f32, f32, f32, f32) {
+    let frac = |v: u8| f32::from(v) / 100.0;
+    (frac(x), frac(y), frac(w), frac(h))
 }
 
 /// One frame of the video at `path`, `ms` milliseconds in, upright (FFmpeg
@@ -4322,14 +4310,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_frame_in_pixels_stays_inside_the_picture() {
-        assert_eq!(frame_px(100, 50, (10, 20, 50, 60)), (10, 10, 50, 30));
-        assert_eq!(frame_px(100, 50, (0, 0, 100, 100)), (0, 0, 100, 50));
-        // A sliver at the far edge is still one pixel, not empty or past it.
-        assert_eq!(frame_px(10, 10, (99, 99, 1, 1)), (9, 9, 1, 1));
-    }
-
-    #[test]
     fn family_boxes_and_the_crop_point_move_into_the_frame() {
         let f = (25, 0, 50, 100);
         let inside = FaceBox {
@@ -4401,6 +4381,19 @@ mod tests {
         let same = photo.clone().framed(None);
         assert_eq!((same.width, same.height, same.frame), (4000, 3000, None));
         assert_eq!(same.family.len(), 2);
+        // A rectangle that is no framing (empty, or past the edge) is none.
+        let unusable = photo.clone().framed(Some((80, 0, 50, 0)));
+        assert_eq!((unusable.width, unusable.frame), (4000, None));
+        // The cover tile's focus is of the framed picture too; a centred
+        // pin (no focus) stays one.
+        let cover = |fx| BookPhoto {
+            cover_focus: Some(fx),
+            ..photo.clone()
+        };
+        let off = cover(0.7).framed(Some((25, 0, 50, 100)));
+        assert!((off.cover_focus.unwrap() - 0.9).abs() < 1e-6);
+        let centred = cover(0.5).framed(Some((0, 0, 50, 100)));
+        assert_eq!(centred.cover_focus, Some(0.5));
         let framed = photo.framed(Some((25, 0, 50, 100)));
         // Landscape cut to a portrait half: lays out (and checks dpi) as one.
         assert_eq!((framed.width, framed.height), (2000, 3000));
