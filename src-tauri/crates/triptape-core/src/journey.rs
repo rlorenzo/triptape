@@ -7,6 +7,7 @@
 //! [`Journey::duration_secs`], so the two cannot drift apart.
 
 use crate::itinerary::{asset_day, ItinStop, Itinerary, LegMode, StopKind};
+use crate::railroute;
 use crate::searoute::{is_water, route, shape_ship_leg};
 use crate::types::Asset;
 
@@ -483,7 +484,9 @@ impl Journey {
                 }
                 _ if explicit.is_some() => explicit.unwrap_or_default(),
                 LegMode::Flight => great_circle(from.pos(), to.pos()),
-                LegMode::Ground => vec![from.pos(), to.pos()],
+                // By Shinkansen where both ends are near a line, else straight.
+                LegMode::Ground => railroute::route(from.pos(), to.pos())
+                    .unwrap_or_else(|| vec![from.pos(), to.pos()]),
                 LegMode::Ship if leg.is_loop => loop_path(from.pos()),
                 LegMode::Ship => {
                     let window = (
@@ -1169,6 +1172,28 @@ mod tests {
             1,
         );
         assert!(Itinerary::from_json(&bad).is_err());
+    }
+
+    #[test]
+    fn a_ground_leg_follows_the_shinkansen_only_near_a_line() {
+        let json = r#"{
+          "stops": [
+            { "id": "tokyo", "label": "Tokyo", "lat": 35.6812, "lon": 139.7671, "depart": "2026-10-03", "kind": "home" },
+            { "id": "osaka", "label": "Osaka", "lat": 34.7025, "lon": 135.4959, "arrive": "2026-10-04", "depart": "2026-10-04" },
+            { "id": "farm", "label": "Farm", "lat": 43.0, "lon": 144.0, "arrive": "2026-10-05" }
+          ],
+          "legs": [
+            { "from": "tokyo", "to": "osaka", "mode": "ground" },
+            { "from": "osaka", "to": "farm", "mode": "ground" }
+          ]
+        }"#;
+        let j = Journey::build(&Itinerary::from_json(json).unwrap(), &[]);
+        let rail = &j.legs[0].path;
+        assert!(rail.len() > 10, "{rail:?}");
+        assert_eq!(rail[0], j.nodes[0].pos);
+        assert_eq!(rail[rail.len() - 1], j.nodes[1].pos);
+        // Far from any line at one end: the old straight line.
+        assert_eq!(j.legs[1].path.len(), 2);
     }
 
     #[test]
