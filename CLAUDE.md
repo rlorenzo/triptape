@@ -5,13 +5,15 @@ TripTape turns a trip's photos and videos into a film, reels and a photo book. T
 ## Build and check
 
 ```sh
+npm install && npm run build       # frontend first: Tauri embeds dist/, so cargo fails without it
 cargo build --workspace
 cargo test --workspace
-npm install && npm run build      # frontend; CI builds it before cargo (Tauri needs dist/)
 ./scripts/check-ffmpeg.sh <ffmpeg> # capability gate
 ```
 
-Plain Homebrew `ffmpeg` lacks libass, drawtext, zscale and vidstab. For real film renders pass `--ffmpeg /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg --ffprobe /opt/homebrew/opt/ffmpeg-full/bin/ffprobe`. ffmpeg-full rejects `-vsync`; use `-fps_mode passthrough`.
+CI also fails on `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `npm run lint` and `npm run check`. `npm run hooks` installs pre-commit and pre-push hooks that run them.
+
+Plain Homebrew `ffmpeg` lacks libass, drawtext, zscale and vidstab. For real film renders pass `--ffmpeg /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg --ffprobe /opt/homebrew/opt/ffmpeg-full/bin/ffprobe`. In your own ffmpeg commands, ffmpeg-full rejects `-vsync`; use `-fps_mode passthrough`.
 
 ## How work lands
 
