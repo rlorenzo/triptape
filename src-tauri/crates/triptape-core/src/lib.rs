@@ -24,6 +24,7 @@ pub mod plan;
 pub mod privacy;
 pub mod process;
 pub mod proxies;
+pub mod railroute;
 pub mod route_stops;
 pub mod scan;
 pub mod score;

@@ -23,8 +23,9 @@ pub fn segment_clear(a: (f64, f64), b: (f64, f64)) -> bool {
     })
 }
 
+/// A heap entry `(cost, index)` ordered so `BinaryHeap` pops the cheapest.
 #[derive(PartialEq)]
-struct Node(f64, usize);
+pub(crate) struct Node(pub(crate) f64, pub(crate) usize);
 impl Eq for Node {}
 impl Ord for Node {
     fn cmp(&self, o: &Self) -> Ordering {
