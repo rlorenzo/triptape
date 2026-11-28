@@ -367,6 +367,36 @@ fn segment_identity(caps: &Capabilities, seg: &Path) -> Option<String> {
     Some(format!("file:{}", hasher.finalize().to_hex()))
 }
 
+/// Fail before the join when a segment's picture is shorter than its slot.
+/// A crossfade chain stops at the first input that runs out, and the film
+/// would lose everything after it while its music played on. The segment's
+/// cache entries are removed, so exporting again renders it fresh.
+fn check_segment_lengths(
+    caps: &Capabilities,
+    segs: &[PathBuf],
+    durations: &[f64],
+) -> Result<(), crate::MediaError> {
+    for (i, (seg, &planned)) in segs.iter().zip(durations).enumerate() {
+        caps.progress.check_cancelled()?;
+        let Some(got) = ffmpeg::short_picture(
+            &caps.ffprobe_bin,
+            seg,
+            planned,
+            ffmpeg::SHORT_PICTURE_TOLERANCE_SECS,
+        ) else {
+            continue;
+        };
+        if let Some(c) = caps.segment_cache.as_deref() {
+            c.forget(seg);
+        }
+        return Err(crate::MediaError::Ffmpeg(format!(
+            "segment {i} ({}) runs {got:.1} s of its {planned:.1} s; its cached copy was removed, so export again to render it fresh",
+            seg.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+        )));
+    }
+    Ok(())
+}
+
 /// Pre-join a long film's segments into chunks (`ranges`, from
 /// [`assembly_chunks`]), each with its own cuts at their transitions and
 /// overlaps; the cuts between chunks are left for the final graph, so the
@@ -418,9 +448,22 @@ fn prejoin_chunks(
             let key = chunk_key(c, &ids?, durs, trans, local_overlaps, keep_ambience, recipe);
             Some((c, key))
         });
-        let hit = cached
-            .as_ref()
-            .is_some_and(|(c, key)| c.fetch(key, &out).is_some());
+        let hit = cached.as_ref().is_some_and(|(c, key)| {
+            c.fetch(key, &out).is_some() && {
+                // An entry cached before chunks were checked can hold a
+                // join that stopped early: drop it and join again.
+                let short = ffmpeg::short_picture(
+                    &caps.ffprobe_bin,
+                    &out,
+                    secs,
+                    ffmpeg::SHORT_PICTURE_TOLERANCE_SECS,
+                );
+                if short.is_some() {
+                    c.remove_entry(key);
+                }
+                short.is_none()
+            }
+        });
         if !hit {
             let args = chunk_join_args(
                 members,
@@ -437,6 +480,18 @@ fn prejoin_chunks(
                     crate::MediaError::Cancelled => e,
                     e => crate::MediaError::Ffmpeg(format!("joining chunk {k}: {e}")),
                 })?;
+            // ffmpeg ends a crossfade chain quietly when one input runs out,
+            // so a short chunk is caught here, before it is cached.
+            if let Some(got) = ffmpeg::short_picture(
+                &caps.ffprobe_bin,
+                &out,
+                secs,
+                ffmpeg::SHORT_PICTURE_TOLERANCE_SECS,
+            ) {
+                return Err(crate::MediaError::Ffmpeg(format!(
+                    "joining chunk {k}: picture runs {got:.1} s of the planned {secs:.1} s"
+                )));
+            }
             if let Some((c, key)) = &cached {
                 c.store(key, &out, secs);
             }
@@ -1800,6 +1855,7 @@ pub fn render_hero_video(
     // grew ffmpeg past 80 GB and macOS killed it). The chunks keep every
     // cut's transition and overlap, so the timeline is unchanged.
     let seg_paths: Vec<PathBuf> = segs.iter().map(|s| s.1.clone()).collect();
+    check_segment_lengths(caps, &seg_paths, &durations)?;
     let join_label = "joining film chunks";
     let joined = prejoin_chunks(
         caps,
@@ -1858,7 +1914,7 @@ pub fn render_hero_video(
 
     // 6. Verify + EDL + sidecar SRT.
     let (out_w, out_h) = recipe.dims(opts.resolution);
-    let probed = ffmpeg::verify_video(&caps.ffprobe_bin, out_mp4, out_w, out_h)?;
+    let probed = ffmpeg::verify_video(&caps.ffprobe_bin, out_mp4, out_w, out_h, Some(total))?;
     let edl = Edl {
         version: 1,
         draft: opts.draft,

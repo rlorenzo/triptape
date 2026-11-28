@@ -576,6 +576,34 @@ impl SegmentCache {
             .insert(path.to_path_buf(), key.to_string());
     }
 
+    /// Remove the entries the segment at `path` came from: its base and any
+    /// overlay baked onto it. For a file found not to match its sidecar, so
+    /// the next export renders it again instead of reusing it.
+    pub fn forget(&self, path: &Path) {
+        let overlay = self
+            .overlays_by_path
+            .lock()
+            .expect("keys lock")
+            .get(path)
+            .cloned();
+        for key in [self.key_of(path), overlay].into_iter().flatten() {
+            self.remove_entry(&key);
+        }
+    }
+
+    /// Remove one entry; one already gone is fine.
+    pub fn remove_entry(&self, key: &str) {
+        if let Some(meta) = read_valid(&self.dir, key) {
+            self.cache_bytes.fetch_sub(
+                meta.size.min(self.cache_bytes.load(Ordering::Relaxed)),
+                Ordering::Relaxed,
+            );
+        }
+        // The sidecar first: an entry without one is already a miss.
+        let _ = std::fs::remove_file(entry_path(&self.dir, key, "json"));
+        let _ = std::fs::remove_file(entry_path(&self.dir, key, "mp4"));
+    }
+
     /// `(entry is in the cache, this call wrote it)`.
     fn store_entry(&self, key: &str, produced: &Path, secs: f64) -> (bool, bool) {
         if read_valid(&self.dir, key).is_some() {
@@ -1032,6 +1060,27 @@ mod tests {
         let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         f.set_modified(SystemTime::now() - Duration::from_secs(secs_ago))
             .unwrap();
+    }
+
+    /// A segment found cut short is forgotten (base and overlay), so the
+    /// next export renders it instead of reusing the bad copy.
+    #[test]
+    fn forget_removes_a_segments_base_and_overlay_entries() {
+        let t = tempfile::tempdir().unwrap();
+        let (dir, work) = (t.path().join("c"), t.path().join("w"));
+        let c = open(&dir, &work, None);
+        let seg = produce(&work, "seg_005.mp4", 64);
+        assert!(c.store("base0", &seg, 4.0));
+        assert!(c.store_overlay("over0", &seg, 4.0));
+        let other = produce(&work, "seg_006.mp4", 64);
+        assert!(c.store("base1", &other, 4.0));
+        c.forget(&seg);
+        assert!(read_valid(&dir, "base0").is_none());
+        assert!(read_valid(&dir, "over0").is_none());
+        assert!(!entry_path(&dir, "base0", "mp4").exists());
+        assert!(read_valid(&dir, "base1").is_some(), "other segments stay");
+        // Removing an entry already gone is harmless.
+        c.remove_entry("base0");
     }
 
     #[test]
