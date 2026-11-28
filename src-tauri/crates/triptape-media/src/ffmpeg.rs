@@ -1089,6 +1089,10 @@ fn stderr_tail(stderr: &[u8]) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct ProbeInfo {
     pub duration_secs: f64,
+    /// Length of the first video stream, `None` when ffprobe gives none. The
+    /// container's length is the longest stream's, so a film whose picture
+    /// stops early still reports its full soundtrack there.
+    pub video_duration_secs: Option<f64>,
     pub width: u32,
     pub height: u32,
     pub fps: f64,
@@ -1193,6 +1197,13 @@ pub(crate) fn parse_probe(
         match s.get("codec_type").and_then(|c| c.as_str()) {
             Some("video") => {
                 info.has_video = true;
+                if info.video_duration_secs.is_none() {
+                    info.video_duration_secs = s
+                        .get("duration")
+                        .and_then(|d| d.as_str())
+                        .and_then(|d| d.parse::<f64>().ok())
+                        .filter(|d| d.is_finite() && *d >= 0.0);
+                }
                 info.width = s.get("width").and_then(|w| w.as_u64()).unwrap_or(0) as u32;
                 info.height = s.get("height").and_then(|h| h.as_u64()).unwrap_or(0) as u32;
                 info.fps = s
@@ -1263,15 +1274,50 @@ fn parse_rate(s: &str) -> Option<f64> {
     }
 }
 
-/// Verify a hero/reel render: video present, expected geometry, CFR 30 fps
-/// (±1 frame duration tolerance is checked by callers against the EDL).
+/// How much shorter than planned a picture may run before it counts as cut
+/// short: frame rounding and encoder padding stay well inside this.
+pub const SHORT_PICTURE_TOLERANCE_SECS: f64 = 0.25;
+
+/// Picture length of `info`: the video stream's own when ffprobe gives one,
+/// else the container's.
+pub fn picture_secs(info: &ProbeInfo) -> f64 {
+    info.video_duration_secs.unwrap_or(info.duration_secs)
+}
+
+/// `Ok(Some(actual))` when the picture at `path` runs more than
+/// [`SHORT_PICTURE_TOLERANCE_SECS`] shorter than `planned`, `Ok(None)` when
+/// it is long enough, and `Err` when it cannot be probed or has no video
+/// stream (a corrupt file is no more usable than a short one).
+pub fn short_picture(
+    ffprobe_bin: &str,
+    path: &Path,
+    planned: f64,
+) -> Result<Option<f64>, super::MediaError> {
+    let actual = picture_secs(&ffprobe_file(ffprobe_bin, path)?);
+    Ok((actual + SHORT_PICTURE_TOLERANCE_SECS < planned).then_some(actual))
+}
+
+/// Verify a hero/reel render: video present, expected geometry, CFR 30 fps,
+/// and, given `expect_secs`, a picture that runs the whole timeline (a join
+/// that stopped early still carries the full music bed, so only the video
+/// stream shows it).
 pub fn verify_video(
     ffprobe_bin: &str,
     path: &Path,
     expect_w: u32,
     expect_h: u32,
+    expect_secs: Option<f64>,
 ) -> Result<ProbeInfo, super::MediaError> {
     let info = ffprobe_file(ffprobe_bin, path)?;
+    if let Some(expect) = expect_secs {
+        let got = picture_secs(&info);
+        // A frame or two of rounding per cut adds up over a long film.
+        if got + 1.0 < expect {
+            return Err(super::MediaError::Ffmpeg(format!(
+                "picture runs {got:.1} s of the planned {expect:.1} s"
+            )));
+        }
+    }
     if info.width != expect_w || info.height != expect_h {
         return Err(super::MediaError::Ffmpeg(format!(
             "geometry {}x{} != expected {expect_w}x{expect_h}",
@@ -1515,6 +1561,23 @@ mod tests {
         let v = probe_json(&format!("{VIDEO},{APAC},{AAC}"));
         let info = parse_probe(&v, Path::new("x.mov")).unwrap();
         assert_eq!(audio_spec(Some(&info)), "0:a:1");
+    }
+
+    /// A film whose picture stopped early still lasts as long as its music
+    /// in the container; the video stream's own length tells them apart.
+    #[test]
+    fn picture_length_comes_from_the_video_stream() {
+        let short = r#"{"codec_type":"video","codec_name":"hevc","width":1920,"height":1080,"avg_frame_rate":"30/1","duration":"0.100000"}"#;
+        let info = parse_probe(&probe_json(&format!("{short},{AAC}")), Path::new("x.mp4")).unwrap();
+        assert_eq!(info.duration_secs, 2.0);
+        assert_eq!(picture_secs(&info), 0.1);
+        // No stream duration: the container's stands in.
+        let info = parse_probe(&probe_json(VIDEO), Path::new("x.mp4")).unwrap();
+        assert_eq!(picture_secs(&info), 2.0);
+        // A stream that reports zero length is empty, not unknown.
+        let empty = short.replace("0.100000", "0.000000");
+        let info = parse_probe(&probe_json(&format!("{empty},{AAC}")), Path::new("x.mp4")).unwrap();
+        assert_eq!(picture_secs(&info), 0.0);
     }
 
     #[test]

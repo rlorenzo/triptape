@@ -333,7 +333,7 @@ pub fn render_reels(
                 continue;
             }
         };
-        let probed = match ffmpeg::verify_video(&caps.ffprobe_bin, &out, 1080, 1920) {
+        let probed = match ffmpeg::verify_video(&caps.ffprobe_bin, &out, 1080, 1920, None) {
             Ok(p) => p,
             Err(e) => {
                 fallbacks.push(format!(
