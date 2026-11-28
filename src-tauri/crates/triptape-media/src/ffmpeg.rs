@@ -1089,10 +1089,10 @@ fn stderr_tail(stderr: &[u8]) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct ProbeInfo {
     pub duration_secs: f64,
-    /// Length of the first video stream, 0 when ffprobe gives none. The
+    /// Length of the first video stream, `None` when ffprobe gives none. The
     /// container's length is the longest stream's, so a film whose picture
     /// stops early still reports its full soundtrack there.
-    pub video_duration_secs: f64,
+    pub video_duration_secs: Option<f64>,
     pub width: u32,
     pub height: u32,
     pub fps: f64,
@@ -1197,12 +1197,12 @@ pub(crate) fn parse_probe(
         match s.get("codec_type").and_then(|c| c.as_str()) {
             Some("video") => {
                 info.has_video = true;
-                if info.video_duration_secs == 0.0 {
+                if info.video_duration_secs.is_none() {
                     info.video_duration_secs = s
                         .get("duration")
                         .and_then(|d| d.as_str())
                         .and_then(|d| d.parse::<f64>().ok())
-                        .unwrap_or(0.0);
+                        .filter(|d| d.is_finite() && *d >= 0.0);
                 }
                 info.width = s.get("width").and_then(|w| w.as_u64()).unwrap_or(0) as u32;
                 info.height = s.get("height").and_then(|h| h.as_u64()).unwrap_or(0) as u32;
@@ -1281,19 +1281,20 @@ pub const SHORT_PICTURE_TOLERANCE_SECS: f64 = 0.25;
 /// Picture length of `info`: the video stream's own when ffprobe gives one,
 /// else the container's.
 pub fn picture_secs(info: &ProbeInfo) -> f64 {
-    if info.video_duration_secs > 0.0 {
-        info.video_duration_secs
-    } else {
-        info.duration_secs
-    }
+    info.video_duration_secs.unwrap_or(info.duration_secs)
 }
 
-/// `Some(actual)` when the picture at `path` runs more than `tolerance`
-/// shorter than `planned`; `None` when it is long enough or cannot be probed
-/// (a missing file fails later, where the caller can say which one).
-pub fn short_picture(ffprobe_bin: &str, path: &Path, planned: f64, tolerance: f64) -> Option<f64> {
-    let actual = picture_secs(&ffprobe_file(ffprobe_bin, path).ok()?);
-    (actual + tolerance < planned).then_some(actual)
+/// `Ok(Some(actual))` when the picture at `path` runs more than
+/// [`SHORT_PICTURE_TOLERANCE_SECS`] shorter than `planned`, `Ok(None)` when
+/// it is long enough, and `Err` when it cannot be probed or has no video
+/// stream (a corrupt file is no more usable than a short one).
+pub fn short_picture(
+    ffprobe_bin: &str,
+    path: &Path,
+    planned: f64,
+) -> Result<Option<f64>, super::MediaError> {
+    let actual = picture_secs(&ffprobe_file(ffprobe_bin, path)?);
+    Ok((actual + SHORT_PICTURE_TOLERANCE_SECS < planned).then_some(actual))
 }
 
 /// Verify a hero/reel render: video present, expected geometry, CFR 30 fps,
@@ -1573,6 +1574,10 @@ mod tests {
         // No stream duration: the container's stands in.
         let info = parse_probe(&probe_json(VIDEO), Path::new("x.mp4")).unwrap();
         assert_eq!(picture_secs(&info), 2.0);
+        // A stream that reports zero length is empty, not unknown.
+        let empty = short.replace("0.100000", "0.000000");
+        let info = parse_probe(&probe_json(&format!("{empty},{AAC}")), Path::new("x.mp4")).unwrap();
+        assert_eq!(picture_secs(&info), 0.0);
     }
 
     #[test]

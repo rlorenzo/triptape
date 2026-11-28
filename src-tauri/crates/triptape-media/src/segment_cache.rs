@@ -543,13 +543,15 @@ impl SegmentCache {
     /// lower-third was baked onto it, else [`key_of`](Self::key_of). A chunk
     /// is keyed on these, so a changed heading re-joins its chunk.
     pub fn content_key_of(&self, path: &Path) -> Option<String> {
-        let overlaid = self
-            .overlays_by_path
+        self.overlay_key_of(path).or_else(|| self.key_of(path))
+    }
+
+    fn overlay_key_of(&self, path: &Path) -> Option<String> {
+        self.overlays_by_path
             .lock()
             .expect("keys lock")
             .get(path)
-            .cloned();
-        overlaid.or_else(|| self.key_of(path))
+            .cloned()
     }
 
     fn note_overlay(&self, path: &Path, key: &str) {
@@ -580,13 +582,10 @@ impl SegmentCache {
     /// overlay baked onto it. For a file found not to match its sidecar, so
     /// the next export renders it again instead of reusing it.
     pub fn forget(&self, path: &Path) {
-        let overlay = self
-            .overlays_by_path
-            .lock()
-            .expect("keys lock")
-            .get(path)
-            .cloned();
-        for key in [self.key_of(path), overlay].into_iter().flatten() {
+        for key in [self.key_of(path), self.overlay_key_of(path)]
+            .into_iter()
+            .flatten()
+        {
             self.remove_entry(&key);
         }
     }
@@ -594,10 +593,10 @@ impl SegmentCache {
     /// Remove one entry; one already gone is fine.
     pub fn remove_entry(&self, key: &str) {
         if let Some(meta) = read_valid(&self.dir, key) {
-            self.cache_bytes.fetch_sub(
-                meta.size.min(self.cache_bytes.load(Ordering::Relaxed)),
-                Ordering::Relaxed,
-            );
+            self.cache_bytes
+                .update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+                    b.saturating_sub(meta.size)
+                });
         }
         // The sidecar first: an entry without one is already a miss.
         let _ = std::fs::remove_file(entry_path(&self.dir, key, "json"));
@@ -1074,7 +1073,13 @@ mod tests {
         assert!(c.store_overlay("over0", &seg, 4.0));
         let other = produce(&work, "seg_006.mp4", 64);
         assert!(c.store("base1", &other, 4.0));
+        let before = c.cache_bytes.load(Ordering::Relaxed);
         c.forget(&seg);
+        assert_eq!(
+            c.cache_bytes.load(Ordering::Relaxed),
+            before - 128,
+            "both entries' bytes released"
+        );
         assert!(read_valid(&dir, "base0").is_none());
         assert!(read_valid(&dir, "over0").is_none());
         assert!(!entry_path(&dir, "base0", "mp4").exists());

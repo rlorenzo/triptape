@@ -369,32 +369,50 @@ fn segment_identity(caps: &Capabilities, seg: &Path) -> Option<String> {
 
 /// Fail before the join when a segment's picture is shorter than its slot.
 /// A crossfade chain stops at the first input that runs out, and the film
-/// would lose everything after it while its music played on. The segment's
-/// cache entries are removed, so exporting again renders it fresh.
+/// would lose everything after it while its music played on. Every short or
+/// unreadable segment's cache entries are removed, so one more export renders
+/// them all fresh.
 fn check_segment_lengths(
     caps: &Capabilities,
     segs: &[PathBuf],
     durations: &[f64],
 ) -> Result<(), crate::MediaError> {
+    let mut first = None;
+    let mut bad = 0usize;
     for (i, (seg, &planned)) in segs.iter().zip(durations).enumerate() {
         caps.progress.check_cancelled()?;
-        let Some(got) = ffmpeg::short_picture(
-            &caps.ffprobe_bin,
-            seg,
-            planned,
-            ffmpeg::SHORT_PICTURE_TOLERANCE_SECS,
-        ) else {
-            continue;
+        let problem = match ffmpeg::short_picture(&caps.ffprobe_bin, seg, planned) {
+            Ok(None) => continue,
+            Ok(Some(got)) => format!("runs {got:.1} s of its {planned:.1} s"),
+            Err(e) => format!("cannot be read ({e})"),
         };
         if let Some(c) = caps.segment_cache.as_deref() {
             c.forget(seg);
         }
-        return Err(crate::MediaError::Ffmpeg(format!(
-            "segment {i} ({}) runs {got:.1} s of its {planned:.1} s; its cached copy was removed, so export again to render it fresh",
-            seg.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
-        )));
+        bad += 1;
+        first.get_or_insert_with(|| {
+            let name = seg
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+            format!("segment {i} ({name}) {problem}")
+        });
     }
-    Ok(())
+    let Some(first) = first else {
+        return Ok(());
+    };
+    let others = match bad {
+        1 => String::new(),
+        n => format!(" (and {} more)", n - 1),
+    };
+    let hint = if caps.segment_cache.is_some() {
+        "cached copies were removed, so export again to render them fresh"
+    } else {
+        "export again to render them fresh"
+    };
+    Err(crate::MediaError::Ffmpeg(format!(
+        "{first}{others}; {hint}"
+    )))
 }
 
 /// Pre-join a long film's segments into chunks (`ranges`, from
@@ -451,17 +469,16 @@ fn prejoin_chunks(
         let hit = cached.as_ref().is_some_and(|(c, key)| {
             c.fetch(key, &out).is_some() && {
                 // An entry cached before chunks were checked can hold a
-                // join that stopped early: drop it and join again.
-                let short = ffmpeg::short_picture(
-                    &caps.ffprobe_bin,
-                    &out,
-                    secs,
-                    ffmpeg::SHORT_PICTURE_TOLERANCE_SECS,
+                // join that stopped early, or a file that no longer reads:
+                // drop it and join again.
+                let valid = matches!(
+                    ffmpeg::short_picture(&caps.ffprobe_bin, &out, secs),
+                    Ok(None)
                 );
-                if short.is_some() {
+                if !valid {
                     c.remove_entry(key);
                 }
-                short.is_none()
+                valid
             }
         });
         if !hit {
@@ -482,12 +499,9 @@ fn prejoin_chunks(
                 })?;
             // ffmpeg ends a crossfade chain quietly when one input runs out,
             // so a short chunk is caught here, before it is cached.
-            if let Some(got) = ffmpeg::short_picture(
-                &caps.ffprobe_bin,
-                &out,
-                secs,
-                ffmpeg::SHORT_PICTURE_TOLERANCE_SECS,
-            ) {
+            let short = ffmpeg::short_picture(&caps.ffprobe_bin, &out, secs)
+                .map_err(|e| crate::MediaError::Ffmpeg(format!("verifying chunk {k}: {e}")))?;
+            if let Some(got) = short {
                 return Err(crate::MediaError::Ffmpeg(format!(
                     "joining chunk {k}: picture runs {got:.1} s of the planned {secs:.1} s"
                 )));
